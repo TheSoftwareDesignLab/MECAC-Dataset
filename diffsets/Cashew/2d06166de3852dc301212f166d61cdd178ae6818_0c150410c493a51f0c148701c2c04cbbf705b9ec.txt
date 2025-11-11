@@ -1,0 +1,2824 @@
+diff --git a/budget/lib/database/tables.dart b/budget/lib/database/tables.dart
+index 97d110eba..02b01b323 100644
+--- a/budget/lib/database/tables.dart
++++ b/budget/lib/database/tables.dart
+@@ -268,6 +268,64 @@ class FinanceDatabase extends _$FinanceDatabase {
+         }).toList());
+   }
+ 
++  Stream<List<TransactionWithCategory>> getTransactionCategoryWithMonth(
++    DateTime date, {
++    String search = "",
++    // Search will be ignored... if these params are passed in
++    List<int> categoryFks = const [],
++  }) {
++    JoinedSelectStatement<HasResultSet, dynamic> query;
++    if (categoryFks.length > 0) {
++      query = (select(transactions)
++            ..where((tbl) {
++              final dateCreated = tbl.dateCreated;
++              return tbl.walletFk.equals(appStateSettings["selectedWallet"]) &
++                  dateCreated.year.equals(date.year) &
++                  dateCreated.month.equals(date.month) &
++                  dateCreated.day.equals(date.day) &
++                  tbl.categoryFk.isIn(categoryFks);
++            }))
++          .join([
++        leftOuterJoin(categories,
++            categories.categoryPk.equalsExp(transactions.categoryFk))
++      ]);
++    } else if (search == "") {
++      query = (select(transactions)
++            ..where((tbl) {
++              final dateCreated = tbl.dateCreated;
++              return tbl.walletFk.equals(appStateSettings["selectedWallet"]) &
++                  dateCreated.year.equals(date.year) &
++                  dateCreated.month.equals(date.month) &
++                  dateCreated.day.equals(date.day);
++            }))
++          .join([
++        leftOuterJoin(categories,
++            categories.categoryPk.equalsExp(transactions.categoryFk))
++      ]);
++    } else {
++      query = ((select(transactions)
++            ..where((tbl) {
++              final dateCreated = tbl.dateCreated;
++              return tbl.walletFk.equals(appStateSettings["selectedWallet"]) &
++                  dateCreated.year.equals(date.year) &
++                  dateCreated.month.equals(date.month) &
++                  dateCreated.day.equals(date.day);
++            }))
++          .join([
++        innerJoin(categories,
++            categories.categoryPk.equalsExp(transactions.categoryFk))
++      ]))
++        ..where(categories.name.like("%" + search + "%") |
++            transactions.name.like("%" + search + "%"));
++    }
++
++    return query.watch().map((rows) => rows.map((row) {
++          return TransactionWithCategory(
++              category: row.readTable(categories),
++              transaction: row.readTable(transactions));
++        }).toList());
++  }
++
+   // //get days that transactions occurred on
+   // Stream<List<DateTime?>> getDatesOfTransaction({
+   //   String search = "",
+@@ -506,7 +564,7 @@ class FinanceDatabase extends _$FinanceDatabase {
+ 
+   Stream<List<TransactionWallet>> watchAllWallets({int? limit, int? offset}) {
+     return (select(wallets)
+-          ..orderBy([(w) => OrderingTerm.asc(w.dateCreated)])
++          ..orderBy([(w) => OrderingTerm.asc(w.order)])
+           ..limit(limit ?? DEFAULT_LIMIT, offset: offset ?? DEFAULT_OFFSET))
+         .watch();
+   }
+@@ -673,6 +731,17 @@ class FinanceDatabase extends _$FinanceDatabase {
+         .go();
+   }
+ 
++  //delete wallet given key
++  Future deleteWallet(int walletPk) {
++    return (delete(wallets)..where((w) => w.walletPk.equals(walletPk))).go();
++  }
++
++  //delete transactions that belong to specific wallet key
++  Future deleteWalletsTransactions(int walletPk) {
++    return (delete(transactions)..where((t) => t.walletFk.equals(walletPk)))
++        .go();
++  }
++
+   // TODO: add budget pk filter
+   // get total amount spent in each category
+   Stream<List<TypedResult>> watchTotalSpentInEachCategory() {
+@@ -758,6 +827,34 @@ class FinanceDatabase extends _$FinanceDatabase {
+         .watch();
+   }
+ 
++  Stream<List<double?>> watchTotalOfWallet(int walletPk) {
++    final totalAmt = transactions.amount.sum();
++    final query = selectOnly(transactions)
++      ..addColumns([totalAmt])
++      ..where(transactions.walletFk.equals(walletPk));
++    return query.map((row) => row.read(totalAmt)).watch();
++  }
++
++  Stream<List<int?>> watchTotalCountOfTransactionsInWallet(int walletPk) {
++    final totalCount = transactions.transactionPk.count();
++    final query = selectOnly(transactions)
++      ..addColumns([totalCount])
++      ..where(transactions.walletFk.equals(walletPk));
++    return query.map((row) => row.read(totalCount)).watch();
++  }
++
++  Future<List<int?>> getTotalCountOfCategories() async {
++    final totalCount = categories.categoryPk.count();
++    final query = selectOnly(categories)..addColumns([totalCount]);
++    return query.map((row) => row.read(totalCount)).get();
++  }
++
++  Future<List<int?>> getTotalCountOfWallets() async {
++    final totalCount = wallets.walletPk.count();
++    final query = selectOnly(wallets)..addColumns([totalCount]);
++    return query.map((row) => row.read(totalCount)).get();
++  }
++
+   Stream<List<Transaction>> watchTotalSpentEachDay(int? budgetPk) {
+     final totalAmt = transactions.amount.sum();
+     final date = transactions.dateCreated.date;
+diff --git a/budget/lib/functions.dart b/budget/lib/functions.dart
+index f07022c48..8f682c959 100644
+--- a/budget/lib/functions.dart
++++ b/budget/lib/functions.dart
+@@ -270,3 +270,9 @@ double getPercentBetweenDates(DateTimeRange timeRange, DateTime currentTime) {
+       millisecondDifference;
+   return percent * 100;
+ }
++
++int daysBetween(DateTime from, DateTime to) {
++  from = DateTime(from.year, from.month, from.day);
++  to = DateTime(to.year, to.month, to.day);
++  return (to.difference(from).inHours / 24).round();
++}
+diff --git a/budget/lib/main.dart b/budget/lib/main.dart
+index 784e235d5..f0e48d6c5 100644
+--- a/budget/lib/main.dart
++++ b/budget/lib/main.dart
+@@ -19,6 +19,10 @@ import 'dart:math';
+ import 'package:shared_preferences/shared_preferences.dart';
+ import 'package:flutter/gestures.dart';
+ 
++/*
++adb tcpip 5555
++adb connect 192.168.0.22
++*/
+ void main() async {
+   database = await constructDb();
+   runApp(InitializeDatabase());
+@@ -67,6 +71,8 @@ Future<Map<String, dynamic>> getUserSettings() async {
+     "theme": "system",
+     "selectedWallet": 0,
+     "accentColor": toHexString(Color(0xFF1B447A)),
++    "showWalletSwitcher": true,
++    "showCumulativeSpending": true,
+   };
+ 
+   final prefs = await SharedPreferences.getInstance();
+@@ -75,7 +81,14 @@ Future<Map<String, dynamic>> getUserSettings() async {
+     await prefs.setString('userSettings', json.encode(userPreferencesDefault));
+     return userPreferencesDefault;
+   } else {
+-    return json.decode(userSettings);
++    var userSettingsJSON = json.decode(userSettings);
++    //Set to defaults if a new setting is added, but no entry saved
++    userPreferencesDefault.forEach((key, value) {
++      if (userSettingsJSON[key] == null) {
++        userSettingsJSON[key] = userPreferencesDefault[key];
++      }
++    });
++    return userSettingsJSON;
+   }
+ }
+ 
+diff --git a/budget/lib/pages/addWalletPage.dart b/budget/lib/pages/addWalletPage.dart
+index a5804b026..5b4c9273e 100644
+--- a/budget/lib/pages/addWalletPage.dart
++++ b/budget/lib/pages/addWalletPage.dart
+@@ -77,7 +77,8 @@ class _AddWalletPageState extends State<AddWalletPage> {
+   }
+ 
+   Future addWallet() async {
+-    print("Added budget");
++    print("Added wallet");
++    int numberOfWallets = (await database.getTotalCountOfWallets())[0] ?? 0;
+     await database.createOrUpdateWallet(
+       TransactionWallet(
+         walletPk: widget.wallet != null
+@@ -86,7 +87,7 @@ class _AddWalletPageState extends State<AddWalletPage> {
+         name: selectedTitle ?? "",
+         colour: toHexString(selectedColor ?? Colors.green),
+         dateCreated: DateTime.now(),
+-        order: 0,
++        order: numberOfWallets,
+       ),
+     );
+     Navigator.pop(context);
+diff --git a/budget/lib/pages/budgetPage.dart b/budget/lib/pages/budgetPage.dart
+index 64327115d..fb6561301 100644
+--- a/budget/lib/pages/budgetPage.dart
++++ b/budget/lib/pages/budgetPage.dart
+@@ -155,7 +155,12 @@ class _BudgetPageState extends State<BudgetPage> {
+                                   budgetRange, DateTime.now()),
+                             ),
+                             Container(height: 15),
+-                            DaySpending(budget: widget.budget, large: true),
++                            DaySpending(
++                              budget: widget.budget,
++                              amount: (widget.budget.amount - totalSpent) /
++                                  daysBetween(DateTime.now(), budgetRange.end),
++                              large: true,
++                            ),
+                             Container(height: 10),
+                           ],
+                         ),
+diff --git a/budget/lib/pages/editWalletsPage.dart b/budget/lib/pages/editWalletsPage.dart
+index a7eda7df1..d8936fdec 100644
+--- a/budget/lib/pages/editWalletsPage.dart
++++ b/budget/lib/pages/editWalletsPage.dart
+@@ -96,19 +96,24 @@ class WalletRowEntry extends StatelessWidget {
+                 child: Container(
+                     width: 40, height: 50, child: Icon(Icons.delete_rounded)),
+                 onTap: () {
+-                  openPopup(context,
+-                      description: "Delete " + wallet.name + "?",
+-                      icon: Icons.delete_rounded,
+-                      onCancel: () {
+-                        Navigator.pop(context);
+-                      },
+-                      onCancelLabel: "Cancel",
+-                      onSubmit: () {
+-                        // database.deleteWallet(wallet.walletPk);
+-                        Navigator.pop(context);
+-                        openSnackbar(context, "Deleted " + wallet.name);
+-                      },
+-                      onSubmitLabel: "Delete");
++                  openPopup(
++                    context,
++                    description: "Delete " +
++                        wallet.name +
++                        "?\nThis will delete all transactions associated with this wallet.",
++                    icon: Icons.delete_rounded,
++                    onCancel: () {
++                      Navigator.pop(context);
++                    },
++                    onCancelLabel: "Cancel",
++                    onSubmit: () {
++                      database.deleteWallet(wallet.walletPk);
++                      database.deleteWalletsTransactions(wallet.walletPk);
++                      Navigator.pop(context);
++                      openSnackbar(context, "Deleted " + wallet.name);
++                    },
++                    onSubmitLabel: "Delete",
++                  );
+                 },
+               ),
+               OpenContainerNavigation(
+diff --git a/budget/lib/pages/homePage.dart b/budget/lib/pages/homePage.dart
+index 628e489f8..f9d669d25 100644
+--- a/budget/lib/pages/homePage.dart
++++ b/budget/lib/pages/homePage.dart
+@@ -16,11 +16,10 @@ import 'package:budget/widgets/transactionEntry.dart';
+ import 'package:budget/widgets/walletEntry.dart';
+ import 'package:flutter/material.dart';
+ import "../struct/budget.dart";
+-import 'package:flutter_sticky_header/flutter_sticky_header.dart';
+ import 'package:budget/colors.dart';
+ 
+ class HomePage extends StatefulWidget {
+-  HomePage({
++  const HomePage({
+     Key? key,
+   }) : super(key: key);
+ 
+@@ -28,276 +27,261 @@ class HomePage extends StatefulWidget {
+   State<HomePage> createState() => HomePageState();
+ }
+ 
+-class HomePageState extends State<HomePage> with AutomaticKeepAliveClientMixin {
++class HomePageState extends State<HomePage>
++    with TickerProviderStateMixin, AutomaticKeepAliveClientMixin {
+   void refreshState() {
+     setState(() {});
+   }
+ 
+   @override
+   bool get wantKeepAlive => true;
++  bool showElevation = false;
++  late ScrollController _scrollController;
++  late AnimationController _animationControllerHeader;
++  late AnimationController _animationControllerHeader2;
+ 
+-  GlobalKey<_HomeAppBarState> _appBarKey = GlobalKey();
+-  double setTitleHeight = 0;
++  void initState() {
++    super.initState();
++    _animationControllerHeader = AnimationController(vsync: this, value: 1);
++    _animationControllerHeader2 = AnimationController(vsync: this, value: 1);
++
++    _scrollController = ScrollController();
++    _scrollController.addListener(_scrollListener);
++  }
+ 
+-  ScrollController _scrollController = ScrollController();
++  _scrollListener() {
++    double percent = _scrollController.offset / (200);
++    if (percent >= 0 && percent <= 1) {
++      _animationControllerHeader.value = 1 - _scrollController.offset / (200);
++      _animationControllerHeader2.value =
++          1 - _scrollController.offset * 2 / (200);
++    }
++  }
++
++  @override
++  void dispose() {
++    super.dispose();
++    _animationControllerHeader.dispose();
++    _animationControllerHeader2.dispose();
++    _scrollController.dispose();
++  }
+ 
+   @override
+   Widget build(BuildContext context) {
+-    return PageFramework(
+-      title: "Welcome",
+-      subtitle: Transform.translate(
+-        offset: Offset(18, -60),
+-        child: TextFont(
+-          text: "Welcome",
+-          fontSize: 17,
+-        ),
+-      ),
+-      subtitleAlignment: Alignment.bottomLeft,
+-      subtitleAnimationSpeed: 900,
+-      subtitleSize: 0.1,
+-      titleWidget: Row(
+-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+-        crossAxisAlignment: CrossAxisAlignment.end,
+-        children: [
+-          Column(
+-            mainAxisAlignment: MainAxisAlignment.end,
+-            crossAxisAlignment: CrossAxisAlignment.start,
+-            children: [
+-              TextFont(
+-                text: "James",
+-                fontSize: 26,
+-                fontWeight: FontWeight.bold,
+-              ),
+-            ],
+-          ),
+-          Container(
+-            height: 40,
+-            width: 40,
+-            color: Colors.red,
+-          ),
+-        ],
+-      ),
+-      backButton: false,
+-      pinned: false,
+-      slivers: [
+-        SliverPadding(
+-          padding: EdgeInsets.only(top: 0, bottom: 25),
+-          sliver: SliverToBoxAdapter(
++    return Scaffold(
++      body: CustomScrollView(
++        controller: _scrollController,
++        slivers: [
++          SliverToBoxAdapter(
+             child: Container(
+-                height: 85.0,
+-                child: StreamBuilder<List<TransactionWallet>>(
+-                    stream: database.watchAllWallets(),
+-                    builder: (context, snapshot) {
+-                      if (snapshot.hasData) {
+-                        return ListView.builder(
+-                          scrollDirection: Axis.horizontal,
+-                          itemCount: snapshot.data!.length + 1,
+-                          itemBuilder: (context, index) {
+-                            bool lastIndex = index == snapshot.data!.length;
+-                            if (lastIndex) {
+-                              return WalletEntryAdd();
+-                            }
+-                            return Padding(
+-                              padding: EdgeInsets.only(
+-                                left: (index == 0 ? 8 : 0.0),
+-                              ),
+-                              child: WalletEntry(
+-                                selected: appStateSettings["selectedWallet"] ==
+-                                    snapshot.data![index].walletPk,
+-                                wallet: snapshot.data![index],
+-                              ),
+-                            );
+-                          },
+-                        );
+-                      }
+-                      return Container();
+-                    })),
+-          ),
+-        ),
+-        StreamBuilder<List<Transaction>>(
+-          stream: database.getTransactionsInTimeRangeFromCategories(
+-            DateTime(
+-              DateTime.now().year,
+-              DateTime.now().month - 1,
+-              DateTime.now().day,
+-            ),
+-            DateTime(
+-              DateTime.now().year,
+-              DateTime.now().month,
+-              DateTime.now().day,
++              height: 236,
++              alignment: Alignment.bottomLeft,
++              padding: EdgeInsets.only(left: 18, bottom: 22, right: 18),
++              child: Row(
++                crossAxisAlignment: CrossAxisAlignment.end,
++                mainAxisAlignment: MainAxisAlignment.spaceBetween,
++                children: [
++                  Column(
++                    crossAxisAlignment: CrossAxisAlignment.start,
++                    mainAxisAlignment: MainAxisAlignment.end,
++                    children: [
++                      AnimatedBuilder(
++                        animation: _animationControllerHeader,
++                        builder: (_, child) {
++                          return Transform.translate(
++                            offset: Offset(0,
++                                20 - 20 * (_animationControllerHeader.value)),
++                            child: child,
++                          );
++                        },
++                        child: FadeTransition(
++                          opacity: _animationControllerHeader2,
++                          child: TextFont(
++                            text: "Hello",
++                            fontWeight: FontWeight.bold,
++                            fontSize: 20,
++                          ),
++                        ),
++                      ),
++                      AnimatedBuilder(
++                        animation: _animationControllerHeader,
++                        builder: (_, child) {
++                          return Transform.scale(
++                            alignment: Alignment.bottomLeft,
++                            scale: _animationControllerHeader.value < 0.5
++                                ? 0.25 + 0.5
++                                : (_animationControllerHeader.value) * 0.5 +
++                                    0.5,
++                            child: child,
++                          );
++                        },
++                        child: TextFont(
++                          text: "James",
++                          fontWeight: FontWeight.bold,
++                          fontSize: 39,
++                        ),
++                      ),
++                    ],
++                  ),
++                  AnimatedBuilder(
++                    animation: _animationControllerHeader,
++                    builder: (_, child) {
++                      return Transform.scale(
++                        alignment: Alignment.bottomRight,
++                        scale: _animationControllerHeader.value < 0.5
++                            ? 0.25 + 0.5
++                            : (_animationControllerHeader.value) * 0.5 + 0.5,
++                        child: child,
++                      );
++                    },
++                    child: Container(
++                      width: 50,
++                      height: 50,
++                      color: Colors.red,
++                    ),
++                  ),
++                ],
++              ),
+             ),
+-            [],
+-            true,
+           ),
+-          builder: (context, snapshot) {
+-            if (snapshot.hasData) {
+-              bool cumulative = true;
+-              double cumulativeTotal = 0;
+-              List<Pair> points = [];
+-              for (DateTime indexDay = DateTime(
++          appStateSettings["showWalletSwitcher"] == true
++              ? SliverPadding(
++                  padding: EdgeInsets.only(top: 0, bottom: 25),
++                  sliver: SliverToBoxAdapter(
++                    child: Container(
++                        height: 85.0,
++                        child: StreamBuilder<List<TransactionWallet>>(
++                            stream: database.watchAllWallets(),
++                            builder: (context, snapshot) {
++                              if (snapshot.hasData) {
++                                return ListView.builder(
++                                  scrollDirection: Axis.horizontal,
++                                  itemCount: snapshot.data!.length + 1,
++                                  itemBuilder: (context, index) {
++                                    bool lastIndex =
++                                        index == snapshot.data!.length;
++                                    if (lastIndex) {
++                                      return WalletEntryAdd();
++                                    }
++                                    return Padding(
++                                      padding: EdgeInsets.only(
++                                        left: (index == 0 ? 8 : 0.0),
++                                      ),
++                                      child: WalletEntry(
++                                        selected: appStateSettings[
++                                                "selectedWallet"] ==
++                                            snapshot.data![index].walletPk,
++                                        wallet: snapshot.data![index],
++                                      ),
++                                    );
++                                  },
++                                );
++                              }
++                              return Container();
++                            })),
++                  ),
++                )
++              : SliverToBoxAdapter(),
++          StreamBuilder<List<Transaction>>(
++            stream: database.getTransactionsInTimeRangeFromCategories(
++              DateTime(
+                 DateTime.now().year,
+                 DateTime.now().month - 1,
+                 DateTime.now().day,
+-              );
+-                  indexDay.compareTo(DateTime.now()) < 0;
+-                  indexDay = indexDay.add(Duration(days: 1))) {
+-                //can be optimized...
+-                double totalForDay = 0;
+-                snapshot.data!.forEach((transaction) {
+-                  if (indexDay.year == transaction.dateCreated.year &&
+-                      indexDay.month == transaction.dateCreated.month &&
+-                      indexDay.day == transaction.dateCreated.day) {
+-                    totalForDay += transaction.amount;
+-                  }
+-                });
+-                cumulativeTotal += totalForDay;
+-                points.add(Pair(points.length.toDouble(),
+-                    cumulative ? cumulativeTotal : totalForDay));
++              ),
++              DateTime(
++                DateTime.now().year,
++                DateTime.now().month,
++                DateTime.now().day,
++              ),
++              [],
++              true,
++            ),
++            builder: (context, snapshot) {
++              if (snapshot.hasData) {
++                bool cumulative = appStateSettings["showCumulativeSpending"];
++                double cumulativeTotal = 0;
++                List<Pair> points = [];
++                for (DateTime indexDay = DateTime(
++                  DateTime.now().year,
++                  DateTime.now().month - 1,
++                  DateTime.now().day,
++                );
++                    indexDay.compareTo(DateTime.now()) < 0;
++                    indexDay = indexDay.add(Duration(days: 1))) {
++                  //can be optimized...
++                  double totalForDay = 0;
++                  snapshot.data!.forEach((transaction) {
++                    if (indexDay.year == transaction.dateCreated.year &&
++                        indexDay.month == transaction.dateCreated.month &&
++                        indexDay.day == transaction.dateCreated.day) {
++                      totalForDay += transaction.amount;
++                    }
++                  });
++                  cumulativeTotal += totalForDay;
++                  points.add(Pair(points.length.toDouble(),
++                      cumulative ? cumulativeTotal : totalForDay));
++                }
++                return SliverToBoxAdapter(
++                  child: LineChartWrapper(points: points, isCurved: false),
++                );
+               }
+-              return SliverToBoxAdapter(
+-                child: LineChartWrapper(points: points, isCurved: false),
+-              );
+-            }
+-            return SliverToBoxAdapter(child: SizedBox());
+-          },
+-        ),
+-        SliverToBoxAdapter(
+-          child: TextFont(
+-            text: "Budgets",
+-            fontSize: 30,
+-            fontWeight: FontWeight.bold,
++              return SliverToBoxAdapter(child: SizedBox());
++            },
+           ),
+-        ),
+-        StreamBuilder<List<Budget>>(
+-          stream: database.watchAllPinnedBudgets(),
+-          builder: (context, snapshot) {
+-            if (snapshot.hasData) {
+-              return SliverPadding(
+-                padding: EdgeInsets.symmetric(vertical: 0),
+-                sliver: SliverList(
+-                  delegate: SliverChildBuilderDelegate(
+-                    (BuildContext context, int index) {
+-                      return Padding(
+-                        padding: const EdgeInsets.only(bottom: 18.0),
+-                        child: BudgetContainer(
+-                          budget: snapshot.data![index],
+-                        ),
+-                      );
+-                    },
+-                    childCount: snapshot.data?.length, //snapshot.data?.length
++          SliverToBoxAdapter(
++            child: Padding(
++              padding:
++                  EdgeInsets.only(left: 18, bottom: 22, right: 18, top: 10),
++              child: TextFont(
++                text: "Budgets",
++                fontSize: 34,
++                fontWeight: FontWeight.bold,
++              ),
++            ),
++          ),
++          StreamBuilder<List<Budget>>(
++            stream: database.watchAllPinnedBudgets(),
++            builder: (context, snapshot) {
++              if (snapshot.hasData) {
++                return SliverPadding(
++                  padding: EdgeInsets.symmetric(vertical: 0),
++                  sliver: SliverList(
++                    delegate: SliverChildBuilderDelegate(
++                      (BuildContext context, int index) {
++                        return Padding(
++                          padding: const EdgeInsets.only(bottom: 18.0),
++                          child: BudgetContainer(
++                            budget: snapshot.data![index],
++                          ),
++                        );
++                      },
++                      childCount: snapshot.data?.length, //snapshot.data?.length
++                    ),
+                   ),
+-                ),
+-              );
+-            } else {
+-              return SliverToBoxAdapter(child: SizedBox());
+-            }
+-          },
+-        ),
+-        SliverToBoxAdapter(
+-          child: TextFont(
+-            text: "Transactions",
+-            fontSize: 30,
+-            fontWeight: FontWeight.bold,
++                );
++              } else {
++                return SliverToBoxAdapter(child: SizedBox());
++              }
++            },
+           ),
+-        ),
+-        ...getTransactionsSlivers(
+-            DateTime(DateTime.now().year, DateTime.now().month - 1,
+-                DateTime.now().day),
+-            DateTime.now()),
+-        SliverToBoxAdapter(child: Container(height: 15)),
+-        SliverFillRemaining(),
+-      ],
+-    );
+-  }
+-}
+-
+-class HomeAppBar extends StatefulWidget {
+-  HomeAppBar(
+-      {Key? key,
+-      required this.defaultTitle,
+-      required this.firstTitle,
+-      required this.scrollController})
+-      : super(key: key);
+-  final String defaultTitle;
+-  final String firstTitle;
+-  final ScrollController scrollController;
+-
+-  @override
+-  _HomeAppBarState createState() => _HomeAppBarState();
+-}
+-
+-class _HomeAppBarState extends State<HomeAppBar> with TickerProviderStateMixin {
+-  late String title = "";
+-  late int direction = -1;
+-  bool switchDefaultTitle = false;
+-  int skipFirstChangeRequests = 0;
+-
+-  @override
+-  void initState() {
+-    widget.scrollController.addListener(_scrollListener);
+-  }
+-
+-  void changeTitle(newTitle, newDirection) {
+-    if (skipFirstChangeRequests < 2) {
+-      skipFirstChangeRequests = skipFirstChangeRequests + 1;
+-      Future.delayed(Duration(milliseconds: 0), () async {
+-        changeTitle(widget.defaultTitle, -1);
+-      });
+-      return;
+-    }
+-    setState(() {
+-      title = newTitle;
+-      direction = newDirection;
+-    });
+-  }
+-
+-  _scrollListener() {
+-    double percent = widget.scrollController.offset / (200 - 65);
+-    if (percent >= 0 && percent <= 1 && switchDefaultTitle == false) {
+-      setState(() {
+-        switchDefaultTitle = true;
+-      });
+-      changeTitle(widget.defaultTitle, -1);
+-    } else if (percent >= 1 && switchDefaultTitle) {
+-      setState(() {
+-        switchDefaultTitle = false;
+-      });
+-      changeTitle(widget.firstTitle, 1);
+-    }
+-  }
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    return AnimatedSwitcher(
+-      duration: Duration(milliseconds: 500),
+-      switchInCurve: Curves.easeInOutCubic,
+-      switchOutCurve: Curves.easeInOutCubic,
+-      transitionBuilder: (Widget child, Animation<double> animation) {
+-        final inAnimation = Tween<Offset>(
+-                begin: Offset(0.0, direction == -1 ? -1 : 1),
+-                end: Offset(0.0, 0.0))
+-            .animate(animation);
+-        final outAnimation = Tween<Offset>(
+-                begin: Offset(0.0, direction == -1 ? 1 : -1),
+-                end: Offset(0.0, 0.0))
+-            .animate(animation);
+-
+-        return ClipRect(
+-          child: SlideTransition(
+-            position: child.key == ValueKey(title) ? inAnimation : outAnimation,
+-            child: child,
++          SliverToBoxAdapter(
++            child: Padding(
++              padding:
++                  EdgeInsets.only(left: 18, bottom: 10, right: 18, top: 10),
++              child: TextFont(
++                text: "Transactions",
++                fontSize: 34,
++                fontWeight: FontWeight.bold,
++              ),
++            ),
+           ),
+-        );
+-      },
+-      child: Container(
+-        width: MediaQuery.of(context).size.width,
+-        key: ValueKey(title),
+-        child: TextFont(
+-          text: title,
+-          fontSize: 26,
+-          fontWeight: FontWeight.bold,
+-          textAlign: TextAlign.left,
+-        ),
++          ...getTransactionsSlivers(
++              DateTime(DateTime.now().year, DateTime.now().month - 1,
++                  DateTime.now().day),
++              DateTime.now()),
++          SliverToBoxAdapter(child: Container(height: 105)),
++        ],
+       ),
+     );
+   }
+diff --git a/budget/lib/pages/settingsPage.dart b/budget/lib/pages/settingsPage.dart
+index 5fbfda8a0..506ca3bfc 100644
+--- a/budget/lib/pages/settingsPage.dart
++++ b/budget/lib/pages/settingsPage.dart
+@@ -64,6 +64,8 @@ class SettingsPageState extends State<SettingsPage>
+       title: "Settings",
+       backButton: false,
+       navbar: true,
++      appBarBackgroundColor: Theme.of(context).colorScheme.accentColor,
++      appBarBackgroundColorStart: Theme.of(context).canvasColor,
+       listWidgets: [
+         SettingsHeader(title: "Data"),
+         SettingsContainerOpenPage(
+@@ -136,6 +138,25 @@ class SettingsPageState extends State<SettingsPage>
+           title: "Select Icon",
+           icon: Icons.portrait,
+         ),
++        SettingsHeader(title: "Layout Customization"),
++        SettingsContainerSwitch(
++          title: "Show Wallet Switcher",
++          description: "On home page",
++          onSwitched: (value) {
++            updateSettings("showWalletSwitcher", value,
++                pagesNeedingRefresh: [0]);
++          },
++          initialValue: appStateSettings["showWalletSwitcher"],
++        ),
++        SettingsContainerSwitch(
++          title: "Show Cumulative Spending",
++          description: "On home page spending graph",
++          onSwitched: (value) {
++            updateSettings("showCumulativeSpending", value,
++                pagesNeedingRefresh: [0]);
++          },
++          initialValue: appStateSettings["showCumulativeSpending"],
++        ),
+       ],
+     );
+   }
+diff --git a/budget/lib/pages/transactionsListPage.dart b/budget/lib/pages/transactionsListPage.dart
+index d99c5a226..71ec5eca2 100644
+--- a/budget/lib/pages/transactionsListPage.dart
++++ b/budget/lib/pages/transactionsListPage.dart
+@@ -20,7 +20,11 @@ import 'package:flutter/material.dart';
+ import 'package:budget/main.dart';
+ import 'package:budget/colors.dart';
+ import 'package:flutter_sticky_header/flutter_sticky_header.dart';
++import 'dart:math';
++import 'package:sliver_tools/sliver_tools.dart';
+ 
++import 'package:flutter/rendering.dart';
++import 'package:flutter/widgets.dart';
+ // List<Widget> getTransactionsSlivers({
+ //   search = "",
+ //   List<int> categoryFks = const [],
+@@ -160,10 +164,17 @@ import 'package:flutter_sticky_header/flutter_sticky_header.dart';
+ //   return transactionsWidgets;
+ // }
+ 
+-List<Widget> getTransactionsSlivers(DateTime startDay, DateTime endDay,
+-    {search = "", List<int> categoryFks = const []}) {
++List<Widget> getTransactionsSlivers(
++  DateTime startDay,
++  DateTime endDay, {
++  search = "",
++  List<int> categoryFks = const [],
++  Function(Transaction, bool)? onSelected,
++  String? listID,
++}) {
+   List<Widget> transactionsWidgets = [];
+   List<DateTime> dates = [];
++  DateTime indexDay;
+   for (DateTime indexDay = startDay;
+       indexDay.millisecondsSinceEpoch <= endDay.millisecondsSinceEpoch;
+       indexDay = indexDay.add(Duration(days: 1))) {
+@@ -175,7 +186,9 @@ List<Widget> getTransactionsSlivers(DateTime startDay, DateTime endDay,
+         stream: database.getTransactionCategoryWithDay(date,
+             search: search, categoryFks: categoryFks),
+         builder: (context, snapshot) {
+-          if (snapshot.hasData && (snapshot.data ?? []).length > 0) {
++          if (snapshot.data != null &&
++              snapshot.hasData &&
++              (snapshot.data ?? []).length > 0) {
+             double totalSpentForDay = 0;
+             snapshot.data!.forEach((transaction) {
+               totalSpentForDay += transaction.transaction.amount;
+@@ -197,6 +210,11 @@ List<Widget> getTransactionsSlivers(DateTime startDay, DateTime endDay,
+                         transaction: snapshot.data![index].transaction,
+                       ),
+                       transaction: snapshot.data![index].transaction,
++                      onSelected: (Transaction transaction, bool selected) {
++                        if (onSelected != null)
++                          onSelected(transaction, selected);
++                      },
++                      listID: listID,
+                     );
+                   },
+                   childCount: snapshot.data?.length,
+@@ -220,7 +238,7 @@ class TransactionsListPage extends StatefulWidget {
+ }
+ 
+ class TransactionsListPageState extends State<TransactionsListPage>
+-    with AutomaticKeepAliveClientMixin {
++    with AutomaticKeepAliveClientMixin, TickerProviderStateMixin {
+   void refreshState() {
+     setState(() {});
+     searchTransaction("");
+@@ -229,10 +247,24 @@ class TransactionsListPageState extends State<TransactionsListPage>
+   @override
+   bool get wantKeepAlive => true;
+ 
+-  late Color selectedColor = Colors.red;
++  bool showAppBarPaddingOffset = false;
++  bool alreadyChanged = false;
++
+   late List<Widget> transactionWidgets = [];
+   DateTime selectedDateStart =
+       DateTime(DateTime.now().year, DateTime.now().month);
++  late ScrollController _scrollController;
++  late AnimationController _animationControllerSearch;
++  late PageController _pageController;
++  late List<int> selectedTransactionIDs = [];
++
++  GlobalKey<_MonthSelectorState> monthSelectorStateKey = GlobalKey();
++
++  onSelected(Transaction transaction, bool selected) {
++    // print(transaction.transactionPk.toString() + " selected!");
++    // print(globalSelectedID["Transactions"]);
++  }
++
+   @override
+   void initState() {
+     super.initState();
+@@ -240,7 +272,21 @@ class TransactionsListPageState extends State<TransactionsListPage>
+       selectedDateStart,
+       new DateTime(selectedDateStart.year, selectedDateStart.month + 1,
+           selectedDateStart.day - 1),
++      onSelected: onSelected,
++      listID: "Transactions",
+     );
++    _scrollController = ScrollController();
++    _scrollController.addListener(_scrollListener);
++    _animationControllerSearch = AnimationController(vsync: this, value: 1);
++    _pageController = PageController(initialPage: 1);
++  }
++
++  @override
++  void dispose() {
++    _scrollController.dispose();
++    _animationControllerSearch.dispose();
++    _pageController.dispose();
++    super.dispose();
+   }
+ 
+   void _loadNewTransactions() {
+@@ -249,6 +295,8 @@ class TransactionsListPageState extends State<TransactionsListPage>
+         selectedDateStart,
+         new DateTime(selectedDateStart.year, selectedDateStart.month + 1,
+             selectedDateStart.day - 1),
++        onSelected: onSelected,
++        listID: "Transactions",
+       );
+     });
+   }
+@@ -256,13 +304,24 @@ class TransactionsListPageState extends State<TransactionsListPage>
+   searchTransaction(String? search) {
+     setState(() {
+       transactionWidgets = getTransactionsSlivers(
+-          DateTime(2022, 01, 1),
+-          new DateTime(DateTime.now().year, DateTime.now().month + 1,
+-              DateTime.now().day),
+-          search: search);
++        DateTime(2021, 01, 1),
++        new DateTime(
++            DateTime.now().year, DateTime.now().month + 1, DateTime.now().day),
++        search: search,
++        onSelected: onSelected,
++        listID: "Transactions",
++      );
+     });
+   }
+ 
++  _scrollListener() {
++    double percent = _scrollController.offset /
++        (MediaQuery.of(context).padding.top + 65 + 50);
++    if (percent >= 0 && percent <= 1) {
++      _animationControllerSearch.value = 1 - percent;
++    }
++  }
++
+   @override
+   Widget build(BuildContext context) {
+     return GestureDetector(
+@@ -273,42 +332,366 @@ class TransactionsListPageState extends State<TransactionsListPage>
+           currentFocus.unfocus();
+         }
+       },
+-      child: PageFramework(
+-        title: "Transactions",
+-        backButton: false,
+-        appBarBackgroundColor: Theme.of(context).colorScheme.accentColor,
+-        appBarBackgroundColorStart: Theme.of(context).canvasColor,
+-        slivers: [
+-          SliverToBoxAdapter(
+-              child: MonthSelector(
+-            selectedDateStart: selectedDateStart,
+-            setSelectedDateStart: (DateTime currentDateTime) {
+-              setState(() {
+-                selectedDateStart = currentDateTime;
+-                _loadNewTransactions();
+-              });
+-            },
+-          )),
+-          SliverToBoxAdapter(child: SizedBox(height: 5)),
+-          ...transactionWidgets,
+-        ],
+-        subtitle: TextInput(
+-          labelText: "Search",
+-          bubbly: true,
+-          icon: Icons.search_rounded,
+-          onSubmitted: (value) {
+-            searchTransaction(value);
++      child: NestedScrollView(
++        controller: _scrollController,
++        headerSliverBuilder:
++            (BuildContext contextHeader, bool innerBoxIsScrolled) {
++          return <Widget>[
++            // SliverOverlapAbsorber(
++            //   handle: NestedScrollView.sliverOverlapAbsorberHandleFor(
++            //       contextHeader),
++            //   sliver: MultiSliver(pushPinnedChildren: false, children: <Widget>[
++            //     PageFrameworkSliverAppBar(
++            //       title: "Transactions",
++            //       appBarBackgroundColor: Colors.transparent,
++            //       appBarBackgroundColorStart: Theme.of(context).canvasColor,
++            //     ),
++            //     AnimatedBuilder(
++            //       animation: _animationControllerSearch,
++            //       builder: (_, child) {
++            //         return Transform.translate(
++            //           offset: Offset(
++            //             0,
++            //             8 - _animationControllerSearch.value * 8,
++            //           ),
++            //           child: child,
++            //         );
++            //       },
++            //       child: TextInput(
++            //         labelText: "Search",
++            //         bubbly: true,
++            //         icon: Icons.search_rounded,
++            //         onSubmitted: (value) {
++            //           searchTransaction(value);
++            //         },
++            //         onChanged: (value) => searchTransaction(value),
++            //       ),
++            //     ),
++            //     MonthSelector(
++            //       selectedDateStart: selectedDateStart,
++            //       setSelectedDateStart: (DateTime currentDateTime) {
++            //         setState(() {
++            //           selectedDateStart = currentDateTime;
++            //           _loadNewTransactions();
++            //         });
++            //       },
++            //     ),
++            //   ]),
++            // ),
++
++            // SliverAppBar(
++            //   backgroundColor: Theme.of(context).colorScheme.accentColor,
++            //   pinned: true,
++            //   expandedHeight: 200.0,
++            //   flexibleSpace: FlexibleSpaceBar(
++            //     titlePadding:
++            //         EdgeInsets.symmetric(vertical: 15, horizontal: 18),
++            //     title: TextFont(
++            //       text: "Transactions",
++            //       fontSize: 26,
++            //       fontWeight: FontWeight.bold,
++            //     ),
++            //     background: Stack(
++            //       children: [
++            //         Container(
++            //           color: Theme.of(context).canvasColor,
++            //         ),
++            //       ],
++            //     ),
++            //   ),
++            //   shape: ContinuousRectangleBorder(
++            //     borderRadius: BorderRadius.vertical(
++            //       bottom: Radius.circular(30),
++            //     ),
++            //   ),
++            // ),
++            // SliverOverlapAbsorber(
++            //   handle: NestedScrollView.sliverOverlapAbsorberHandleFor(
++            //       contextHeader),
++            //   sliver: MultiSliver(
++            //     pushPinnedChildren: false,
++            //     children: <Widget>[
++            //       SliverAppBar(
++            //         backgroundColor: Theme.of(context).colorScheme.accentColor,
++            //         pinned: true,
++            //         expandedHeight: 200.0,
++            //         flexibleSpace: FlexibleSpaceBar(
++            //           titlePadding:
++            //               EdgeInsets.symmetric(vertical: 15, horizontal: 18),
++            //           title: TextFont(
++            //             text: "Transactions",
++            //             fontSize: 26,
++            //             fontWeight: FontWeight.bold,
++            //           ),
++            //           background: Stack(
++            //             children: [
++            //               Container(
++            //                 color: Theme.of(context).canvasColor,
++            //               ),
++            //             ],
++            //           ),
++            //         ),
++            //         shape: ContinuousRectangleBorder(
++            //           borderRadius: BorderRadius.vertical(
++            //             bottom: Radius.circular(30),
++            //           ),
++            //         ),
++            //       ),
++            //       SliverPersistentHeader(
++            //         delegate: _ProductTabSliver(
++            //           Container(
++            //             height: 50,
++            //             child: TextInput(
++            //               labelText: "Search",
++            //               bubbly: true,
++            //               icon: Icons.search_rounded,
++            //               onSubmitted: (value) {
++            //                 searchTransaction(value);
++            //               },
++            //               onChanged: (value) => searchTransaction(value),
++            //             ),
++            //           ),
++            //         ),
++            //       ),
++            //       //or list of widgets here... but doesnt work, scroll is padded by no scrolling...
++            //     ],
++            //   ),
++            // ),
++            PageFrameworkSliverAppBar(
++              title: "Transactions",
++              appBarBackgroundColor: Theme.of(context).colorScheme.accentColor,
++              appBarBackgroundColorStart: Theme.of(context).canvasColor,
++              actions: [
++                Container(
++                    margin: EdgeInsets.only(top: 10),
++                    child:
++                        IconButton(onPressed: () {}, icon: Icon(Icons.search)))
++              ],
++            ),
++            // !showAppBarPaddingOffset
++            //     ? SliverToBoxAdapter(
++            //         child: AnimatedBuilder(
++            //           animation: _animationControllerSearch,
++            //           builder: (_, child) {
++            //             return Transform.translate(
++            //               offset: Offset(
++            //                 0,
++            //                 8 - _animationControllerSearch.value * 8,
++            //               ),
++            //               child: child,
++            //             );
++            //           },
++            //           child: TextInput(
++            //             labelText: "Search",
++            //             bubbly: true,
++            //             icon: Icons.search_rounded,
++            //             onSubmitted: (value) {
++            //               searchTransaction(value);
++            //             },
++            //             onChanged: (value) => searchTransaction(value),
++            //           ),
++            //         ),
++            //       )
++            //     : SliverToBoxAdapter(
++            //         child: SizedBox.shrink(),
++            //       ),
++            // !showAppBarPaddingOffset
++            //     ? SliverToBoxAdapter(
++            //         child: MonthSelector(
++            //           selectedDateStart: selectedDateStart,
++            //           setSelectedDateStart: (DateTime currentDateTime) {
++            //             setState(() {
++            //               selectedDateStart = currentDateTime;
++            //               _loadNewTransactions();
++            //             });
++            //           },
++            //         ),
++            //       )
++            //     : SliverToBoxAdapter(
++            //         child: SizedBox.shrink(),
++            //       ),
++            // SliverOverlapAbsorber(
++            //   handle: NestedScrollView.sliverOverlapAbsorberHandleFor(context),
++            //   sliver: SliverPersistentHeader(
++            //     pinned: true,
++            //     delegate: _ProductTabSliver(Container(
++            //       height: 100,
++            //       color: Colors.red,
++            //       child: Text("hello"),
++            //     )),
++            //   ),
++            // ),
++          ];
++        },
++        body: Builder(
++          builder: (BuildContext context2) {
++            return Scaffold(
++              extendBodyBehindAppBar: false,
++              appBar: AppBar(
++                backgroundColor: Colors.transparent,
++                title: MediaQuery.of(context).padding.top >= 25
++                    ? FadeTransition(
++                        opacity: _animationControllerSearch,
++                        child: TextInput(
++                          labelText: "Search",
++                          bubbly: true,
++                          icon: Icons.search_rounded,
++                          onSubmitted: (value) {
++                            searchTransaction(value);
++                          },
++                          onChanged: (value) => searchTransaction(value),
++                        ),
++                      )
++                    : SizedBox.shrink(),
++                titleSpacing: 0,
++                primary: false,
++                toolbarHeight: 65,
++                bottom: PreferredSize(
++                  child: Column(
++                    children: [
++                      MonthSelector(
++                        key: monthSelectorStateKey,
++                        selectedDateStart: selectedDateStart,
++                        setSelectedDateStart: (DateTime currentDateTime) {
++                          setState(() {
++                            selectedDateStart = currentDateTime;
++                            _loadNewTransactions();
++                          });
++                        },
++                      ),
++                      SizedBox(
++                        height: 10,
++                      )
++                    ],
++                  ),
++                  preferredSize: Size.fromHeight(0),
++                ),
++              ),
++              body: PageView(
++                controller: _pageController,
++                onPageChanged: (index) {
++                  if (alreadyChanged) {
++                    alreadyChanged = false;
++                    _pageController.animateToPage(
++                      1,
++                      duration: Duration(milliseconds: 500),
++                      curve: Curves.easeInOutCubicEmphasized,
++                    );
++                  } else {
++                    alreadyChanged = true;
++                    setState(() {
++                      selectedDateStart = DateTime(selectedDateStart.year,
++                          selectedDateStart.month + index - 1);
++                      _loadNewTransactions();
++                    });
++                    _pageController.animateToPage(
++                      1,
++                      duration: Duration(milliseconds: 500),
++                      curve: Curves.easeInOutCubicEmphasized,
++                    );
++                    double middle =
++                        -MediaQuery.of(context).size.width / 2 + 100 / 2;
++                    int difference =
++                        (DateTime.now().year - selectedDateStart.year) * 12 +
++                            (DateTime.now().month - selectedDateStart.month) +
++                            1;
++                    monthSelectorStateKey.currentState!
++                        .scrollTo(middle - difference * 100 + 100);
++                  }
++                },
++                children: <Widget>[
++                  Center(
++                    child: Text('First Page'),
++                  ),
++                  CustomScrollView(
++                    // controller: _scrollController,
++                    slivers: [
++                      // SliverOverlapInjector(
++                      //   handle: NestedScrollView.sliverOverlapAbsorberHandleFor(
++                      //       context2),
++                      // ),
++                      // SliverAppBar(
++                      //   title: Text("hello"),
++                      //   pinned: true,
++                      //   expandedHeight: 100,
++                      //   toolbarHeight: 100,
++                      // ),
++
++                      //Needed in older version of flutter:
++                      // SliverToBoxAdapter(),
++                      ...transactionWidgets,
++                      // SliverToBoxAdapter(),
++
++                      // SliverFillRemaining(),
++                    ],
++                  ),
++                  Center(
++                    child: Text('Third Page'),
++                  )
++                ],
++              ),
++            );
+           },
+-          onChanged: (value) => searchTransaction(value),
+         ),
+-        subtitleSize: 20,
+-        subtitleAnimationSpeed: 4.5,
+-        // onBottomReached: _onBottomReached,
+       ),
+     );
+   }
+ }
+ 
++class _ProductTabSliver extends SliverPersistentHeaderDelegate {
++  final Widget widget;
++
++  _ProductTabSliver(this.widget);
++
++  @override
++  Widget build(
++      BuildContext context, double shrinkOffset, bool overlapsContent) {
++    return Container(
++        decoration: BoxDecoration(
++          color: Colors.red,
++        ),
++        child: widget);
++  }
++
++  @override
++  double get maxExtent => 50;
++
++  @override
++  double get minExtent => 50;
++
++  @override
++  bool shouldRebuild(SliverPersistentHeaderDelegate oldDelegate) {
++    return false;
++  }
++}
++
++class _ProductTabSliver2 extends SliverPersistentHeaderDelegate {
++  final Widget widget;
++
++  _ProductTabSliver2(this.widget);
++
++  @override
++  Widget build(
++      BuildContext context, double shrinkOffset, bool overlapsContent) {
++    return Container(
++        decoration: BoxDecoration(
++          color: Colors.red,
++        ),
++        child: widget);
++  }
++
++  @override
++  double get maxExtent => 100;
++
++  @override
++  double get minExtent => 100;
++
++  @override
++  bool shouldRebuild(SliverPersistentHeaderDelegate oldDelegate) {
++    return false;
++  }
++}
++
+ class MonthSelector extends StatefulWidget {
+   const MonthSelector({
+     Key? key,
+@@ -328,36 +711,45 @@ class _MonthSelectorState extends State<MonthSelector> {
+   GlobalKey<_MultiDirectionalInfiniteScrollState>
+       MultiDirectionalInfiniteScrollKey = GlobalKey();
+ 
+-  @override
+-  Widget build(BuildContext context) {
++  scrollTo(double position) {
++    MultiDirectionalInfiniteScrollKey.currentState!
++        .scrollTo(Duration(milliseconds: 700), position: position);
++  }
++
++  _onScroll(double position) {
+     final upperBound = 200;
+     final lowerBound = -200 - MediaQuery.of(context).size.width / 2 - 100;
++    if (position > upperBound) {
++      if (showScrollBottom == false)
++        setState(() {
++          showScrollBottom = true;
++        });
++    } else if (position < lowerBound) {
++      if (showScrollTop == false)
++        setState(() {
++          showScrollTop = true;
++        });
++    }
++    if (position > lowerBound && position < upperBound) {
++      if (showScrollTop == true)
++        setState(() {
++          showScrollTop = false;
++        });
++      if (showScrollBottom == true)
++        setState(() {
++          showScrollBottom = false;
++        });
++    }
++  }
++
++  @override
++  Widget build(BuildContext context) {
+     return Stack(
+       children: [
+         MultiDirectionalInfiniteScroll(
+           key: MultiDirectionalInfiniteScrollKey,
+           onScroll: (position) {
+-            if (position > upperBound) {
+-              if (showScrollBottom == false)
+-                setState(() {
+-                  showScrollBottom = true;
+-                });
+-            } else if (position < lowerBound) {
+-              if (showScrollTop == false)
+-                setState(() {
+-                  showScrollTop = true;
+-                });
+-            }
+-            if (position > lowerBound && position < upperBound) {
+-              if (showScrollTop == true)
+-                setState(() {
+-                  showScrollTop = false;
+-                });
+-              if (showScrollBottom == true)
+-                setState(() {
+-                  showScrollBottom = false;
+-                });
+-            }
++            _onScroll(position);
+           },
+           height: 50,
+           overBoundsDetection: 50,
+@@ -415,8 +807,7 @@ class _MonthSelectorState extends State<MonthSelector> {
+                                           : FontWeight.normal,
+                                     ),
+                             ),
+-                            currentDateTime.month == 1 &&
+-                                    DateTime.now().month != 1
++                            DateTime.now().year != currentDateTime.year
+                                 ? AnimatedSwitcher(
+                                     duration: Duration(milliseconds: 300),
+                                     child: isSelected
+@@ -568,41 +959,6 @@ class _MonthSelectorState extends State<MonthSelector> {
+   }
+ }
+ 
+-// class TrianglePainter extends CustomPainter {
+-//   final Color strokeColor;
+-//   final PaintingStyle paintingStyle;
+-//   final double strokeWidth;
+-
+-//   TrianglePainter(
+-//       {this.strokeColor = Colors.black,
+-//       this.strokeWidth = 3,
+-//       this.paintingStyle = PaintingStyle.stroke});
+-
+-//   @override
+-//   void paint(Canvas canvas, Size size) {
+-//     Paint paint = Paint()
+-//       ..color = strokeColor
+-//       ..strokeWidth = strokeWidth
+-//       ..style = paintingStyle;
+-
+-//     canvas.drawPath(getTrianglePath(size.width, size.height), paint);
+-//   }
+-
+-//   Path getTrianglePath(double x, double y) {
+-//     return Path()
+-//       ..moveTo(0, y)
+-//       ..lineTo(x / 2, 0)
+-//       ..lineTo(x, y);
+-//   }
+-
+-//   @override
+-//   bool shouldRepaint(TrianglePainter oldDelegate) {
+-//     return oldDelegate.strokeColor != strokeColor ||
+-//         oldDelegate.paintingStyle != paintingStyle ||
+-//         oldDelegate.strokeWidth != strokeWidth;
+-//   }
+-// }
+-
+ class MultiDirectionalInfiniteScroll extends StatefulWidget {
+   const MultiDirectionalInfiniteScroll({
+     Key? key,
+@@ -683,7 +1039,6 @@ class _MultiDirectionalInfiniteScrollState
+     if (_scrollController.offset <=
+         _scrollController.position.minScrollExtent +
+             widget.overBoundsDetection) {
+-      print(_scrollController.position.minScrollExtent);
+       _onStartReached();
+       if (widget.onBottomLoaded != null) {
+         widget.onBottomLoaded!();
+@@ -738,28 +1093,84 @@ class _MultiDirectionalInfiniteScrollState
+   }
+ }
+ 
+-// SliverPersistentHeader(
+-//   delegate: SectionHeaderDelegate(TextFont(text: "text")),
+-//   pinned: true,
+-// ),
++class SliverPinnedOverlapInjector extends SingleChildRenderObjectWidget {
++  const SliverPinnedOverlapInjector({
++    required this.handle,
++    Key? key,
++  }) : super(key: key);
++
++  final SliverOverlapAbsorberHandle handle;
+ 
+-// class SectionHeaderDelegate extends SliverPersistentHeaderDelegate {
+-//   final Widget widget;
+-//   final double height;
++  @override
++  RenderSliverPinnedOverlapInjector createRenderObject(BuildContext context) {
++    return RenderSliverPinnedOverlapInjector(
++      handle: handle,
++    );
++  }
+ 
+-//   SectionHeaderDelegate(this.widget, [this.height = 50]);
++  @override
++  void updateRenderObject(
++    BuildContext context,
++    RenderSliverPinnedOverlapInjector renderObject,
++  ) {
++    renderObject.handle = handle;
++  }
++}
+ 
+-//   @override
+-//   Widget build(context, double shrinkOffset, bool overlapsContent) {
+-//     return widget;
+-//   }
++class RenderSliverPinnedOverlapInjector extends RenderSliver {
++  RenderSliverPinnedOverlapInjector({
++    required SliverOverlapAbsorberHandle handle,
++  }) : _handle = handle;
+ 
+-//   @override
+-//   double get maxExtent => height;
++  double? _currentLayoutExtent;
++  double? _currentMaxExtent;
+ 
+-//   @override
+-//   double get minExtent => height;
++  SliverOverlapAbsorberHandle get handle => _handle;
++  SliverOverlapAbsorberHandle _handle;
++  set handle(SliverOverlapAbsorberHandle value) {
++    if (handle == value) return;
++    if (attached) {
++      handle.removeListener(markNeedsLayout);
++    }
++    _handle = value;
++    if (attached) {
++      handle.addListener(markNeedsLayout);
++      if (handle.layoutExtent != _currentLayoutExtent ||
++          handle.scrollExtent != _currentMaxExtent) markNeedsLayout();
++    }
++  }
+ 
+-//   @override
+-//   bool shouldRebuild(SliverPersistentHeaderDelegate oldDelegate) => false;
+-// }
++  @override
++  void attach(PipelineOwner owner) {
++    super.attach(owner);
++    handle.addListener(markNeedsLayout);
++    if (handle.layoutExtent != _currentLayoutExtent ||
++        handle.scrollExtent != _currentMaxExtent) markNeedsLayout();
++  }
++
++  @override
++  void detach() {
++    handle.removeListener(markNeedsLayout);
++    super.detach();
++  }
++
++  @override
++  void performLayout() {
++    _currentLayoutExtent = handle.layoutExtent;
++
++    final paintedExtent = min(
++      _currentLayoutExtent!,
++      constraints.remainingPaintExtent - constraints.overlap,
++    );
++
++    geometry = SliverGeometry(
++      paintExtent: paintedExtent,
++      maxPaintExtent: _currentLayoutExtent!,
++      maxScrollObstructionExtent: _currentLayoutExtent!,
++      paintOrigin: constraints.overlap,
++      scrollExtent: _currentLayoutExtent!,
++      layoutExtent: max(0, paintedExtent - constraints.scrollOffset),
++      hasVisualOverflow: paintedExtent < _currentLayoutExtent!,
++    );
++  }
++}
+diff --git a/budget/lib/widgets/accountAndBackup.dart b/budget/lib/widgets/accountAndBackup.dart
+index 1af071b44..bd48f9f64 100644
+--- a/budget/lib/widgets/accountAndBackup.dart
++++ b/budget/lib/widgets/accountAndBackup.dart
+@@ -583,12 +583,14 @@ class _ImportingEntriesPopupState extends State<ImportingEntriesPopup> {
+           .categoryPk;
+     } catch (_) {
+       print("category not found");
++      int numberOfCategories =
++          (await database.getTotalCountOfCategories())[0] ?? 0;
+       await database.createOrUpdateCategory(
+         TransactionCategory(
+           categoryPk: DateTime.now().millisecondsSinceEpoch,
+           name: row[assignedColumns["category"]!["setHeaderIndex"]],
+           dateCreated: DateTime.now(),
+-          order: 0,
++          order: numberOfCategories,
+           colour:
+               toHexString(getSettingConstants(appStateSettings)["accentColor"]),
+           income: amount > 0,
+diff --git a/budget/lib/widgets/budgetContainer.dart b/budget/lib/widgets/budgetContainer.dart
+index 7218d5423..0a1c1b033 100644
+--- a/budget/lib/widgets/budgetContainer.dart
++++ b/budget/lib/widgets/budgetContainer.dart
+@@ -107,7 +107,11 @@ class BudgetContainer extends StatelessWidget {
+               Container(
+                 height: 14,
+               ),
+-              DaySpending(budget: budget),
++              DaySpending(
++                budget: budget,
++                amount: (budget.amount - totalSpent) /
++                    daysBetween(DateTime.now(), budgetRange.end),
++              ),
+             ],
+           );
+         } else {
+@@ -179,12 +183,16 @@ class BudgetContainer extends StatelessWidget {
+ }
+ 
+ class DaySpending extends StatelessWidget {
+-  const DaySpending(
+-      {Key? key, required Budget this.budget, bool this.large = false})
+-      : super(key: key);
++  const DaySpending({
++    Key? key,
++    required Budget this.budget,
++    required double this.amount,
++    bool this.large = false,
++  }) : super(key: key);
+ 
+   final Budget budget;
+   final bool large;
++  final double amount;
+ 
+   @override
+   Widget build(BuildContext context) {
+@@ -192,7 +200,8 @@ class DaySpending extends StatelessWidget {
+       child: FittedBox(
+         fit: BoxFit.fitWidth,
+         child: TextFont(
+-          text: "You can keep spending " + getCurrencyString() + "15 each day.",
++          text:
++              "You can keep spending " + convertToMoney(amount) + " each day.",
+           fontSize: large ? 17 : 15,
+           textAlign: TextAlign.center,
+         ),
+diff --git a/budget/lib/widgets/fadeIn.dart b/budget/lib/widgets/fadeIn.dart
+index e65684a8a..b12c2a6fa 100644
+--- a/budget/lib/widgets/fadeIn.dart
++++ b/budget/lib/widgets/fadeIn.dart
+@@ -30,9 +30,10 @@ class _FadeInState extends State<FadeIn> {
+   @override
+   Widget build(BuildContext context) {
+     return AnimatedOpacity(
+-        opacity: widgetOpacity,
+-        duration: Duration(milliseconds: 500),
+-        child: widget.child);
++      opacity: widgetOpacity,
++      duration: Duration(milliseconds: 500),
++      child: widget.child,
++    );
+   }
+ }
+ 
+@@ -198,6 +199,7 @@ class CountNumber extends StatefulWidget {
+     this.initialCount = 0,
+     this.decimals = 2,
+     this.dynamicDecimals = false,
++    this.lazyFirstRender = true,
+   }) : super(key: key);
+ 
+   final double count;
+@@ -208,6 +210,7 @@ class CountNumber extends StatefulWidget {
+   final double initialCount;
+   final int decimals;
+   final bool dynamicDecimals;
++  final bool lazyFirstRender;
+ 
+   @override
+   State<CountNumber> createState() => _CountNumberState();
+@@ -216,15 +219,24 @@ class CountNumber extends StatefulWidget {
+ class _CountNumberState extends State<CountNumber> {
+   double previousAmount = 0;
+   int decimals = 2;
++  bool lazyFirstRender = true;
+   @override
+   void initState() {
+     super.initState();
+     previousAmount = widget.initialCount;
+     decimals = widget.decimals;
++    lazyFirstRender = widget.lazyFirstRender;
+   }
+ 
+   @override
+   Widget build(BuildContext context) {
++    if (lazyFirstRender && widget.initialCount == widget.count) {
++      lazyFirstRender = false;
++      return widget.textBuilder(
++        widget.initialCount,
++      );
++    }
++
+     if (widget.dynamicDecimals) {
+       if (widget.count % 1 == 0) {
+         decimals = 0;
+diff --git a/budget/lib/widgets/openPopup.dart b/budget/lib/widgets/openPopup.dart
+index 51520b18f..a9efafdbe 100644
+--- a/budget/lib/widgets/openPopup.dart
++++ b/budget/lib/widgets/openPopup.dart
+@@ -93,91 +93,69 @@ Future<T?> openPopup<T extends Object?>(
+               color: Theme.of(context).colorScheme.lightDarkAccent,
+               borderRadius: BorderRadius.circular(10),
+             ),
+-            child: Stack(
+-              alignment: Alignment.topCenter,
++            child: Column(
++              mainAxisSize: MainAxisSize.min,
+               children: [
+-                icon != null
+-                    ? Transform.translate(
+-                        offset: Offset(0, -50),
+-                        child: Container(
+-                          decoration: BoxDecoration(
+-                            color: Theme.of(context).colorScheme.accentColor,
+-                            borderRadius: BorderRadius.circular(1000),
+-                          ),
+-                          padding: EdgeInsets.all(15),
+-                          child: Icon(
+-                            icon,
+-                            size: 50,
+-                          ),
+-                        ),
+-                      )
+-                    : SizedBox.shrink(),
+-                Row(
+-                  mainAxisSize: MainAxisSize.min,
+-                  children: [
+-                    Flexible(
+-                      child: Padding(
+-                        padding: const EdgeInsets.all(8.0),
+-                        child: Column(
++                Container(height: 7),
++                Padding(
++                  padding:
++                      const EdgeInsets.symmetric(vertical: 8.0, horizontal: 10),
++                  child: Icon(
++                    icon,
++                    size: 65,
++                    color: Theme.of(context).colorScheme.accentColor,
++                  ),
++                ),
++                Padding(
++                  padding:
++                      const EdgeInsets.symmetric(vertical: 8.0, horizontal: 10),
++                  child: TextFont(
++                    text: title ?? "",
++                    fontSize: 23,
++                    fontWeight: FontWeight.bold,
++                  ),
++                ),
++                Padding(
++                  padding:
++                      const EdgeInsets.symmetric(vertical: 8.0, horizontal: 10),
++                  child: TextFont(
++                    textAlign: TextAlign.center,
++                    text: description ?? "",
++                    fontSize: 17,
++                    maxLines: 100,
++                  ),
++                ),
++                onSubmitLabel != null || onCancelLabel != null
++                    ? Padding(
++                        padding: const EdgeInsets.symmetric(vertical: 16.0),
++                        child: Row(
++                          mainAxisAlignment: MainAxisAlignment.center,
+                           mainAxisSize: MainAxisSize.min,
+                           children: [
+-                            icon == null
+-                                ? TextFont(
+-                                    text: title ?? "",
+-                                    fontSize: 25,
+-                                    fontWeight: FontWeight.bold,
+-                                  )
+-                                : Container(
+-                                    height: 30,
+-                                    width: 1,
+-                                  ),
+-                            description != null
+-                                ? TextFont(
+-                                    text: description,
+-                                    fontSize: 19,
+-                                    maxLines: 100,
+-                                  )
++                            onSubmitLabel != null
++                                ? Button(
++                                    label: onSubmitLabel,
++                                    width: 100,
++                                    height: 50,
++                                    onTap: onSubmit ?? () {})
+                                 : SizedBox.shrink(),
+-                            onSubmitLabel != null || onCancelLabel != null
++                            onSubmitLabel != null && onCancelLabel != null
+                                 ? Container(
+-                                    height: 12,
+-                                    width: 1,
++                                    width: 15,
+                                   )
+                                 : SizedBox.shrink(),
+-                            onSubmitLabel != null || onCancelLabel != null
+-                                ? Row(
+-                                    mainAxisAlignment: MainAxisAlignment.center,
+-                                    mainAxisSize: MainAxisSize.min,
+-                                    children: [
+-                                      onSubmitLabel != null
+-                                          ? Button(
+-                                              label: onSubmitLabel,
+-                                              width: 100,
+-                                              height: 50,
+-                                              onTap: onSubmit ?? () {})
+-                                          : SizedBox.shrink(),
+-                                      onSubmitLabel != null &&
+-                                              onCancelLabel != null
+-                                          ? Container(
+-                                              width: 15,
+-                                            )
+-                                          : SizedBox.shrink(),
+-                                      onCancelLabel != null
+-                                          ? Button(
+-                                              label: onCancelLabel,
+-                                              width: 100,
+-                                              height: 50,
+-                                              onTap: onCancel ?? () {})
+-                                          : SizedBox.shrink(),
+-                                    ],
+-                                  )
++                            onCancelLabel != null
++                                ? Button(
++                                    label: onCancelLabel,
++                                    width: 100,
++                                    height: 50,
++                                    onTap: onCancel ?? () {})
+                                 : SizedBox.shrink(),
+                           ],
+                         ),
+-                      ),
+-                    ),
+-                  ],
+-                ),
++                      )
++                    : SizedBox.shrink(),
++                Container(height: 6),
+               ],
+             ),
+           ),
+diff --git a/budget/lib/widgets/pageFramework.dart b/budget/lib/widgets/pageFramework.dart
+index e26d130a8..03c9cbc81 100644
+--- a/budget/lib/widgets/pageFramework.dart
++++ b/budget/lib/widgets/pageFramework.dart
+@@ -21,6 +21,7 @@ class PageFramework extends StatefulWidget {
+     this.pinned = true,
+     this.subtitleAlignment = Alignment.bottomCenter,
+     this.customTitleBuilder,
++    this.onScroll,
+   }) : super(key: key);
+ 
+   final String title;
+@@ -39,6 +40,7 @@ class PageFramework extends StatefulWidget {
+   final bool pinned;
+   final Alignment subtitleAlignment;
+   final Function(AnimationController _animationController)? customTitleBuilder;
++  final Function(double position)? onScroll;
+   @override
+   State<PageFramework> createState() => _PageFrameworkState();
+ }
+@@ -61,6 +63,9 @@ class _PageFrameworkState extends State<PageFramework>
+   }
+ 
+   _scrollListener() {
++    if (widget.onScroll != null) {
++      widget.onScroll!(_scrollController.offset);
++    }
+     if (widget.onBottomReached != null &&
+         _scrollController.offset >=
+             _scrollController.position.maxScrollExtent) {
+@@ -108,92 +113,24 @@ class _PageFrameworkState extends State<PageFramework>
+       body: CustomScrollView(
+         controller: _scrollController,
+         slivers: [
+-          SliverAppBar(
+-            leading: widget.backButton == true
+-                ? Container(
+-                    padding: EdgeInsets.only(top: 12.5),
+-                    child: FadeTransition(
+-                      opacity: _animationControllerOpacity,
+-                      child: IconButton(
+-                        onPressed: () {
+-                          Navigator.pop(context);
+-                        },
+-                        icon: Icon(
+-                          Icons.arrow_back_rounded,
+-                          color: Theme.of(context).colorScheme.black,
+-                        ),
+-                      ),
+-                    ),
+-                  )
+-                : Container(),
+-            backgroundColor: widget.appBarBackgroundColor == null
+-                ? Theme.of(context).canvasColor
+-                : widget.appBarBackgroundColor,
+-            floating: false,
++          PageFrameworkSliverAppBar(
++            title: widget.title,
++            titleWidget: widget.titleWidget,
++            appBarBackgroundColor: widget.appBarBackgroundColor,
++            appBarBackgroundColorStart: widget.appBarBackgroundColorStart,
++            showElevationAfterScrollPast: widget.showElevationAfterScrollPast,
++            backButton: widget.backButton,
++            subtitle: widget.subtitle,
++            subtitleSize: widget.subtitleSize,
++            subtitleAnimationSpeed: widget.subtitleAnimationSpeed,
++            onBottomReached: widget.onBottomReached,
+             pinned: widget.pinned,
+-            expandedHeight: 200.0,
+-            collapsedHeight: 65,
+-            elevation: showElevation ? 0 : 5,
+-            flexibleSpace: FlexibleSpaceBar(
+-              titlePadding: EdgeInsets.symmetric(vertical: 15, horizontal: 18),
+-              title: widget.customTitleBuilder == null
+-                  ? AnimatedBuilder(
+-                      animation: _animationControllerShift,
+-                      builder: (_, child) {
+-                        return Transform.translate(
+-                          offset: Offset(
+-                            widget.backButton
+-                                ? 40 * _animationControllerShift.value
+-                                : 0,
+-                            -(widget.subtitleSize ?? 0) *
+-                                (1 - _animationControllerShift.value),
+-                          ),
+-                          child: child,
+-                        );
+-                      },
+-                      child: widget.titleWidget ??
+-                          TextFont(
+-                            text: widget.title,
+-                            fontSize: 26,
+-                            fontWeight: FontWeight.bold,
+-                          ),
+-                    )
+-                  : widget.customTitleBuilder!(_animationControllerShift),
+-              background: Stack(
+-                children: [
+-                  Container(
+-                    color: widget.appBarBackgroundColorStart,
+-                  ),
+-                  widget.subtitle != null
+-                      ? AnimatedBuilder(
+-                          animation: _animationControllerShift,
+-                          builder: (_, child) {
+-                            return Transform.translate(
+-                                offset: Offset(
+-                                  0,
+-                                  -(widget.subtitleSize ?? 0) *
+-                                      (_animationControllerShift.value) *
+-                                      widget.subtitleAnimationSpeed,
+-                                ),
+-                                child: child);
+-                          },
+-                          child: Align(
+-                            alignment: widget.subtitleAlignment,
+-                            child: FadeTransition(
+-                              opacity: _animationController0at50,
+-                              child: widget.subtitle,
+-                            ),
+-                          ),
+-                        )
+-                      : SizedBox(),
+-                ],
+-              ),
+-            ),
+-            shape: ContinuousRectangleBorder(
+-              borderRadius: BorderRadius.vertical(
+-                bottom: Radius.circular(25),
+-              ),
+-            ),
++            subtitleAlignment: widget.subtitleAlignment,
++            customTitleBuilder: widget.customTitleBuilder,
++            showElevation: showElevation,
++            animationControllerOpacity: _animationControllerOpacity,
++            animationControllerShift: _animationControllerShift,
++            animationController0at50: _animationController0at50,
+           ),
+           ...widget.slivers,
+           widget.listWidgets != null
+@@ -212,6 +149,148 @@ class _PageFrameworkState extends State<PageFramework>
+   }
+ }
+ 
++class PageFrameworkSliverAppBar extends StatelessWidget {
++  const PageFrameworkSliverAppBar({
++    Key? key,
++    this.title = "",
++    this.titleWidget,
++    this.appBarBackgroundColor,
++    this.appBarBackgroundColorStart,
++    this.showElevationAfterScrollPast,
++    this.backButton = true,
++    this.subtitle = null,
++    this.subtitleSize = null,
++    this.subtitleAnimationSpeed = 5,
++    this.onBottomReached,
++    this.pinned = true,
++    this.subtitleAlignment = Alignment.bottomCenter,
++    this.customTitleBuilder,
++    this.showElevation,
++    this.animationControllerOpacity,
++    this.animationControllerShift,
++    this.animationController0at50,
++    this.actions,
++  }) : super(key: key);
++
++  final String title;
++  final Widget? titleWidget;
++  final Color? appBarBackgroundColor;
++  final double? showElevationAfterScrollPast;
++  final bool backButton;
++  final Color? appBarBackgroundColorStart;
++  final Widget? subtitle;
++  final double? subtitleSize;
++  final double subtitleAnimationSpeed;
++  final VoidCallback? onBottomReached;
++  final bool pinned;
++  final Alignment subtitleAlignment;
++  final Function(AnimationController _animationController)? customTitleBuilder;
++  final AnimationController? animationControllerOpacity;
++  final AnimationController? animationControllerShift;
++  final AnimationController? animationController0at50;
++  final bool? showElevation;
++  final List<Widget>? actions;
++
++  @override
++  Widget build(BuildContext context) {
++    return SliverAppBar(
++      leading: backButton == true && animationControllerOpacity != null
++          ? Container(
++              padding: EdgeInsets.only(top: 12.5),
++              child: FadeTransition(
++                opacity: animationControllerOpacity!,
++                child: IconButton(
++                  onPressed: () {
++                    Navigator.pop(context);
++                  },
++                  icon: Icon(
++                    Icons.arrow_back_rounded,
++                    color: Theme.of(context).colorScheme.black,
++                  ),
++                ),
++              ),
++            )
++          : Container(),
++      backgroundColor: appBarBackgroundColor == null
++          ? Theme.of(context).canvasColor
++          : appBarBackgroundColor,
++      floating: false,
++      pinned: pinned,
++      expandedHeight: 200.0,
++      collapsedHeight: 65,
++      elevation: showElevation == true ? 0 : 5,
++      actions: actions,
++      flexibleSpace: FlexibleSpaceBar(
++        titlePadding: EdgeInsets.symmetric(vertical: 15, horizontal: 18),
++        title: animationControllerShift == null
++            ? titleWidget ??
++                TextFont(
++                  text: title,
++                  fontSize: 26,
++                  fontWeight: FontWeight.bold,
++                )
++            : customTitleBuilder == null
++                ? AnimatedBuilder(
++                    animation: animationControllerShift!,
++                    builder: (_, child) {
++                      return Transform.translate(
++                        offset: Offset(
++                          backButton ? 40 * animationControllerShift!.value : 0,
++                          -(subtitleSize ?? 0) *
++                              (1 - animationControllerShift!.value),
++                        ),
++                        child: child,
++                      );
++                    },
++                    child: titleWidget ??
++                        TextFont(
++                          text: title,
++                          fontSize: 26,
++                          fontWeight: FontWeight.bold,
++                        ),
++                  )
++                : customTitleBuilder!(animationControllerShift!),
++        background: Stack(
++          children: [
++            Container(
++              color: appBarBackgroundColorStart,
++            ),
++            subtitle != null &&
++                    animationControllerShift != null &&
++                    animationController0at50 != null
++                ? AnimatedBuilder(
++                    animation: animationControllerShift!,
++                    builder: (_, child) {
++                      return Transform.translate(
++                          offset: Offset(
++                            0,
++                            -(subtitleSize ?? 0) *
++                                (animationControllerShift!.value) *
++                                subtitleAnimationSpeed,
++                          ),
++                          child: child);
++                    },
++                    child: Align(
++                      alignment: subtitleAlignment,
++                      child: FadeTransition(
++                        opacity: animationController0at50!,
++                        child: subtitle,
++                      ),
++                    ),
++                  )
++                : SizedBox(),
++          ],
++        ),
++      ),
++      shape: ContinuousRectangleBorder(
++        borderRadius: BorderRadius.vertical(
++          bottom: Radius.circular(30),
++        ),
++      ),
++    );
++  }
++}
++
+ 
+ // customTitleBuilder: (_animationControllerShift) {
+ //   return AnimatedBuilder(
+diff --git a/budget/lib/widgets/tappable.dart b/budget/lib/widgets/tappable.dart
+index 175c9f3da..7fabffc1e 100644
+--- a/budget/lib/widgets/tappable.dart
++++ b/budget/lib/widgets/tappable.dart
+@@ -2,15 +2,16 @@ import 'package:flutter/material.dart';
+ import '../colors.dart';
+ 
+ class Tappable extends StatelessWidget {
+-  Tappable(
+-      {Key? key,
+-      this.onTap,
+-      this.onHighlightChanged,
+-      this.borderRadius = 0,
+-      this.color,
+-      this.type = MaterialType.canvas,
+-      required this.child})
+-      : super(key: key);
++  Tappable({
++    Key? key,
++    this.onTap,
++    this.onHighlightChanged,
++    this.borderRadius = 0,
++    this.color,
++    this.type = MaterialType.canvas,
++    required this.child,
++    this.onLongPress,
++  }) : super(key: key);
+ 
+   final double borderRadius;
+   final VoidCallback? onTap;
+@@ -18,6 +19,7 @@ class Tappable extends StatelessWidget {
+   final Color? color;
+   final Widget child;
+   final MaterialType type;
++  final VoidCallback? onLongPress;
+ 
+   @override
+   Widget build(BuildContext context) {
+@@ -30,6 +32,7 @@ class Tappable extends StatelessWidget {
+         onTap: onTap,
+         onHighlightChanged: onHighlightChanged,
+         child: child,
++        onLongPress: onLongPress,
+       ),
+     );
+   }
+diff --git a/budget/lib/widgets/transactionEntry.dart b/budget/lib/widgets/transactionEntry.dart
+index f4be4b034..0ee2899d0 100644
+--- a/budget/lib/widgets/transactionEntry.dart
++++ b/budget/lib/widgets/transactionEntry.dart
+@@ -3,6 +3,7 @@ import 'package:budget/functions.dart';
+ import 'package:budget/struct/databaseGlobal.dart';
+ import 'package:budget/struct/transactionCategory.dart';
+ import 'package:budget/struct/transactionTag.dart';
++import 'package:budget/widgets/fadeIn.dart';
+ import 'package:budget/widgets/openPopup.dart';
+ import 'package:budget/widgets/tappable.dart';
+ import 'package:budget/widgets/textWidgets.dart';
+@@ -12,26 +13,50 @@ import 'package:animations/animations.dart';
+ import '../colors.dart';
+ import 'package:intl/intl.dart';
+ 
+-class TransactionEntry extends StatelessWidget {
+-  TransactionEntry(
+-      {Key? key,
+-      required this.openPage,
+-      required this.transaction,
+-      this.category})
+-      : super(key: key);
++class TransactionEntry extends StatefulWidget {
++  TransactionEntry({
++    Key? key,
++    required this.openPage,
++    required this.transaction,
++    this.listID, //needs to be unique based on the page to avoid conflicting globalSelectedIDs
++    this.category,
++    this.onSelected,
++  }) : super(key: key);
+ 
+   final Widget openPage;
+   final Transaction transaction;
++  final String? listID;
+   final TransactionCategory? category;
++  final Function(Transaction transaction, bool selected)? onSelected;
++
++  @override
++  State<TransactionEntry> createState() => _TransactionEntryState();
++}
++
++Map<String, List<int>> globalSelectedID = {};
+ 
++class _TransactionEntryState extends State<TransactionEntry> {
+   final double fabSize = 50;
+ 
++  bool selected = false;
++
+   @override
+   Widget build(BuildContext context) {
++    if (globalSelectedID[widget.listID ?? "0"] == null) {
++      globalSelectedID[widget.listID ?? "0"] = [];
++    }
++    if (selected !=
++        globalSelectedID[widget.listID ?? "0"]!
++            .contains(widget.transaction.transactionPk))
++      setState(() {
++        selected = globalSelectedID[widget.listID ?? "0"]!
++            .contains(widget.transaction.transactionPk);
++      });
++
+     return OpenContainer<bool>(
+       transitionType: ContainerTransitionType.fade,
+       openBuilder: (BuildContext context, VoidCallback _) {
+-        return openPage;
++        return widget.openPage;
+       },
+       onClosed: () {}(),
+       closedColor: Theme.of(context).canvasColor,
+@@ -42,178 +67,165 @@ class TransactionEntry extends StatelessWidget {
+       closedElevation: 0.0,
+       openColor: Theme.of(context).colorScheme.lightDarkAccent,
+       closedBuilder: (BuildContext _, VoidCallback openContainer) {
+-        return Dismissible(
+-          confirmDismiss: (DismissDirection direction) async {
+-            return await openPopup(
+-              context,
+-              description: "Delete " + transaction.name,
+-              icon: Icons.delete,
+-              onCancel: () => Navigator.of(context).pop(false),
+-              onCancelLabel: "Cancel",
+-              onSubmit: () {
+-                Navigator.of(context).pop(true);
+-                Future.delayed(Duration(milliseconds: 500), () async {
+-                  await database.deleteTransaction(transaction.transactionPk);
+-                });
+-              },
+-              onSubmitLabel: "Delete",
+-            );
+-          },
+-          background: Container(
+-            margin: EdgeInsets.symmetric(horizontal: 10),
+-            decoration: BoxDecoration(
+-              color: Colors.redAccent,
+-              borderRadius: BorderRadius.circular(10),
+-            ),
+-            alignment: AlignmentDirectional.centerStart,
+-            child: Padding(
+-              padding: EdgeInsets.fromLTRB(20.0, 0.0, 0.0, 0.0),
+-              child: Icon(
+-                Icons.delete,
+-                color: Colors.white,
++        return Padding(
++          padding:
++              const EdgeInsets.only(left: 13, right: 13, top: 1, bottom: 2),
++          child: Tappable(
++            borderRadius: 15,
++            onLongPress: () {
++              if (!selected) {
++                globalSelectedID[widget.listID ?? "0"]!
++                    .add(widget.transaction.transactionPk);
++              } else {
++                globalSelectedID[widget.listID ?? "0"]!
++                    .remove(widget.transaction.transactionPk);
++              }
++              setState(() {
++                selected = !selected;
++              });
++              if (widget.onSelected != null)
++                widget.onSelected!(widget.transaction, selected);
++            },
++            onTap: () async {
++              openContainer();
++            },
++            child: AnimatedContainer(
++              duration: const Duration(seconds: 1),
++              curve: Curves.easeInOutCubicEmphasized,
++              padding: EdgeInsets.only(
++                left: selected ? 15 - 2 : 10 - 2,
++                right: selected ? 15 : 10,
++                top: selected ? 8 : 4,
++                bottom: selected ? 8 : 4,
+               ),
+-            ),
+-          ),
+-          secondaryBackground: Container(
+-            margin: EdgeInsets.symmetric(horizontal: 10),
+-            decoration: BoxDecoration(
+-              color: Colors.redAccent,
+-              borderRadius: BorderRadius.circular(10),
+-            ),
+-            alignment: AlignmentDirectional.centerEnd,
+-            child: Padding(
+-              padding: EdgeInsets.fromLTRB(0.0, 0.0, 20.0, 0.0),
+-              child: Icon(
+-                Icons.delete,
+-                color: Colors.white,
++              decoration: BoxDecoration(
++                color: selected
++                    ? Theme.of(context).colorScheme.accentColor.withAlpha(100)
++                    : Colors.transparent,
++                borderRadius: BorderRadius.all(Radius.circular(12)),
+               ),
+-            ),
+-          ),
+-          child: Padding(
+-            padding: EdgeInsets.only(top: 1, bottom: 3, left: 13, right: 13),
+-            child: Tappable(
+-              borderRadius: 15,
+-              onTap: () async {
+-                openContainer();
+-              },
+-              child: Container(
+-                margin: EdgeInsets.only(left: 8, right: 12, top: 4, bottom: 4),
+-                child: Row(
+-                  children: [
+-                    CategoryIcon(
+-                      categoryPk: transaction.categoryFk,
+-                      size: 33,
+-                      sizePadding: 15,
+-                      margin: EdgeInsets.zero,
+-                    ),
+-                    Container(
+-                      width: 15,
+-                    ),
+-                    Expanded(
+-                      child: transaction.name != ""
+-                          ? TextFont(
+-                              text: transaction.name,
+-                              fontSize: 18,
+-                            )
+-                          : category == null
+-                              ? StreamBuilder<TransactionCategory>(
+-                                  stream: database
+-                                      .getCategory(transaction.categoryFk),
+-                                  builder: (context, snapshot) {
+-                                    if (snapshot.hasData) {
+-                                      return TextFont(
+-                                        text: snapshot.data!.name,
+-                                        fontSize: 18,
+-                                      );
+-                                    }
+-                                    return Container();
+-                                  },
+-                                )
+-                              : TextFont(
+-                                  text: category!.name,
+-                                  fontSize: 18,
+-                                ),
+-                    ),
+-                    // Expanded(
+-                    //   child: Container(
+-                    //     child: Column(
+-                    //       crossAxisAlignment: CrossAxisAlignment.start,
+-                    //       children: [
+-                    //         transaction.name != ""
+-                    //             ? TextFont(
+-                    //                 text: transaction.name,
+-                    //                 fontSize: 20,
+-                    //               )
+-                    //             : Container(
+-                    //                 height: transaction.note == "" ? 0 : 7),
+-                    //         transaction.name == "" &&
+-                    //                 (transaction.labelFks?.length ?? 0) > 0
+-                    //             ? TagIcon(
+-                    //                 tag: TransactionTag(
+-                    //                     title: "test",
+-                    //                     id: "test",
+-                    //                     categoryID: "id"),
+-                    //                 size: transaction.note == "" ? 20 : 16)
+-                    //             : Container(),
+-                    //         transaction.name == "" &&
+-                    //                 (transaction.labelFks?.length ?? 0) == 0
+-                    //             ? StreamBuilder<TransactionCategory>(
+-                    //                 stream: database
+-                    //                     .getCategory(transaction.categoryFk),
+-                    //                 builder: (context, snapshot) {
+-                    //                   if (snapshot.hasData) {
+-                    //                     return TextFont(
+-                    //                       text: snapshot.data!.name,
+-                    //                       fontSize:
+-                    //                           transaction.note == "" ? 20 : 20,
+-                    //                     );
+-                    //                   }
+-                    //                   return TextFont(
+-                    //                     text: "",
+-                    //                     fontSize:
+-                    //                         transaction.note == "" ? 20 : 20,
+-                    //                   );
+-                    //                 })
+-                    //             : Container(),
+-                    //         transaction.name == "" && transaction.note != ""
+-                    //             ? Container(height: 4)
+-                    //             : Container(),
+-                    //         transaction.note == ""
+-                    //             ? Container()
+-                    //             : TextFont(
+-                    //                 text: transaction.note,
+-                    //                 fontSize: 16,
+-                    //                 maxLines: 2,
+-                    //               ),
+-                    //         transaction.note == ""
+-                    //             ? Container()
+-                    //             : Container(height: 4),
+-                    //         //TODO loop through all tags relating to this entry
+-                    //         transaction.name != "" &&
+-                    //                 (transaction.labelFks?.length ?? 0) > 0
+-                    //             ? TagIcon(
+-                    //                 tag: TransactionTag(
+-                    //                     title: "test",
+-                    //                     id: "test",
+-                    //                     categoryID: "id"),
+-                    //                 size: 12)
+-                    //             : Container()
+-                    //       ],
+-                    //     ),
+-                    //   ),
+-                    // ),
+-                    TextFont(
+-                      text: convertToMoney(transaction.amount),
+-                      fontSize: 20,
+-                      fontWeight: FontWeight.w600,
+-                    ),
+-                  ],
+-                ),
++              child: Row(
++                children: [
++                  CategoryIcon(
++                    categoryPk: widget.transaction.categoryFk,
++                    size: 33,
++                    sizePadding: 15,
++                    margin: EdgeInsets.zero,
++                  ),
++                  Container(
++                    width: 15,
++                  ),
++                  Expanded(
++                    child: widget.transaction.name != ""
++                        ? TextFont(
++                            text: widget.transaction.name,
++                            fontSize: 18,
++                          )
++                        : widget.category == null
++                            ? StreamBuilder<TransactionCategory>(
++                                stream: database
++                                    .getCategory(widget.transaction.categoryFk),
++                                builder: (context, snapshot) {
++                                  if (snapshot.hasData) {
++                                    return TextFont(
++                                      text: snapshot.data!.name,
++                                      fontSize: 18,
++                                    );
++                                  }
++                                  return Container();
++                                },
++                              )
++                            : TextFont(
++                                text: widget.category!.name,
++                                fontSize: 18,
++                              ),
++                  ),
++                  // Expanded(
++                  //   child: Container(
++                  //     child: Column(
++                  //       crossAxisAlignment: CrossAxisAlignment.start,
++                  //       children: [
++                  //         transaction.name != ""
++                  //             ? TextFont(
++                  //                 text: transaction.name,
++                  //                 fontSize: 20,
++                  //               )
++                  //             : Container(
++                  //                 height: transaction.note == "" ? 0 : 7),
++                  //         transaction.name == "" &&
++                  //                 (transaction.labelFks?.length ?? 0) > 0
++                  //             ? TagIcon(
++                  //                 tag: TransactionTag(
++                  //                     title: "test",
++                  //                     id: "test",
++                  //                     categoryID: "id"),
++                  //                 size: transaction.note == "" ? 20 : 16)
++                  //             : Container(),
++                  //         transaction.name == "" &&
++                  //                 (transaction.labelFks?.length ?? 0) == 0
++                  //             ? StreamBuilder<TransactionCategory>(
++                  //                 stream: database
++                  //                     .getCategory(transaction.categoryFk),
++                  //                 builder: (context, snapshot) {
++                  //                   if (snapshot.hasData) {
++                  //                     return TextFont(
++                  //                       text: snapshot.data!.name,
++                  //                       fontSize:
++                  //                           transaction.note == "" ? 20 : 20,
++                  //                     );
++                  //                   }
++                  //                   return TextFont(
++                  //                     text: "",
++                  //                     fontSize:
++                  //                         transaction.note == "" ? 20 : 20,
++                  //                   );
++                  //                 })
++                  //             : Container(),
++                  //         transaction.name == "" && transaction.note != ""
++                  //             ? Container(height: 4)
++                  //             : Container(),
++                  //         transaction.note == ""
++                  //             ? Container()
++                  //             : TextFont(
++                  //                 text: transaction.note,
++                  //                 fontSize: 16,
++                  //                 maxLines: 2,
++                  //               ),
++                  //         transaction.note == ""
++                  //             ? Container()
++                  //             : Container(height: 4),
++                  //         //TODO loop through all tags relating to this entry
++                  //         transaction.name != "" &&
++                  //                 (transaction.labelFks?.length ?? 0) > 0
++                  //             ? TagIcon(
++                  //                 tag: TransactionTag(
++                  //                     title: "test",
++                  //                     id: "test",
++                  //                     categoryID: "id"),
++                  //                 size: 12)
++                  //             : Container()
++                  //       ],
++                  //     ),
++                  //   ),
++                  // ),
++                  CountNumber(
++                    count: (widget.transaction.amount),
++                    duration: Duration(milliseconds: 2000),
++                    dynamicDecimals: true,
++                    initialCount: (widget.transaction.amount),
++                    textBuilder: (number) {
++                      return TextFont(
++                        textAlign: TextAlign.left,
++                        text: convertToMoney(number),
++                        fontSize: 20,
++                        fontWeight: FontWeight.bold,
++                      );
++                    },
++                  ),
++                ],
+               ),
+             ),
+           ),
+-          key: ValueKey<int>(transaction.transactionPk),
+-          onDismissed: (DismissDirection direction) {},
+         );
+       },
+     );
+diff --git a/budget/lib/widgets/walletEntry.dart b/budget/lib/widgets/walletEntry.dart
+index 6f734613c..d95d35309 100644
+--- a/budget/lib/widgets/walletEntry.dart
++++ b/budget/lib/widgets/walletEntry.dart
+@@ -1,6 +1,11 @@
++import 'dart:developer';
++
+ import 'package:budget/database/tables.dart';
++import 'package:budget/functions.dart';
+ import 'package:budget/main.dart';
+ import 'package:budget/pages/addWalletPage.dart';
++import 'package:budget/struct/databaseGlobal.dart';
++import 'package:budget/widgets/fadeIn.dart';
+ import 'package:budget/widgets/openContainerNavigation.dart';
+ import 'package:budget/widgets/tappable.dart';
+ import 'package:budget/widgets/textWidgets.dart';
+@@ -44,16 +49,49 @@ class WalletEntry extends StatelessWidget {
+                   text: wallet.name,
+                   fontWeight: FontWeight.bold,
+                 ),
+-                TextFont(
+-                  text: "\$ -9,700",
+-                  fontSize: 15,
+-                  fontWeight: FontWeight.bold,
++                StreamBuilder<List<double?>>(
++                  stream: database.watchTotalOfWallet(wallet.walletPk),
++                  builder: (context, snapshot) {
++                    if (snapshot.hasData && snapshot.data != null) {
++                      return CountNumber(
++                        count: (snapshot.data![0] ?? 0 * -1),
++                        duration: Duration(milliseconds: 4000),
++                        dynamicDecimals: true,
++                        initialCount: (snapshot.data![0] ?? 0 * -1),
++                        textBuilder: (number) {
++                          return TextFont(
++                            textAlign: TextAlign.left,
++                            text: convertToMoney(number),
++                            fontSize: 17,
++                            fontWeight: FontWeight.bold,
++                          );
++                        },
++                      );
++                    } else {
++                      return SizedBox();
++                    }
++                  },
+                 ),
+-                TextFont(
+-                  text: "5 transactions",
+-                  fontSize: 14,
+-                  textColor:
+-                      Theme.of(context).colorScheme.black.withOpacity(0.65),
++                StreamBuilder<List<int?>>(
++                  stream: database
++                      .watchTotalCountOfTransactionsInWallet(wallet.walletPk),
++                  builder: (context, snapshot) {
++                    if (snapshot.hasData && snapshot.data != null) {
++                      return TextFont(
++                        textAlign: TextAlign.left,
++                        text: snapshot.data![0] == 1
++                            ? (snapshot.data![0].toString() + " transaction")
++                            : (snapshot.data![0].toString() + " transactions"),
++                        fontSize: 14,
++                        textColor: Theme.of(context)
++                            .colorScheme
++                            .black
++                            .withOpacity(0.65),
++                      );
++                    } else {
++                      return SizedBox();
++                    }
++                  },
+                 ),
+               ],
+             ),
+diff --git a/budget/pubspec.lock b/budget/pubspec.lock
+index 4c1cb4d99..bdea50a64 100644
+--- a/budget/pubspec.lock
++++ b/budget/pubspec.lock
+@@ -168,7 +168,7 @@ packages:
+       name: collection
+       url: "https://pub.dartlang.org"
+     source: hosted
+-    version: "1.15.0"
++    version: "1.16.0"
+   convert:
+     dependency: transitive
+     description:
+@@ -231,7 +231,7 @@ packages:
+       name: fake_async
+       url: "https://pub.dartlang.org"
+     source: hosted
+-    version: "1.2.0"
++    version: "1.3.0"
+   ffi:
+     dependency: transitive
+     description:
+@@ -292,7 +292,7 @@ packages:
+       name: flutter_sticky_header
+       url: "https://pub.dartlang.org"
+     source: hosted
+-    version: "0.6.0"
++    version: "0.6.2"
+   flutter_test:
+     dependency: "direct dev"
+     description: flutter
+@@ -414,7 +414,7 @@ packages:
+       name: js
+       url: "https://pub.dartlang.org"
+     source: hosted
+-    version: "0.6.3"
++    version: "0.6.4"
+   json_annotation:
+     dependency: transitive
+     description:
+@@ -449,7 +449,7 @@ packages:
+       name: material_color_utilities
+       url: "https://pub.dartlang.org"
+     source: hosted
+-    version: "0.1.3"
++    version: "0.1.4"
+   math_expressions:
+     dependency: "direct main"
+     description:
+@@ -484,7 +484,7 @@ packages:
+       name: path
+       url: "https://pub.dartlang.org"
+     source: hosted
+-    version: "1.8.0"
++    version: "1.8.1"
+   path_provider:
+     dependency: "direct main"
+     description:
+@@ -721,6 +721,13 @@ packages:
+       url: "https://pub.dartlang.org"
+     source: hosted
+     version: "0.5.2"
++  sliver_tools:
++    dependency: "direct main"
++    description:
++      name: sliver_tools
++      url: "https://pub.dartlang.org"
++    source: hosted
++    version: "0.2.6"
+   source_gen:
+     dependency: transitive
+     description:
+@@ -734,7 +741,7 @@ packages:
+       name: source_span
+       url: "https://pub.dartlang.org"
+     source: hosted
+-    version: "1.8.1"
++    version: "1.8.2"
+   sqlite3:
+     dependency: transitive
+     description:
+@@ -811,7 +818,7 @@ packages:
+       name: test_api
+       url: "https://pub.dartlang.org"
+     source: hosted
+-    version: "0.4.8"
++    version: "0.4.9"
+   timing:
+     dependency: transitive
+     description:
+@@ -909,7 +916,7 @@ packages:
+       name: vector_math
+       url: "https://pub.dartlang.org"
+     source: hosted
+-    version: "2.1.1"
++    version: "2.1.2"
+   watcher:
+     dependency: transitive
+     description:
+@@ -946,5 +953,5 @@ packages:
+     source: hosted
+     version: "3.1.0"
+ sdks:
+-  dart: ">=2.15.0 <3.0.0"
++  dart: ">=2.17.0-0 <3.0.0"
+   flutter: ">=2.8.0"
+diff --git a/budget/pubspec.yaml b/budget/pubspec.yaml
+index b4b2899ef..da4aea81b 100644
+--- a/budget/pubspec.yaml
++++ b/budget/pubspec.yaml
+@@ -43,6 +43,7 @@ dependencies:
+   shared_preferences: ^2.0.13
+   csv: ^5.0.1
+   sliding_sheet: ^0.5.2
++  sliver_tools: ^0.2.6
+   
+ dev_dependencies:
+   flutter_test:

@@ -1,0 +1,171 @@
+diff --git a/flutter/lib/common/widgets/remote_input.dart b/flutter/lib/common/widgets/remote_input.dart
+index ad50d483932..89443e14f60 100644
+--- a/flutter/lib/common/widgets/remote_input.dart
++++ b/flutter/lib/common/widgets/remote_input.dart
+@@ -51,6 +51,9 @@ class RawPointerMouseRegion extends StatelessWidget {
+         onPointerUp: inputModel.onPointUpImage,
+         onPointerMove: inputModel.onPointMoveImage,
+         onPointerSignal: inputModel.onPointerSignalImage,
++        onPointerPanZoomStart: inputModel.onPointerPanZoomStart,
++        onPointerPanZoomUpdate: inputModel.onPointerPanZoomUpdate,
++        onPointerPanZoomEnd: inputModel.onPointerPanZoomEnd,
+         child: MouseRegion(
+             cursor: cursor ?? MouseCursor.defer,
+             onEnter: onEnter,
+diff --git a/flutter/lib/models/input_model.dart b/flutter/lib/models/input_model.dart
+index 83171514d73..eb1b4a3ff7c 100644
+--- a/flutter/lib/models/input_model.dart
++++ b/flutter/lib/models/input_model.dart
+@@ -1,3 +1,4 @@
++import 'dart:async';
+ import 'dart:convert';
+ import 'dart:math';
+ import 'dart:ui' as ui;
+@@ -39,6 +40,10 @@ class InputModel {
+   var alt = false;
+   var command = false;
+ 
++  // trackpad
++  var trackpadScrollDistance = Offset.zero;
++  Timer? _flingTimer;
++
+   // mouse
+   final isPhysicalMouse = false.obs;
+   int _lastMouseDownButtons = 0;
+@@ -236,6 +241,7 @@ class InputModel {
+     if (!enter) {
+       resetModifiers();
+     }
++    _flingTimer?.cancel();
+     bind.sessionEnterOrLeave(id: id, enter: enter);
+   }
+ 
+@@ -258,6 +264,57 @@ class InputModel {
+     }
+   }
+ 
++  int _signOrZero(num x) {
++    if (x == 0) {
++      return 0;
++    } else {
++      return x > 0 ? 1 : -1;
++    }
++  }
++
++  void onPointerPanZoomStart(PointerPanZoomStartEvent e) {}
++
++  // https://docs.flutter.dev/release/breaking-changes/trackpad-gestures
++  // TODO(support zoom in/out)
++  void onPointerPanZoomUpdate(PointerPanZoomUpdateEvent e) {
++    var delta = e.panDelta;
++    trackpadScrollDistance += delta;
++    bind.sessionSendMouse(
++        id: id,
++        msg:
++            '{"type": "trackpad", "x": "${delta.dx.toInt()}", "y": "${delta.dy.toInt()}"}');
++  }
++
++  // Simple simulation for fling.
++  void _scheduleFling(var x, y, dx, dy) {
++    if (dx <= 0 && dy <= 0) {
++      return;
++    }
++    _flingTimer = Timer(Duration(milliseconds: 10), () {
++      bind.sessionSendMouse(
++          id: id, msg: '{"type": "trackpad", "x": "$x", "y": "$y"}');
++      dx--;
++      dy--;
++      if (dx == 0) {
++        x = 0;
++      }
++      if (dy == 0) {
++        y = 0;
++      }
++      _scheduleFling(x, y, dx, dy);
++    });
++  }
++
++  void onPointerPanZoomEnd(PointerPanZoomEndEvent e) {
++    var x = _signOrZero(trackpadScrollDistance.dx);
++    var y = _signOrZero(trackpadScrollDistance.dy);
++    var dx = trackpadScrollDistance.dx.abs() ~/ 40;
++    var dy = trackpadScrollDistance.dy.abs() ~/ 40;
++    _scheduleFling(x, y, dx, dy);
++
++    trackpadScrollDistance = Offset.zero;
++  }
++
+   void onPointDownImage(PointerDownEvent e) {
+     debugPrint("onPointDownImage");
+     if (e.kind != ui.PointerDeviceKind.mouse) {
+diff --git a/src/client.rs b/src/client.rs
+index 3f738a36978..b3be51cb4f2 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -1572,9 +1572,14 @@ pub async fn handle_test_delay(t: TestDelay, peer: &mut Stream) {
+     }
+ }
+ 
++/// Whether is track pad scrolling.
+ #[inline]
+-#[cfg(all(target_os = "macos", not(feature = "flutter")))]
++#[cfg(all(target_os = "macos"))]
+ fn check_scroll_on_mac(mask: i32, x: i32, y: i32) -> bool {
++    // flutter version we set mask type bit to 4 when track pad scrolling.
++    if mask & 7 == 4 {
++        return true;
++    }
+     if mask & 3 != 3 {
+         return false;
+     }
+@@ -1597,7 +1602,7 @@ fn check_scroll_on_mac(mask: i32, x: i32, y: i32) -> bool {
+ ///
+ /// * `mask` - Mouse event.
+ ///     * mask = buttons << 3 | type
+-///     * type, 1: down, 2: up, 3: wheel
++///     * type, 1: down, 2: up, 3: wheel, 4: trackpad
+ ///     * buttons, 1: left, 2: right, 4: middle
+ /// * `x` - X coordinate.
+ /// * `y` - Y coordinate.
+@@ -1636,7 +1641,7 @@ pub fn send_mouse(
+     if command {
+         mouse_event.modifiers.push(ControlKey::Meta.into());
+     }
+-    #[cfg(all(target_os = "macos", not(feature = "flutter")))]
++    #[cfg(all(target_os = "macos"))]
+     if check_scroll_on_mac(mask, x, y) {
+         mouse_event.modifiers.push(ControlKey::Scroll.into());
+     }
+diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
+index 36e38f86e69..bfee92f88ef 100644
+--- a/src/flutter_ffi.rs
++++ b/src/flutter_ffi.rs
+@@ -156,6 +156,7 @@ pub fn session_reconnect(id: String) {
+ 
+ pub fn session_toggle_option(id: String, value: String) {
+     if let Some(session) = SESSIONS.write().unwrap().get_mut(&id) {
++        log::warn!("toggle option {}", value);
+         session.toggle_option(value);
+     }
+ }
+@@ -907,6 +908,7 @@ pub fn session_send_mouse(id: String, msg: String) {
+                 "down" => 1,
+                 "up" => 2,
+                 "wheel" => 3,
++                "trackpad" => 4,
+                 _ => 0,
+             };
+         }
+diff --git a/src/server/input_service.rs b/src/server/input_service.rs
+index 005c828bc33..ca63fed9496 100644
+--- a/src/server/input_service.rs
++++ b/src/server/input_service.rs
+@@ -513,7 +513,7 @@ pub fn handle_mouse_(evt: &MouseEvent) {
+             }
+             _ => {}
+         },
+-        3 => {
++        3 | 4 => {
+             #[allow(unused_mut)]
+             let mut x = evt.x;
+             #[allow(unused_mut)]

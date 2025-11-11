@@ -1,0 +1,809 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/history/PagedHistoryProvider.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/history/PagedHistoryProvider.kt
+index dee137c07418..06379d6df5d0 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/history/PagedHistoryProvider.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/history/PagedHistoryProvider.kt
+@@ -6,29 +6,75 @@ package org.mozilla.fenix.components.history
+ 
+ import androidx.annotation.VisibleForTesting
+ import mozilla.components.browser.storage.sync.PlacesHistoryStorage
++import mozilla.components.concept.storage.HistoryMetadata
++import mozilla.components.concept.storage.HistoryMetadataKey
+ import mozilla.components.concept.storage.VisitInfo
+ import mozilla.components.concept.storage.VisitType
+ import mozilla.components.support.ktx.kotlin.tryGetHostFromUrl
+ import org.mozilla.fenix.FeatureFlags
+ import org.mozilla.fenix.library.history.History
+-import org.mozilla.fenix.library.history.toHistoryMetadata
+ import org.mozilla.fenix.perf.runBlockingIncrement
+ import kotlin.math.abs
+ 
+ private const val BUFFER_TIME = 15000 /* 15 seconds in ms */
+ 
+ /**
+- * An Interface for providing a paginated list of [History].
++ * Class representing a history entry.
++ * Contrast this with [History] that's the same, but with an assigned position, for pagination
++ * and display purposes.
++ */
++sealed class HistoryDB {
++    abstract val title: String
++    abstract val visitedAt: Long
++    abstract val selected: Boolean
++
++    data class Regular(
++        override val title: String,
++        val url: String,
++        override val visitedAt: Long,
++        override val selected: Boolean = false
++    ) : HistoryDB()
++
++    data class Metadata(
++        override val title: String,
++        val url: String,
++        override val visitedAt: Long,
++        val totalViewTime: Int,
++        val historyMetadataKey: HistoryMetadataKey,
++        override val selected: Boolean = false
++    ) : HistoryDB()
++
++    data class Group(
++        override val title: String,
++        override val visitedAt: Long,
++        val items: List<Metadata>,
++        override val selected: Boolean = false
++    ) : HistoryDB()
++}
++
++private fun HistoryMetadata.toHistoryDBMetadata(): HistoryDB.Metadata {
++    return HistoryDB.Metadata(
++        title = title?.takeIf(String::isNotEmpty)
++            ?: key.url.tryGetHostFromUrl(),
++        url = key.url,
++        visitedAt = createdAt,
++        totalViewTime = totalViewTime,
++        historyMetadataKey = key
++    )
++}
++
++/**
++ * An Interface for providing a paginated list of [HistoryDB].
+  */
+ interface PagedHistoryProvider {
+     /**
+-     * Gets a list of [History].
++     * Gets a list of [HistoryDB].
+      *
+      * @param offset How much to offset the list by
+      * @param numberOfItems How many items to fetch
+-     * @param onComplete A callback that returns the list of [History]
++     * @param onComplete A callback that returns the list of [HistoryDB]
+      */
+-    fun getHistory(offset: Int, numberOfItems: Int, onComplete: (List<History>) -> Unit)
++    fun getHistory(offset: Int, numberOfItems: Int, onComplete: (List<HistoryDB>) -> Unit)
+ }
+ 
+ /**
+@@ -59,18 +105,18 @@ class DefaultPagedHistoryProvider(
+         it == VisitType.REDIRECT_PERMANENT || it == VisitType.REDIRECT_TEMPORARY
+     }
+ 
+-    @Volatile private var historyGroups: List<History.Group>? = null
++    @Volatile private var historyGroups: List<HistoryDB.Group>? = null
+ 
+     @Suppress("LongMethod")
+     override fun getHistory(
+         offset: Int,
+         numberOfItems: Int,
+-        onComplete: (List<History>) -> Unit,
++        onComplete: (List<HistoryDB>) -> Unit,
+     ) {
+         // A PagedList DataSource runs on a background thread automatically.
+         // If we run this in our own coroutineScope it breaks the PagedList
+         runBlockingIncrement {
+-            val history: List<History>
++            val history: List<HistoryDB>
+ 
+             if (showHistorySearchGroups) {
+                 // We need to re-fetch all the history metadata if the offset resets back at 0
+@@ -81,10 +127,10 @@ class DefaultPagedHistoryProvider(
+                         .filter { it.key.searchTerm != null }
+                         .groupBy { it.key.searchTerm!! }
+                         .map { (searchTerm, items) ->
+-                            History.Group(
++                            HistoryDB.Group(
+                                 title = searchTerm,
+                                 visitedAt = items.first().createdAt,
+-                                items = items.map { it.toHistoryMetadata() }
++                                items = items.map { it.toHistoryDBMetadata() }
+                             )
+                         }
+                 }
+@@ -143,9 +189,9 @@ class DefaultPagedHistoryProvider(
+     private suspend fun getHistoryAndSearchGroups(
+         offset: Int,
+         numberOfItems: Int,
+-    ): List<History> {
+-        val result = mutableListOf<History>()
+-        val history: List<History.Regular> = historyStorage
++    ): List<HistoryDB> {
++        val result = mutableListOf<HistoryDB>()
++        val history: List<HistoryDB.Regular> = historyStorage
+             .getVisitsPaginated(
+                 offset.toLong(),
+                 numberOfItems.toLong(),
+@@ -207,12 +253,12 @@ class DefaultPagedHistoryProvider(
+             .sortedByDescending { it.visitedAt }
+     }
+ 
+-    private fun transformVisitInfoToHistoryItem(visit: VisitInfo): History.Regular {
++    private fun transformVisitInfoToHistoryItem(visit: VisitInfo): HistoryDB.Regular {
+         val title = visit.title
+             ?.takeIf(String::isNotEmpty)
+             ?: visit.url.tryGetHostFromUrl()
+ 
+-        return History.Regular(
++        return HistoryDB.Regular(
+             title = title,
+             url = visit.url,
+             visitedAt = visit.visitTime
+@@ -221,11 +267,11 @@ class DefaultPagedHistoryProvider(
+ }
+ 
+ @VisibleForTesting
+-internal fun List<History>.removeConsecutiveDuplicates(): List<History> {
++internal fun List<HistoryDB>.removeConsecutiveDuplicates(): List<HistoryDB> {
+     var previousURL = ""
+     return filter {
+         var isNotDuplicate = true
+-        previousURL = if (it is History.Regular) {
++        previousURL = if (it is HistoryDB.Regular) {
+             isNotDuplicate = it.url != previousURL
+             it.url
+         } else {
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/recentvisits/controller/RecentVisitsController.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/recentvisits/controller/RecentVisitsController.kt
+index 6b195d6c1bae..34e9135d8ed9 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/recentvisits/controller/RecentVisitsController.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/recentvisits/controller/RecentVisitsController.kt
+@@ -96,7 +96,7 @@ class DefaultRecentVisitsController(
+             HomeFragmentDirections.actionGlobalHistoryMetadataGroup(
+                 title = recentHistoryGroup.title,
+                 historyMetadataItems = recentHistoryGroup.historyMetadata
+-                    .map { it.toHistoryMetadata() }.toTypedArray()
++                    .mapIndexed { index, item -> item.toHistoryMetadata(index) }.toTypedArray()
+             )
+         )
+     }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryDataSource.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryDataSource.kt
+index fd70d8842879..edb4898da47e 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryDataSource.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryDataSource.kt
+@@ -6,6 +6,7 @@ package org.mozilla.fenix.library.history
+ 
+ import androidx.annotation.VisibleForTesting
+ import androidx.paging.ItemKeyedDataSource
++import org.mozilla.fenix.components.history.HistoryDB
+ import org.mozilla.fenix.components.history.PagedHistoryProvider
+ 
+ class HistoryDataSource(
+@@ -15,22 +16,20 @@ class HistoryDataSource(
+     // Because the pagination is not based off of the key
+     // we want to start at 1, not 0 to be able to send the correct offset
+     // to the `historyProvider.getHistory` call.
+-    override fun getKey(item: History): Int = item.position!! + 1
++    override fun getKey(item: History): Int = item.position + 1
+ 
+     override fun loadInitial(
+         params: LoadInitialParams<Int>,
+         callback: LoadInitialCallback<History>
+     ) {
+         historyProvider.getHistory(INITIAL_OFFSET, params.requestedLoadSize) { history ->
+-            val positionedHistory = assignPositions(offset = INITIAL_OFFSET, history)
+-            callback.onResult(positionedHistory)
++            callback.onResult(history.positionWithOffset(INITIAL_OFFSET))
+         }
+     }
+ 
+     override fun loadAfter(params: LoadParams<Int>, callback: LoadCallback<History>) {
+         historyProvider.getHistory(params.key, params.requestedLoadSize) { history ->
+-            val positionedHistory = assignPositions(offset = params.key, history)
+-            callback.onResult(positionedHistory)
++            callback.onResult(history.positionWithOffset(params.key))
+         }
+     }
+ 
+@@ -38,38 +37,67 @@ class HistoryDataSource(
+ 
+     companion object {
+         private const val INITIAL_OFFSET = 0
++    }
++}
+ 
+-        @VisibleForTesting
+-        internal fun assignPositions(offset: Int, history: List<History>): List<History> {
+-            return history.foldIndexed(listOf()) { index, prev, item ->
+-                // Only offset once while folding, so that we don't accumulate the offset for each element.
+-                val itemOffset = if (index == 0) {
+-                    offset
++@VisibleForTesting
++internal fun List<HistoryDB>.positionWithOffset(offset: Int): List<History> {
++    return this.foldIndexed(listOf()) { index, prev, item ->
++        // Only offset once while folding, so that we don't accumulate the offset for each element.
++        val itemOffset = if (index == 0) {
++            offset
++        } else {
++            0
++        }
++        val previousPosition = prev.lastOrNull()?.position ?: 0
++        when (item) {
++            is HistoryDB.Group -> {
++                // XXX considering an empty group to have a non-zero offset is the obvious
++                // limitation of the current approach, and indicates that we're conflating
++                // two concepts here - position of an element for the sake of a RecyclerView,
++                // and an offset for the sake of our history pagination API.
++                val groupOffset = if (item.items.isEmpty()) {
++                    1
+                 } else {
+-                    0
+-                }
+-                val previousPosition = prev.lastOrNull()?.position ?: 0
+-                when (item) {
+-                    is History.Group -> {
+-                        // XXX considering an empty group to have a non-zero offset is the obvious
+-                        // limitation of the current approach, and indicates that we're conflating
+-                        // two concepts here - position of an element for the sake of a RecyclerView,
+-                        // and an offset for the sake of our history pagination API.
+-                        val groupOffset = if (item.items.isEmpty()) {
+-                            1
+-                        } else {
+-                            item.items.size
+-                        }
+-                        prev + item.copy(position = previousPosition + itemOffset + groupOffset)
+-                    }
+-                    is History.Metadata -> {
+-                        prev + item.copy(position = previousPosition + itemOffset + 1)
+-                    }
+-                    is History.Regular -> {
+-                        prev + item.copy(position = previousPosition + itemOffset + 1)
+-                    }
++                    item.items.size
+                 }
++                prev + item.positioned(position = previousPosition + itemOffset + groupOffset)
++            }
++            is HistoryDB.Metadata -> {
++                prev + item.positioned(previousPosition + itemOffset + 1)
++            }
++            is HistoryDB.Regular -> {
++                prev + item.positioned(previousPosition + itemOffset + 1)
+             }
+         }
+     }
+ }
++
++private fun HistoryDB.Group.positioned(position: Int): History.Group {
++    return History.Group(
++        position = position,
++        items = this.items.mapIndexed { index, item -> item.positioned(index) },
++        title = this.title,
++        visitedAt = this.visitedAt
++    )
++}
++
++private fun HistoryDB.Metadata.positioned(position: Int): History.Metadata {
++    return History.Metadata(
++        position = position,
++        historyMetadataKey = this.historyMetadataKey,
++        title = this.title,
++        totalViewTime = this.totalViewTime,
++        url = this.url,
++        visitedAt = this.visitedAt
++    )
++}
++
++private fun HistoryDB.Regular.positioned(position: Int): History.Regular {
++    return History.Regular(
++        position = position,
++        title = this.title,
++        url = this.url,
++        visitedAt = this.visitedAt
++    )
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryFragmentStore.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryFragmentStore.kt
+index 2fe0d98ef341..d061ef1ca04e 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryFragmentStore.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryFragmentStore.kt
+@@ -17,7 +17,7 @@ import mozilla.components.support.ktx.kotlin.tryGetHostFromUrl
+  * Class representing a history entry.
+  */
+ sealed class History : Parcelable {
+-    abstract val position: Int?
++    abstract val position: Int
+     abstract val title: String
+     abstract val visitedAt: Long
+     abstract val selected: Boolean
+@@ -25,14 +25,14 @@ sealed class History : Parcelable {
+     /**
+      * A regular history item.
+      *
+-     * @property id Unique id of the history item.
++     * @property position Position of this item in a result list of other [History] items.
+      * @property title Title of the history item.
+      * @property url URL of the history item.
+      * @property visitedAt Timestamp of when this history item was visited.
+      * @property selected Whether or not the history item is selected.
+      */
+     @Parcelize data class Regular(
+-        override val position: Int? = null,
++        override val position: Int,
+         override val title: String,
+         val url: String,
+         override val visitedAt: Long,
+@@ -42,7 +42,7 @@ sealed class History : Parcelable {
+     /**
+      * A history metadata item.
+      *
+-     * @property id Unique id of the history metadata item.
++     * @property position Position of this item in a result list of other [History] items.
+      * @property title Title of the history metadata item.
+      * @property url URL of the history metadata item.
+      * @property visitedAt Timestamp of when this history metadata item was visited.
+@@ -52,7 +52,7 @@ sealed class History : Parcelable {
+      * @property selected Whether or not the history metadata item is selected.
+      */
+     @Parcelize data class Metadata(
+-        override val position: Int? = null,
++        override val position: Int,
+         override val title: String,
+         val url: String,
+         override val visitedAt: Long,
+@@ -64,14 +64,14 @@ sealed class History : Parcelable {
+     /**
+      * A history metadata group.
+      *
+-     * @property id Unique id of the history metadata group.
++     * @property position Position of this item in a result list of other [History] items.
+      * @property title Title of the history metadata group.
+      * @property visitedAt Timestamp of when this history metadata group was visited.
+      * @property items List of history metadata items associated with the group.
+      * @property selected Whether or not the history group is selected.
+      */
+     @Parcelize data class Group(
+-        override val position: Int? = null,
++        override val position: Int,
+         override val title: String,
+         override val visitedAt: Long,
+         val items: List<Metadata>,
+@@ -82,7 +82,7 @@ sealed class History : Parcelable {
+ /**
+  * Extension function for converting a [HistoryMetadata] into a [History.Metadata].
+  */
+-fun HistoryMetadata.toHistoryMetadata(position: Int? = null): History.Metadata {
++fun HistoryMetadata.toHistoryMetadata(position: Int): History.Metadata {
+     return History.Metadata(
+         position = position,
+         title = title?.takeIf(String::isNotEmpty)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryView.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryView.kt
+index c771b76c048b..28e0bd76e028 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryView.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryView.kt
+@@ -76,7 +76,7 @@ class HistoryView(
+             val unselectedItems = oldMode.selectedItems - state.mode.selectedItems
+ 
+             state.mode.selectedItems.union(unselectedItems).forEach { item ->
+-                historyAdapter.notifyItemChanged(item.position!!)
++                historyAdapter.notifyItemChanged(item.position)
+             }
+         }
+ 
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/components/history/PagedHistoryProviderTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/components/history/PagedHistoryProviderTest.kt
+index 986b2f8ffe9c..c4014be159a9 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/components/history/PagedHistoryProviderTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/components/history/PagedHistoryProviderTest.kt
+@@ -16,7 +16,6 @@ import mozilla.components.concept.storage.VisitType
+ import org.junit.Assert.assertEquals
+ import org.junit.Before
+ import org.junit.Test
+-import org.mozilla.fenix.library.history.History
+ 
+ class PagedHistoryProviderTest {
+ 
+@@ -92,7 +91,7 @@ class PagedHistoryProviderTest {
+         coEvery { storage.getDetailedVisits(any(), any(), any()) } returns emptyList()
+         coEvery { storage.getHistoryMetadataSince(any()) } returns listOf(historyEntry1, historyEntry2, historyEntry3)
+ 
+-        var actualResults: List<History>? = null
++        var actualResults: List<HistoryDB>? = null
+         provider.getHistory(10, 5) {
+             actualResults = it
+         }
+@@ -114,19 +113,19 @@ class PagedHistoryProviderTest {
+         }
+ 
+         val results = listOf(
+-            History.Group(
++            HistoryDB.Group(
+                 title = historyEntry1.key.searchTerm!!,
+                 visitedAt = historyEntry1.createdAt,
+                 // Results are de-duped by URL and sorted descending by createdAt/visitedAt
+                 items = listOf(
+-                    History.Metadata(
++                    HistoryDB.Metadata(
+                         title = historyEntry1.title!!,
+                         url = historyEntry1.key.url,
+                         visitedAt = historyEntry1.createdAt,
+                         totalViewTime = historyEntry1.totalViewTime,
+                         historyMetadataKey = historyMetadataKey1
+                     ),
+-                    History.Metadata(
++                    HistoryDB.Metadata(
+                         title = historyEntry3.title!!,
+                         url = historyEntry3.key.url,
+                         visitedAt = historyEntry3.createdAt,
+@@ -135,7 +134,7 @@ class PagedHistoryProviderTest {
+                     )
+                 )
+             ),
+-            History.Regular(
++            HistoryDB.Regular(
+                 title = visitInfo3.title!!,
+                 url = visitInfo3.url,
+                 visitedAt = visitInfo3.visitTime
+@@ -175,7 +174,7 @@ class PagedHistoryProviderTest {
+         coEvery { storage.getDetailedVisits(any(), any(), any()) } returns emptyList()
+         coEvery { storage.getHistoryMetadataSince(any()) } returns listOf(historyEntry1)
+ 
+-        var actualResults: List<History>? = null
++        var actualResults: List<HistoryDB>? = null
+         provider.getHistory(0, 5) {
+             actualResults = it
+         }
+@@ -197,12 +196,12 @@ class PagedHistoryProviderTest {
+         }
+ 
+         val results = listOf(
+-            History.Group(
++            HistoryDB.Group(
+                 title = historyEntry1.key.searchTerm!!,
+                 visitedAt = historyEntry1.createdAt,
+                 // Results are de-duped by URL and sorted descending by createdAt/visitedAt
+                 items = listOf(
+-                    History.Metadata(
++                    HistoryDB.Metadata(
+                         title = historyEntry1.title!!,
+                         url = historyEntry1.key.url,
+                         visitedAt = historyEntry1.createdAt,
+@@ -247,7 +246,7 @@ class PagedHistoryProviderTest {
+         coEvery { storage.getDetailedVisits(any(), any(), any()) } returns emptyList()
+         coEvery { storage.getHistoryMetadataSince(any()) } returns listOf(historyEntry1)
+ 
+-        var actualResults: List<History>? = null
++        var actualResults: List<HistoryDB>? = null
+         provider.getHistory(0, 5) {
+             actualResults = it
+         }
+@@ -269,12 +268,12 @@ class PagedHistoryProviderTest {
+         }
+ 
+         val results = listOf(
+-            History.Group(
++            HistoryDB.Group(
+                 title = historyEntry1.key.searchTerm!!,
+                 visitedAt = historyEntry1.createdAt,
+                 // Results are de-duped by URL and sorted descending by createdAt/visitedAt
+                 items = listOf(
+-                    History.Metadata(
++                    HistoryDB.Metadata(
+                         title = historyEntry1.title!!,
+                         url = historyEntry1.key.url,
+                         visitedAt = historyEntry1.createdAt,
+@@ -396,7 +395,7 @@ class PagedHistoryProviderTest {
+ 
+         coEvery { storage.getHistoryMetadataSince(any()) } returns listOf(historyEntry1, historyEntry2, historyEntry3, historyEntry4)
+ 
+-        var actualResults: List<History>? = null
++        var actualResults: List<HistoryDB>? = null
+         provider.getHistory(10, 5) {
+             actualResults = it
+         }
+@@ -418,18 +417,18 @@ class PagedHistoryProviderTest {
+         }
+ 
+         val results = listOf(
+-            History.Group(
++            HistoryDB.Group(
+                 title = historyEntry2.key.searchTerm!!,
+                 visitedAt = historyEntry2.createdAt,
+                 items = listOf(
+-                    History.Metadata(
++                    HistoryDB.Metadata(
+                         title = historyEntry2.title!!,
+                         url = historyEntry2.key.url,
+                         visitedAt = historyEntry2.createdAt,
+                         totalViewTime = historyEntry2.totalViewTime,
+                         historyMetadataKey = historyMetadataKey2
+                     ),
+-                    History.Metadata(
++                    HistoryDB.Metadata(
+                         title = historyEntry1.title!!,
+                         url = historyEntry1.key.url,
+                         visitedAt = historyEntry1.createdAt,
+@@ -445,32 +444,32 @@ class PagedHistoryProviderTest {
+     @Test
+     fun `WHEN removeConsecutiveDuplicates is called THEN all consecutive duplicates must be removed`() {
+         val results = listOf(
+-            History.Group(
++            HistoryDB.Group(
+                 title = "Group 1",
+                 visitedAt = 0,
+                 items = emptyList()
+             ),
+-            History.Regular(
++            HistoryDB.Regular(
+                 title = "No duplicate item",
+                 url = "url",
+                 visitedAt = 0
+             ),
+-            History.Regular(
++            HistoryDB.Regular(
+                 title = "Duplicate item 1",
+                 url = "url",
+                 visitedAt = 0
+             ),
+-            History.Regular(
++            HistoryDB.Regular(
+                 title = "Duplicate item 2",
+                 url = "url",
+                 visitedAt = 0
+             ),
+-            History.Group(
++            HistoryDB.Group(
+                 title = "Group 5",
+                 visitedAt = 0,
+                 items = emptyList()
+             ),
+-            History.Regular(
++            HistoryDB.Regular(
+                 title = "No duplicate item",
+                 url = "url",
+                 visitedAt = 0
+@@ -478,22 +477,22 @@ class PagedHistoryProviderTest {
+         ).removeConsecutiveDuplicates()
+ 
+         val expectedList = listOf(
+-            History.Group(
++            HistoryDB.Group(
+                 title = "Group 1",
+                 visitedAt = 0,
+                 items = emptyList()
+             ),
+-            History.Regular(
++            HistoryDB.Regular(
+                 title = "No duplicate item",
+                 url = "url",
+                 visitedAt = 0
+             ),
+-            History.Group(
++            HistoryDB.Group(
+                 title = "Group 5",
+                 visitedAt = 0,
+                 items = emptyList()
+             ),
+-            History.Regular(
++            HistoryDB.Regular(
+                 title = "No duplicate item",
+                 url = "url",
+                 visitedAt = 0
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryAdapterTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryAdapterTest.kt
+index 8bfe6dc93a0c..296b3b160a96 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryAdapterTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryAdapterTest.kt
+@@ -14,6 +14,7 @@ class HistoryAdapterTest {
+     @Test
+     fun `WHEN grouping history item with future date THEN item is grouped to today`() {
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = System.currentTimeMillis() + DateUtils.WEEK_IN_MILLIS
+@@ -26,6 +27,7 @@ class HistoryAdapterTest {
+     @Test
+     fun `WHEN grouping history item with today's date THEN item is grouped to today`() {
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = System.currentTimeMillis() - DateUtils.MINUTE_IN_MILLIS
+@@ -44,6 +46,7 @@ class HistoryAdapterTest {
+         }
+ 
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = calendar.timeInMillis
+@@ -62,6 +65,7 @@ class HistoryAdapterTest {
+         }
+ 
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = calendar.timeInMillis - DateUtils.HOUR_IN_MILLIS
+@@ -79,6 +83,7 @@ class HistoryAdapterTest {
+         calendar.set(Calendar.SECOND, 0)
+ 
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = calendar.timeInMillis - (DateUtils.HOUR_IN_MILLIS * 23)
+@@ -97,6 +102,7 @@ class HistoryAdapterTest {
+         }
+ 
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = calendar.timeInMillis - (DateUtils.HOUR_IN_MILLIS * 25)
+@@ -109,6 +115,7 @@ class HistoryAdapterTest {
+     @Test
+     fun `WHEN grouping history item with 3 days ago date THEN item is grouped to this week`() {
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = System.currentTimeMillis() - (DateUtils.DAY_IN_MILLIS * 3)
+@@ -121,6 +128,7 @@ class HistoryAdapterTest {
+     @Test
+     fun `WHEN grouping history item with 6 days ago date THEN item is grouped to this week`() {
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = System.currentTimeMillis() - (DateUtils.DAY_IN_MILLIS * 6)
+@@ -133,6 +141,7 @@ class HistoryAdapterTest {
+     @Test
+     fun `WHEN grouping history item with 8 days ago date THEN item is grouped to this month`() {
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = System.currentTimeMillis() - (DateUtils.DAY_IN_MILLIS * 8)
+@@ -145,6 +154,7 @@ class HistoryAdapterTest {
+     @Test
+     fun `WHEN grouping history item with 29 days ago date THEN item is grouped to this month`() {
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = System.currentTimeMillis() - (DateUtils.DAY_IN_MILLIS * 29)
+@@ -157,6 +167,7 @@ class HistoryAdapterTest {
+     @Test
+     fun `WHEN grouping history item with 31 days ago date THEN item is grouped to older`() {
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = System.currentTimeMillis() - (DateUtils.DAY_IN_MILLIS * 31)
+@@ -169,6 +180,7 @@ class HistoryAdapterTest {
+     @Test
+     fun `WHEN grouping history item with zero date THEN item is grouped to older`() {
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = 0
+@@ -181,6 +193,7 @@ class HistoryAdapterTest {
+     @Test
+     fun `WHEN grouping history item with negative date THEN item is grouped to older`() {
+         val history = History.Regular(
++            position = 1,
+             title = "test item",
+             url = "url",
+             visitedAt = -100
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryDataSourceTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryDataSourceTest.kt
+index 87a469c6e2e9..737c642d6508 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryDataSourceTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryDataSourceTest.kt
+@@ -7,6 +7,7 @@ package org.mozilla.fenix.library.history
+ import mozilla.components.concept.storage.HistoryMetadataKey
+ import org.junit.Assert.assertEquals
+ import org.junit.Test
++import org.mozilla.fenix.components.history.HistoryDB
+ 
+ class HistoryDataSourceTest {
+     private val testCases = listOf(
+@@ -154,10 +155,7 @@ class HistoryDataSourceTest {
+         assertEquals(
+             "For case $history with offset $offset",
+             expectedPositions,
+-            HistoryDataSource.assignPositions(
+-                offset = offset,
+-                history.toHistoryWithoutPositions()
+-            ).map { it.position }
++            history.toHistoryDB().positionWithOffset(offset).map { it.position }
+         )
+     }
+ 
+@@ -169,14 +167,14 @@ class HistoryDataSourceTest {
+ 
+     // For position tests, we just care about the basic tree structure here,
+     // the details (view times, timestamps, etc) don't matter.
+-    private fun List<TestHistory>.toHistoryWithoutPositions(): List<History> {
++    private fun List<TestHistory>.toHistoryDB(): List<HistoryDB> {
+         return this.map {
+             when (it) {
+                 is TestHistory.Regular -> {
+-                    History.Regular(title = it.url, url = it.url, visitedAt = 0)
++                    HistoryDB.Regular(title = it.url, url = it.url, visitedAt = 0)
+                 }
+                 is TestHistory.Metadata -> {
+-                    History.Metadata(
++                    HistoryDB.Metadata(
+                         title = it.url,
+                         url = it.url,
+                         visitedAt = 0,
+@@ -185,10 +183,10 @@ class HistoryDataSourceTest {
+                     )
+                 }
+                 is TestHistory.Group -> {
+-                    History.Group(
++                    HistoryDB.Group(
+                         title = it.title, visitedAt = 0,
+                         items = it.items.map { item ->
+-                            History.Metadata(
++                            HistoryDB.Metadata(
+                                 title = item,
+                                 url = item,
+                                 visitedAt = 0,
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/library/historymetadata/HistoryMetadataGroupFragmentStoreTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/library/historymetadata/HistoryMetadataGroupFragmentStoreTest.kt
+index 87ff39617560..88ab71188e87 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/library/historymetadata/HistoryMetadataGroupFragmentStoreTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/library/historymetadata/HistoryMetadataGroupFragmentStoreTest.kt
+@@ -19,6 +19,7 @@ class HistoryMetadataGroupFragmentStoreTest {
+     private lateinit var store: HistoryMetadataGroupFragmentStore
+ 
+     private val mozillaHistoryMetadataItem = History.Metadata(
++        position = 1,
+         title = "Mozilla",
+         url = "mozilla.org",
+         visitedAt = 0,
+@@ -26,6 +27,7 @@ class HistoryMetadataGroupFragmentStoreTest {
+         historyMetadataKey = HistoryMetadataKey("http://www.mozilla.com", "mozilla", null)
+     )
+     private val firefoxHistoryMetadataItem = History.Metadata(
++        position = 1,
+         title = "Firefox",
+         url = "firefox.com",
+         visitedAt = 0,
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/library/historymetadata/controller/HistoryMetadataGroupControllerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/library/historymetadata/controller/HistoryMetadataGroupControllerTest.kt
+index 196c0ab854d4..5c4bf92aa0d9 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/library/historymetadata/controller/HistoryMetadataGroupControllerTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/library/historymetadata/controller/HistoryMetadataGroupControllerTest.kt
+@@ -53,6 +53,7 @@ class HistoryMetadataGroupControllerTest {
+     private val searchTerm = "mozilla"
+     private val historyMetadataKey = HistoryMetadataKey("http://www.mozilla.com", searchTerm, null)
+     private val mozillaHistoryMetadataItem = History.Metadata(
++        position = 1,
+         title = "Mozilla",
+         url = "mozilla.org",
+         visitedAt = 0,
+@@ -60,6 +61,7 @@ class HistoryMetadataGroupControllerTest {
+         historyMetadataKey = historyMetadataKey
+     )
+     private val firefoxHistoryMetadataItem = History.Metadata(
++        position = 1,
+         title = "Firefox",
+         url = "firefox.com",
+         visitedAt = 0,
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/library/historymetadata/view/HistoryMetadataGroupItemViewHolderTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/library/historymetadata/view/HistoryMetadataGroupItemViewHolderTest.kt
+index 574b5a8bdf9b..6e1afbdac39a 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/library/historymetadata/view/HistoryMetadataGroupItemViewHolderTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/library/historymetadata/view/HistoryMetadataGroupItemViewHolderTest.kt
+@@ -29,6 +29,7 @@ class HistoryMetadataGroupItemViewHolderTest {
+     private lateinit var selectionHolder: SelectionHolder<History.Metadata>
+ 
+     private val item = History.Metadata(
++        position = 1,
+         title = "Mozilla",
+         url = "mozilla.org",
+         visitedAt = 0,

@@ -1,0 +1,275 @@
+diff --git a/Signal/src/ViewControllers/MediaDetailViewController.h b/Signal/src/ViewControllers/MediaDetailViewController.h
+index 7d0ba948255..1337e602a6c 100644
+--- a/Signal/src/ViewControllers/MediaDetailViewController.h
++++ b/Signal/src/ViewControllers/MediaDetailViewController.h
+@@ -17,7 +17,9 @@ typedef NS_OPTIONS(NSInteger, MediaGalleryOption) {
+ 
+ @protocol MediaDetailViewControllerDelegate <NSObject>
+ 
+-- (void)dismissSelfAnimated:(BOOL)isAnimated completion:(void (^_Nullable)(void))completionBlock;
++- (void)mediaDetailViewController:(MediaDetailViewController *)mediaDetailViewController
++    requestDeleteConversationViewItem:(ConversationViewItem *)conversationViewItem;
++
+ - (void)mediaDetailViewController:(MediaDetailViewController *)mediaDetailViewController
+                    isPlayingVideo:(BOOL)isPlayingVideo;
+ 
+diff --git a/Signal/src/ViewControllers/MediaDetailViewController.m b/Signal/src/ViewControllers/MediaDetailViewController.m
+index f1f463d4d3c..cb0e1844544 100644
+--- a/Signal/src/ViewControllers/MediaDetailViewController.m
++++ b/Signal/src/ViewControllers/MediaDetailViewController.m
+@@ -411,35 +411,27 @@ - (void)didPressDelete:(id)sender
+         [UIAlertController alertControllerWithTitle:nil message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+ 
+     [actionSheet
+-        addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"TXT_DELETE_TITLE", nil)
+-                                           style:UIAlertActionStyleDestructive
+-                                         handler:^(UIAlertAction *action) {
+-                                             OWSAssert([self.presentingViewController
+-                                                 isKindOfClass:[UINavigationController class]]);
+-                                             UINavigationController *navController
+-                                                 = (UINavigationController *)self.presentingViewController;
+-
+-                                             if ([navController.topViewController
+-                                                     isKindOfClass:[ConversationViewController class]]) {
+-                                                 [self.delegate dismissSelfAnimated:YES
+-                                                                         completion:^{
+-                                                                             [self.viewItem deleteAction];
+-                                                                         }];
+-                                             } else if ([navController.topViewController
+-                                                            isKindOfClass:[MessageDetailViewController class]]) {
+-                                                 [self.delegate dismissSelfAnimated:YES
+-                                                                         completion:^{
+-                                                                             [self.viewItem deleteAction];
+-                                                                         }];
+-                                                 [navController popViewControllerAnimated:YES];
+-                                             } else {
+-                                                 OWSFail(@"Unexpected presentation context.");
+-                                                 [self.delegate dismissSelfAnimated:YES
+-                                                                         completion:^{
+-                                                                             [self.viewItem deleteAction];
+-                                                                         }];
+-                                             }
+-                                         }]];
++        addAction:[UIAlertAction
++                      actionWithTitle:NSLocalizedString(@"TXT_DELETE_TITLE", nil)
++                                style:UIAlertActionStyleDestructive
++                              handler:^(UIAlertAction *action) {
++                                  [self.delegate mediaDetailViewController:self
++                                         requestDeleteConversationViewItem:self.viewItem];
++
++                                  // TODO maybe this would be more straight forward if the MessageDetailVC was the
++                                  // deleteDelegate
++                                  if ([self.presentingViewController isKindOfClass:[UINavigationController class]]) {
++                                      UINavigationController *navController
++                                          = (UINavigationController *)self.presentingViewController;
++                                      if ([navController.topViewController
++                                              isKindOfClass:[MessageDetailViewController class]]) {
++                                          MessageDetailViewController *messageDetailViewController
++                                              = (MessageDetailViewController *)navController.topViewController;
++                                          messageDetailViewController.wasDeleted = YES;
++                                          [navController popViewControllerAnimated:YES];
++                                      }
++                                  }
++                              }]];
+ 
+     [actionSheet addAction:[OWSAlerts cancelAction]];
+ 
+diff --git a/Signal/src/ViewControllers/MediaGalleryViewController.swift b/Signal/src/ViewControllers/MediaGalleryViewController.swift
+index 65c7c214041..9b2c82ac986 100644
+--- a/Signal/src/ViewControllers/MediaGalleryViewController.swift
++++ b/Signal/src/ViewControllers/MediaGalleryViewController.swift
+@@ -175,6 +175,8 @@ protocol MediaGalleryDataSource: class {
+ 
+     func showAllMedia(focusedItem: MediaGalleryItem)
+     func dismissMediaDetailViewController(_ mediaDetailViewController: MediaPageViewController, animated isAnimated: Bool, completion: (() -> Void)?)
++
++    func delete(message: TSMessage)
+ }
+ 
+ class MediaGalleryViewController: UINavigationController, MediaGalleryDataSource, MediaTileViewControllerDelegate {
+@@ -182,6 +184,7 @@ class MediaGalleryViewController: UINavigationController, MediaGalleryDataSource
+     private var pageViewController: MediaPageViewController?
+ 
+     private let uiDatabaseConnection: YapDatabaseConnection
++    private let editingDatabaseConnection: YapDatabaseConnection
+     private let mediaGalleryFinder: OWSMediaGalleryFinder
+ 
+     private var initialDetailItem: MediaGalleryItem?
+@@ -199,6 +202,9 @@ class MediaGalleryViewController: UINavigationController, MediaGalleryDataSource
+         self.thread = thread
+         assert(uiDatabaseConnection.isInLongLivedReadTransaction())
+         self.uiDatabaseConnection = uiDatabaseConnection
++
++        self.editingDatabaseConnection = OWSPrimaryStorage.shared().newDatabaseConnection()
++
+         self.options = options
+         self.mediaGalleryFinder = OWSMediaGalleryFinder(thread: thread)
+ 
+@@ -631,6 +637,12 @@ class MediaGalleryViewController: UINavigationController, MediaGalleryDataSource
+                 Logger.debug("\(self.logTag) in \(#function) fetching set: \(unfetchedSet)")
+                 let nsRange: NSRange = NSRange(location: unfetchedSet.min()!, length: unfetchedSet.count)
+                 self.mediaGalleryFinder.enumerateMediaMessages(range: nsRange, transaction: transaction) { (message: TSMessage) in
++
++                    guard !self.deletedMessages.contains(message) else {
++                        Logger.debug("\(self.logTag) skipping \(message) which has been deleted.")
++                        return
++                    }
++
+                     guard let item: MediaGalleryItem = self.buildGalleryItem(message: message, transaction: transaction) else {
+                         owsFail("\(self.logTag) in \(#function) unexpectedly failed to buildGalleryItem")
+                         return
+@@ -700,6 +712,65 @@ class MediaGalleryViewController: UINavigationController, MediaGalleryDataSource
+         }
+     }
+ 
++    var deletedMessages: Set<TSMessage> = Set()
++    func delete(message: TSMessage) {
++        Logger.info("\(logTag) in \(#function) with message: \(String(describing: message.uniqueId)) attachmentId: \(String(describing: message.attachmentIds.firstObject))")
++
++        // TODO put this somewhere reasonable...
++        self.mediaTileViewController.collectionView!.layoutIfNeeded()
++
++        self.editingDatabaseConnection.asyncReadWrite { transaction in
++            message.remove(with: transaction)
++        }
++
++        self.deletedMessages.insert(message)
++
++        var deletedSections: IndexSet = IndexSet()
++        var deletedIndexPaths: [IndexPath] = []
++
++        guard let itemIndex = galleryItems.index(where: { $0.message == message }) else {
++            owsFail("\(logTag) in \(#function) removing unknown item.")
++            return
++        }
++        let item: MediaGalleryItem = galleryItems[itemIndex]
++
++        self.galleryItems.remove(at: itemIndex)
++
++        guard let sectionIndex = sectionDates.index(where: { $0 == item.galleryDate }) else {
++            owsFail("\(logTag) in \(#function) item with unknown date.")
++            return
++        }
++
++        guard var sectionItems = self.sections[item.galleryDate] else {
++            owsFail("\(logTag) in \(#function) item with unknown section")
++            return
++        }
++
++        if sectionItems == [item] {
++            // Last item in section. Delete section.
++            self.sections[item.galleryDate] = nil
++            self.sectionDates.remove(at: sectionIndex)
++
++            deletedSections.insert(sectionIndex + 1)
++            deletedIndexPaths.append(IndexPath(row: 0, section: sectionIndex + 1))
++        } else {
++            guard let sectionRowIndex = sectionItems.index(of: item) else {
++                owsFail("\(logTag) in \(#function) item with unknown sectionRowIndex")
++                return
++            }
++
++            sectionItems.remove(at: sectionRowIndex)
++            self.sections[item.galleryDate] = sectionItems
++
++            deletedIndexPaths.append(IndexPath(row: sectionRowIndex, section: sectionIndex + 1))
++        }
++
++        // TODO? notify pager view
++
++        // notify tile view    
++        self.mediaTileViewController.updatedDataSource(deletedSections: deletedSections, deletedItems: deletedIndexPaths)
++    }
++
+     let kGallerySwipeLoadBatchSize: UInt = 5
+ 
+     internal func galleryItem(after currentItem: MediaGalleryItem) -> MediaGalleryItem? {
+diff --git a/Signal/src/ViewControllers/MediaPageViewController.swift b/Signal/src/ViewControllers/MediaPageViewController.swift
+index f555e33a002..07f8fc56481 100644
+--- a/Signal/src/ViewControllers/MediaPageViewController.swift
++++ b/Signal/src/ViewControllers/MediaPageViewController.swift
+@@ -440,8 +440,6 @@ class MediaPageViewController: UIPageViewController, UIPageViewControllerDataSou
+         return viewController
+     }
+ 
+-    // MARK: MediaDetailViewControllerDelegate
+-
+     public func dismissSelf(animated isAnimated: Bool, completion: (() -> Void)? = nil) {
+         // Swapping mediaView for presentationView will be perceptible if we're not zoomed out all the way.
+         // currentVC
+@@ -457,6 +455,28 @@ class MediaPageViewController: UIPageViewController, UIPageViewControllerDataSou
+         mediaGalleryDataSource.dismissMediaDetailViewController(self, animated: isAnimated, completion: completion)
+     }
+ 
++    // MARK: MediaDetailViewControllerDelegate
++
++    public func mediaDetailViewController(_ mediaDetailViewController: MediaDetailViewController, requestDelete conversationViewItem: ConversationViewItem) {
++        guard let mediaGalleryDataSource = self.mediaGalleryDataSource else {
++            owsFail("\(logTag) in \(#function) mediaGalleryDataSource was unexpectedly nil")
++            self.presentingViewController?.dismiss(animated: true)
++
++            return
++        }
++
++        guard let message = conversationViewItem.interaction as? TSMessage else {
++            owsFail("\(logTag) in \(#function) unexpected interaction: \(type(of: conversationViewItem))")
++            self.presentingViewController?.dismiss(animated: true)
++
++            return
++        }
++
++        dismissSelf(animated: true) {
++            mediaGalleryDataSource.delete(message: message)
++        }
++    }
++
+     public func mediaDetailViewController(_ mediaDetailViewController: MediaDetailViewController, isPlayingVideo: Bool) {
+         guard mediaDetailViewController == currentViewController else {
+             Logger.verbose("\(logTag) in \(#function) ignoring stale delegate.")
+diff --git a/Signal/src/ViewControllers/MediaTileViewController.swift b/Signal/src/ViewControllers/MediaTileViewController.swift
+index 3c4e1eb3a7a..0c123c7f504 100644
+--- a/Signal/src/ViewControllers/MediaTileViewController.swift
++++ b/Signal/src/ViewControllers/MediaTileViewController.swift
+@@ -145,6 +145,19 @@ public class MediaTileViewController: UICollectionViewController, MediaGalleryCe
+ 
+     // MARK: UIColletionViewDataSource
+ 
++    public func updatedDataSource(deletedSections: IndexSet, deletedItems: [IndexPath]) {
++        guard let collectionView = self.collectionView else {
++            owsFail("\(logTag) in \(#function) collectionView was unexpetedly nil")
++            return
++        }
++
++        // If collectionView hasn't been laid out yet, it won't have the sections/rows to remove.
++        collectionView.performBatchUpdates({
++            collectionView.deleteSections(deletedSections)
++            collectionView.deleteItems(at: deletedItems)
++        })
++    }
++
+     override public func numberOfSections(in collectionView: UICollectionView) -> Int {
+         guard galleryDates.count > 0 else {
+             // empty gallery
+diff --git a/Signal/src/ViewControllers/MessageDetailViewController.swift b/Signal/src/ViewControllers/MessageDetailViewController.swift
+index c9409e1ca33..5008438c233 100644
+--- a/Signal/src/ViewControllers/MessageDetailViewController.swift
++++ b/Signal/src/ViewControllers/MessageDetailViewController.swift
+@@ -29,6 +29,7 @@ class MessageDetailViewController: OWSViewController, UIScrollViewDelegate, Medi
+     let mode: MessageMetadataViewMode
+     let viewItem: ConversationViewItem
+     var message: TSMessage
++    var wasDeleted: Bool = false
+ 
+     var mediaMessageView: MediaMessageView?
+ 
+@@ -622,6 +623,10 @@ class MessageDetailViewController: OWSViewController, UIScrollViewDelegate, Medi
+ 
+         updateDBConnectionAndMessageToLatest()
+ 
++        guard !wasDeleted else {
++            // Item was deleted. Don't bother re-rendering, it will fail and we'll soon be dismissed.
++            return
++        }
+         updateContent()
+     }
+ 

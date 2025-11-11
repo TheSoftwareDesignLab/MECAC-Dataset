@@ -1,0 +1,147 @@
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/main/MeFragment.kt b/WordPress/src/main/java/org/wordpress/android/ui/main/MeFragment.kt
+index cb9fb855dde8..8b8d420e48d1 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/main/MeFragment.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/main/MeFragment.kt
+@@ -21,6 +21,10 @@ import androidx.lifecycle.ViewModelProvider
+ import androidx.lifecycle.lifecycleScope
+ import com.google.android.material.dialog.MaterialAlertDialogBuilder
+ import com.google.android.material.snackbar.Snackbar
++import com.gravatar.quickeditor.GravatarQuickEditor
++import com.gravatar.quickeditor.ui.editor.AuthenticationMethod
++import com.gravatar.quickeditor.ui.editor.AvatarPickerContentLayout
++import com.gravatar.quickeditor.ui.editor.GravatarQuickEditorParams
+ import com.gravatar.services.AvatarService
+ import com.gravatar.services.GravatarResult
+ import com.gravatar.types.Email
+@@ -82,6 +86,7 @@ import org.wordpress.android.util.ToastUtils
+ import org.wordpress.android.util.ToastUtils.Duration.SHORT
+ import org.wordpress.android.util.WPMediaUtils
+ import org.wordpress.android.util.config.DomainManagementFeatureConfig
++import org.wordpress.android.util.config.GravatarQuickEditorFeatureConfig
+ import org.wordpress.android.util.config.QRCodeAuthFlowFeatureConfig
+ import org.wordpress.android.util.config.RecommendTheAppFeatureConfig
+ import org.wordpress.android.util.extensions.getColorFromAttribute
+@@ -131,6 +136,9 @@ class MeFragment : Fragment(R.layout.me_fragment), OnScrollToTopListener {
+     @Inject
+     lateinit var qrCodeAuthFlowFeatureConfig: QRCodeAuthFlowFeatureConfig
+ 
++    @Inject
++    lateinit var gravatarQuickEditorFeatureConfig: GravatarQuickEditorFeatureConfig
++
+     @Inject
+     lateinit var jetpackBrandingUtils: JetpackBrandingUtils
+ 
+@@ -156,6 +164,7 @@ class MeFragment : Fragment(R.layout.me_fragment), OnScrollToTopListener {
+ 
+     private val shouldShowDomainButton
+         get() = BuildConfig.IS_JETPACK_APP && domainManagementFeatureConfig.isEnabled() && accountStore.hasAccessToken()
++
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         (requireActivity().application as WordPress).component().inject(this)
+@@ -192,7 +201,21 @@ class MeFragment : Fragment(R.layout.me_fragment), OnScrollToTopListener {
+ 
+         val showPickerListener = OnClickListener {
+             AnalyticsTracker.track(ME_GRAVATAR_TAPPED)
+-            showPhotoPickerForGravatar()
++            if (gravatarQuickEditorFeatureConfig.isEnabled()) {
++                GravatarQuickEditor.show(
++                    fragment = this@MeFragment,
++                    gravatarQuickEditorParams = GravatarQuickEditorParams {
++                        email = Email(accountStore.account.email)
++                        avatarPickerContentLayout = AvatarPickerContentLayout.Horizontal
++                    },
++                    authenticationMethod = AuthenticationMethod.Bearer(accountStore.accessToken.orEmpty()),
++                    onAvatarSelected = {
++                        loadAvatar(null, true)
++                    },
++                )
++            } else {
++                showPhotoPickerForGravatar()
++            }
+         }
+         avatarContainer.setOnClickListener(showPickerListener)
+         rowMyProfile.setOnClickListener {
+@@ -473,9 +496,9 @@ class MeFragment : Fragment(R.layout.me_fragment), OnScrollToTopListener {
+         isUpdatingGravatar = isUpdating
+     }
+ 
+-    private fun MeFragmentBinding.loadAvatar(injectFilePath: String?) {
++    private fun MeFragmentBinding.loadAvatar(injectFilePath: String?, forceRefresh: Boolean = false) {
+         val newAvatarUploaded = !injectFilePath.isNullOrEmpty()
+-        val avatarUrl = meGravatarLoader.constructGravatarUrl(accountStore.account.avatarUrl)
++        val avatarUrl = meGravatarLoader.constructGravatarUrl(accountStore.account.avatarUrl, forceRefresh)
+         meGravatarLoader.load(
+             newAvatarUploaded,
+             avatarUrl,
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/main/utils/MeGravatarLoader.kt b/WordPress/src/main/java/org/wordpress/android/ui/main/utils/MeGravatarLoader.kt
+index f4b6ad1464fc..510aa29967bd 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/main/utils/MeGravatarLoader.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/main/utils/MeGravatarLoader.kt
+@@ -56,8 +56,9 @@ class MeGravatarLoader @Inject constructor(
+         }
+     }
+ 
+-    fun constructGravatarUrl(rawAvatarUrl: String): String {
++    fun constructGravatarUrl(rawAvatarUrl: String, forceRefresh: Boolean = false): String {
+         val avatarSz = resourseProvider.getDimensionPixelSize(R.dimen.avatar_sz_extra_small)
+-        return WPAvatarUtils.rewriteAvatarUrl(rawAvatarUrl, avatarSz)
++        val cacheBuster = if (forceRefresh) System.currentTimeMillis().toString() else null
++        return WPAvatarUtils.rewriteAvatarUrl(rawAvatarUrl, avatarSz, cacheBuster)
+     }
+ }
+diff --git a/WordPress/src/main/java/org/wordpress/android/util/WPAvatarUtils.java b/WordPress/src/main/java/org/wordpress/android/util/WPAvatarUtils.java
+index 1c37575f6e4c..b2b11088bd09 100644
+--- a/WordPress/src/main/java/org/wordpress/android/util/WPAvatarUtils.java
++++ b/WordPress/src/main/java/org/wordpress/android/util/WPAvatarUtils.java
+@@ -22,6 +22,7 @@ public class WPAvatarUtils {
+     private WPAvatarUtils() {
+         throw new IllegalStateException("Utility class");
+     }
++
+     public static final DefaultAvatarOption DEFAULT_AVATAR = MysteryPerson.INSTANCE;
+ 
+     /**
+@@ -35,7 +36,8 @@ private WPAvatarUtils() {
+      * @return the fixed url
+      */
+     public static String rewriteAvatarUrl(@NonNull final String imageUrl, int avatarSz,
+-                                          @Nullable DefaultAvatarOption defaultImage) {
++                                          @Nullable DefaultAvatarOption defaultImage,
++                                          @Nullable String cacheBuster) {
+         if (TextUtils.isEmpty(imageUrl)) {
+             return "";
+         }
+@@ -47,10 +49,10 @@ public static String rewriteAvatarUrl(@NonNull final String imageUrl, int avatar
+             try {
+                 return new AvatarUrl(new URL(imageUrl),
+                         new AvatarQueryOptions.Builder()
+-                            .setPreferredSize(avatarSz)
+-                            .setDefaultAvatarOption(defaultImage)
+-                            .build()
+-                        ).url(null).toString();
++                                .setPreferredSize(avatarSz)
++                                .setDefaultAvatarOption(defaultImage)
++                                .build()
++                ).url(cacheBuster).toString();
+             } catch (MalformedURLException | IllegalArgumentException e) {
+                 return "";
+             }
+@@ -58,6 +60,16 @@ public static String rewriteAvatarUrl(@NonNull final String imageUrl, int avatar
+     }
+ 
+     public static String rewriteAvatarUrl(@NonNull final String imageUrl, int avatarSz) {
+-        return rewriteAvatarUrl(imageUrl, avatarSz, DEFAULT_AVATAR);
++        return rewriteAvatarUrl(imageUrl, avatarSz, DEFAULT_AVATAR, null);
++    }
++
++    public static String rewriteAvatarUrl(@NonNull final String imageUrl, int avatarSz,
++                                          @Nullable DefaultAvatarOption defaultImage) {
++        return rewriteAvatarUrl(imageUrl, avatarSz, defaultImage, null);
++    }
++
++    public static String rewriteAvatarUrl(@NonNull final String imageUrl, int avatarSz,
++                                          @Nullable String cacheBuster) {
++        return rewriteAvatarUrl(imageUrl, avatarSz, DEFAULT_AVATAR, cacheBuster);
+     }
+ }

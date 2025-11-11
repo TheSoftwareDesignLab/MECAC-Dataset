@@ -1,0 +1,482 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/CollectionManager.kt b/AnkiDroid/src/main/java/com/ichi2/anki/CollectionManager.kt
+index 1ea97ab735e2..f471858ccf06 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/CollectionManager.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/CollectionManager.kt
+@@ -51,6 +51,8 @@ object CollectionManager {
+      */
+     private var collection: Collection? = null
+ 
++    private var queue: CoroutineDispatcher = Dispatchers.IO.limitedParallelism(1)
++
+     private val robolectric = "robolectric" == Build.FINGERPRINT
+ 
+     @VisibleForTesting
+@@ -65,10 +67,21 @@ object CollectionManager {
+      * TODO Allow suspendable blocks, rely on locking instead.
+      *
+      * TODO Disallow running functions that are supposed to be run inside the queue outside of it.
+-     *   See [com.ichi2.anki.withQueue]
++     *   For instance, this can be done by marking a [block] with a context
++     *   that cannot be instantiated outside of this class:
++     *
++     *       suspend fun<T> withQueue(block: context(Queue) () -> T): T {
++     *          return withContext(collectionOperationsDispatcher) {
++     *              block(queue)
++     *          }
++     *      }
++     *
++     *   Then, only functions that are also marked can be run inside the block:
++     *
++     *       context(Queue) suspend fun canOnlyBeRunInWithQueue()
+      */
+     private suspend fun<T> withQueue(block: CollectionManager.() -> T): T {
+-        return withContext(collectionOperationsDispatcher) {
++        return withContext(queue) {
+             this@CollectionManager.block()
+         }
+     }
+@@ -213,9 +226,12 @@ object CollectionManager {
+         }
+     }
+ 
+-    context(Queue) fun deleteCollectionDirectory() {
+-        ensureClosedInner(save = false)
+-        getCollectionDirectory().deleteRecursively()
++    // TODO Move withQueue to call site
++    suspend fun deleteCollectionDirectory() {
++        withQueue {
++            ensureClosedInner(save = false)
++            getCollectionDirectory().deleteRecursively()
++        }
+     }
+ 
+     fun getCollectionDirectory() =
+@@ -374,39 +390,6 @@ object CollectionManager {
+     fun setTestDispatcher(dispatcher: CoroutineDispatcher) {
+         // note: we avoid the call to .limitedParallelism() here,
+         // as it does not seem to be compatible with the test scheduler
+-        collectionOperationsDispatcher = dispatcher
+-    }
+-}
+-
+-private var collectionOperationsDispatcher = Dispatchers.IO.limitedParallelism(1)
+-
+-/**
+- * A marker for functions that can only be run inside [withQueue], for instance,
+- *
+- *     context(Queue) fun foo() {}
+- */
+-class Queue private constructor() {
+-    companion object { init { queue = Queue() } }
+-}
+-
+-private lateinit var queue: Queue
+-
+-// This is silly, but I can't think of a better way to have a public Queue
+-// and a private instance of it
+-@Suppress("unused") private val forceQueueInitialization = Queue.Companion
+-
+-/**
+- * Like [CollectionManager.withQueue], but also allows running functions marked with [Queue].
+- * Experimental.
+- *
+- *     foo() // Error: No required context receiver found ...
+- *
+- *     withQueue {
+- *         foo() // Ok
+- *     }
+- */
+-suspend fun<T> withQueue(block: context(Queue) () -> T): T {
+-    return withContext(collectionOperationsDispatcher) {
+-        block(queue)
++        queue = dispatcher
+     }
+ }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/ui/dialogs/tools/AsyncDialogs.kt b/AnkiDroid/src/main/java/com/ichi2/anki/ui/dialogs/tools/AsyncDialogs.kt
+index acbf525abf31..c5cafe6fb497 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/ui/dialogs/tools/AsyncDialogs.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/ui/dialogs/tools/AsyncDialogs.kt
+@@ -16,11 +16,12 @@ package com.ichi2.anki.ui.dialogs.tools
+ 
+ import android.app.AlertDialog
+ import android.content.Context
++import androidx.annotation.StringRes
+ import kotlinx.coroutines.suspendCancellableCoroutine
+ import kotlin.coroutines.Continuation
+ import kotlin.coroutines.resume
+ 
+-class AsyncDialogBuilder(private val alertDialogBuilder: AlertDialog.Builder) {
++open class AsyncDialogBuilder(private val alertDialogBuilder: AlertDialog.Builder) {
+     lateinit var continuation: Continuation<DialogResult>
+     private lateinit var checkedItems: BooleanArray
+ 
+@@ -61,6 +62,29 @@ class AsyncDialogBuilder(private val alertDialogBuilder: AlertDialog.Builder) {
+     }
+ }
+ 
++/**
++ * A clutch that delegates calls to [AlertDialog.Builder].
++ * All defined methods have the exact same signature.
++ *
++ * TODO When context receivers are finalized, remove this class and instead say:
++ *   suspend fun Context.awaitDialog(block: context(AsyncDialogBuilder, AlertDialog.Builder) () -> Unit): DialogResult {
++ *       val alertDialogBuilder = AlertDialog.Builder(this@Context)
++ *       val asyncDialogBuilder = AsyncDialogBuilder(alertDialogBuilder)
++ *       block(asyncDialogBuilder, alertDialogBuilder)
++ *       ...
++ *   }
++ */
++class CompoundDialogBuilder(private val alertDialogBuilder: AlertDialog.Builder) : AsyncDialogBuilder(alertDialogBuilder) {
++    /** @see AlertDialog.Builder.setTitle */
++    fun setTitle(@StringRes titleId: Int): AlertDialog.Builder = alertDialogBuilder.setTitle(titleId)
++    /** @see AlertDialog.Builder.setTitle */
++    fun setTitle(title: CharSequence): AlertDialog.Builder = alertDialogBuilder.setTitle(title)
++    /** @see AlertDialog.Builder.setMessage */
++    fun setMessage(@StringRes messageId: Int): AlertDialog.Builder = alertDialogBuilder.setMessage(messageId)
++    /** @see AlertDialog.Builder.setMessage */
++    fun setMessage(message: CharSequence): AlertDialog.Builder = alertDialogBuilder.setMessage(message)
++}
++
+ sealed interface DialogResult {
+     object Cancel : DialogResult
+ 
+@@ -90,16 +114,16 @@ sealed interface DialogResult {
+  * instead of using [AlertDialog.Builder] methods that take listeners,
+  * use an [AsyncDialogBuilder] method of the same name without one.
+  */
+-suspend fun Context.awaitDialog(block: context(AsyncDialogBuilder, AlertDialog.Builder) () -> Unit): DialogResult {
+-    val alertDialogBuilder = AlertDialog.Builder(this@Context)
+-    val asyncDialogBuilder = AsyncDialogBuilder(alertDialogBuilder)
++suspend fun Context.awaitDialog(block: CompoundDialogBuilder.() -> Unit): DialogResult {
++    val alertDialogBuilder = AlertDialog.Builder(this)
++    val compoundDialogBuilder = CompoundDialogBuilder(alertDialogBuilder)
+ 
+-    block(asyncDialogBuilder, alertDialogBuilder)
++    compoundDialogBuilder.block()
+ 
+     alertDialogBuilder
+-        .setOnCancelListener { asyncDialogBuilder.continuation.resume(DialogResult.Cancel) }
++        .setOnCancelListener { compoundDialogBuilder.continuation.resume(DialogResult.Cancel) }
+         .create()
+         .show()
+ 
+-    return suspendCancellableCoroutine { asyncDialogBuilder.continuation = it }
++    return suspendCancellableCoroutine { compoundDialogBuilder.continuation = it }
+ }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/ui/preferences/screens/BackupLimitsPresenter.kt b/AnkiDroid/src/main/java/com/ichi2/anki/ui/preferences/screens/BackupLimitsPresenter.kt
+index bae1e09c1770..27be3a7f1fd2 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/ui/preferences/screens/BackupLimitsPresenter.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/ui/preferences/screens/BackupLimitsPresenter.kt
+@@ -14,7 +14,6 @@
+ 
+ package com.ichi2.anki.ui.preferences.screens
+ 
+-import androidx.fragment.app.Fragment
+ import androidx.fragment.app.viewModels
+ import androidx.lifecycle.*
+ import androidx.preference.EditTextPreference
+@@ -92,8 +91,8 @@ class NewBackendBackupLimitsViewModel : ViewModel(), CollectionDirectoryProvider
+  *
+  *     backupLimitsPresenter.refresh()
+  */
+-context(PreferenceFragmentCompat) class BackupLimitsPresenter : DefaultLifecycleObserver {
+-    private val viewModel: NewBackendBackupLimitsViewModel by viewModels()
++class BackupLimitsPresenter(private val fragment: PreferenceFragmentCompat) : DefaultLifecycleObserver {
++    private val viewModel: NewBackendBackupLimitsViewModel by fragment.viewModels()
+ 
+     private lateinit var maxNumberOfBackupsPreference: IncrementerNumberRangePreferenceCompat
+ 
+@@ -104,15 +103,15 @@ context(PreferenceFragmentCompat) class BackupLimitsPresenter : DefaultLifecycle
+     private lateinit var monthlyBackupsToKeepPreference: IncrementerNumberRangePreferenceCompat
+ 
+     override fun onCreate(owner: LifecycleOwner) {
+-        addPreferencesFromResource(R.xml.preferences_backup_limits) // Hierarchies get merged
++        fragment.addPreferencesFromResource(R.xml.preferences_backup_limits) // Hierarchies get merged
+ 
+-        maxNumberOfBackupsPreference = requirePreference(R.string.pref_backup_max_key)
++        maxNumberOfBackupsPreference = fragment.requirePreference(R.string.pref_backup_max_key)
+ 
+-        backupsHelpPreference = requirePreference(R.string.pref_backups_help_key)
+-        minutesBetweenAutomaticBackupsPreference = requirePreference(R.string.pref_minutes_between_automatic_backups_key)
+-        dailyBackupsToKeepPreference = requirePreference(R.string.pref_daily_backups_to_keep_key)
+-        weeklyBackupsToKeepPreference = requirePreference(R.string.pref_weekly_backups_to_keep_key)
+-        monthlyBackupsToKeepPreference = requirePreference(R.string.pref_monthly_backups_to_keep_key)
++        backupsHelpPreference = fragment.requirePreference(R.string.pref_backups_help_key)
++        minutesBetweenAutomaticBackupsPreference = fragment.requirePreference(R.string.pref_minutes_between_automatic_backups_key)
++        dailyBackupsToKeepPreference = fragment.requirePreference(R.string.pref_daily_backups_to_keep_key)
++        weeklyBackupsToKeepPreference = fragment.requirePreference(R.string.pref_weekly_backups_to_keep_key)
++        monthlyBackupsToKeepPreference = fragment.requirePreference(R.string.pref_monthly_backups_to_keep_key)
+ 
+         minutesBetweenAutomaticBackupsPreference
+             .launchWhenChanged<Int> { viewModel.updateBackupLimits { minimumIntervalMins = it } }
+@@ -142,9 +141,11 @@ context(PreferenceFragmentCompat) class BackupLimitsPresenter : DefaultLifecycle
+ 
+             preference.onClickListener = listener@{
+                 when (val state = viewModel.flowOfState.value) {
+-                    is State.Fetching -> showSnackbar("Fetching…")
+-                    is State.Error.NoCollection -> showSnackbar("Collection does not exist")
+-                    is State.Error.Exception -> showSnackbar(requireContext().getUserFriendlyErrorText(state.exception))
++                    is State.Fetching -> fragment.showSnackbar("Fetching…")
++                    is State.Error.NoCollection -> fragment.showSnackbar("Collection does not exist")
++                    is State.Error.Exception -> fragment.showSnackbar(
++                        text = fragment.requireContext().getUserFriendlyErrorText(state.exception)
++                    )
+                     is State.Fetched -> return@listener ShouldShowDialog.Yes
+                 }
+                 return@listener ShouldShowDialog.No
+@@ -153,7 +154,7 @@ context(PreferenceFragmentCompat) class BackupLimitsPresenter : DefaultLifecycle
+ 
+         // We don't have any useful data in case the state isn't State.Fetched, but
+         // we still need to trigger the summary providers. Setting dummy values is one simple way.
+-        lifecycleScope.launch {
++        fragment.lifecycleScope.launch {
+             viewModel.flowOfState.collect { state ->
+                 val limits = if (state is State.Fetched) state.backupLimits else BackupLimits.getDefaultInstance()
+                 minutesBetweenAutomaticBackupsPreference.setValue(limits.minimumIntervalMins)
+@@ -183,13 +184,14 @@ context(PreferenceFragmentCompat) class BackupLimitsPresenter : DefaultLifecycle
+     }
+ 
+     fun observeLifecycle() {
+-        lifecycle.addObserver(this)
++        fragment.lifecycle.addObserver(this)
+     }
+-}
+ 
+-context(Fragment) private inline fun <reified T> Preference.launchWhenChanged(crossinline block: suspend (T) -> Unit) {
+-    setOnPreferenceChangeListener { _, newValue ->
+-        launchCatchingTask { block(newValue as T) } // T reified in order to make the cast checked
+-        true
++    // T is reified in order to make the cast checked
++    private inline fun <reified T> Preference.launchWhenChanged(crossinline block: suspend (T) -> Unit) {
++        setOnPreferenceChangeListener { _, newValue ->
++            this@BackupLimitsPresenter.fragment.launchCatchingTask { block(newValue as T) }
++            true
++        }
+     }
+ }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/managespace/FileUtils.kt b/AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/managespace/FileUtils.kt
+index ffda704dd5ba..2950a8cdf9e7 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/managespace/FileUtils.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/managespace/FileUtils.kt
+@@ -103,11 +103,11 @@ private val Context.externalDirs: Set<File> get() =
+ /**
+  * Get the size of a file or a directory in bytes. Cancellable.
+  */
+-context(CoroutineScope) fun File.calculateSize(): Long {
++fun CoroutineScope.calculateSize(file: File): Long {
+     ensureActive()
+     return when {
+-        isDirectory -> listFiles()?.sumOf { it.calculateSize() } ?: 0
+-        else -> length()
++        file.isDirectory -> file.listFiles()?.sumOf(::calculateSize) ?: 0
++        else -> file.length()
+     }
+ }
+ 
+@@ -126,12 +126,12 @@ class CanNotWriteToOrCreateFileException(val file: File) : Exception() {
+     override val message get() = "Can not write to or create file: $file"
+ }
+ 
+-context(CollectionDirectoryProvider) suspend fun ensureCanWriteToOrCreateCollectionDirectory() {
++suspend fun CollectionDirectoryProvider.ensureCanWriteToOrCreateCollectionDirectory() {
+     if (!withContext(Dispatchers.IO) { collectionDirectory.canWriteToOrCreate() })
+         throw CanNotWriteToOrCreateFileException(collectionDirectory)
+ }
+ 
+-context(CollectionDirectoryProvider) suspend fun collectionDirectoryExists() =
++suspend fun CollectionDirectoryProvider.collectionDirectoryExists() =
+     withContext(Dispatchers.IO) { collectionDirectory.exists() }
+ 
+ /********************************************* Etc ************************************************/
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/managespace/ManageSpaceFragment.kt b/AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/managespace/ManageSpaceFragment.kt
+index 7d34e5210571..f031fb9f6758 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/managespace/ManageSpaceFragment.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/managespace/ManageSpaceFragment.kt
+@@ -22,7 +22,6 @@ import android.app.Application
+ import android.os.Build
+ import android.text.format.Formatter
+ import androidx.core.content.ContextCompat.getSystemService
+-import androidx.fragment.app.Fragment
+ import androidx.fragment.app.viewModels
+ import androidx.lifecycle.AndroidViewModel
+ import androidx.lifecycle.lifecycleScope
+@@ -75,8 +74,8 @@ class ManageSpaceViewModel(val app: Application) : AndroidViewModel(app), Collec
+     private fun launchSearchForUnusedMedia() = viewModelScope.launch {
+         flowOfDeleteUnusedMediaSize.ifCollectionDirectoryExistsEmit {
+             withCol {
+-                val unusedFiles = media.findUnusedMediaFiles()
+-                val unusedFilesSize = unusedFiles.sumOf { file -> file.calculateSize() }
++                val unusedFiles = with(media) { findUnusedMediaFiles() }
++                val unusedFilesSize = unusedFiles.sumOf(::calculateSize)
+                 Size.FilesAndBytes(unusedFiles, unusedFilesSize)
+             }
+         }
+@@ -102,7 +101,7 @@ class ManageSpaceViewModel(val app: Application) : AndroidViewModel(app), Collec
+         flowOfDeleteBackupsSize.ifCollectionDirectoryExistsEmit {
+             withCol {
+                 val backupFiles = BackupManager.getBackups(File(this.path)).toList()
+-                val backupFilesSize = backupFiles.sumOf { file -> file.calculateSize() }
++                val backupFilesSize = backupFiles.sumOf(::calculateSize)
+                 Size.FilesAndBytes(backupFiles, backupFilesSize)
+             }
+         }
+@@ -121,13 +120,13 @@ class ManageSpaceViewModel(val app: Application) : AndroidViewModel(app), Collec
+     private fun launchCalculationOfCollectionSize() = viewModelScope.launch {
+         flowOfDeleteCollectionSize.ifCollectionDirectoryExistsEmit {
+             withContext(Dispatchers.IO) {
+-                Size.Bytes(collectionDirectory.calculateSize())
++                Size.Bytes(calculateSize(collectionDirectory))
+             }
+         }
+     }
+ 
+     suspend fun deleteCollection() {
+-        withQueue { CollectionManager.deleteCollectionDirectory() }
++        CollectionManager.deleteCollectionDirectory() // Executed in withQueue
+ 
+         launchCalculationOfBackupsSize()
+         launchCalculationOfSizeOfEverything()
+@@ -184,7 +183,7 @@ class ManageSpaceFragment : SettingsFragment() {
+     override val preferenceResource = R.xml.manage_space
+     override val analyticsScreenNameConstant = "manageSpace"
+ 
+-    private val backupLimitsPresenter = BackupLimitsPresenter().also { it.observeLifecycle() }
++    private val backupLimitsPresenter = BackupLimitsPresenter(this).also { it.observeLifecycle() }
+ 
+     private val viewModel: ManageSpaceViewModel by viewModels()
+ 
+@@ -213,7 +212,7 @@ class ManageSpaceFragment : SettingsFragment() {
+ 
+     /************************************ Delete unused media *************************************/
+ 
+-    context(CoroutineScope) private suspend fun onDeleteUnusedMediaClick() {
++    private suspend fun onDeleteUnusedMediaClick() {
+         val size = viewModel.flowOfDeleteUnusedMediaSize.value
+         if (size is Size.Error && size.exception is Media.MediaCheckRequiredException) {
+             val mediaCheckPromptResult = requireContext().awaitDialog {
+@@ -253,7 +252,7 @@ class ManageSpaceFragment : SettingsFragment() {
+ 
+     /*************************************** Delete backups ***************************************/
+ 
+-    context(CoroutineScope) private suspend fun onDeleteBackupsClick() {
++    private suspend fun onDeleteBackupsClick() {
+         val size = viewModel.flowOfDeleteBackupsSize.value
+         if (size is Size.FilesAndBytes) {
+             val formatter = LocalizedUnambiguousBackupTimeFormatter()
+@@ -286,7 +285,7 @@ class ManageSpaceFragment : SettingsFragment() {
+     //   Note that this might be not quite trivial, as the activities might be visible to user.
+     //   One way would be to have the activities register broadcast receivers that perform finish;
+     //   Another would be maintaining weak references to them. Would be nice to find a better way.
+-    context(CoroutineScope) private suspend fun onDeleteCollectionClick() {
++    private suspend fun onDeleteCollectionClick() {
+         val size = viewModel.flowOfDeleteCollectionSize.value
+         if (size is Size.Bytes) {
+             val deleteCollectionPromptResult = requireContext().awaitDialog {
+@@ -334,7 +333,7 @@ class ManageSpaceFragment : SettingsFragment() {
+         }
+     }
+ 
+-    context(CoroutineScope) private suspend fun onDeleteEverythingClick() {
++    private suspend fun onDeleteEverythingClick() {
+         val deleteEverythingPromptResult = requireContext().awaitDialog {
+             setTitle(deleteEverythingDialogTitle)
+             setMessage(deleteEverythingDialogMessage)
+@@ -346,41 +345,41 @@ class ManageSpaceFragment : SettingsFragment() {
+             viewModel.deleteEverything()
+         }
+     }
+-}
+ 
+-/**************************************************************************************************
+- **************************************************************************************************
+- **************************************************************************************************/
++    /**********************************************************************************************
++     ************************************* Misplaced methods **************************************
++     **********************************************************************************************/
+ 
+-// TODO Android N and earlier, formatFileSize & formatShortFileSize use powers of 1024.
+-//   Perhaps correct input so that powers of 1000 are used on every API level?
+-context(Fragment) private fun TextWidgetPreference.setWidgetTextBy(size: Size) {
+-    fun Long.toHumanReadableSize() = Formatter.formatShortFileSize(requireContext(), this)
++    // TODO Android N and earlier, formatFileSize & formatShortFileSize use powers of 1024.
++    //   Perhaps correct input so that powers of 1000 are used on every API level?
++    private fun TextWidgetPreference.setWidgetTextBy(size: Size) {
++        fun Long.toHumanReadableSize() = Formatter.formatShortFileSize(requireContext(), this)
+ 
+-    widgetText = when (size) {
+-        is Size.Calculating -> "Calcu-\nlating…"
+-        is Size.Error -> size.widgetText
+-        is Size.Bytes -> size.totalSize.toHumanReadableSize()
+-        is Size.FilesAndBytes -> "${size.files.size} files \n${size.totalSize.toHumanReadableSize()}"
+-    }
++        widgetText = when (size) {
++            is Size.Calculating -> "Calcu-\nlating…"
++            is Size.Error -> size.widgetText
++            is Size.Bytes -> size.totalSize.toHumanReadableSize()
++            is Size.FilesAndBytes -> "${size.files.size} files \n${size.totalSize.toHumanReadableSize()}"
++        }
+ 
+-    isEnabled = !(
+-        size is Size.Bytes && size.totalSize == 0L ||
+-            size is Size.FilesAndBytes && size.files.isEmpty()
+-        )
+-}
++        isEnabled = !(
++            size is Size.Bytes && size.totalSize == 0L ||
++                size is Size.FilesAndBytes && size.files.isEmpty()
++            )
++    }
+ 
+-context(Fragment) private fun Preference.launchOnPreferenceClick(block: suspend CoroutineScope.() -> Unit) {
+-    setOnPreferenceClickListener {
+-        launchCatchingTask { block() }
+-        true
++    private fun Preference.launchOnPreferenceClick(block: suspend CoroutineScope.() -> Unit) {
++        setOnPreferenceClickListener {
++            launchCatchingTask { block() }
++            true
++        }
+     }
+-}
+ 
+-context(Fragment) private fun showSnackbarIfCalculatingOrError(size: Size) {
+-    when (size) {
+-        is Size.Calculating -> showSnackbar("Calculating…")
+-        is Size.Error -> showSnackbar(requireContext().getUserFriendlyErrorText(size.exception))
+-        else -> {}
++    private fun showSnackbarIfCalculatingOrError(size: Size) {
++        when (size) {
++            is Size.Calculating -> showSnackbar("Calculating…")
++            is Size.Error -> showSnackbar(requireContext().getUserFriendlyErrorText(size.exception))
++            else -> {}
++        }
+     }
+ }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/libanki/Media.kt b/AnkiDroid/src/main/java/com/ichi2/libanki/Media.kt
+index f143ec8fd764..f781a101d29c 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/libanki/Media.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/libanki/Media.kt
+@@ -431,9 +431,8 @@ create table meta (dirMod int, lastUsn int); insert into meta values (0, 0);"""
+      *   The backend also provides a method for checking media, [BackendMedia.check];
+      *   however it seems it performs normalization unconditionally.
+      */
+-    context(CoroutineScope)
+     @Throws(MediaCheckRequiredException::class)
+-    fun findUnusedMediaFiles(): List<File> {
++    fun CoroutineScope.findUnusedMediaFiles(): List<File> {
+         val namesOfFilesUsedInNotes = mutableSetOf<String>()
+ 
+         col.db.query("select mid, flds from notes").use { cursor: Cursor ->
+diff --git a/build.gradle b/build.gradle
+index 18920652e4ff..23a7392223ee 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -97,7 +97,7 @@ subprojects {
+         tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).all {
+             kotlinOptions {
+                 allWarningsAsErrors = fatalWarnings
+-                freeCompilerArgs = ['-Xjvm-default=all', "-Xcontext-receivers"]
++                freeCompilerArgs = ['-Xjvm-default=all']
+             }
+         }
+     }

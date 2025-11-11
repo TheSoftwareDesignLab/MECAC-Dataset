@@ -1,0 +1,420 @@
+diff --git a/Signal/src/ViewControllers/ConversationView/CV/CVComponents/CVComponentBodyText.swift b/Signal/src/ViewControllers/ConversationView/CV/CVComponents/CVComponentBodyText.swift
+index ba4c081e5ee..90563933a2b 100644
+--- a/Signal/src/ViewControllers/ConversationView/CV/CVComponents/CVComponentBodyText.swift
++++ b/Signal/src/ViewControllers/ConversationView/CV/CVComponents/CVComponentBodyText.swift
+@@ -13,7 +13,7 @@ public class CVComponentBodyText: CVComponentBase, CVComponent {
+         let bodyText: CVComponentState.BodyText
+         let isTextExpanded: Bool
+         let searchText: String?
+-        let revealedSpoilerIndexes: Set<Int>
++        let revealedSpoilerIds: Set<Int>
+         let hasTapForMore: Bool
+         let shouldUseAttributedText: Bool
+         let hasPendingMessageRequest: Bool
+@@ -51,8 +51,8 @@ public class CVComponentBodyText: CVComponentBase, CVComponent {
+     private var searchText: String? {
+         bodyTextState.searchText
+     }
+-    private var revealedSpoilerIndexes: Set<Int> {
+-        bodyTextState.revealedSpoilerIndexes
++    private var revealedSpoilerIds: Set<Int> {
++        bodyTextState.revealedSpoilerIds
+     }
+     private var hasTapForMore: Bool {
+         bodyTextState.hasTapForMore
+@@ -357,7 +357,7 @@ public class CVComponentBodyText: CVComponentBase, CVComponent {
+         let textExpansion = viewStateSnapshot.textExpansion
+         let searchText = viewStateSnapshot.searchText
+         let isTextExpanded = textExpansion.isTextExpanded(interactionId: interaction.uniqueId)
+-        let revealedSpoilerIndexes = viewStateSnapshot.spoilerReveal.revealedSpoilerIndexes(
++        let revealedSpoilerIds = viewStateSnapshot.spoilerReveal.revealedSpoilerIds(
+             interactionUniqueId: interaction.uniqueId
+         )
+ 
+@@ -399,21 +399,19 @@ public class CVComponentBodyText: CVComponentBase, CVComponent {
+                     textWasTruncated: textWasTruncated
+                 )
+                 if FeatureFlags.textFormattingReceiveSupport {
+-                    var spoilerIndex = 0
+-                    var spoilerItems = [CVTextLabel.Item]()
+-                    attributedText.enumerateMentionsAndStyles { _, style, range, _  in
+-                        guard let style, style.contains(.spoiler) else { return }
+-                        let index = spoilerIndex
+-                        spoilerIndex += 1
+-                        guard revealedSpoilerIndexes.contains(index).negated else { return }
+-                        spoilerItems.append(.unrevealedSpoiler(
+-                            CVTextLabel.UnrevealedSpoilerItem(
+-                                index: index,
+-                                interactionUniqueId: interaction.uniqueId,
+-                                range: range
++                    let spoilerItems: [CVTextLabel.Item] = MessageBodyRanges
++                        .spoilerAttributes(in: attributedText).compactMap { spoilerAttribute in
++                            guard revealedSpoilerIds.contains(spoilerAttribute.id).negated else {
++                                return nil
++                            }
++                            return .unrevealedSpoiler(
++                                CVTextLabel.UnrevealedSpoilerItem(
++                                    spoilerId: spoilerAttribute.id,
++                                    interactionUniqueId: interaction.uniqueId,
++                                    range: spoilerAttribute.effectiveRange
++                                )
+                             )
+-                        ))
+-                    }
++                        }
+                     // Spoilers take precedence and overwrite other items. Where their ranges overlap,
+                     // we need to cut off the detected item ranges and replace with spoiler range.
+                     items = NSRangeUtil.replacingRanges(
+@@ -433,7 +431,7 @@ public class CVComponentBodyText: CVComponentBase, CVComponent {
+         return State(bodyText: bodyText,
+                      isTextExpanded: isTextExpanded,
+                      searchText: searchText,
+-                     revealedSpoilerIndexes: revealedSpoilerIndexes,
++                     revealedSpoilerIds: revealedSpoilerIds,
+                      hasTapForMore: hasTapForMore,
+                      shouldUseAttributedText: shouldUseAttributedText,
+                      hasPendingMessageRequest: hasPendingMessageRequest,
+@@ -757,6 +755,7 @@ public class CVComponentBodyText: CVComponentBase, CVComponent {
+         )
+         linkifyData(attributedText: attributedText)
+ 
++        var matchedSearchRangeColors = [(NSRange, UIColor)]()
+         if let searchText = searchText,
+            searchText.count >= ConversationSearchController.kMinimumSearchTextLength {
+             let searchableText = FullTextSearchFinder.normalize(text: searchText)
+@@ -767,8 +766,10 @@ public class CVComponentBodyText: CVComponentBase, CVComponent {
+                                            options: [.withoutAnchoringBounds],
+                                            range: attributedText.string.entireRange) {
+                     owsAssertDebug(match.range.length >= ConversationSearchController.kMinimumSearchTextLength)
+-                    attributedText.addAttribute(.backgroundColor, value: UIColor.yellow, range: match.range)
++                    let highlightColor = UIColor.yellow
++                    attributedText.addAttribute(.backgroundColor, value: highlightColor, range: match.range)
+                     attributedText.addAttribute(.foregroundColor, value: UIColor.ows_black, range: match.range)
++                    matchedSearchRangeColors.append((match.range, highlightColor))
+                 }
+             } catch {
+                 owsFailDebug("Error: \(error)")
+@@ -783,11 +784,14 @@ public class CVComponentBodyText: CVComponentBase, CVComponent {
+                 on: attributedText,
+                 baseFont: textMessageFont,
+                 textColor: bodyTextColor,
+-                spoilerStyler: { spoilerIndex, _ in
+-                    if revealedSpoilerIndexes.contains(spoilerIndex) {
++                spoilerStyler: { spoilerAttribute in
++                    if revealedSpoilerIds.contains(spoilerAttribute.id) {
+                         return .revealed
+                     } else {
+-                        return .concealedWithHighlight(bodyTextColor)
++                        return .concealedWithHighlight(MessageBodyRanges.SpoilerStyle.HighlightColors(
++                            baseColor: bodyTextColor,
++                            otherColors: matchedSearchRangeColors
++                        ))
+                     }
+                 }
+             )
+diff --git a/Signal/src/ViewControllers/ConversationView/CVViewState.swift b/Signal/src/ViewControllers/ConversationView/CVViewState.swift
+index a98840848d5..a100883a34d 100644
+--- a/Signal/src/ViewControllers/ConversationView/CVViewState.swift
++++ b/Signal/src/ViewControllers/ConversationView/CVViewState.swift
+@@ -410,29 +410,28 @@ public class CVTextExpansion {
+ // MARK: -
+ 
+ public class CVSpoilerReveal {
+-    private var revealedSpoilerIndexesByInteractionUniqueId = [String: Set<Int>]()
++    private var revealedSpoilerIdsByInteractionUniqueId = [String: Set<Int>]()
+ 
+-    /// Returns the set of indexes in the ordered list of spoiler ranges for a given message that
+-    /// should be revealed. e.g. [0, 3] means that the first and third spoiler range, when ordered
+-    /// from the start of the text to the end, should be revealed.
+-    public func revealedSpoilerIndexes(
++    /// Returns the set of IDs in the ordered list of spoiler ranges for a given message that
++    /// should be revealed.
++    public func revealedSpoilerIds(
+         interactionUniqueId: String
+     ) -> Set<Int> {
+-        return revealedSpoilerIndexesByInteractionUniqueId[interactionUniqueId] ?? []
++        return revealedSpoilerIdsByInteractionUniqueId[interactionUniqueId] ?? []
+     }
+ 
+     public func setSpoilerRevealed(
+-        atIndex revealedIndex: Int,
++        withID id: Int,
+         onInteractionUniqueId interactionUniqueId: String
+     ) {
+-        var revealedIndexes = revealedSpoilerIndexesByInteractionUniqueId[interactionUniqueId] ?? Set()
+-        revealedIndexes.insert(revealedIndex)
+-        revealedSpoilerIndexesByInteractionUniqueId[interactionUniqueId] = revealedIndexes
++        var revealedIds = revealedSpoilerIdsByInteractionUniqueId[interactionUniqueId] ?? Set()
++        revealedIds.insert(id)
++        revealedSpoilerIdsByInteractionUniqueId[interactionUniqueId] = revealedIds
+     }
+ 
+     func copy() -> CVSpoilerReveal {
+         let returnValue = CVSpoilerReveal()
+-        returnValue.revealedSpoilerIndexesByInteractionUniqueId = revealedSpoilerIndexesByInteractionUniqueId
++        returnValue.revealedSpoilerIdsByInteractionUniqueId = revealedSpoilerIdsByInteractionUniqueId
+         return returnValue
+     }
+ }
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationViewController+BodyTextItems.swift b/Signal/src/ViewControllers/ConversationView/ConversationViewController+BodyTextItems.swift
+index ce5998b06fe..c9b087e1e0a 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationViewController+BodyTextItems.swift
++++ b/Signal/src/ViewControllers/ConversationView/ConversationViewController+BodyTextItems.swift
+@@ -384,7 +384,7 @@ extension ConversationViewController {
+     // Taps and long presses do the same thing.
+     private func didTapOrLongPressUnrevealedSpoiler(_ unrevealedSpoilerItem: CVTextLabel.UnrevealedSpoilerItem) {
+         viewState.spoilerReveal.setSpoilerRevealed(
+-            atIndex: unrevealedSpoilerItem.index,
++            withID: unrevealedSpoilerItem.spoilerId,
+             onInteractionUniqueId: unrevealedSpoilerItem.interactionUniqueId
+         )
+         self.loadCoordinator.enqueueReload(
+diff --git a/SignalServiceKit/src/Messages/MessageBody.swift b/SignalServiceKit/src/Messages/MessageBody.swift
+index c7df3f98b72..27c507cad8b 100644
+--- a/SignalServiceKit/src/Messages/MessageBody.swift
++++ b/SignalServiceKit/src/Messages/MessageBody.swift
+@@ -577,7 +577,52 @@ public class MessageBodyRanges: NSObject, NSCopying, NSSecureCoding {
+     /// when the font and text color are available.
+     public func setStyleAttributesWithoutApplying(on string: NSMutableAttributedString) {
+         for (range, style) in styles {
+-            string.addAttributes([.owsStyle: style], range: range)
++            var attrs: [NSAttributedString.Key: Any] = [
++                .owsStyle: style
++            ]
++            if style.contains(.spoiler) {
++                SpoilerAttribute.fromOriginalRange(range).addToAttributes(&attrs)
++            }
++            string.addAttributes(attrs, range: range)
++        }
++    }
++
++    public struct SpoilerAttribute {
++        /// Externally: identifies a single spoiler range, even if the actual attribute has been
++        /// split when applied, as happens when a parallel attribute is applied to the middle
++        /// of a spoiler range.
++        ///
++        /// Really this is just the original fill range of the spoiler, hashed. But that detail is
++        /// irrelevant to everthing outside of this class.
++        public let id: Int
++        public let effectiveRange: NSRange
++
++        private static let idKey = NSAttributedString.Key("OWSStyle.spoilerId")
++
++        fileprivate static func extractFromAttributes(
++            _ attrs: [NSAttributedString.Key: Any],
++            range: NSRange
++        ) -> Self {
++            guard let id = attrs[Self.idKey] as? Int else {
++                return .fromOriginalRange(range)
++            }
++            return .init(id: id, effectiveRange: range)
++        }
++
++        fileprivate static func fromOriginalRange(_ range: NSRange) -> Self {
++            var hasher = Hasher()
++            hasher.combine(range)
++            let id = hasher.finalize()
++            return .init(id: id, effectiveRange: range)
++        }
++
++        private init(id: Int, effectiveRange: NSRange) {
++            self.id = id
++            self.effectiveRange = effectiveRange
++        }
++
++        fileprivate func addToAttributes(_ attrs: inout [NSAttributedString.Key: Any]) {
++            attrs[Self.idKey] = id
+         }
+     }
+ 
+@@ -585,8 +630,20 @@ public class MessageBodyRanges: NSObject, NSCopying, NSSecureCoding {
+         case revealed
+         // TODO[TextFormatting]: instead of highlight, we should use
+         // a fancy animation which won't be represented in attributes.
+-        case concealedWithHighlight(UIColor)
++        case concealedWithHighlight(HighlightColors)
+         // TODO[TextFormatting]: add concealed with characters option
++
++        public struct HighlightColors {
++            public let baseColor: UIColor
++            // Subranges within the spoiler range to apply other
++            // colors to.
++            public let otherColors: [(NSRange, UIColor)]
++
++            public init(baseColor: UIColor, otherColors: [(NSRange, UIColor)]) {
++                self.baseColor = baseColor
++                self.otherColors = otherColors
++            }
++        }
+     }
+ 
+     /// Applies styles to the provided string (sets attributes for font, strikethrough, etc).
+@@ -595,13 +652,14 @@ public class MessageBodyRanges: NSObject, NSCopying, NSSecureCoding {
+         to string: NSMutableAttributedString,
+         baseFont: UIFont,
+         textColor: UIColor,
+-        spoilerStyler: (Int, NSRange) -> SpoilerStyle
++        spoilerStyler: (SpoilerAttribute) -> SpoilerStyle
+     ) {
+         var spoilerCount = 0
+         for (range, style) in styles {
+             Self.applyStyle(
+                 style: style,
+                 to: string,
++                attributes: [:],
+                 range: range,
+                 baseFont: baseFont,
+                 textColor: textColor,
+@@ -617,7 +675,7 @@ public class MessageBodyRanges: NSObject, NSCopying, NSSecureCoding {
+         on string: NSMutableAttributedString,
+         baseFont: UIFont,
+         textColor: UIColor,
+-        spoilerStyler: (Int, NSRange) -> SpoilerStyle
++        spoilerStyler: (SpoilerAttribute) -> SpoilerStyle
+     ) {
+         let copy = NSAttributedString(attributedString: string)
+         var spoilerCount = 0
+@@ -630,6 +688,7 @@ public class MessageBodyRanges: NSObject, NSCopying, NSSecureCoding {
+                 applyStyle(
+                     style: style,
+                     to: string,
++                    attributes: attrs,
+                     range: range,
+                     baseFont: baseFont,
+                     textColor: textColor,
+@@ -643,10 +702,11 @@ public class MessageBodyRanges: NSObject, NSCopying, NSSecureCoding {
+     private static func applyStyle(
+         style: Style,
+         to string: NSMutableAttributedString,
++        attributes originalAttributes: [NSAttributedString.Key: Any],
+         range: NSRange,
+         baseFont: UIFont,
+         textColor: UIColor,
+-        spoilerStyler: (Int, NSRange) -> SpoilerStyle,
++        spoilerStyler: (SpoilerAttribute) -> SpoilerStyle,
+         spoilerCount: inout Int
+     ) {
+         var fontTraits: UIFontDescriptor.SymbolicTraits = []
+@@ -666,12 +726,21 @@ public class MessageBodyRanges: NSObject, NSCopying, NSSecureCoding {
+             attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+             attributes[.strikethroughColor] = textColor
+         }
++        var otherHighlightColors: [(NSRange, UIColor)]?
+         if style.contains(.spoiler) {
+-            switch spoilerStyler(spoilerCount, range) {
++            let spoilerAttribute = SpoilerAttribute.extractFromAttributes(
++                originalAttributes,
++                range: range
++            )
++            switch spoilerStyler(spoilerAttribute) {
+             case .revealed:
+-                break
+-            case .concealedWithHighlight(let highlightColor):
+-                attributes[.backgroundColor] = highlightColor
++                attributes[.foregroundColor] = textColor
++                spoilerAttribute.addToAttributes(&attributes)
++            case .concealedWithHighlight(let highlightColors):
++                attributes[.foregroundColor] = highlightColors.baseColor
++                attributes[.backgroundColor] = highlightColors.baseColor
++                spoilerAttribute.addToAttributes(&attributes)
++                otherHighlightColors = highlightColors.otherColors
+             }
+             spoilerCount += 1
+         }
+@@ -679,6 +748,63 @@ public class MessageBodyRanges: NSObject, NSCopying, NSSecureCoding {
+             attributes[.font] = baseFont.withTraits(fontTraits)
+         }
+         string.addAttributes(attributes, range: range)
++
++        if let otherHighlightColors {
++            for (otherRange, otherColor) in otherHighlightColors {
++                let lowInside = otherRange.lowerBound >= range.lowerBound
++                    && otherRange.lowerBound < range.upperBound
++                let highInside = otherRange.upperBound <= range.upperBound
++                    && otherRange.upperBound > range.lowerBound
++                var otherAttributes: [NSAttributedString.Key: Any] = [
++                    .foregroundColor: otherColor,
++                    .backgroundColor: otherColor,
++                    .owsStyle: style
++                ]
++                SpoilerAttribute.extractFromAttributes(
++                    originalAttributes,
++                    range: range
++                ).addToAttributes(&otherAttributes)
++                if lowInside && highInside {
++                    string.addAttributes(
++                        otherAttributes,
++                        range: otherRange
++                    )
++                } else if lowInside {
++                    string.addAttributes(
++                        otherAttributes,
++                        range: NSRange(
++                            location: otherRange.location,
++                            length: range.upperBound - otherRange.lowerBound
++                        )
++                    )
++                } else if highInside {
++                    string.addAttributes(
++                        otherAttributes,
++                        range: NSRange(
++                            location: range.location,
++                            length: otherRange.upperBound - range.lowerBound
++                        )
++                    )
++                }
++            }
++        }
++    }
++
++    public static func spoilerAttributes(in string: NSAttributedString) -> [SpoilerAttribute] {
++        var spoilerAttributes = [SpoilerAttribute]()
++        string.enumerateAttributes(
++            in: string.entireRange,
++            using: { attrs, range, _ in
++                guard
++                    let style = attrs[.owsStyle] as? Style,
++                    style.contains(.spoiler)
++                else {
++                    return
++                }
++                spoilerAttributes.append(SpoilerAttribute.extractFromAttributes(attrs, range: range))
++            }
++        )
++        return spoilerAttributes
+     }
+ 
+     override public func isEqual(_ object: Any?) -> Bool {
+diff --git a/SignalUI/Views/ConversationView/CVTextLabel.swift b/SignalUI/Views/ConversationView/CVTextLabel.swift
+index 190260ff759..aecc8f85263 100644
+--- a/SignalUI/Views/ConversationView/CVTextLabel.swift
++++ b/SignalUI/Views/ConversationView/CVTextLabel.swift
+@@ -90,20 +90,22 @@ public class CVTextLabel: NSObject {
+     // MARK: -
+ 
+     public struct UnrevealedSpoilerItem: Equatable, NSRangeProviding {
+-        // The index in the array of all spoilers in the component.
+-        // Uniquely identifies this spoiler when e.g. revealing.
+-        public let index: Int
++        public let spoilerId: Int
+         public let interactionUniqueId: String
+         public let range: NSRange
+ 
+-        public init(index: Int, interactionUniqueId: String, range: NSRange) {
+-            self.index = index
++        public init(spoilerId: Int, interactionUniqueId: String, range: NSRange) {
++            self.spoilerId = spoilerId
+             self.interactionUniqueId = interactionUniqueId
+             self.range = range
+         }
+ 
+         public func copyWithNewRange(_ range: NSRange) -> CVTextLabel.UnrevealedSpoilerItem {
+-            return UnrevealedSpoilerItem(index: index, interactionUniqueId: interactionUniqueId, range: range)
++            return UnrevealedSpoilerItem(
++                spoilerId: spoilerId,
++                interactionUniqueId: interactionUniqueId,
++                range: range
++            )
+         }
+     }
+ 

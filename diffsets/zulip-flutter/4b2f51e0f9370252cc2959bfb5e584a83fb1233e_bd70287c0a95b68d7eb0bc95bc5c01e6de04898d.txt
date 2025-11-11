@@ -1,0 +1,186 @@
+diff --git a/lib/notifications/display.dart b/lib/notifications/display.dart
+index 1b85ccaebc..210a08ee57 100644
+--- a/lib/notifications/display.dart
++++ b/lib/notifications/display.dart
+@@ -453,6 +453,39 @@ class NotificationDisplayManager {
+ 
+   static String _personKey(Uri realmUrl, int userId) => "$realmUrl|$userId";
+ 
++  /// Provides the route and the account ID by parsing the notification URL.
++  ///
++  /// The URL must have been generated using [NotificationOpenPayload.buildUrl]
++  /// while creating the notification.
++  ///
++  /// Returns null and shows an error dialog if the associated account is not
++  /// found in the global store.
++  static AccountRoute<void>? routeForNotification({
++    required BuildContext context,
++    required Uri url,
++  }) {
++    final globalStore = GlobalStoreWidget.of(context);
++
++    assert(debugLog('got notif: url: $url'));
++    assert(url.scheme == 'zulip' && url.host == 'notification');
++    final payload = NotificationOpenPayload.parseUrl(url);
++
++    final account = globalStore.accounts.firstWhereOrNull((account) =>
++      account.realmUrl == payload.realmUrl && account.userId == payload.userId);
++    if (account == null) { // TODO(log)
++      final zulipLocalizations = ZulipLocalizations.of(context);
++      showErrorDialog(context: context,
++        title: zulipLocalizations.errorNotificationOpenTitle,
++        message: zulipLocalizations.errorNotificationOpenAccountMissing);
++      return null;
++    }
++
++    return MessageListPage.buildRoute(
++      accountId: account.id,
++      // TODO(#82): Open at specific message, not just conversation
++      narrow: payload.narrow);
++  }
++
+   /// Navigates to the [MessageListPage] of the specific conversation
+   /// given the `zulip://notification/…` Android intent data URL,
+   /// generated with [NotificationOpenPayload.buildUrl] while creating
+@@ -460,29 +493,16 @@ class NotificationDisplayManager {
+   static Future<void> navigateForNotification(Uri url) async {
+     assert(debugLog('opened notif: url: $url'));
+ 
+-    assert(url.scheme == 'zulip' && url.host == 'notification');
+-    final payload = NotificationOpenPayload.parseUrl(url);
+-
+     NavigatorState navigator = await ZulipApp.navigator;
+     final context = navigator.context;
+     assert(context.mounted);
+     if (!context.mounted) return; // TODO(linter): this is impossible as there's no actual async gap, but the use_build_context_synchronously lint doesn't see that
+ 
+-    final zulipLocalizations = ZulipLocalizations.of(context);
+-    final globalStore = GlobalStoreWidget.of(context);
+-    final account = globalStore.accounts.firstWhereOrNull((account) =>
+-      account.realmUrl == payload.realmUrl && account.userId == payload.userId);
+-    if (account == null) { // TODO(log)
+-      showErrorDialog(context: context,
+-        title: zulipLocalizations.errorNotificationOpenTitle,
+-        message: zulipLocalizations.errorNotificationOpenAccountMissing);
+-      return;
+-    }
++    final route = routeForNotification(context: context, url: url);
++    if (route == null) return; // TODO(log)
+ 
+     // TODO(nav): Better interact with existing nav stack on notif open
+-    unawaited(navigator.push(MaterialAccountWidgetRoute<void>(accountId: account.id,
+-      // TODO(#82): Open at specific message, not just conversation
+-      page: MessageListPage(initNarrow: payload.narrow))));
++    unawaited(navigator.push(route));
+   }
+ 
+   static Future<Uint8List?> _fetchBitmap(Uri url) async {
+diff --git a/lib/widgets/app.dart b/lib/widgets/app.dart
+index b6786ea3d1..9fa82144a1 100644
+--- a/lib/widgets/app.dart
++++ b/lib/widgets/app.dart
+@@ -143,7 +143,6 @@ class _ZulipAppState extends State<ZulipApp> with WidgetsBindingObserver {
+   void initState() {
+     super.initState();
+     WidgetsBinding.instance.addObserver(this);
+-    _handleInitialRoute();
+   }
+ 
+   @override
+@@ -157,8 +156,25 @@ class _ZulipAppState extends State<ZulipApp> with WidgetsBindingObserver {
+     // we use the Navigator which should be available when this callback is
+     // called and it's context should have the required ancestors.
+     final context = ZulipApp.navigatorKey.currentContext!;
+-    final globalStore = GlobalStoreWidget.of(context);
+ 
++    final initialRouteUrl = Uri.tryParse(initialRoute);
++    if (initialRouteUrl case Uri(scheme: 'zulip', host: 'notification')) {
++      final route = NotificationDisplayManager.routeForNotification(
++        context: context,
++        url: initialRouteUrl);
++
++      if (route != null) {
++        return [
++          HomePage.buildRoute(accountId: route.accountId),
++          route,
++        ];
++      } else {
++        // The account didn't match any existing accounts,
++        // fall through to show the default route below.
++      }
++    }
++
++    final globalStore = GlobalStoreWidget.of(context);
+     // TODO(#524) choose initial account as last one used
+     final initialAccountId = globalStore.accounts.firstOrNull?.id;
+     return [
+@@ -169,13 +185,6 @@ class _ZulipAppState extends State<ZulipApp> with WidgetsBindingObserver {
+     ];
+   }
+ 
+-  Future<void> _handleInitialRoute() async {
+-    final initialRouteUrl = Uri.parse(WidgetsBinding.instance.platformDispatcher.defaultRouteName);
+-    if (initialRouteUrl case Uri(scheme: 'zulip', host: 'notification')) {
+-      await NotificationDisplayManager.navigateForNotification(initialRouteUrl);
+-    }
+-  }
+-
+   @override
+   Future<bool> didPushRouteInformation(routeInformation) async {
+     switch (routeInformation.uri) {
+diff --git a/test/notifications/display_test.dart b/test/notifications/display_test.dart
+index b72e97ed01..51ec661930 100644
+--- a/test/notifications/display_test.dart
++++ b/test/notifications/display_test.dart
+@@ -960,11 +960,12 @@ void main() {
+   group('NotificationDisplayManager open', () {
+     late List<Route<void>> pushedRoutes;
+ 
+-    void takeStartingRoutes({bool withAccount = true}) {
++    void takeStartingRoutes({Account? account, bool withAccount = true}) {
++      account ??= eg.selfAccount;
+       final expected = <Condition<Object?>>[
+         if (withAccount)
+           (it) => it.isA<MaterialAccountWidgetRoute>()
+-            ..accountId.equals(eg.selfAccount.id)
++            ..accountId.equals(account!.id)
+             ..page.isA<HomePage>()
+         else
+           (it) => it.isA<WidgetRoute>().page.isA<ChooseAccountPage>(),
+@@ -1130,6 +1131,36 @@ void main() {
+       takeStartingRoutes();
+       matchesNavigation(check(pushedRoutes).single, account, message);
+     });
++
++    testWidgets('uses associated account as initial account; if initial route', (tester) async {
++      addTearDown(testBinding.reset);
++
++      final accountA = eg.selfAccount;
++      final accountB = eg.otherAccount;
++      final message = eg.streamMessage();
++      final data = messageFcmMessage(message, account: accountB);
++      await testBinding.globalStore.add(accountA, eg.initialSnapshot());
++      await testBinding.globalStore.add(accountB, eg.initialSnapshot());
++
++      final intentDataUrl = NotificationOpenPayload(
++        realmUrl: data.realmUrl,
++        userId: data.userId,
++        narrow: switch (data.recipient) {
++          FcmMessageChannelRecipient(:var streamId, :var topic) =>
++            TopicNarrow(streamId, topic),
++          FcmMessageDmRecipient(:var allRecipientIds) =>
++            DmNarrow(allRecipientIds: allRecipientIds, selfUserId: data.userId),
++        }).buildUrl();
++      addTearDown(tester.binding.platformDispatcher.clearDefaultRouteNameTestValue);
++      tester.binding.platformDispatcher.defaultRouteNameTestValue = intentDataUrl.toString();
++
++      await prepare(tester, early: true);
++      check(pushedRoutes).isEmpty(); // GlobalStore hasn't loaded yet
++
++      await tester.pump();
++      takeStartingRoutes(account: accountB);
++      matchesNavigation(check(pushedRoutes).single, accountB, message);
++    });
+   });
+ 
+   group('NotificationOpenPayload', () {

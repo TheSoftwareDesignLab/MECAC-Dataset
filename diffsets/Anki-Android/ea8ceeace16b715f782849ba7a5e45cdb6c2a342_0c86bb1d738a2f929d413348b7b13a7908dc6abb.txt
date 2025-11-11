@@ -1,0 +1,273 @@
+diff --git a/.idea/dictionaries/davidallison.xml b/.idea/dictionaries/davidallison.xml
+index f545befc375e..2d55a13d777a 100644
+--- a/.idea/dictionaries/davidallison.xml
++++ b/.idea/dictionaries/davidallison.xml
+@@ -122,6 +122,7 @@
+       <w>uint</w>
+       <w>unbury</w>
+       <w>unburying</w>
++      <w>uncatchable</w>
+       <w>undeletable</w>
+       <w>underlaid</w>
+       <w>unflag</w>
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt b/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt
+index 9308422f3716..504ab80e0413 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt
+@@ -77,6 +77,8 @@ import com.ichi2.anki.InitialActivity.StartupFailure.*
+ import com.ichi2.anki.StudyOptionsFragment.StudyOptionsListener
+ import com.ichi2.anki.UIUtils.showThemedToast
+ import com.ichi2.anki.analytics.UsageAnalytics
++import com.ichi2.anki.deckpicker.BITMAP_BYTES_PER_PIXEL
++import com.ichi2.anki.deckpicker.BackgroundImage
+ import com.ichi2.anki.dialogs.*
+ import com.ichi2.anki.dialogs.DatabaseErrorDialog.DatabaseErrorDialogType
+ import com.ichi2.anki.dialogs.DeckPickerContextMenu.DeckPickerContextMenuOption
+@@ -757,16 +759,26 @@ open class DeckPicker :
+         }
+         val currentAnkiDroidDirectory = CollectionHelper.getCurrentAnkiDroidDirectory(this)
+         val imgFile = File(currentAnkiDroidDirectory, "DeckPickerBackground.png")
+-        return if (!imgFile.exists()) {
++        if (!imgFile.exists()) {
+             Timber.d("No DeckPicker background image")
+             backgroundView.setBackgroundResource(0)
+-            false
+-        } else {
+-            Timber.i("Applying background")
+-            val drawable = Drawable.createFromPath(imgFile.absolutePath)
+-            backgroundView.setImageDrawable(drawable)
+-            true
++            return false
+         }
++
++        // TODO: Temporary fix to stop a crash on startup [15450], it can be removed either:
++        // * by moving this check to an upgrade path
++        // * once enough time has passed
++        val size = BackgroundImage.getBackgroundImageDimensions(this)
++        if (size.width * size.height * BITMAP_BYTES_PER_PIXEL > BackgroundImage.MAX_BITMAP_SIZE) {
++            Timber.w("DeckPicker background image dimensions too large")
++            backgroundView.setBackgroundResource(0)
++            return false
++        }
++
++        Timber.i("Applying background")
++        val drawable = Drawable.createFromPath(imgFile.absolutePath)
++        backgroundView.setImageDrawable(drawable)
++        return true
+     }
+ 
+     override fun onCreateOptionsMenu(menu: Menu): Boolean {
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/deckpicker/BackgroundImage.kt b/AnkiDroid/src/main/java/com/ichi2/anki/deckpicker/BackgroundImage.kt
+new file mode 100644
+index 000000000000..cc3c31569a6b
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/deckpicker/BackgroundImage.kt
+@@ -0,0 +1,99 @@
++/*
++ *  Copyright (c) 2024 David Allison <davidallisongithub@gmail.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify it under
++ *  the terms of the GNU General Public License as published by the Free Software
++ *  Foundation; either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++ *  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with
++ *  this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package com.ichi2.anki.deckpicker
++
++import android.content.Context
++import android.graphics.BitmapFactory
++import android.net.Uri
++import android.provider.MediaStore
++import com.ichi2.anki.CollectionHelper
++import com.ichi2.anki.R
++import com.ichi2.anki.preferences.AppearanceSettingsFragment
++import com.ichi2.anki.snackbar.showSnackbar
++import java.io.File
++import java.io.FileInputStream
++import java.io.FileOutputStream
++
++const val BITMAP_BYTES_PER_PIXEL = 4
++
++object BackgroundImage {
++    /*
++     * RecordingCanvas.MAX_BITMAP_SIZE is @hide
++     * https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/graphics/java/android/graphics/RecordingCanvas.java;l=49;drc=ed769e0aede2a840ea8cdff87ce593eb6ea8a7c6;bpv=1;bpt=1?q=%22trying%20to%20draw%20too%20large%22
++     *
++     * WARN: This skips a test for "ro.hwui.max_texture_allocation_size"
++     * The actual size may be larger, this is a minimum
++     */
++    const val MAX_BITMAP_SIZE: Long = 100 * 1024 * 1024
++
++    sealed interface FileSizeResult {
++        data object OK : FileSizeResult
++
++        /** Large files can cause OutOfMemoryError */
++        data class FileTooLarge(val currentMB: Long, val maxMB: Long) : FileSizeResult
++
++        /** Large bitmaps cause uncatchable: RuntimeException("Canvas: trying to draw too large(Xbytes) bitmap.") */
++        data class UncompressedBitmapTooLarge(val width: Long, val height: Long) : FileSizeResult
++    }
++
++    context (AppearanceSettingsFragment)
++    fun validateBackgroundImageFileSize(selectedImage: Uri): FileSizeResult {
++        val filePathColumn = arrayOf(MediaStore.MediaColumns.SIZE, MediaStore.MediaColumns.WIDTH, MediaStore.MediaColumns.HEIGHT)
++        requireContext().contentResolver.query(selectedImage, filePathColumn, null, null, null).use { cursor ->
++            cursor!!.moveToFirst()
++            val fileSizeInMB = cursor.getLong(0) / (1024 * 1024)
++            if (fileSizeInMB >= 10) {
++                return FileSizeResult.FileTooLarge(currentMB = fileSizeInMB, maxMB = 10)
++            }
++
++            val width = cursor.getLong(1)
++            val height = cursor.getLong(2)
++
++            // Default MAX_IMAGE_SIZE on Android
++            if (width * height * BITMAP_BYTES_PER_PIXEL > MAX_BITMAP_SIZE) {
++                return FileSizeResult.UncompressedBitmapTooLarge(width = width, height = height)
++            }
++
++            return FileSizeResult.OK
++        }
++    }
++
++    context (AppearanceSettingsFragment)
++    fun import(selectedImage: Uri) {
++        val currentAnkiDroidDirectory = CollectionHelper.getCurrentAnkiDroidDirectory(requireContext())
++        val imageName = "DeckPickerBackground.png"
++        val destFile = File(currentAnkiDroidDirectory, imageName)
++        (requireContext().contentResolver.openInputStream(selectedImage) as FileInputStream).channel.use { sourceChannel ->
++            FileOutputStream(destFile).channel.use { destChannel ->
++                destChannel.transferFrom(sourceChannel, 0, sourceChannel.size())
++                showSnackbar(R.string.background_image_applied)
++            }
++        }
++    }
++
++    data class Size(val width: Int, val height: Int)
++    fun getBackgroundImageDimensions(context: Context): Size {
++        val currentAnkiDroidDirectory = CollectionHelper.getCurrentAnkiDroidDirectory(context)
++        val imageName = "DeckPickerBackground.png"
++        val destFile = File(currentAnkiDroidDirectory, imageName)
++        val bmp = BitmapFactory.decodeFile(destFile.absolutePath)
++        val w = bmp.width
++        val h = bmp.height
++        bmp.recycle()
++        return Size(width = w, height = h)
++    }
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/preferences/AppearanceSettingsFragment.kt b/AnkiDroid/src/main/java/com/ichi2/anki/preferences/AppearanceSettingsFragment.kt
+index d6c8cc50af2a..317d1bef39a1 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/preferences/AppearanceSettingsFragment.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/preferences/AppearanceSettingsFragment.kt
+@@ -16,7 +16,6 @@
+ package com.ichi2.anki.preferences
+ 
+ import android.os.Build
+-import android.provider.MediaStore
+ import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.core.app.ActivityCompat
+ import androidx.preference.ListPreference
+@@ -25,6 +24,8 @@ import androidx.preference.SwitchPreferenceCompat
+ import anki.config.ConfigKey
+ import com.ichi2.anki.*
+ import com.ichi2.anki.CollectionManager.withCol
++import com.ichi2.anki.deckpicker.BackgroundImage
++import com.ichi2.anki.deckpicker.BackgroundImage.FileSizeResult
+ import com.ichi2.anki.snackbar.showSnackbar
+ import com.ichi2.themes.Theme
+ import com.ichi2.themes.Themes
+@@ -32,8 +33,6 @@ import com.ichi2.themes.Themes.systemIsInNightMode
+ import com.ichi2.themes.Themes.updateCurrentTheme
+ import timber.log.Timber
+ import java.io.File
+-import java.io.FileInputStream
+-import java.io.FileOutputStream
+ 
+ class AppearanceSettingsFragment : SettingsFragment() {
+     private var backgroundImage: SwitchPreferenceCompat? = null
+@@ -155,40 +154,32 @@ class AppearanceSettingsFragment : SettingsFragment() {
+     }
+ 
+     private val backgroundImageResultLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { selectedImage ->
+-        if (selectedImage != null) {
+-            // handling file may result in exception
+-            try {
+-                val filePathColumn = arrayOf(MediaStore.MediaColumns.SIZE)
+-                requireContext().contentResolver.query(selectedImage, filePathColumn, null, null, null).use { cursor ->
+-                    cursor!!.moveToFirst()
+-                    // file size in MB
+-                    val fileLength = cursor.getLong(0) / (1024 * 1024)
+-                    val currentAnkiDroidDirectory = CollectionHelper.getCurrentAnkiDroidDirectory(requireContext())
+-                    val imageName = "DeckPickerBackground.png"
+-                    val destFile = File(currentAnkiDroidDirectory, imageName)
+-                    // Image size less than 10 MB copied to AnkiDroid directory
+-                    if (fileLength < 10) {
+-                        (requireContext().contentResolver.openInputStream(selectedImage) as FileInputStream).channel.use { sourceChannel ->
+-                            FileOutputStream(destFile).channel.use { destChannel ->
+-                                destChannel.transferFrom(sourceChannel, 0, sourceChannel.size())
+-                                showSnackbar(R.string.background_image_applied)
+-                            }
+-                        }
+-                    } else {
+-                        backgroundImage!!.isChecked = false
+-                        UIUtils.showThemedToast(requireContext(), getString(R.string.image_max_size_allowed, 10), false)
+-                    }
+-                }
+-            } catch (e: OutOfMemoryError) {
+-                Timber.w(e)
+-                showSnackbar(getString(R.string.error_selecting_image, e.localizedMessage))
+-            } catch (e: Exception) {
+-                Timber.w(e)
+-                showSnackbar(getString(R.string.error_selecting_image, e.localizedMessage))
+-            }
+-        } else {
++        if (selectedImage == null) {
+             backgroundImage!!.isChecked = false
+             showSnackbar(R.string.no_image_selected)
++            return@registerForActivityResult
++        }
++        // handling file may result in exception
++        try {
++            when (val sizeResult = BackgroundImage.validateBackgroundImageFileSize(selectedImage)) {
++                is FileSizeResult.FileTooLarge -> {
++                    backgroundImage!!.isChecked = false
++                    UIUtils.showThemedToast(requireContext(), getString(R.string.image_max_size_allowed, sizeResult.maxMB), false)
++                }
++                is FileSizeResult.UncompressedBitmapTooLarge -> {
++                    backgroundImage!!.isChecked = false
++                    UIUtils.showThemedToast(requireContext(), getString(R.string.image_dimensions_too_large, sizeResult.width, sizeResult.height), false)
++                }
++                is FileSizeResult.OK -> {
++                    BackgroundImage.import(selectedImage)
++                }
++            }
++        } catch (e: OutOfMemoryError) {
++            Timber.w(e)
++            showSnackbar(getString(R.string.error_selecting_image, e.localizedMessage))
++        } catch (e: Exception) {
++            Timber.w(e)
++            showSnackbar(getString(R.string.error_selecting_image, e.localizedMessage))
+         }
+     }
+ }
+diff --git a/AnkiDroid/src/main/res/values/03-dialogs.xml b/AnkiDroid/src/main/res/values/03-dialogs.xml
+index 33d75018875e..6d76f474a357 100644
+--- a/AnkiDroid/src/main/res/values/03-dialogs.xml
++++ b/AnkiDroid/src/main/res/values/03-dialogs.xml
+@@ -173,7 +173,8 @@
+     <string name="failed_to_apply_background_image">Failed to apply background image %s</string>
+     <string name="background_image_too_large">Deck Picker background too large</string>
+     <string name="image_max_size_allowed">Maximum image size %d MB allowed</string>
+-    
++    <string name="image_dimensions_too_large">Image dimensions are too large (%1$d × %2$d)</string>
++
+     <!-- Global Intent handler -->
+     <!-- Also used by Card Browser, not renaming to save translators effort -->
+     <string name="intent_handler_failed_no_storage_permission">Missing required storage permission. Please grant storage permission then retry your action.</string>

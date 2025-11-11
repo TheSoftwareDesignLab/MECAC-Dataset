@@ -1,0 +1,227 @@
+diff --git a/android-components/components/browser/session/src/main/java/mozilla/components/browser/session/SessionManager.kt b/android-components/components/browser/session/src/main/java/mozilla/components/browser/session/SessionManager.kt
+index 66bf6589c5d5..af02d077a006 100644
+--- a/android-components/components/browser/session/src/main/java/mozilla/components/browser/session/SessionManager.kt
++++ b/android-components/components/browser/session/src/main/java/mozilla/components/browser/session/SessionManager.kt
+@@ -16,6 +16,7 @@ import mozilla.components.support.base.observer.ObserverRegistry
+ @Suppress("TooManyFunctions")
+ class SessionManager(
+     val engine: Engine,
++    val defaultSession: (() -> Session)? = null,
+     delegate: Observable<SessionManager.Observer> = ObserverRegistry()
+ ) : Observable<SessionManager.Observer> by delegate {
+     private val values = mutableListOf<Session>()
+@@ -158,6 +159,13 @@ class SessionManager(
+ 
+         notifyObservers { onSessionRemoved(session) }
+ 
++        // NB: we're not explicitly calling notifyObservers here, since adding a session when none
++        // are present will notify observers with onSessionSelected.
++        if (selectedIndex == NO_SELECTION && defaultSession != null) {
++            add(defaultSession.invoke())
++            return
++        }
++
+         if (selectionUpdated && selectedIndex != NO_SELECTION) {
+             notifyObservers { onSessionSelected(selectedSessionOrThrow) }
+         }
+@@ -173,18 +181,35 @@ class SessionManager(
+         }
+ 
+         selectedIndex = NO_SELECTION
++
++        // NB: This callback indicates to observers that either removeSessions or removeAll were
++        // invoked, not that the manager is now empty.
+         notifyObservers { onAllSessionsRemoved() }
++
++        if (defaultSession != null) {
++            add(defaultSession.invoke())
++        }
+     }
+ 
+     /**
+      * Removes all sessions including CustomTab sessions.
+      */
+     fun removeAll() = synchronized(values) {
++        val onlyCustomTabSessionsPresent = values.isNotEmpty() && sessions.isEmpty()
++
+         values.forEach { unlink(it) }
+         values.clear()
+ 
+         selectedIndex = NO_SELECTION
++
++        // NB: This callback indicates to observers that either removeSessions or removeAll were
++        // invoked, not that the manager is now empty.
+         notifyObservers { onAllSessionsRemoved() }
++
++        // Don't create a default session if we only had CustomTab sessions to begin with.
++        if (!onlyCustomTabSessionsPresent && defaultSession != null) {
++            add(defaultSession.invoke())
++        }
+     }
+ 
+     /**
+diff --git a/android-components/components/browser/session/src/test/java/mozilla/components/browser/session/SessionManagerTest.kt b/android-components/components/browser/session/src/test/java/mozilla/components/browser/session/SessionManagerTest.kt
+index 530cd7c98654..4425b20c41e1 100644
+--- a/android-components/components/browser/session/src/test/java/mozilla/components/browser/session/SessionManagerTest.kt
++++ b/android-components/components/browser/session/src/test/java/mozilla/components/browser/session/SessionManagerTest.kt
+@@ -15,13 +15,45 @@ import org.junit.Assert.assertNull
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ import org.mockito.Mockito
+-import org.mockito.Mockito.doReturn
+-import org.mockito.Mockito.never
+ import org.mockito.Mockito.verify
+ import org.mockito.Mockito.verifyNoMoreInteractions
++import org.mockito.Mockito.times
++import org.mockito.Mockito.never
++import org.mockito.Mockito.doReturn
+ import org.mockito.Mockito.spy
+ 
+ class SessionManagerTest {
++    @Test
++    fun `default session can be specified`() {
++        val manager = SessionManager(mock(), defaultSession = { Session("http://www.mozilla.org") })
++        assertEquals(0, manager.size)
++    }
++
++    @Test
++    fun `default session is used when manager becomes empty`() {
++        val session0 = Session("about:blank")
++        val session1 = Session("http://www.firefox.com")
++
++        val manager = SessionManager(mock(), defaultSession = { session0 })
++
++        manager.add(session1)
++        assertEquals(1, manager.size)
++        assertEquals("http://www.firefox.com", manager.selectedSessionOrThrow.url)
++
++        manager.remove(session1)
++        assertEquals(1, manager.size)
++        assertEquals("about:blank", manager.selectedSessionOrThrow.url)
++
++        manager.add(session1)
++        manager.removeAll()
++        assertEquals(1, manager.size)
++        assertEquals("about:blank", manager.selectedSessionOrThrow.url)
++
++        manager.removeSessions()
++        assertEquals(1, manager.size)
++        assertEquals("about:blank", manager.selectedSessionOrThrow.url)
++    }
++
+     @Test
+     fun `session can be added`() {
+         val manager = SessionManager(mock())
+@@ -111,6 +143,74 @@ class SessionManagerTest {
+         verifyNoMoreInteractions(observer)
+     }
+ 
++    @Test
++    fun `observer is called when all sessions removed and default session present`() {
++        val session0 = Session("https://www.mozilla.org")
++        val manager = SessionManager(mock(), defaultSession = { session0 })
++        val observer: SessionManager.Observer = mock()
++
++        manager.register(observer)
++
++        manager.removeAll()
++
++        assertEquals(1, manager.size)
++        verify(observer).onSessionAdded(session0)
++        verify(observer).onSessionSelected(session0)
++        verify(observer).onAllSessionsRemoved()
++
++        val observer2: SessionManager.Observer = mock()
++
++        manager.register(observer2)
++
++        manager.removeSessions()
++
++        assertEquals(1, manager.size)
++        verify(observer2).onSessionAdded(session0)
++        verify(observer2).onSessionSelected(session0)
++        verify(observer2).onAllSessionsRemoved()
++    }
++
++    @Test
++    fun `default session not used when all sessions were removed and they were all CustomTab`() {
++        val session1 = Session("https://www.mozilla.org")
++        session1.customTabConfig = Mockito.mock(CustomTabConfig::class.java)
++
++        val manager = SessionManager(mock(), defaultSession = { Session("about:blank") })
++        val observer: SessionManager.Observer = mock()
++
++        manager.add(session1)
++        manager.register(observer)
++
++        manager.removeAll()
++
++        assertEquals(0, manager.size)
++        verify(observer).onAllSessionsRemoved()
++    }
++
++    @Test
++    fun `default session is used when all sessions were removed and they were mixed CustomTab and regular`() {
++        val session1 = Session("https://www.mozilla.org")
++        session1.customTabConfig = Mockito.mock(CustomTabConfig::class.java)
++        val session2 = Session("https://www.firefox.com")
++
++        val session0 = Session("about:blank")
++        val manager = SessionManager(mock(), defaultSession = { session0 })
++        val observer: SessionManager.Observer = mock()
++
++        manager.register(observer)
++
++        manager.add(session1)
++        manager.add(session2)
++        manager.removeAll()
++
++        assertEquals(1, manager.size)
++        assertEquals("about:blank", manager.selectedSessionOrThrow.url)
++
++        verify(observer).onAllSessionsRemoved()
++        verify(observer).onSessionSelected(session0)
++        verify(observer).onSessionAdded(session0)
++    }
++
+     @Test
+     fun `observer is called when session is removed`() {
+         val manager = SessionManager(mock())
+diff --git a/android-components/samples/browser/src/main/java/org/mozilla/samples/browser/DefaultComponents.kt b/android-components/samples/browser/src/main/java/org/mozilla/samples/browser/DefaultComponents.kt
+index 298f6cf050da..fbb6efa11b85 100644
+--- a/android-components/samples/browser/src/main/java/org/mozilla/samples/browser/DefaultComponents.kt
++++ b/android-components/samples/browser/src/main/java/org/mozilla/samples/browser/DefaultComponents.kt
+@@ -33,7 +33,7 @@ open class DefaultComponents(private val applicationContext: Context) {
+     val sessionStorage by lazy { DefaultSessionStorage(applicationContext) }
+ 
+     val sessionManager by lazy {
+-        SessionManager(engine).apply {
++        SessionManager(engine, defaultSession = { Session("about:blank") }).apply {
+             sessionStorage.restore(this)
+ 
+             if (size == 0) {
+diff --git a/android-components/samples/browser/src/main/java/org/mozilla/samples/browser/TabsTrayFragment.kt b/android-components/samples/browser/src/main/java/org/mozilla/samples/browser/TabsTrayFragment.kt
+index e87e9646705b..1ca0c522ba5e 100644
+--- a/android-components/samples/browser/src/main/java/org/mozilla/samples/browser/TabsTrayFragment.kt
++++ b/android-components/samples/browser/src/main/java/org/mozilla/samples/browser/TabsTrayFragment.kt
+@@ -45,8 +45,7 @@ class TabsTrayFragment : Fragment(), BackHandler {
+             tabsTray,
+             components.sessionManager,
+             components.tabsUseCases,
+-            ::closeTabsTray,
+-            onTabsTrayEmpty = ::createNewTab)
++            ::closeTabsTray)
+     }
+ 
+     override fun onStart() {
+@@ -66,10 +65,6 @@ class TabsTrayFragment : Fragment(), BackHandler {
+         return true
+     }
+ 
+-    private fun createNewTab() {
+-        components.tabsUseCases.addSession.invoke("about:blank")
+-    }
+-
+     private fun closeTabsTray() {
+         activity?.supportFragmentManager?.beginTransaction()?.apply {
+             replace(R.id.container, BrowserFragment.create())

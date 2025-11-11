@@ -1,0 +1,197 @@
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/giphy/GiphyPickerActivity.kt b/WordPress/src/main/java/org/wordpress/android/ui/giphy/GiphyPickerActivity.kt
+index 9c6e0cae8990..a9ce2d90c54c 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/giphy/GiphyPickerActivity.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/giphy/GiphyPickerActivity.kt
+@@ -18,6 +18,7 @@ import org.wordpress.android.ui.ActionableEmptyView
+ import org.wordpress.android.ui.giphy.GiphyMediaViewHolder.ThumbnailViewDimensions
+ import org.wordpress.android.util.AniUtils
+ import org.wordpress.android.util.DisplayUtils
++import org.wordpress.android.util.ToastUtils
+ import org.wordpress.android.util.WPLinkMovementMethod
+ import org.wordpress.android.util.getDistinct
+ import org.wordpress.android.util.image.ImageManager
+@@ -60,6 +61,7 @@ class GiphyPickerActivity : AppCompatActivity() {
+         initializeSearchView()
+         initializeSelectionBar()
+         initializeEmptyView()
++        initializeRangeLoadErrorEventHandlers()
+     }
+ 
+     /**
+@@ -198,6 +200,14 @@ class GiphyPickerActivity : AppCompatActivity() {
+         })
+     }
+ 
++    private fun initializeRangeLoadErrorEventHandlers() {
++        viewModel.rangeLoadErrorEvent.observe(this, Observer { event ->
++            event?.getContentIfNotHandled()?.let {
++                ToastUtils.showToast(this@GiphyPickerActivity, R.string.no_network_message)
++            }
++        })
++    }
++
+     /**
+      * Close this Activity when the up button is pressed
+      */
+diff --git a/WordPress/src/main/java/org/wordpress/android/viewmodel/Event.kt b/WordPress/src/main/java/org/wordpress/android/viewmodel/Event.kt
+new file mode 100644
+index 000000000000..d11570a68937
+--- /dev/null
++++ b/WordPress/src/main/java/org/wordpress/android/viewmodel/Event.kt
+@@ -0,0 +1,27 @@
++package org.wordpress.android.viewmodel
++
++/**
++ * Used as a wrapper for data that is exposed via a LiveData that represents an event.
++ */
++open class Event<out T>(private val content: T) {
++
++    var hasBeenHandled = false
++        private set // Allow external read but not write
++
++    /**
++     * Returns the content and prevents its use again.
++     */
++    fun getContentIfNotHandled(): T? {
++        return if (hasBeenHandled) {
++            null
++        } else {
++            hasBeenHandled = true
++            content
++        }
++    }
++
++    /**
++     * Returns the content, even if it's already been handled.
++     */
++    fun peekContent(): T = content
++}
+diff --git a/WordPress/src/main/java/org/wordpress/android/viewmodel/giphy/GiphyPickerDataSource.kt b/WordPress/src/main/java/org/wordpress/android/viewmodel/giphy/GiphyPickerDataSource.kt
+index 2acc70084a37..63a63025f754 100644
+--- a/WordPress/src/main/java/org/wordpress/android/viewmodel/giphy/GiphyPickerDataSource.kt
++++ b/WordPress/src/main/java/org/wordpress/android/viewmodel/giphy/GiphyPickerDataSource.kt
+@@ -1,9 +1,12 @@
+ package org.wordpress.android.viewmodel.giphy
+ 
++import android.arch.lifecycle.LiveData
++import android.arch.lifecycle.MutableLiveData
+ import android.arch.paging.PositionalDataSource
+ import com.giphy.sdk.core.models.Media
+ import com.giphy.sdk.core.models.enums.MediaType.gif
+ import com.giphy.sdk.core.network.api.GPHApiClient
++import org.wordpress.android.viewmodel.Event
+ 
+ /**
+  * The PagedListDataSource that is created and managed by [GiphyPickerDataSourceFactory]
+@@ -19,6 +22,9 @@ class GiphyPickerDataSource(
+     var initialLoadError: Throwable? = null
+         private set
+ 
++    private val _rangeLoadErrorEvent = MutableLiveData<Event<Throwable>>()
++    val rangeLoadErrorEvent: LiveData<Event<Throwable>> = _rangeLoadErrorEvent
++
+     /**
+      * Always the load the first page (startingPosition = 0) from the Giphy API
+      *
+@@ -34,6 +40,7 @@ class GiphyPickerDataSource(
+         val startPosition = 0
+ 
+         initialLoadError = null
++        _rangeLoadErrorEvent.postValue(null)
+ 
+         // Do not do any API call if the [searchQuery] is empty
+         if (searchQuery.isBlank()) {
+@@ -55,9 +62,16 @@ class GiphyPickerDataSource(
+      * Load a given range of items ([params]) from the Giphy API
+      */
+     override fun loadRange(params: LoadRangeParams, callback: LoadRangeCallback<GiphyMediaViewModel>) {
+-        apiClient.search(searchQuery, gif, params.loadSize, params.startPosition, null, null) { response, _ ->
++        apiClient.search(searchQuery, gif, params.loadSize, params.startPosition, null, null) { response, error ->
+             if (response != null) {
+                 callback.onResult(response.data.toGiphyMediaViewModels())
++            } else {
++                // Do not replace the error if we already dispatched one. This makes the UI better since loadRange()
++                // gets called every time we load a part in the endless scroll. The user would be seeing an endless
++                // stream of error messages if we don't throttle it here.
++                if (_rangeLoadErrorEvent.value == null) {
++                    _rangeLoadErrorEvent.value = Event(error)
++                }
+             }
+         }
+     }
+diff --git a/WordPress/src/main/java/org/wordpress/android/viewmodel/giphy/GiphyPickerDataSourceFactory.kt b/WordPress/src/main/java/org/wordpress/android/viewmodel/giphy/GiphyPickerDataSourceFactory.kt
+index 63f714f6365f..d643f0781709 100644
+--- a/WordPress/src/main/java/org/wordpress/android/viewmodel/giphy/GiphyPickerDataSourceFactory.kt
++++ b/WordPress/src/main/java/org/wordpress/android/viewmodel/giphy/GiphyPickerDataSourceFactory.kt
+@@ -1,9 +1,13 @@
+ package org.wordpress.android.viewmodel.giphy
+ 
++import android.arch.lifecycle.LiveData
++import android.arch.lifecycle.MutableLiveData
++import android.arch.lifecycle.Transformations
+ import android.arch.paging.DataSource
+ import android.arch.paging.DataSource.Factory
+ import com.giphy.sdk.core.network.api.GPHApiClient
+ import org.wordpress.android.BuildConfig
++import org.wordpress.android.viewmodel.Event
+ 
+ /**
+  * Creates instances of [GiphyPickerDataSource]
+@@ -30,21 +34,22 @@ class GiphyPickerDataSourceFactory : Factory<Int, GiphyMediaViewModel>() {
+     var searchQuery: String = ""
+         set(value) {
+             field = value
+-            dataSource?.invalidate()
++            dataSource.value?.invalidate()
+         }
+ 
+-    val initialLoadError: Throwable? get() = dataSource?.initialLoadError
+-
+     /**
+      * The last [dataSource] that was created
+      *
+      * We retain this so we can invalidate it later when [searchQuery] is changed.
+      */
+-    private var dataSource: GiphyPickerDataSource? = null
++    private val dataSource = MutableLiveData<GiphyPickerDataSource>()
++
++    val initialLoadError: Throwable? get() = dataSource.value?.initialLoadError
++    val rangeLoadErrorEvent: LiveData<Event<Throwable>> = Transformations.switchMap(dataSource) { it.rangeLoadErrorEvent }
+ 
+     override fun create(): DataSource<Int, GiphyMediaViewModel> {
+         val dataSource = GiphyPickerDataSource(apiClient, searchQuery)
+-        this.dataSource = dataSource
++        this.dataSource.postValue(dataSource)
+         return dataSource
+     }
+ }
+diff --git a/WordPress/src/main/java/org/wordpress/android/viewmodel/giphy/GiphyPickerViewModel.kt b/WordPress/src/main/java/org/wordpress/android/viewmodel/giphy/GiphyPickerViewModel.kt
+index 50f3a3dfa96d..adfed7b82967 100644
+--- a/WordPress/src/main/java/org/wordpress/android/viewmodel/giphy/GiphyPickerViewModel.kt
++++ b/WordPress/src/main/java/org/wordpress/android/viewmodel/giphy/GiphyPickerViewModel.kt
+@@ -8,6 +8,7 @@ import android.arch.paging.LivePagedListBuilder
+ import android.arch.paging.PagedList
+ import android.arch.paging.PagedList.BoundaryCallback
+ import org.wordpress.android.util.getDistinct
++import org.wordpress.android.viewmodel.Event
+ 
+ /**
+  * Holds the data for [GiphyPickerActivity]
+@@ -49,6 +50,8 @@ class GiphyPickerViewModel(
+      */
+     val emptyDisplayMode: LiveData<EmptyDisplayMode> = _emptyDisplayMode
+ 
++    val rangeLoadErrorEvent: LiveData<Event<Throwable>> = dataSourceFactory.rangeLoadErrorEvent
++
+     private val _selectedMediaViewModelList = MutableLiveData<LinkedHashMap<String, GiphyMediaViewModel>>()
+     /**
+      * A [Map] of the [GiphyMediaViewModel]s that were selected by the user
+@@ -71,7 +74,7 @@ class GiphyPickerViewModel(
+     }
+ 
+     /**
+-     * Update the [emptyDisplayMode] depending on the number of API search results
++     * Update the [emptyDisplayMode] depending on the number of API search results or whether there was an error.
+      */
+     private val pagedListBoundaryCallback = object : BoundaryCallback<GiphyMediaViewModel>() {
+         override fun onZeroItemsLoaded() {

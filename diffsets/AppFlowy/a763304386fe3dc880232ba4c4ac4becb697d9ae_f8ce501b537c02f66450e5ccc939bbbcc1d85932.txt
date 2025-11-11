@@ -1,0 +1,343 @@
+diff --git a/frontend/appflowy_flutter/lib/plugins/document/application/document_bloc.dart b/frontend/appflowy_flutter/lib/plugins/document/application/document_bloc.dart
+index 0ef0c92f64f72..fe4434fa876e4 100644
+--- a/frontend/appflowy_flutter/lib/plugins/document/application/document_bloc.dart
++++ b/frontend/appflowy_flutter/lib/plugins/document/application/document_bloc.dart
+@@ -1,8 +1,6 @@
+ import 'dart:async';
+ import 'dart:convert';
+ 
+-import 'package:flutter/foundation.dart';
+-
+ import 'package:appflowy/plugins/document/application/doc_sync_state_listener.dart';
+ import 'package:appflowy/plugins/document/application/document_awareness_metadata.dart';
+ import 'package:appflowy/plugins/document/application/document_collab_adapter.dart';
+@@ -34,6 +32,7 @@ import 'package:appflowy_editor/appflowy_editor.dart'
+         Position,
+         paragraphNode;
+ import 'package:appflowy_result/appflowy_result.dart';
++import 'package:flutter/foundation.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+ import 'package:freezed_annotation/freezed_annotation.dart';
+ 
+@@ -96,19 +95,29 @@ class DocumentBloc extends Bloc<DocumentEvent, DocumentState> {
+   @override
+   Future<void> close() async {
+     isClosing = true;
+-    _updateSelectionDebounce.dispose();
+-    _syncThrottle.dispose();
++    await checkDocumentIntegrity();
++    await _cancelSubscriptions();
++    _clearEditorState();
++    return super.close();
++  }
++
++  Future<void> _cancelSubscriptions() async {
+     await _documentService.syncAwarenessStates(documentId: documentId);
+     await _documentListener.stop();
+     await _syncStateListener.stop();
+     await _viewListener?.stop();
+     await _transactionSubscription?.cancel();
+     await _documentService.closeDocument(viewId: documentId);
++  }
++
++  void _clearEditorState() {
++    _updateSelectionDebounce.dispose();
++    _syncThrottle.dispose();
++
+     _syncTimer?.cancel();
+     _syncTimer = null;
+     state.editorState?.service.keyboardService?.closeKeyboard();
+     state.editorState?.dispose();
+-    return super.close();
+   }
+ 
+   Future<void> _onDocumentEvent(
+@@ -389,6 +398,34 @@ class DocumentBloc extends Bloc<DocumentEvent, DocumentState> {
+       metadata: jsonEncode(metadata.toJson()),
+     );
+   }
++
++  // this is only used for debug mode
++  Future<void> checkDocumentIntegrity() async {
++    if (!enableDocumentInternalLog) {
++      return;
++    }
++
++    final cloudDocResult =
++        await _documentService.getDocument(documentId: documentId);
++    final cloudDoc = cloudDocResult.fold((s) => s, (f) => null)?.toDocument();
++    final localDoc = state.editorState?.document;
++    if (cloudDoc == null || localDoc == null) {
++      return;
++    }
++    final cloudJson = cloudDoc.toJson();
++    final localJson = localDoc.toJson();
++    final deepEqual = const DeepCollectionEquality().equals(
++      cloudJson,
++      localJson,
++    );
++    if (!deepEqual) {
++      Log.error('document integrity check failed');
++      // Enable it to debug the document integrity check failed
++      // Log.error('cloud doc: $cloudJson');
++      // Log.error('local doc: $localJson');
++      assert(false, 'document integrity check failed');
++    }
++  }
+ }
+ 
+ @freezed
+diff --git a/frontend/appflowy_flutter/lib/plugins/document/application/editor_transaction_adapter.dart b/frontend/appflowy_flutter/lib/plugins/document/application/editor_transaction_adapter.dart
+index 057e06768d515..0fd3ddc445230 100644
+--- a/frontend/appflowy_flutter/lib/plugins/document/application/editor_transaction_adapter.dart
++++ b/frontend/appflowy_flutter/lib/plugins/document/application/editor_transaction_adapter.dart
+@@ -40,7 +40,7 @@ class TransactionAdapter {
+ 
+   Future<void> apply(Transaction transaction, EditorState editorState) async {
+     if (enableDocumentInternalLog) {
+-      Log.debug(
++      Log.info(
+         '[TransactionAdapter] 2. apply transaction begin ${transaction.hashCode} in $hashCode',
+       );
+     }
+@@ -48,7 +48,7 @@ class TransactionAdapter {
+     await _applyInternal(transaction, editorState);
+ 
+     if (enableDocumentInternalLog) {
+-      Log.debug(
++      Log.info(
+         '[TransactionAdapter] 3. apply transaction end ${transaction.hashCode} in $hashCode',
+       );
+     }
+@@ -60,17 +60,12 @@ class TransactionAdapter {
+   ) async {
+     final stopwatch = Stopwatch()..start();
+     if (enableDocumentInternalLog) {
+-      Log.debug('transaction => ${transaction.toJson()}');
++      Log.info('transaction => ${transaction.toJson()}');
+     }
+-    final actions = transaction.operations
+-        .map((op) => op.toBlockAction(editorState, documentId))
+-        .whereNotNull()
+-        .expand((element) => element)
+-        .toList(growable: false); // avoid lazy evaluation
+-    final textActions = actions.where(
+-      (e) =>
+-          e.textDeltaType != TextDeltaType.none && e.textDeltaPayloadPB != null,
+-    );
++
++    final actions = transactionToBlockActions(transaction, editorState);
++    final textActions = filterTextDeltaActions(actions);
++
+     final actionCostTime = stopwatch.elapsedMilliseconds;
+     for (final textAction in textActions) {
+       final payload = textAction.textDeltaPayloadPB!;
+@@ -82,8 +77,8 @@ class TransactionAdapter {
+           delta: payload.delta,
+         );
+         if (enableDocumentInternalLog) {
+-          Log.debug(
+-            '[editor_transaction_adapter] create external text: ${payload.delta}',
++          Log.info(
++            '[editor_transaction_adapter] create external text: id: ${payload.textId} delta: ${payload.delta}',
+           );
+         }
+       } else if (type == TextDeltaType.update) {
+@@ -93,18 +88,18 @@ class TransactionAdapter {
+           delta: payload.delta,
+         );
+         if (enableDocumentInternalLog) {
+-          Log.debug(
+-            '[editor_transaction_adapter] update external text: ${payload.delta}',
++          Log.info(
++            '[editor_transaction_adapter] update external text: id: ${payload.textId} delta: ${payload.delta}',
+           );
+         }
+       }
+     }
+-    final blockActions =
+-        actions.map((e) => e.blockActionPB).toList(growable: false);
++
++    final blockActions = filterBlockActions(actions);
+ 
+     for (final action in blockActions) {
+       if (enableDocumentInternalLog) {
+-        Log.debug(
++        Log.info(
+           '[editor_transaction_adapter] action => ${action.toProto3Json()}',
+         );
+       }
+@@ -114,14 +109,44 @@ class TransactionAdapter {
+       documentId: documentId,
+       actions: blockActions,
+     );
++
+     final elapsed = stopwatch.elapsedMilliseconds;
+     stopwatch.stop();
+     if (enableDocumentInternalLog) {
+-      Log.debug(
++      Log.info(
+         '[editor_transaction_adapter] apply transaction cost: total $elapsed ms, converter action $actionCostTime ms, apply action ${elapsed - actionCostTime} ms',
+       );
+     }
+   }
++
++  List<BlockActionWrapper> transactionToBlockActions(
++    Transaction transaction,
++    EditorState editorState,
++  ) {
++    return transaction.operations
++        .map((op) => op.toBlockAction(editorState, documentId))
++        .whereNotNull()
++        .expand((element) => element)
++        .toList(growable: false); // avoid lazy evaluation
++  }
++
++  List<BlockActionWrapper> filterTextDeltaActions(
++    List<BlockActionWrapper> actions,
++  ) {
++    return actions
++        .where(
++          (e) =>
++              e.textDeltaType != TextDeltaType.none &&
++              e.textDeltaPayloadPB != null,
++        )
++        .toList(growable: false);
++  }
++
++  List<BlockActionPB> filterBlockActions(
++    List<BlockActionWrapper> actions,
++  ) {
++    return actions.map((e) => e.blockActionPB).toList(growable: false);
++  }
+ }
+ 
+ extension BlockAction on Operation {
+@@ -294,6 +319,15 @@ extension on UpdateOperation {
+         externalType: _kExternalTextType,
+       );
+ 
++      if (enableDocumentInternalLog) {
++        Log.info('create text delta: $textDeltaPayloadPB');
++      }
++
++      // update the external text id and external type to the block
++      blockActionPB.payload.block
++        ..externalId = textId
++        ..externalType = _kExternalTextType;
++
+       actions.add(
+         BlockActionWrapper(
+           blockActionPB: blockActionPB,
+@@ -310,6 +344,15 @@ extension on UpdateOperation {
+               delta: jsonEncode(diff),
+             );
+ 
++      if (enableDocumentInternalLog) {
++        Log.info('update text delta: $textDeltaPayloadPB');
++      }
++
++      // update the external text id and external type to the block
++      blockActionPB.payload.block
++        ..externalId = textId
++        ..externalType = _kExternalTextType;
++
+       actions.add(
+         BlockActionWrapper(
+           blockActionPB: blockActionPB,
+diff --git a/frontend/appflowy_flutter/test/unit_test/editor/transaction_adapter_test.dart b/frontend/appflowy_flutter/test/unit_test/editor/transaction_adapter_test.dart
+index 93e27bc45b0ac..64c81fb7f741c 100644
+--- a/frontend/appflowy_flutter/test/unit_test/editor/transaction_adapter_test.dart
++++ b/frontend/appflowy_flutter/test/unit_test/editor/transaction_adapter_test.dart
+@@ -1,10 +1,13 @@
++import 'dart:async';
++
++import 'package:appflowy/plugins/document/application/document_service.dart';
+ import 'package:appflowy/plugins/document/application/editor_transaction_adapter.dart';
+ import 'package:appflowy_backend/protobuf/flowy-document/protobuf.dart';
+ import 'package:appflowy_editor/appflowy_editor.dart';
+ import 'package:flutter_test/flutter_test.dart';
+ 
+ void main() {
+-  group('TransactionAdapter', () {
++  group('TransactionAdapter:', () {
+     test('toBlockAction insert node with children operation', () {
+       final editorState = EditorState.blank();
+ 
+@@ -148,5 +151,76 @@ void main() {
+         reason: '1 - prev id',
+       );
+     });
++
++    test('update the external id and external type', () async {
++      // create a node without external id and external type
++      // the editing this node, the adapter should generate a new action
++      //  to assign a new external id and external type.
++      final node = bulletedListNode(text: 'Hello');
++      final document = Document(
++        root: pageNode(
++          children: [
++            node,
++          ],
++        ),
++      );
++
++      final transactionAdapter = TransactionAdapter(
++        documentId: '',
++        documentService: DocumentService(),
++      );
++
++      final editorState = EditorState(
++        document: document,
++      );
++
++      final completer = Completer();
++      editorState.transactionStream.listen((event) {
++        final time = event.$1;
++        if (time == TransactionTime.before) {
++          final actions = transactionAdapter.transactionToBlockActions(
++            event.$2,
++            editorState,
++          );
++          final textActions =
++              transactionAdapter.filterTextDeltaActions(actions);
++          final blockActions = transactionAdapter.filterBlockActions(actions);
++          expect(textActions.length, 1);
++          expect(blockActions.length, 1);
++
++          // check text operation
++          final textAction = textActions.first;
++          final textId = textAction.textDeltaPayloadPB?.textId;
++          {
++            expect(textAction.textDeltaType, TextDeltaType.create);
++
++            expect(textId, isNotEmpty);
++            final delta = textAction.textDeltaPayloadPB?.delta;
++            expect(delta, equals('[{"insert":"HelloWorld"}]'));
++          }
++
++          // check block operation
++          {
++            final blockAction = blockActions.first;
++            expect(blockAction.action, BlockActionTypePB.Update);
++            expect(blockAction.payload.block.id, node.id);
++            expect(
++              blockAction.payload.block.externalId,
++              textId,
++            );
++            expect(blockAction.payload.block.externalType, 'text');
++          }
++        } else if (time == TransactionTime.after) {
++          completer.complete();
++        }
++      });
++
++      await editorState.insertText(
++        5,
++        'World',
++        node: node,
++      );
++      await completer.future;
++    });
+   });
+ }

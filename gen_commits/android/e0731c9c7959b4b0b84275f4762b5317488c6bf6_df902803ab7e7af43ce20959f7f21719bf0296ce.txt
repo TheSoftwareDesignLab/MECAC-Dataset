@@ -1,0 +1,860 @@
+diff --git a/app/src/full/java/io/homeassistant/companion/android/settings/wear/SettingsWearViewModel.kt b/app/src/full/java/io/homeassistant/companion/android/settings/wear/SettingsWearViewModel.kt
+index 4513ea9292b..fabab805ec8 100644
+--- a/app/src/full/java/io/homeassistant/companion/android/settings/wear/SettingsWearViewModel.kt
++++ b/app/src/full/java/io/homeassistant/companion/android/settings/wear/SettingsWearViewModel.kt
+@@ -6,6 +6,7 @@ import android.util.Log
+ import androidx.compose.runtime.mutableStateListOf
+ import androidx.compose.runtime.mutableStateMapOf
+ import androidx.compose.runtime.mutableStateOf
++import androidx.core.net.toUri
+ import androidx.lifecycle.AndroidViewModel
+ import androidx.lifecycle.viewModelScope
+ import com.fasterxml.jackson.databind.JsonMappingException
+@@ -205,12 +206,21 @@ class SettingsWearViewModel @Inject constructor(
+         }
+     }
+ 
++    private fun readUriData(uri: String): ByteArray {
++        if (uri.isEmpty()) return ByteArray(0)
++        return getApplication<HomeAssistantApplication>().contentResolver.openInputStream(uri.toUri())!!.buffered().use {
++            it.readBytes()
++        }
++    }
++
+     fun sendAuthToWear(
+         url: String,
+         authCode: String,
+         deviceName: String,
+         deviceTrackingEnabled: Boolean,
+-        notificationsEnabled: Boolean
++        notificationsEnabled: Boolean,
++        tlsClientCertificateUri: String,
++        tlsClientCertificatePassword: String
+     ) {
+         _hasData.value = false // Show loading indicator
+         val putDataRequest = PutDataMapRequest.create("/authenticate").run {
+@@ -221,6 +231,8 @@ class SettingsWearViewModel @Inject constructor(
+             dataMap.putString("DeviceName", deviceName)
+             dataMap.putBoolean("LocationTracking", deviceTrackingEnabled)
+             dataMap.putBoolean("Notifications", notificationsEnabled)
++            dataMap.putByteArray("TLSClientCertificateData", readUriData(tlsClientCertificateUri))
++            dataMap.putString("TLSClientCertificatePassword", tlsClientCertificatePassword)
+             setUrgent()
+             asPutDataRequest()
+         }
+diff --git a/app/src/full/java/io/homeassistant/companion/android/settings/wear/views/SettingsWearMainView.kt b/app/src/full/java/io/homeassistant/companion/android/settings/wear/views/SettingsWearMainView.kt
+index d9e8d647f19..864829a3713 100644
+--- a/app/src/full/java/io/homeassistant/companion/android/settings/wear/views/SettingsWearMainView.kt
++++ b/app/src/full/java/io/homeassistant/companion/android/settings/wear/views/SettingsWearMainView.kt
+@@ -10,6 +10,7 @@ import androidx.appcompat.app.AppCompatActivity
+ import androidx.lifecycle.lifecycleScope
+ import com.google.android.gms.wearable.Node
+ import dagger.hilt.android.AndroidEntryPoint
++import io.homeassistant.companion.android.HomeAssistantApplication
+ import io.homeassistant.companion.android.onboarding.OnboardApp
+ import io.homeassistant.companion.android.settings.wear.SettingsWearViewModel
+ import kotlinx.coroutines.cancel
+@@ -71,15 +72,16 @@ class SettingsWearMainView : AppCompatActivity() {
+                 locationTrackingPossible = false,
+                 notificationsPossible = false,
+                 isWatch = true,
+-                discoveryOptions = OnboardApp.DiscoveryOptions.ADD_EXISTING_EXTERNAL
++                discoveryOptions = OnboardApp.DiscoveryOptions.ADD_EXISTING_EXTERNAL,
++                mayRequireTlsClientCertificate = (application as HomeAssistantApplication).keyChainRepository.getPrivateKey() != null
+             ) // While notifications are technically possible, the app can't handle this for the Wear device
+         )
+     }
+ 
+     private fun onOnboardingComplete(result: OnboardApp.Output?) {
+         if (result != null) {
+-            val (url, authCode, deviceName, deviceTrackingEnabled, _) = result
+-            settingsWearViewModel.sendAuthToWear(url, authCode, deviceName, deviceTrackingEnabled, true)
++            val (url, authCode, deviceName, deviceTrackingEnabled, _, tlsCertificateUri, tlsCertificatePassword) = result
++            settingsWearViewModel.sendAuthToWear(url, authCode, deviceName, deviceTrackingEnabled, true, tlsCertificateUri, tlsCertificatePassword)
+         } else {
+             Log.e(TAG, "onOnboardingComplete: Activity result returned null intent data")
+         }
+diff --git a/app/src/main/java/io/homeassistant/companion/android/HomeAssistantApplication.kt b/app/src/main/java/io/homeassistant/companion/android/HomeAssistantApplication.kt
+index da1e0e67547..1fd52d5dcd9 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/HomeAssistantApplication.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/HomeAssistantApplication.kt
+@@ -30,6 +30,7 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.launch
+ import javax.inject.Inject
++import javax.inject.Named
+ 
+ @HiltAndroidApp
+ open class HomeAssistantApplication : Application() {
+@@ -40,6 +41,7 @@ open class HomeAssistantApplication : Application() {
+     lateinit var prefsRepository: PrefsRepository
+ 
+     @Inject
++    @Named("keyChainRepository")
+     lateinit var keyChainRepository: KeyChainRepository
+ 
+     @Inject
+diff --git a/app/src/main/java/io/homeassistant/companion/android/onboarding/OnboardApp.kt b/app/src/main/java/io/homeassistant/companion/android/onboarding/OnboardApp.kt
+index 101ede8a2c3..031df6b01ad 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/onboarding/OnboardApp.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/onboarding/OnboardApp.kt
+@@ -15,6 +15,7 @@ class OnboardApp : ActivityResultContract<OnboardApp.Input, OnboardApp.Output?>(
+         private const val EXTRA_NOTIFICATIONS_POSSIBLE = "notifications_possible"
+         private const val EXTRA_IS_WATCH = "extra_is_watch"
+         private const val EXTRA_DISCOVERY_OPTIONS = "extra_discovery_options"
++        private const val EXTRA_MAY_REQUIRE_TLS_CLIENT_CERTIFICATE = "may_require_tls_client_certificate"
+ 
+         fun parseInput(intent: Intent): Input = Input(
+             url = intent.getStringExtra(EXTRA_URL),
+@@ -22,7 +23,8 @@ class OnboardApp : ActivityResultContract<OnboardApp.Input, OnboardApp.Output?>(
+             locationTrackingPossible = intent.getBooleanExtra(EXTRA_LOCATION_TRACKING_POSSIBLE, false),
+             notificationsPossible = intent.getBooleanExtra(EXTRA_NOTIFICATIONS_POSSIBLE, true),
+             isWatch = intent.getBooleanExtra(EXTRA_IS_WATCH, false),
+-            discoveryOptions = intent.getStringExtra(EXTRA_DISCOVERY_OPTIONS)?.let { DiscoveryOptions.valueOf(it) }
++            discoveryOptions = intent.getStringExtra(EXTRA_DISCOVERY_OPTIONS)?.let { DiscoveryOptions.valueOf(it) },
++            mayRequireTlsClientCertificate = intent.getBooleanExtra(EXTRA_MAY_REQUIRE_TLS_CLIENT_CERTIFICATE, false)
+         )
+     }
+ 
+@@ -40,7 +42,8 @@ class OnboardApp : ActivityResultContract<OnboardApp.Input, OnboardApp.Output?>(
+         val locationTrackingPossible: Boolean = BuildConfig.FLAVOR == "full",
+         val notificationsPossible: Boolean = true,
+         val isWatch: Boolean = false,
+-        val discoveryOptions: DiscoveryOptions? = null
++        val discoveryOptions: DiscoveryOptions? = null,
++        val mayRequireTlsClientCertificate: Boolean = false
+     )
+ 
+     data class Output(
+@@ -48,7 +51,9 @@ class OnboardApp : ActivityResultContract<OnboardApp.Input, OnboardApp.Output?>(
+         val authCode: String,
+         val deviceName: String,
+         val deviceTrackingEnabled: Boolean,
+-        val notificationsEnabled: Boolean
++        val notificationsEnabled: Boolean,
++        val tlsClientCertificateUri: String,
++        val tlsClientCertificatePassword: String
+     ) {
+         fun toIntent(): Intent {
+             return Intent().apply {
+@@ -57,6 +62,22 @@ class OnboardApp : ActivityResultContract<OnboardApp.Input, OnboardApp.Output?>(
+                 putExtra("DeviceName", deviceName)
+                 putExtra("LocationTracking", deviceTrackingEnabled)
+                 putExtra("Notifications", notificationsEnabled)
++                putExtra("TLSClientCertificateUri", tlsClientCertificateUri)
++                putExtra("TLSClientCertificatePassword", tlsClientCertificatePassword)
++            }
++        }
++
++        companion object {
++            fun fromIntent(intent: Intent): Output {
++                return Output(
++                    url = intent.getStringExtra("URL").toString(),
++                    authCode = intent.getStringExtra("AuthCode").toString(),
++                    deviceName = intent.getStringExtra("DeviceName").toString(),
++                    deviceTrackingEnabled = intent.getBooleanExtra("LocationTracking", false),
++                    notificationsEnabled = intent.getBooleanExtra("Notifications", true),
++                    tlsClientCertificateUri = intent.getStringExtra("TLSClientCertificateUri").toString(),
++                    tlsClientCertificatePassword = intent.getStringExtra("TLSClientCertificatePassword").toString()
++                )
+             }
+         }
+     }
+@@ -69,6 +90,7 @@ class OnboardApp : ActivityResultContract<OnboardApp.Input, OnboardApp.Output?>(
+             putExtra(EXTRA_NOTIFICATIONS_POSSIBLE, input.notificationsPossible)
+             putExtra(EXTRA_IS_WATCH, input.isWatch)
+             putExtra(EXTRA_DISCOVERY_OPTIONS, input.discoveryOptions?.toString())
++            putExtra(EXTRA_MAY_REQUIRE_TLS_CLIENT_CERTIFICATE, input.mayRequireTlsClientCertificate)
+         }
+     }
+ 
+@@ -77,17 +99,6 @@ class OnboardApp : ActivityResultContract<OnboardApp.Input, OnboardApp.Output?>(
+             return null
+         }
+ 
+-        val url = intent.getStringExtra("URL").toString()
+-        val authCode = intent.getStringExtra("AuthCode").toString()
+-        val deviceName = intent.getStringExtra("DeviceName").toString()
+-        val deviceTrackingEnabled = intent.getBooleanExtra("LocationTracking", false)
+-        val notificationsEnabled = intent.getBooleanExtra("Notifications", true)
+-        return Output(
+-            url = url,
+-            authCode = authCode,
+-            deviceName = deviceName,
+-            deviceTrackingEnabled = deviceTrackingEnabled,
+-            notificationsEnabled = notificationsEnabled
+-        )
++        return Output.fromIntent(intent)
+     }
+ }
+diff --git a/app/src/main/java/io/homeassistant/companion/android/onboarding/OnboardingActivity.kt b/app/src/main/java/io/homeassistant/companion/android/onboarding/OnboardingActivity.kt
+index 6a5af07ab12..9b0ea77a650 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/onboarding/OnboardingActivity.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/onboarding/OnboardingActivity.kt
+@@ -44,6 +44,7 @@ class OnboardingActivity : BaseActivity() {
+         }
+         viewModel.deviceIsWatch = input.isWatch
+         viewModel.discoveryOptions = input.discoveryOptions
++        viewModel.mayRequireTlsClientCertificate = input.mayRequireTlsClientCertificate
+ 
+         if (savedInstanceState == null) {
+             supportFragmentManager.commit {
+diff --git a/app/src/main/java/io/homeassistant/companion/android/onboarding/OnboardingViewModel.kt b/app/src/main/java/io/homeassistant/companion/android/onboarding/OnboardingViewModel.kt
+index 3f4e109b298..67c761bea6a 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/onboarding/OnboardingViewModel.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/onboarding/OnboardingViewModel.kt
+@@ -1,6 +1,7 @@
+ package io.homeassistant.companion.android.onboarding
+ 
+ import android.app.Application
++import android.net.Uri
+ import android.util.Log
+ import android.webkit.URLUtil
+ import android.widget.Toast
+@@ -52,6 +53,11 @@ class OnboardingViewModel @Inject constructor(
+     var locationTrackingEnabled by mutableStateOf(false)
+     val notificationsPossible = mutableStateOf(true)
+     var notificationsEnabled by mutableStateOf(false)
++    var mayRequireTlsClientCertificate by mutableStateOf(false)
++    var tlsClientCertificateUri: Uri? by mutableStateOf(null)
++    var tlsClientCertificateFilename by mutableStateOf("")
++    var tlsClientCertificatePassword by mutableStateOf("")
++    var tlsClientCertificatePasswordCorrect by mutableStateOf(false)
+ 
+     private var authCode = ""
+ 
+@@ -81,7 +87,9 @@ class OnboardingViewModel @Inject constructor(
+         authCode = authCode,
+         deviceName = deviceName.value,
+         deviceTrackingEnabled = locationTrackingEnabled,
+-        notificationsEnabled = notificationsEnabled
++        notificationsEnabled = notificationsEnabled,
++        tlsClientCertificateUri = tlsClientCertificateUri?.toString() ?: "",
++        tlsClientCertificatePassword = tlsClientCertificatePassword
+     )
+ 
+     fun onDiscoveryActive() {
+diff --git a/app/src/main/java/io/homeassistant/companion/android/onboarding/authentication/AuthenticationFragment.kt b/app/src/main/java/io/homeassistant/companion/android/onboarding/authentication/AuthenticationFragment.kt
+index 1da92365431..5ee2c243aee 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/onboarding/authentication/AuthenticationFragment.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/onboarding/authentication/AuthenticationFragment.kt
+@@ -36,6 +36,7 @@ import io.homeassistant.companion.android.util.isStarted
+ import okhttp3.HttpUrl
+ import okhttp3.HttpUrl.Companion.toHttpUrl
+ import javax.inject.Inject
++import javax.inject.Named
+ import io.homeassistant.companion.android.common.R as commonR
+ 
+ @AndroidEntryPoint
+@@ -54,6 +55,7 @@ class AuthenticationFragment : Fragment() {
+     lateinit var themesManager: ThemesManager
+ 
+     @Inject
++    @Named("keyChainRepository")
+     lateinit var keyChainRepository: KeyChainRepository
+ 
+     @SuppressLint("SetJavaScriptEnabled")
+diff --git a/app/src/main/java/io/homeassistant/companion/android/onboarding/integration/MobileAppIntegrationFragment.kt b/app/src/main/java/io/homeassistant/companion/android/onboarding/integration/MobileAppIntegrationFragment.kt
+index 2f846edae09..e0e50d50196 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/onboarding/integration/MobileAppIntegrationFragment.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/onboarding/integration/MobileAppIntegrationFragment.kt
+@@ -8,6 +8,7 @@ import android.net.Uri
+ import android.os.Build
+ import android.os.Bundle
+ import android.os.PowerManager
++import android.provider.OpenableColumns
+ import android.provider.Settings
+ import android.view.LayoutInflater
+ import android.view.View
+@@ -18,6 +19,7 @@ import androidx.compose.ui.platform.ComposeView
+ import androidx.core.content.getSystemService
+ import androidx.fragment.app.Fragment
+ import androidx.fragment.app.activityViewModels
++import androidx.lifecycle.lifecycleScope
+ import com.google.accompanist.themeadapter.material.MdcTheme
+ import dagger.hilt.android.AndroidEntryPoint
+ import io.homeassistant.companion.android.R
+@@ -25,6 +27,9 @@ import io.homeassistant.companion.android.common.util.DisabledLocationHandler
+ import io.homeassistant.companion.android.onboarding.OnboardingViewModel
+ import io.homeassistant.companion.android.onboarding.notifications.NotificationPermissionFragment
+ import io.homeassistant.companion.android.sensors.LocationSensorManager
++import kotlinx.coroutines.launch
++import java.io.IOException
++import java.security.KeyStore
+ import io.homeassistant.companion.android.common.R as commonR
+ 
+ @AndroidEntryPoint
+@@ -33,6 +38,9 @@ class MobileAppIntegrationFragment : Fragment() {
+     private val requestLocationPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+         onLocationPermissionResult(it)
+     }
++    private val getContent = registerForActivityResult(ActivityResultContracts.GetContent()) {
++        onGetContentResult(it)
++    }
+ 
+     private var dialog: AlertDialog? = null
+     private val viewModel by activityViewModels<OnboardingViewModel>()
+@@ -49,6 +57,8 @@ class MobileAppIntegrationFragment : Fragment() {
+                         onboardingViewModel = viewModel,
+                         openPrivacyPolicy = this@MobileAppIntegrationFragment::openPrivacyPolicy,
+                         onLocationTrackingChanged = this@MobileAppIntegrationFragment::onLocationTrackingChanged,
++                        onSelectTLSCertificateClicked = this@MobileAppIntegrationFragment::onSelectTLSCertificateClicked,
++                        onCheckPassword = this@MobileAppIntegrationFragment::onCheckTLSCertificatePassword,
+                         onFinishClicked = this@MobileAppIntegrationFragment::onComplete
+                     )
+                 }
+@@ -88,6 +98,41 @@ class MobileAppIntegrationFragment : Fragment() {
+         viewModel.setLocationTracking(checked)
+     }
+ 
++    private fun onSelectTLSCertificateClicked() {
++        getContent.launch("*/*")
++    }
++
++    private fun onCheckTLSCertificatePassword(password: String) {
++        lifecycleScope.launch {
++            var ok: Boolean
++            context?.contentResolver?.openInputStream(viewModel.tlsClientCertificateUri!!)!!.buffered().use {
++                val keystore = KeyStore.getInstance("PKCS12")
++                ok = try {
++                    keystore.load(it, password.toCharArray())
++                    true
++                } catch (e: IOException) {
++                    // we cannot determine if it failed due to wrong password or other reasons, since e.cause is not set to UnrecoverableKeyException
++                    false
++                }
++            }
++            viewModel.tlsClientCertificatePasswordCorrect = ok
++        }
++    }
++
++    @SuppressLint("Range")
++    private fun onGetContentResult(uri: Uri?) {
++        if (uri != null) {
++            context?.contentResolver?.query(uri, null, null, null, null)?.use { cursor ->
++                cursor.moveToFirst()
++
++                viewModel.tlsClientCertificateUri = uri
++                viewModel.tlsClientCertificateFilename = cursor.getString(cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME))
++            }
++            // check with empty password
++            onCheckTLSCertificatePassword("")
++        }
++    }
++
+     private fun requestPermissions(sensorId: String) {
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+             requestLocationPermissions.launch(
+diff --git a/app/src/main/java/io/homeassistant/companion/android/onboarding/integration/MobileAppIntegrationView.kt b/app/src/main/java/io/homeassistant/companion/android/onboarding/integration/MobileAppIntegrationView.kt
+index 251e5ce444f..e7d11d13810 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/onboarding/integration/MobileAppIntegrationView.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/onboarding/integration/MobileAppIntegrationView.kt
+@@ -3,19 +3,26 @@ package io.homeassistant.companion.android.onboarding.integration
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxHeight
+ import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.text.KeyboardActions
+ import androidx.compose.foundation.text.KeyboardOptions
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material.Button
++import androidx.compose.material.Icon
++import androidx.compose.material.MaterialTheme
+ import androidx.compose.material.Switch
+ import androidx.compose.material.SwitchDefaults
+ import androidx.compose.material.Text
+ import androidx.compose.material.TextButton
+ import androidx.compose.material.TextField
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.CheckCircle
++import androidx.compose.material.icons.filled.Error
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.ExperimentalComposeUiApi
+@@ -26,6 +33,8 @@ import androidx.compose.ui.res.colorResource
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.text.input.ImeAction
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.text.input.PasswordVisualTransformation
+ import androidx.compose.ui.unit.dp
+ import com.mikepenz.iconics.typeface.library.community.material.CommunityMaterial
+ import io.homeassistant.companion.android.onboarding.OnboardingHeaderView
+@@ -38,6 +47,8 @@ fun MobileAppIntegrationView(
+     onboardingViewModel: OnboardingViewModel,
+     openPrivacyPolicy: () -> Unit,
+     onLocationTrackingChanged: (Boolean) -> Unit,
++    onSelectTLSCertificateClicked: () -> Unit,
++    onCheckPassword: (String) -> Unit,
+     onFinishClicked: () -> Unit
+ ) {
+     val scrollState = rememberScrollState()
+@@ -97,6 +108,69 @@ fun MobileAppIntegrationView(
+                     fontWeight = FontWeight.Light
+                 )
+             }
++            if (onboardingViewModel.deviceIsWatch && onboardingViewModel.mayRequireTlsClientCertificate) {
++                Spacer(modifier = Modifier.height(16.dp))
++
++                Text(
++                    text = stringResource(id = commonR.string.tls_cert_onboarding_title),
++                    style = MaterialTheme.typography.h6
++                )
++                Text(
++                    text = stringResource(id = commonR.string.tls_cert_onboarding_description),
++                    fontWeight = FontWeight.Light
++                )
++                Row(
++                    modifier = Modifier.fillMaxWidth(),
++                    horizontalArrangement = Arrangement.SpaceBetween
++                ) {
++                    Button(onClick = onSelectTLSCertificateClicked) {
++                        Text(text = stringResource(id = commonR.string.select_file))
++                    }
++                    Text(
++                        text = onboardingViewModel.tlsClientCertificateFilename,
++                        modifier = Modifier
++                            .align(Alignment.CenterVertically)
++                    )
++                }
++                if (onboardingViewModel.tlsClientCertificateUri != null) {
++                    TextField(
++                        value = onboardingViewModel.tlsClientCertificatePassword,
++                        onValueChange = {
++                            onboardingViewModel.tlsClientCertificatePassword = it
++                            onCheckPassword(onboardingViewModel.tlsClientCertificatePassword)
++                        },
++                        label = { Text(text = stringResource(id = commonR.string.password)) },
++                        singleLine = true,
++                        visualTransformation = PasswordVisualTransformation(),
++                        keyboardOptions = KeyboardOptions(
++                            keyboardType = KeyboardType.Password,
++                            imeAction = ImeAction.Done
++                        ),
++                        keyboardActions = KeyboardActions(
++                            onDone = {
++                                keyboardController?.hide()
++                            }
++                        ),
++                        trailingIcon = {
++                            if (onboardingViewModel.tlsClientCertificatePasswordCorrect) {
++                                Icon(
++                                    imageVector = Icons.Filled.CheckCircle,
++                                    tint = colorResource(commonR.color.colorOnBackground),
++                                    contentDescription = stringResource(id = commonR.string.password_correct)
++                                )
++                            } else {
++                                Icon(
++                                    imageVector = Icons.Filled.Error,
++                                    tint = colorResource(commonR.color.colorWarning),
++                                    contentDescription = stringResource(id = commonR.string.password_incorrect)
++                                )
++                            }
++                        },
++                        isError = !onboardingViewModel.tlsClientCertificatePasswordCorrect,
++                        modifier = Modifier.fillMaxWidth()
++                    )
++                }
++            }
+             TextButton(onClick = openPrivacyPolicy) {
+                 Text(stringResource(id = commonR.string.privacy_url))
+             }
+@@ -108,7 +182,10 @@ fun MobileAppIntegrationView(
+                 .fillMaxWidth(),
+             horizontalArrangement = Arrangement.End
+         ) {
+-            Button(onClick = onFinishClicked) {
++            Button(
++                onClick = onFinishClicked,
++                enabled = !onboardingViewModel.deviceIsWatch || onboardingViewModel.tlsClientCertificateUri == null || onboardingViewModel.tlsClientCertificatePasswordCorrect
++            ) {
+                 Text(stringResource(id = commonR.string.continue_connect))
+             }
+         }
+diff --git a/app/src/main/java/io/homeassistant/companion/android/util/TLSWebViewClient.kt b/app/src/main/java/io/homeassistant/companion/android/util/TLSWebViewClient.kt
+index 5bc8e935de6..706e895b2a2 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/util/TLSWebViewClient.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/util/TLSWebViewClient.kt
+@@ -19,8 +19,9 @@ import java.security.PrivateKey
+ import java.security.cert.CertificateException
+ import java.security.cert.X509Certificate
+ import javax.inject.Inject
++import javax.inject.Named
+ 
+-open class TLSWebViewClient @Inject constructor(private var keyChainRepository: KeyChainRepository) : WebViewClient() {
++open class TLSWebViewClient @Inject constructor(@Named("keyChainRepository") private var keyChainRepository: KeyChainRepository) : WebViewClient() {
+ 
+     var isTLSClientAuthNeeded = false
+         private set
+diff --git a/app/src/main/java/io/homeassistant/companion/android/webview/WebViewActivity.kt b/app/src/main/java/io/homeassistant/companion/android/webview/WebViewActivity.kt
+index c4a2ca55c1e..8641c88fe28 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/webview/WebViewActivity.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/webview/WebViewActivity.kt
+@@ -116,6 +116,7 @@ import org.chromium.net.CronetEngine
+ import org.json.JSONObject
+ import java.util.concurrent.Executors
+ import javax.inject.Inject
++import javax.inject.Named
+ import io.homeassistant.companion.android.common.R as commonR
+ 
+ @OptIn(androidx.media3.common.util.UnstableApi::class)
+@@ -189,6 +190,7 @@ class WebViewActivity : BaseActivity(), io.homeassistant.companion.android.webvi
+     lateinit var authenticationDao: AuthenticationDao
+ 
+     @Inject
++    @Named("keyChainRepository")
+     lateinit var keyChainRepository: KeyChainRepository
+ 
+     private lateinit var binding: ActivityWebviewBinding
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/data/DataModule.kt b/common/src/main/java/io/homeassistant/companion/android/common/data/DataModule.kt
+index 701558b6aa4..f5f813892ca 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/common/data/DataModule.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/common/data/DataModule.kt
+@@ -18,6 +18,7 @@ import io.homeassistant.companion.android.common.data.authentication.impl.Authen
+ import io.homeassistant.companion.android.common.data.integration.impl.IntegrationService
+ import io.homeassistant.companion.android.common.data.keychain.KeyChainRepository
+ import io.homeassistant.companion.android.common.data.keychain.KeyChainRepositoryImpl
++import io.homeassistant.companion.android.common.data.keychain.KeyStoreRepositoryImpl
+ import io.homeassistant.companion.android.common.data.prefs.PrefsRepository
+ import io.homeassistant.companion.android.common.data.prefs.PrefsRepositoryImpl
+ import io.homeassistant.companion.android.common.data.prefs.WearPrefsRepository
+@@ -159,8 +160,14 @@ abstract class DataModule {
+ 
+     @Binds
+     @Singleton
++    @Named("keyChainRepository")
+     abstract fun bindKeyChainRepository(keyChainRepository: KeyChainRepositoryImpl): KeyChainRepository
+ 
++    @Binds
++    @Singleton
++    @Named("keyStore")
++    abstract fun bindKeyStore(keyStore: KeyStoreRepositoryImpl): KeyChainRepository
++
+     @Binds
+     @Singleton
+     abstract fun bindServerManager(serverManager: ServerManagerImpl): ServerManager
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/data/TLSHelper.kt b/common/src/main/java/io/homeassistant/companion/android/common/data/TLSHelper.kt
+index 713f8e2373e..34ff2588e84 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/common/data/TLSHelper.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/common/data/TLSHelper.kt
+@@ -9,12 +9,16 @@ import java.security.Principal
+ import java.security.PrivateKey
+ import java.security.cert.X509Certificate
+ import javax.inject.Inject
++import javax.inject.Named
+ import javax.net.ssl.SSLContext
+ import javax.net.ssl.TrustManagerFactory
+ import javax.net.ssl.X509ExtendedKeyManager
+ import javax.net.ssl.X509TrustManager
+ 
+-class TLSHelper @Inject constructor(private val keyChainRepository: KeyChainRepository) {
++class TLSHelper @Inject constructor(
++    @Named("keyChainRepository") private val keyChainRepository: KeyChainRepository,
++    @Named("keyStore") private val keyStore: KeyChainRepository
++) {
+ 
+     fun setupOkHttpClientSSLSocketFactory(builder: OkHttpClient.Builder) {
+         val trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+@@ -64,7 +68,7 @@ class TLSHelper @Inject constructor(private val keyChainRepository: KeyChainRepo
+ 
+                 // block until a chain is provided via the TLSWebView
+                 runBlocking {
+-                    chain = keyChainRepository.getCertificateChain()
++                    chain = keyChainRepository.getCertificateChain() ?: keyStore.getCertificateChain()
+                 }
+ 
+                 return chain
+@@ -75,7 +79,7 @@ class TLSHelper @Inject constructor(private val keyChainRepository: KeyChainRepo
+ 
+                 // block until a key is provided via the TLSWebView
+                 runBlocking {
+-                    key = keyChainRepository.getPrivateKey()
++                    key = keyChainRepository.getPrivateKey() ?: keyStore.getPrivateKey()
+                 }
+ 
+                 return key
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/data/keychain/KeyChainRepository.kt b/common/src/main/java/io/homeassistant/companion/android/common/data/keychain/KeyChainRepository.kt
+index 10e85e804b9..acf09438d83 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/common/data/keychain/KeyChainRepository.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/common/data/keychain/KeyChainRepository.kt
+@@ -12,6 +12,8 @@ interface KeyChainRepository {
+ 
+     suspend fun load(context: Context)
+ 
++    suspend fun setData(alias: String, privateKey: PrivateKey, certificateChain: Array<X509Certificate>)
++
+     fun getAlias(): String?
+ 
+     fun getPrivateKey(): PrivateKey?
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/data/keychain/KeyChainRepositoryImpl.kt b/common/src/main/java/io/homeassistant/companion/android/common/data/keychain/KeyChainRepositoryImpl.kt
+index ce6dd5b2f41..8dad643d6dc 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/common/data/keychain/KeyChainRepositoryImpl.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/common/data/keychain/KeyChainRepositoryImpl.kt
+@@ -6,6 +6,7 @@ import android.util.Log
+ import io.homeassistant.companion.android.common.data.prefs.PrefsRepository
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.withContext
++import java.lang.UnsupportedOperationException
+ import java.security.PrivateKey
+ import java.security.cert.X509Certificate
+ import javax.inject.Inject
+@@ -40,6 +41,10 @@ class KeyChainRepositoryImpl @Inject constructor(
+         doLoad(context)
+     }
+ 
++    override suspend fun setData(alias: String, privateKey: PrivateKey, certificateChain: Array<X509Certificate>) {
++        throw UnsupportedOperationException("setData not supported for KeyChainRepositoryImpl")
++    }
++
+     override fun getAlias(): String? {
+         return alias
+     }
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/data/keychain/KeyStoreRepositoryImpl.kt b/common/src/main/java/io/homeassistant/companion/android/common/data/keychain/KeyStoreRepositoryImpl.kt
+new file mode 100644
+index 00000000000..a55f7316f2c
+--- /dev/null
++++ b/common/src/main/java/io/homeassistant/companion/android/common/data/keychain/KeyStoreRepositoryImpl.kt
+@@ -0,0 +1,106 @@
++package io.homeassistant.companion.android.common.data.keychain
++
++import android.content.Context
++import android.util.Log
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import java.security.KeyStore
++import java.security.KeyStore.PrivateKeyEntry
++import java.security.PrivateKey
++import java.security.cert.X509Certificate
++import javax.inject.Inject
++
++class KeyStoreRepositoryImpl @Inject constructor() : KeyChainRepository {
++    companion object {
++        private const val TAG = "KeyStoreRepository"
++        const val ALIAS = "TLSClientCertificate"
++    }
++
++    private var alias: String? = null
++    private var key: PrivateKey? = null
++    private var chain: Array<X509Certificate>? = null
++
++    override suspend fun clear() {
++        // intentionally left empty
++    }
++
++    override suspend fun load(context: Context, alias: String) = withContext(Dispatchers.IO) {
++        this@KeyStoreRepositoryImpl.alias = alias
++        doLoad()
++    }
++
++    override suspend fun load(context: Context) {
++        throw IllegalArgumentException("Key alias cannot be null.")
++    }
++
++    override suspend fun setData(alias: String, privateKey: PrivateKey, certificateChain: Array<X509Certificate>) = withContext(Dispatchers.IO) {
++        // clear state
++        this@KeyStoreRepositoryImpl.alias = null
++        this@KeyStoreRepositoryImpl.key = null
++        this@KeyStoreRepositoryImpl.chain = null
++
++        // store and load certificate to/from KeyStore
++        doStore(alias, privateKey, certificateChain)
++        this@KeyStoreRepositoryImpl.alias = alias
++        doLoad()
++    }
++
++    override fun getAlias(): String? {
++        return alias
++    }
++
++    override fun getPrivateKey(): PrivateKey? {
++        return key
++    }
++
++    override fun getCertificateChain(): Array<X509Certificate>? {
++        return chain
++    }
++
++    @Synchronized
++    private fun doLoad() {
++        if (alias != null && alias?.isNotEmpty() == true) {
++            val aks = KeyStore.getInstance("AndroidKeyStore").apply {
++                load(null)
++                if (!containsAlias(alias)) return
++            }
++            val entry = try {
++                aks.getEntry(alias, null) as PrivateKeyEntry
++            } catch (e: Exception) {
++                Log.e(TAG, "Exception getting KeyStore.Entry", e)
++                null
++            }
++            if (entry != null) {
++                if (chain == null) {
++                    chain = try {
++                        @Suppress("UNCHECKED_CAST")
++                        entry.certificateChain as Array<X509Certificate>
++                    } catch (e: Exception) {
++                        Log.e(TAG, "Exception getting certificate chain", e)
++                        null
++                    }
++                }
++                if (key == null) {
++                    key = try {
++                        entry.privateKey
++                    } catch (e: Exception) {
++                        Log.e(TAG, "Exception getting private key", e)
++                        null
++                    }
++                }
++            }
++        }
++    }
++
++    @Synchronized
++    private fun doStore(alias: String, key: PrivateKey, chain: Array<X509Certificate>) {
++        try {
++            KeyStore.getInstance("AndroidKeyStore").apply {
++                load(null)
++                setEntry(alias, PrivateKeyEntry(key, chain), null)
++            }
++        } catch (e: Exception) {
++            Log.e(TAG, "Exception storing KeyStore.Entry", e)
++        }
++    }
++}
+diff --git a/common/src/main/res/values/strings.xml b/common/src/main/res/values/strings.xml
+index bb460d188e7..95179839823 100644
+--- a/common/src/main/res/values/strings.xml
++++ b/common/src/main/res/values/strings.xml
+@@ -490,6 +490,8 @@
+     <string name="other_settings">Other settings</string>
+     <string name="other">Other</string>
+     <string name="password">Password</string>
++    <string name="password_correct">Correct password</string>
++    <string name="password_incorrect">Incorrect password</string>
+     <string name="permission_explanation_calls">In order to track incoming and outgoing call\'s occurrence we need access to your phone state. No phone numbers or other call details will be stored.</string>
+     <string name="permission_explanation">In order to use location tracking features or different connection urls based on WiFi SSID we need access to your location. If you want consistent background updates you will also need to allow background processing</string>
+     <string name="persistent_notification">Persistent notification</string>
+@@ -551,6 +553,7 @@
+     <string name="security">Security</string>
+     <string name="select">Select</string>
+     <string name="select_entity_to_display">Select entity to display</string>
++    <string name="select_file">Select file</string>
+     <string name="select_instance">Select your Home Assistant server</string>
+     <string name="sensor_description_active_notification_count">Total count of active notifications that are visible to the user including silent, persistent and the Sensor Worker notifications.</string>
+     <string name="sensor_description_app_importance">If the app is in the foreground, background or any other state it can be</string>
+@@ -1093,6 +1096,8 @@
+     <string name="tls_cert_title">TLS client certificate error</string>
+     <string name="tls_cert_not_found_message">The remote site requires a client certificate.\nPlease install the required credential on your phone and try again.</string>
+     <string name="tls_cert_expired_message">The certificate is not yet or no longer valid.\nPlease install a new credential on your phone and try again.</string>
++    <string name="tls_cert_onboarding_description">If your Home Assistant instance requires TLS client certificate authentication, select a TLS client certificate file to install it on your Wear OS device.</string>
++    <string name="tls_cert_onboarding_title">TLS client certificate</string>
+     <string name="basic_sensor_name_battery_power">Battery power</string>
+     <string name="widget_checkbox_require_authentication">Require authentication</string>
+     <string name="widget_error_authenticating">Error authenticating - is an authentication method configured?</string>
+diff --git a/wear/src/main/java/io/homeassistant/companion/android/HomeAssistantApplication.kt b/wear/src/main/java/io/homeassistant/companion/android/HomeAssistantApplication.kt
+index 2d0297475ee..31df51a82da 100644
+--- a/wear/src/main/java/io/homeassistant/companion/android/HomeAssistantApplication.kt
++++ b/wear/src/main/java/io/homeassistant/companion/android/HomeAssistantApplication.kt
+@@ -11,14 +11,32 @@ import android.nfc.NfcAdapter
+ import android.os.Build
+ import android.os.PowerManager
+ import dagger.hilt.android.HiltAndroidApp
++import io.homeassistant.companion.android.common.data.keychain.KeyChainRepository
++import io.homeassistant.companion.android.common.data.keychain.KeyStoreRepositoryImpl
+ import io.homeassistant.companion.android.complications.ComplicationReceiver
+ import io.homeassistant.companion.android.sensors.SensorReceiver
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.launch
++import javax.inject.Inject
++import javax.inject.Named
+ 
+ @HiltAndroidApp
+ open class HomeAssistantApplication : Application() {
++    private val ioScope: CoroutineScope = CoroutineScope(Dispatchers.IO + Job())
++
++    @Inject
++    @Named("keyStore")
++    lateinit var keyStore: KeyChainRepository
++
+     override fun onCreate() {
+         super.onCreate()
+ 
++        ioScope.launch {
++            keyStore.load(applicationContext, KeyStoreRepositoryImpl.ALIAS)
++        }
++
+         val sensorReceiver = SensorReceiver()
+         // This will cause the sensor to be updated every time the OS broadcasts that a cable was plugged/unplugged.
+         // This should be nearly instantaneous allowing automations to fire immediately when a phone is plugged
+diff --git a/wear/src/main/java/io/homeassistant/companion/android/phone/PhoneSettingsListener.kt b/wear/src/main/java/io/homeassistant/companion/android/phone/PhoneSettingsListener.kt
+index 6ad8bfefc55..17ee1c147fc 100755
+--- a/wear/src/main/java/io/homeassistant/companion/android/phone/PhoneSettingsListener.kt
++++ b/wear/src/main/java/io/homeassistant/companion/android/phone/PhoneSettingsListener.kt
+@@ -18,6 +18,8 @@ import com.google.android.gms.wearable.WearableListenerService
+ import dagger.hilt.android.AndroidEntryPoint
+ import io.homeassistant.companion.android.BuildConfig
+ import io.homeassistant.companion.android.common.data.integration.DeviceRegistration
++import io.homeassistant.companion.android.common.data.keychain.KeyChainRepository
++import io.homeassistant.companion.android.common.data.keychain.KeyStoreRepositoryImpl
+ import io.homeassistant.companion.android.common.data.prefs.WearPrefsRepository
+ import io.homeassistant.companion.android.common.data.servers.ServerManager
+ import io.homeassistant.companion.android.common.util.WearDataMessages
+@@ -42,7 +44,11 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.tasks.await
++import java.security.KeyStore
++import java.security.PrivateKey
++import java.security.cert.X509Certificate
+ import javax.inject.Inject
++import javax.inject.Named
+ 
+ @AndroidEntryPoint
+ @SuppressLint("VisibleForTests") // https://issuetracker.google.com/issues/239451111
+@@ -57,6 +63,14 @@ class PhoneSettingsListener : WearableListenerService(), DataClient.OnDataChange
+     @Inject
+     lateinit var favoritesDao: FavoritesDao
+ 
++    @Inject
++    @Named("keyChainRepository")
++    lateinit var keyChainRepository: KeyChainRepository
++
++    @Inject
++    @Named("keyStore")
++    lateinit var keyStore: KeyChainRepository
++
+     private val mainScope: CoroutineScope = CoroutineScope(Dispatchers.Main + Job())
+ 
+     private val objectMapper = jacksonObjectMapper()
+@@ -135,6 +149,24 @@ class PhoneSettingsListener : WearableListenerService(), DataClient.OnDataChange
+             val deviceName = dataMap.getString("DeviceName")
+             val deviceTrackingEnabled = dataMap.getBoolean("LocationTracking")
+             val notificationsEnabled = dataMap.getBoolean("Notifications")
++            val tlsClientCertificateData = dataMap.getByteArray("TLSClientCertificateData")
++            val tlsClientCertificatePassword = dataMap.getString("TLSClientCertificatePassword").orEmpty().toCharArray()
++
++            // load TLS key
++            if (tlsClientCertificateData != null && tlsClientCertificateData.isNotEmpty()) {
++                KeyStore.getInstance("PKCS12").apply {
++                    load(tlsClientCertificateData.inputStream(), tlsClientCertificatePassword)
++
++                    val alias = aliases().nextElement()
++                    val certificateChain = getCertificateChain(alias).filterIsInstance<X509Certificate>().toTypedArray()
++                    val privateKey = getKey(alias, tlsClientCertificatePassword) as PrivateKey
++
++                    // we store the TLS Client key under a static alias because there is currently
++                    // no way to ask the user for the correct alias
++                    keyStore.setData(KeyStoreRepositoryImpl.ALIAS, privateKey, certificateChain)
++                    keyChainRepository.load(applicationContext)
++                }
++            }
+ 
+             val formattedUrl = UrlUtil.formattedUrlString(url)
+             val server = Server(

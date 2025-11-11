@@ -1,0 +1,145 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/browser/CardBrowserFragment.kt b/AnkiDroid/src/main/java/com/ichi2/anki/browser/CardBrowserFragment.kt
+index 0ee898bc3158..892574b7c38c 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/browser/CardBrowserFragment.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/browser/CardBrowserFragment.kt
+@@ -52,6 +52,7 @@ import com.ichi2.anki.launchCatchingTask
+ import com.ichi2.anki.observability.ChangeManager
+ import com.ichi2.anki.snackbar.showSnackbar
+ import com.ichi2.anki.ui.attachFastScroller
++import com.ichi2.anki.utils.ext.visibleItemPositions
+ import com.ichi2.utils.HandlerUtils
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.launch
+@@ -72,6 +73,10 @@ class CardBrowserFragment :
+     @VisibleForTesting
+     lateinit var cardsListView: RecyclerView
+ 
++    /** LayoutManager for [cardsListView] */
++    val layoutManager: LinearLayoutManager
++        get() = cardsListView.layoutManager as LinearLayoutManager
++
+     @VisibleForTesting
+     lateinit var browserColumnHeadings: ViewGroup
+ 
+@@ -144,9 +149,26 @@ class CardBrowserFragment :
+             // update adapter to remove check boxes
+             cardsAdapter.notifyDataSetChanged()
+             if (modeChange is SingleSelectCause.DeselectRow) {
++                cardsAdapter.notifyDataSetChanged()
+                 autoScrollTo(modeChange.selection)
+             } else if (modeChange is MultiSelectCause.RowSelected) {
++                cardsAdapter.notifyDataSetChanged()
+                 autoScrollTo(modeChange.selection)
++            } else if (modeChange is SingleSelectCause && !modeChange.previouslySelectedRowIds.isNullOrEmpty()) {
++                // if any visible rows are selected, anchor on the first row
++
++                // obtain the offset of the row before we call notifyDataSetChanged
++                val rowPositionAndOffset =
++                    try {
++                        val visibleRowIds = layoutManager.visibleItemPositions.map { viewModel.getRowAtPosition(it) }
++                        val firstVisibleRowId = visibleRowIds.firstOrNull { modeChange.previouslySelectedRowIds!!.contains(it) }
++                        firstVisibleRowId?.let { firstVisibleRowId.toRowSelection() }
++                    } catch (e: Exception) {
++                        Timber.w(e)
++                        null
++                    }
++                cardsAdapter.notifyDataSetChanged()
++                rowPositionAndOffset?.let { autoScrollTo(it) }
+             }
+         }
+ 
+@@ -276,7 +298,6 @@ class CardBrowserFragment :
+         }
+ 
+     private fun calculateTopOffset(cardPosition: Int): Int {
+-        val layoutManager = cardsListView.layoutManager as LinearLayoutManager
+         val firstVisiblePosition = layoutManager.findFirstVisibleItemPosition()
+         val view = cardsListView.getChildAt(cardPosition - firstVisiblePosition)
+         return view?.top ?: 0
+@@ -284,7 +305,7 @@ class CardBrowserFragment :
+ 
+     private fun autoScrollTo(rowSelection: RowSelection) {
+         val newPosition = viewModel.getPositionOfId(rowSelection.rowId) ?: return
+-        (cardsListView.layoutManager as LinearLayoutManager).scrollToPositionWithOffset(newPosition, rowSelection.topOffset)
++        layoutManager.scrollToPositionWithOffset(newPosition, rowSelection.topOffset)
+     }
+ 
+     private fun CardOrNoteId.toRowSelection() =
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/browser/CardBrowserViewModel.kt b/AnkiDroid/src/main/java/com/ichi2/anki/browser/CardBrowserViewModel.kt
+index 92653a473cad..08c99eae712f 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/browser/CardBrowserViewModel.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/browser/CardBrowserViewModel.kt
+@@ -598,8 +598,12 @@ class CardBrowserViewModel(
+     fun selectNone(): Job? {
+         if (_selectedRows.isEmpty()) return null
+         Timber.d("selecting none")
++        val removalReason =
++            SingleSelectCause.Other.apply {
++                this.previouslySelectedRowIds = _selectedRows.toSet()
++            }
+         _selectedRows.clear()
+-        return onRemoveSelectedRows(disableMultiSelectIfEmpty = false, reason = SingleSelectCause.Other)
++        return onRemoveSelectedRows(disableMultiSelectIfEmpty = false, reason = removalReason)
+     }
+ 
+     /**
+@@ -1075,6 +1079,7 @@ class CardBrowserViewModel(
+      * Turn off [Multi-Select Mode][isInMultiSelectMode] and return to normal state
+      */
+     fun endMultiSelectMode(reason: SingleSelectCause) {
++        reason.previouslySelectedRowIds = _selectedRows.toSet()
+         _selectedRows.clear()
+         flowOfMultiSelectModeChanged.value = reason
+     }
+@@ -1286,6 +1291,8 @@ class CardBrowserViewModel(
+             data object NavigateBack : SingleSelectCause()
+ 
+             data object Other : SingleSelectCause()
++
++            var previouslySelectedRowIds: Set<CardOrNoteId>? = null
+         }
+ 
+         sealed class MultiSelectCause : ChangeMultiSelectMode() {
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/utils/ext/LinearLayoutManager.kt b/AnkiDroid/src/main/java/com/ichi2/anki/utils/ext/LinearLayoutManager.kt
+new file mode 100644
+index 000000000000..6127d65dd8ca
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/utils/ext/LinearLayoutManager.kt
+@@ -0,0 +1,37 @@
++/*
++ *  Copyright (c) 2025 David Allison <davidallisongithub@gmail.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify it under
++ *  the terms of the GNU General Public License as published by the Free Software
++ *  Foundation; either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++ *  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with
++ *  this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package com.ichi2.anki.utils.ext
++
++import androidx.recyclerview.widget.LinearLayoutManager
++import androidx.recyclerview.widget.RecyclerView
++
++/**
++ * Returns range of adapter positions of the visible items.
++ *
++ * This position does not include adapter changes that were dispatched after the last layout pass.
++ *
++ * Returns [IntRange.EMPTY] if the [LinearLayoutManager] contains no items.
++ */
++val LinearLayoutManager.visibleItemPositions: IntRange
++    get() {
++        val first = findFirstVisibleItemPosition()
++        val last = findLastVisibleItemPosition()
++        if (first == RecyclerView.NO_POSITION || last == RecyclerView.NO_POSITION) {
++            return IntRange.EMPTY
++        }
++        return first..last
++    }

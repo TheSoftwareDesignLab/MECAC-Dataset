@@ -1,0 +1,453 @@
+diff --git a/android-components/components/service/nimbus/messaging.fml.yaml b/android-components/components/service/nimbus/messaging.fml.yaml
+index 734fd0bda7f7..639bac1320e5 100644
+--- a/android-components/components/service/nimbus/messaging.fml.yaml
++++ b/android-components/components/service/nimbus/messaging.fml.yaml
+@@ -133,13 +133,20 @@ objects:
+           The surface identifier for this message.
+         type: SurfaceName
+         default: homescreen
+-      trigger:
++      trigger-if-all:
+         type: List<TriggerName>
+         description: >
+           A list of strings corresponding to
+           targeting expressions. The message will be
+-          shown if all expressions `true`.
++          shown if all expressions are `true`.
+         default: []
++      exclude-if-any:
++        type: List<TriggerName>
++        description: >
++          A list of strings corresponding to
++          targeting expressions. The message will not be
++          shown if any of the expressions are `true`.
++        default: [ ]
+   StyleData:
+     description: >
+       A group of properties (predominantly visual) to
+diff --git a/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/Message.kt b/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/Message.kt
+index 58a959d9390d..46aa647c92b3 100644
+--- a/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/Message.kt
++++ b/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/Message.kt
+@@ -7,15 +7,20 @@ package mozilla.components.service.nimbus.messaging
+ import androidx.annotation.VisibleForTesting
+ 
+ /**
+- * A data class that holds a representation of GleanPlum message from Nimbus.
++ * A data class that holds a representation of a message from Nimbus.
++ *
++ * In order to be eligible to be shown, all `triggerIfAll` expressions
++ * AND none of the `excludeIfAny` expressions must evaluate to `true`.
+  *
+  * @param id identifies a message as unique.
+  * @param data Data information provided from Nimbus.
+  * @param action A strings that represents which action should be performed
+  * after a message is clicked.
+  * @param style Indicates how a message should be styled.
+- * @param triggers A list of strings corresponding to targeting expressions. The message
+- * will be shown if all expressions `true`.
++ * @param triggerIfAll A list of strings corresponding to JEXL targeting expressions. The message
++ * will be shown if _all_ expressions evaluate to `true`.
++ * @param excludeIfAny A list of strings corresponding to JEXL targeting expressions. The message
++ * will _not_ be shown if _any_ expressions evaluate to `true`.
+  * @param metadata Metadata that help to identify if a message should shown.
+  */
+ data class Message(
+@@ -23,7 +28,8 @@ data class Message(
+     internal val data: MessageData,
+     internal val action: String,
+     internal val style: StyleData,
+-    internal val triggers: List<String>,
++    internal val triggerIfAll: List<String>,
++    internal val excludeIfAny: List<String> = listOf(),
+     internal val metadata: Metadata,
+ ) {
+     val text: String
+diff --git a/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorage.kt b/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorage.kt
+index d2337bbd595e..b24d8a45a83a 100644
+--- a/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorage.kt
++++ b/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorage.kt
+@@ -91,8 +91,10 @@ class NimbusMessagingStorage(
+             "CONTROL_ACTION"
+         }
+ 
+-        val trigger = sanitizeTriggers(message.trigger, featureValue.triggers) ?: return null
++        val triggerIfAll = sanitizeTriggers(message.triggerIfAll, featureValue.triggers) ?: return null
++        val excludeIfAny = sanitizeTriggers(message.excludeIfAny, featureValue.triggers) ?: return null
+         val style = sanitizeStyle(message.style, featureValue.styles) ?: return null
++
+         val storageMetadata = metadataStorage.getMetadata()
+ 
+         return Message(
+@@ -100,8 +102,9 @@ class NimbusMessagingStorage(
+             data = message,
+             action = action,
+             style = style,
++            triggerIfAll = triggerIfAll,
++            excludeIfAny = excludeIfAny,
+             metadata = storageMetadata[key] ?: addMetadata(key),
+-            triggers = trigger,
+         )
+     }
+ 
+@@ -178,7 +181,14 @@ class NimbusMessagingStorage(
+     ): Message? {
+         val message = availableMessages
+             .filter { !excluded.contains(it.id) }
+-            .firstOrNull { isMessageEligible(it, helper) } ?: return null
++            .firstOrNull {
++                try {
++                    isMessageEligible(it, helper)
++                } catch (e: NimbusException) {
++                    reportMalformedMessage(it.id)
++                    false
++                }
++            } ?: return null
+ 
+         // If this is an experimental message, but not a placebo, then just return the message.
+         if (!message.data.isControl) {
+@@ -319,21 +329,29 @@ class NimbusMessagingStorage(
+         message: Message,
+         helper: NimbusMessagingHelperInterface,
+     ): Boolean {
+-        return message.triggers.all { condition ->
+-            try {
+-                if (malFormedMap.containsKey(condition)) {
+-                    return false
+-                }
+-                helper.evalJexl(condition)
+-            } catch (e: NimbusException.EvaluationException) {
+-                reportMalformedMessage(message.id)
+-                malFormedMap[condition] = message.id
+-                logger.info("Unable to evaluate $condition")
+-                false
+-            }
++        return message.triggerIfAll.all { condition ->
++            evalJexl(message, helper, condition)
++        } && !message.excludeIfAny.any { condition ->
++            evalJexl(message, helper, condition)
+         }
+     }
+ 
++    private fun evalJexl(
++        message: Message,
++        helper: NimbusMessagingHelperInterface,
++        condition: String,
++    ): Boolean =
++        try {
++            if (malFormedMap.containsKey(condition)) {
++                throw NimbusException.EvaluationException(condition)
++            }
++            helper.evalJexl(condition)
++        } catch (e: NimbusException) {
++            malFormedMap[condition] = message.id
++            logger.info("Unable to evaluate ${message.id} trigger: $condition")
++            throw NimbusException.EvaluationException(condition)
++        }
++
+     @VisibleForTesting
+     internal fun getOnControlBehavior(): ControlMessageBehavior = messagingFeature.value().onControl
+ 
+diff --git a/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingControllerTest.kt b/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingControllerTest.kt
+index be17d6405b47..e956b4269bea 100644
+--- a/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingControllerTest.kt
++++ b/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingControllerTest.kt
+@@ -273,7 +273,8 @@ class NimbusMessagingControllerTest {
+             data = messageData,
+             style = style,
+             metadata = Message.Metadata(id, displayCount),
+-            triggers = emptyList(),
++            triggerIfAll = emptyList(),
++            excludeIfAny = emptyList(),
+             action = action,
+         )
+ }
+diff --git a/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorageTest.kt b/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorageTest.kt
+index 08f081e9f185..3ff19ef91248 100644
+--- a/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorageTest.kt
++++ b/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorageTest.kt
+@@ -16,6 +16,7 @@ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertNotNull
+ import org.junit.Assert.assertNull
++import org.junit.Assert.assertThrows
+ import org.junit.Assert.assertTrue
+ import org.junit.Before
+ import org.junit.Rule
+@@ -427,7 +428,7 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             mock(),
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         `when`(helper.evalJexl(any())).thenReturn(true)
+@@ -455,18 +456,18 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             mock(),
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         `when`(helper.evalJexl(any())).then { throw NimbusException.EvaluationException("") }
+ 
+-        val result = storage.isMessageEligible(message, helper)
+-
+-        assertFalse(result)
++        assertThrows(NimbusException.EvaluationException::class.java) {
++            storage.isMessageEligible(message, helper)
++        }
+     }
+ 
+     @Test
+-    fun `GIVEN a previously malformed trigger WHEN calling isMessageEligible THEN return false and not evaluate`() {
++    fun `GIVEN a previously malformed trigger WHEN calling isMessageEligible THEN throw and not evaluate`() {
+         val helper: NimbusMessagingHelperInterface = mock()
+         val message = Message(
+             "same-id",
+@@ -474,22 +475,22 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             mock(),
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         storage.malFormedMap["trigger"] = "same-id"
+ 
+         `when`(helper.evalJexl(any())).then { throw NimbusException.EvaluationException("") }
+ 
+-        val result = storage.isMessageEligible(message, helper)
++        assertThrows(NimbusException.EvaluationException::class.java) {
++            storage.isMessageEligible(message, helper)
++        }
+ 
+-        assertFalse(result)
+         verify(helper, never()).evalJexl("trigger")
+-        assertFalse(malformedWasReported)
+     }
+ 
+     @Test
+-    fun `GIVEN a non previously malformed trigger WHEN calling isMessageEligible THEN return false and not evaluate`() {
++    fun `GIVEN a non previously malformed trigger WHEN calling isMessageEligible THEN throw and not evaluate`() {
+         val helper: NimbusMessagingHelperInterface = mock()
+         val message = Message(
+             "same-id",
+@@ -497,18 +498,18 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             mock(),
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         `when`(helper.evalJexl(any())).then { throw NimbusException.EvaluationException("") }
+ 
+         assertFalse(storage.malFormedMap.containsKey("trigger"))
+ 
+-        val result = storage.isMessageEligible(message, helper)
++        assertThrows(NimbusException.EvaluationException::class.java) {
++            storage.isMessageEligible(message, helper)
++        }
+ 
+-        assertFalse(result)
+         assertTrue(storage.malFormedMap.containsKey("trigger"))
+-        assertTrue(malformedWasReported)
+     }
+ 
+     @Test
+@@ -520,7 +521,7 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             mock(),
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         doReturn(false).`when`(spiedStorage).isMessageEligible(any(), any())
+@@ -539,7 +540,7 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             style = displayOnceStyle,
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         doReturn(true).`when`(spiedStorage).isMessageEligible(any(), any())
+@@ -561,7 +562,7 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             style = displayOnceStyle,
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         doReturn(true).`when`(spiedStorage).isMessageEligible(any(), any())
+@@ -589,7 +590,7 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             style = displayOnceStyle,
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         val controlMessage = Message(
+@@ -598,7 +599,7 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             style = displayOnceStyle,
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         doReturn(true).`when`(spiedStorage).isMessageEligible(any(), any())
+@@ -627,7 +628,7 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             style = displayOnceStyle,
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         val controlMessage = Message(
+@@ -636,7 +637,7 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             style = displayOnceStyle,
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         doReturn(true).`when`(spiedStorage).isMessageEligible(any(), any())
+@@ -667,7 +668,7 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             style = displayOnceStyle,
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         val incorrectMessage = Message(
+@@ -676,7 +677,7 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             style = displayOnceStyle,
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         val controlMessage = Message(
+@@ -685,7 +686,7 @@ class NimbusMessagingStorageTest {
+             action = "action",
+             style = displayOnceStyle,
+             listOf("trigger"),
+-            Message.Metadata("same-id"),
++            metadata = Message.Metadata("same-id"),
+         )
+ 
+         doReturn(true).`when`(spiedStorage).isMessageEligible(any(), any())
+@@ -800,7 +801,7 @@ class NimbusMessagingStorageTest {
+     ) = MessageData(
+         action = Res.string(action),
+         style = style,
+-        trigger = triggers,
++        triggerIfAll = triggers,
+         surface = surface,
+         isControl = isControl,
+         text = Res.string(text),
+diff --git a/fenix/app/messaging-evergreen-messages.fml.yaml b/fenix/app/messaging-evergreen-messages.fml.yaml
+index 36e7d2b15ba1..3c63e3ed90fb 100644
+--- a/fenix/app/messaging-evergreen-messages.fml.yaml
++++ b/fenix/app/messaging-evergreen-messages.fml.yaml
+@@ -29,9 +29,10 @@ import:
+                 text: default_browser_experiment_card_text
+                 surface: homescreen
+                 action: "MAKE_DEFAULT_BROWSER"
+-                trigger:
+-                  - I_AM_NOT_DEFAULT_BROWSER
++                trigger-if-all:
+                   - USER_ESTABLISHED_INSTALL
++                exclude-if-any:
++                  - I_AM_DEFAULT_BROWSER
+                 style: PERSISTENT
+                 button-label: preferences_set_as_default_browser
+ 
+@@ -47,7 +48,8 @@ import:
+                 text: nimbus_notification_default_browser_text
+                 surface: notification
+                 style: NOTIFICATION
+-                trigger:
+-                  - I_AM_NOT_DEFAULT_BROWSER
++                trigger-if-all:
+                   - DAY_3_AFTER_INSTALL
++                exclude-if-any:
++                  - I_AM_DEFAULT_BROWSER
+                 action: MAKE_DEFAULT_BROWSER
+diff --git a/fenix/app/src/androidTest/java/org/mozilla/fenix/ui/NimbusMessagingHomescreenTest.kt b/fenix/app/src/androidTest/java/org/mozilla/fenix/ui/NimbusMessagingHomescreenTest.kt
+index 3fcdeaf4e12f..f71784acc59c 100644
+--- a/fenix/app/src/androidTest/java/org/mozilla/fenix/ui/NimbusMessagingHomescreenTest.kt
++++ b/fenix/app/src/androidTest/java/org/mozilla/fenix/ui/NimbusMessagingHomescreenTest.kt
+@@ -66,7 +66,7 @@ class NimbusMessagingHomescreenTest {
+                         buttonLabel = Res.string(messageButtonLabel),
+                         text = Res.string(messageText),
+                         title = Res.string(messageTitle),
+-                        trigger = listOf("ALWAYS"),
++                        triggerIfAll = listOf("ALWAYS"),
+                     ),
+                 ),
+                 styles = mapOf(
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/components/AppStoreTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/components/AppStoreTest.kt
+index 78d0fabae938..cfd2e2876689 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/components/AppStoreTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/components/AppStoreTest.kt
+@@ -113,6 +113,7 @@ class AppStoreTest {
+                 "action",
+                 mockk(),
+                 emptyList(),
++                emptyList(),
+                 mockk(),
+             )
+             appStore.dispatch(UpdateMessageToShow(message)).join()
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/messaging/DefaultMessageControllerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/messaging/DefaultMessageControllerTest.kt
+index 35d5d8b48804..d94c96dfc40d 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/messaging/DefaultMessageControllerTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/messaging/DefaultMessageControllerTest.kt
+@@ -69,7 +69,8 @@ class DefaultMessageControllerTest {
+         data = data,
+         style = mockk(relaxed = true),
+         action = "action",
+-        triggers = emptyList(),
++        triggerIfAll = emptyList(),
++        excludeIfAny = emptyList(),
+         metadata = Message.Metadata(
+             id = "id",
+             displayCount = 0,
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/messaging/state/MessagingMiddlewareTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/messaging/state/MessagingMiddlewareTest.kt
+index b4f72cd14afc..88b9161583e4 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/messaging/state/MessagingMiddlewareTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/messaging/state/MessagingMiddlewareTest.kt
+@@ -355,7 +355,8 @@ private fun createMessage(
+     action: String = "action",
+     styleData: StyleData = StyleData(),
+     triggers: List<String> = listOf("triggers"),
+-) = Message(messageId, data, action, styleData, triggers, metadata)
++    except: List<String> = listOf(),
++) = Message(messageId, data, action, styleData, triggers, except, metadata)
+ 
+ private fun createMetadata(
+     displayCount: Int = 0,
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/messaging/state/MessagingReducerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/messaging/state/MessagingReducerTest.kt
+index dbb111eb4339..43d1f44e9473 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/messaging/state/MessagingReducerTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/messaging/state/MessagingReducerTest.kt
+@@ -52,7 +52,7 @@ class MessagingReducerTest {
+             data = MessageData(surface = surface),
+             action = action,
+             style = StyleData(),
+-            triggers = listOf(),
++            triggerIfAll = listOf(),
+             metadata = Message.Metadata(id = id),
+         )
+ 

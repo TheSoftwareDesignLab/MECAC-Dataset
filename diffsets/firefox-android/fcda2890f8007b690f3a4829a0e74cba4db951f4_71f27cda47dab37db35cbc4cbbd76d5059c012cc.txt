@@ -1,0 +1,773 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/Core.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/Core.kt
+index 42dbc4e8328d..0e4169a6d070 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/Core.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/Core.kt
+@@ -49,6 +49,12 @@ class Core(private val context: Context) {
+             .crashHandler(CrashHandlerService::class.java)
+             .build()
+ 
++        val fontSize = Settings.getInstance(context).fontSizeFactor
++        if (fontSize != 1f) {
++            runtimeSettings.automaticFontSizeAdjustment = false
++            runtimeSettings.fontSizeFactor = fontSize
++        }
++
+         GeckoRuntime.create(context, runtimeSettings)
+     }
+ 
+@@ -65,7 +71,8 @@ class Core(private val context: Context) {
+             testingModeEnabled = false,
+             trackingProtectionPolicy = createTrackingProtectionPolicy(),
+             historyTrackingDelegate = HistoryDelegate(historyStorage),
+-            preferredColorScheme = getPreferredColorScheme()
++            preferredColorScheme = getPreferredColorScheme(),
++            automaticFontSizeAdjustment = Settings.getInstance(context).fontSizeFactor == 1f
+         )
+ 
+         GeckoEngine(context, defaultSettings, runtime)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/AccessibilityFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/AccessibilityFragment.kt
+index 46721e1f6490..0e400bd330ee 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/AccessibilityFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/AccessibilityFragment.kt
+@@ -6,18 +6,33 @@ package org.mozilla.fenix.settings
+ 
+ import android.os.Bundle
+ import androidx.appcompat.app.AppCompatActivity
++import androidx.preference.Preference
+ import androidx.preference.PreferenceFragmentCompat
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.utils.Settings
+ 
+ class AccessibilityFragment : PreferenceFragmentCompat() {
+-
+-    override fun onCreate(savedInstanceState: Bundle?) {
+-        super.onCreate(savedInstanceState)
++    override fun onResume() {
++        super.onResume()
+         (activity as AppCompatActivity).title = getString(R.string.preferences_accessibility)
+         (activity as AppCompatActivity).supportActionBar?.show()
++        val textSizePreference =
++            findPreference<PercentageSeekBarPreference>(getString(R.string.pref_key_accessibility_font_scale))
++        textSizePreference?.onPreferenceChangeListener =
++            Preference.OnPreferenceChangeListener { _, newValue ->
++                (newValue as? Int).let {
++                    val newTextScale = (newValue as Int).toFloat() / PERCENT_TO_DECIMAL
++                    Settings.getInstance(context!!).setFontSizeFactor(newTextScale)
++                }
++                true
++            }
+     }
+ 
+     override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+         setPreferencesFromResource(R.xml.accessibility_preferences, rootKey)
+     }
++
++    companion object {
++        const val PERCENT_TO_DECIMAL = 100f
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/PercentageSeekBarPreference.java b/fenix/app/src/main/java/org/mozilla/fenix/settings/PercentageSeekBarPreference.java
+new file mode 100644
+index 000000000000..1605b7e818d1
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/PercentageSeekBarPreference.java
+@@ -0,0 +1,517 @@
++package org.mozilla.fenix.settings;
++/*
++ * Copyright 2018 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import android.content.Context;
++import android.content.res.TypedArray;
++import android.os.Parcel;
++import android.os.Parcelable;
++import android.util.AttributeSet;
++import android.util.Log;
++import android.util.TypedValue;
++import android.view.KeyEvent;
++import android.view.View;
++import android.widget.SeekBar;
++import android.widget.SeekBar.OnSeekBarChangeListener;
++import android.widget.TextView;
++import androidx.preference.Preference;
++import androidx.preference.PreferenceViewHolder;
++import org.mozilla.fenix.R;
++
++import java.text.NumberFormat;
++
++/**
++ * Preference based on android.preference.SeekBarPreference but uses support preference as a base
++ * . It contains a title and a {@link SeekBar} and a SeekBar value {@link TextView} and an Example {@link TextView}.
++ * The actual preference layout is customizable by setting {@code android:layout} on the
++ * preference widget layout or {@code seekBarPreferenceStyle} attribute.
++ *
++ * <p>The {@link SeekBar} within the preference can be defined adjustable or not by setting {@code
++ * adjustable} attribute. If adjustable, the preference will be responsive to DPAD left/right keys.
++ * Otherwise, it skips those keys.
++ *
++ * <p>The {@link SeekBar} value view can be shown or disabled by setting {@code showSeekBarValue}
++ * attribute to true or false, respectively.
++ *
++ * <p>Other {@link SeekBar} specific attributes (e.g. {@code title, summary, defaultValue, min,
++ * max})
++ * can be set directly on the preference widget layout.
++ */
++public class PercentageSeekBarPreference extends Preference {
++    private static final String TAG = "SeekBarPreference";
++    @SuppressWarnings("WeakerAccess") /* synthetic access */
++            int mSeekBarValue;
++    @SuppressWarnings("WeakerAccess") /* synthetic access */
++            int mMin;
++    private int mMax;
++    private int mSeekBarIncrement;
++    @SuppressWarnings("WeakerAccess") /* synthetic access */
++            boolean mTrackingTouch;
++    @SuppressWarnings("WeakerAccess") /* synthetic access */
++            SeekBar mSeekBar;
++    private TextView mSeekBarValueTextView;
++    private TextView mExampleTextTextView;
++    // Whether the SeekBar should respond to the left/right keys
++    @SuppressWarnings("WeakerAccess") /* synthetic access */
++            boolean mAdjustable;
++    // Whether to show the SeekBar value TextView next to the bar
++    private boolean mShowSeekBarValue;
++    // Whether the SeekBarPreference should continuously save the Seekbar value while it is being
++    // dragged.
++    @SuppressWarnings("WeakerAccess") /* synthetic access */
++            boolean mUpdatesContinuously;
++    /**
++     * Listener reacting to the {@link SeekBar} changing value by the user
++     */
++    private OnSeekBarChangeListener mSeekBarChangeListener = new OnSeekBarChangeListener() {
++        @Override
++        public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
++            if (fromUser && (mUpdatesContinuously || !mTrackingTouch)) {
++                syncValueInternal(seekBar);
++            } else {
++                // We always want to update the text while the seekbar is being dragged
++                updateLabelValue(progress + mMin);
++                updateExampleTextValue(progress + mMin);
++            }
++        }
++
++        @Override
++        public void onStartTrackingTouch(SeekBar seekBar) {
++            mTrackingTouch = true;
++        }
++
++        @Override
++        public void onStopTrackingTouch(SeekBar seekBar) {
++            mTrackingTouch = false;
++            if (seekBar.getProgress() + mMin != mSeekBarValue) {
++                syncValueInternal(seekBar);
++            }
++        }
++    };
++
++    /**
++     * Listener reacting to the user pressing DPAD left/right keys if {@code
++     * adjustable} attribute is set to true; it transfers the key presses to the {@link SeekBar}
++     * to be handled accordingly.
++     */
++    private View.OnKeyListener mSeekBarKeyListener = new View.OnKeyListener() {
++        @Override
++        public boolean onKey(View v, int keyCode, KeyEvent event) {
++            if (event.getAction() != KeyEvent.ACTION_DOWN) {
++                return false;
++            }
++
++            if (!mAdjustable && (keyCode == KeyEvent.KEYCODE_DPAD_LEFT
++                    || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT)) {
++                // Right or left keys are pressed when in non-adjustable mode; Skip the keys.
++                return false;
++            }
++
++            // We don't want to propagate the click keys down to the SeekBar view since it will
++            // create the ripple effect for the thumb.
++            if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
++                return false;
++            }
++
++            if (mSeekBar == null) {
++                Log.e(TAG, "SeekBar view is null and hence cannot be adjusted.");
++                return false;
++            }
++            return mSeekBar.onKeyDown(keyCode, event);
++        }
++    };
++
++    public PercentageSeekBarPreference(
++            Context context, AttributeSet attrs, int defStyleAttr, int defStyleRes) {
++        super(context, attrs, defStyleAttr, defStyleRes);
++
++        TypedArray a = context.obtainStyledAttributes(
++                attrs, R.styleable.SeekBarPreference, defStyleAttr, defStyleRes);
++
++        // The ordering of these two statements are important. If we want to set max first, we need
++        // to perform the same steps by changing min/max to max/min as following:
++        // mMax = a.getInt(...) and setMin(...).
++        mMin = a.getInt(R.styleable.SeekBarPreference_min, 0);
++        setMax(a.getInt(R.styleable.SeekBarPreference_android_max, 100));
++        setSeekBarIncrement(a.getInt(R.styleable.SeekBarPreference_seekBarIncrement, 0));
++        mAdjustable = a.getBoolean(R.styleable.SeekBarPreference_adjustable, true);
++        mShowSeekBarValue = a.getBoolean(R.styleable.SeekBarPreference_showSeekBarValue, false);
++        mUpdatesContinuously = a.getBoolean(R.styleable.SeekBarPreference_updatesContinuously,
++                false);
++        a.recycle();
++    }
++
++    public PercentageSeekBarPreference(Context context, AttributeSet attrs, int defStyleAttr) {
++        this(context, attrs, defStyleAttr, 0);
++    }
++
++    public PercentageSeekBarPreference(Context context, AttributeSet attrs) {
++        this(context, attrs, R.attr.seekBarPreferenceStyle);
++    }
++
++    public PercentageSeekBarPreference(Context context) {
++        this(context, null);
++    }
++
++    @Override
++    public void onBindViewHolder(PreferenceViewHolder view) {
++        super.onBindViewHolder(view);
++        view.itemView.setOnKeyListener(mSeekBarKeyListener);
++        mSeekBar = (SeekBar) view.findViewById(R.id.seekbar);
++        mExampleTextTextView = (TextView) view.findViewById(R.id.sampleText);
++        mSeekBarValueTextView = (TextView) view.findViewById(R.id.seekbar_value);
++        if (mShowSeekBarValue) {
++            mSeekBarValueTextView.setVisibility(View.VISIBLE);
++        } else {
++            mSeekBarValueTextView.setVisibility(View.GONE);
++            mSeekBarValueTextView = null;
++        }
++
++        if (mSeekBar == null) {
++            Log.e(TAG, "SeekBar view is null in onBindViewHolder.");
++            return;
++        }
++        mSeekBar.setOnSeekBarChangeListener(mSeekBarChangeListener);
++        mSeekBar.setMax(mMax - mMin);
++        // If the increment is not zero, use that. Otherwise, use the default mKeyProgressIncrement
++        // in AbsSeekBar when it's zero. This default increment value is set by AbsSeekBar
++        // after calling setMax. That's why it's important to call setKeyProgressIncrement after
++        // calling setMax() since setMax() can change the increment value.
++        if (mSeekBarIncrement != 0) {
++            mSeekBar.setKeyProgressIncrement(mSeekBarIncrement);
++        } else {
++            mSeekBarIncrement = mSeekBar.getKeyProgressIncrement();
++        }
++
++        mSeekBar.setProgress(mSeekBarValue - mMin);
++        updateExampleTextValue(mSeekBarValue);
++        updateLabelValue(mSeekBarValue);
++        mSeekBar.setEnabled(isEnabled());
++    }
++
++    @Override
++    protected void onSetInitialValue(Object defaultValue) {
++        if (defaultValue == null) {
++            defaultValue = 0;
++        }
++        setValue(getPersistedInt((Integer) defaultValue));
++    }
++
++    @Override
++    protected Object onGetDefaultValue(TypedArray a, int index) {
++        return a.getInt(index, 0);
++    }
++
++    /**
++     * Gets the lower bound set on the {@link SeekBar}.
++     *
++     * @return The lower bound set
++     */
++    public int getMin() {
++        return mMin;
++    }
++
++    /**
++     * Sets the lower bound on the {@link SeekBar}.
++     *
++     * @param min The lower bound to set
++     */
++    public void setMin(int min) {
++        if (min > mMax) {
++            min = mMax;
++        }
++        if (min != mMin) {
++            mMin = min;
++            notifyChanged();
++        }
++    }
++
++    /**
++     * Returns the amount of increment change via each arrow key click. This value is derived from
++     * user's specified increment value if it's not zero. Otherwise, the default value is picked
++     * from the default mKeyProgressIncrement value in {@link android.widget.AbsSeekBar}.
++     *
++     * @return The amount of increment on the {@link SeekBar} performed after each user's arrow
++     * key press
++     */
++    public final int getSeekBarIncrement() {
++        return mSeekBarIncrement;
++    }
++
++    /**
++     * Sets the increment amount on the {@link SeekBar} for each arrow key press.
++     *
++     * @param seekBarIncrement The amount to increment or decrement when the user presses an
++     *                         arrow key.
++     */
++    public final void setSeekBarIncrement(int seekBarIncrement) {
++        if (seekBarIncrement != mSeekBarIncrement) {
++            mSeekBarIncrement = Math.min(mMax - mMin, Math.abs(seekBarIncrement));
++            notifyChanged();
++        }
++    }
++
++    /**
++     * Gets the upper bound set on the {@link SeekBar}.
++     *
++     * @return The upper bound set
++     */
++    public int getMax() {
++        return mMax;
++    }
++
++    /**
++     * Sets the upper bound on the {@link SeekBar}.
++     *
++     * @param max The upper bound to set
++     */
++    public final void setMax(int max) {
++        if (max < mMin) {
++            max = mMin;
++        }
++        if (max != mMax) {
++            mMax = max;
++            notifyChanged();
++        }
++    }
++
++    /**
++     * Gets whether the {@link SeekBar} should respond to the left/right keys.
++     *
++     * @return Whether the {@link SeekBar} should respond to the left/right keys
++     */
++    public boolean isAdjustable() {
++        return mAdjustable;
++    }
++
++    /**
++     * Sets whether the {@link SeekBar} should respond to the left/right keys.
++     *
++     * @param adjustable Whether the {@link SeekBar} should respond to the left/right keys
++     */
++    public void setAdjustable(boolean adjustable) {
++        mAdjustable = adjustable;
++    }
++
++    /**
++     * Gets whether the {@link androidx.preference.SeekBarPreference} should continuously save the {@link SeekBar} value
++     * while it is being dragged. Note that when the value is true,
++     * {@link Preference.OnPreferenceChangeListener} will be called continuously as well.
++     *
++     * @return Whether the {@link androidx.preference.SeekBarPreference} should continuously save the {@link SeekBar}
++     * value while it is being dragged
++     * @see #setUpdatesContinuously(boolean)
++     */
++    public boolean getUpdatesContinuously() {
++        return mUpdatesContinuously;
++    }
++
++    /**
++     * Sets whether the {@link androidx.preference.SeekBarPreference} should continuously save the {@link SeekBar} value
++     * while it is being dragged.
++     *
++     * @param updatesContinuously Whether the {@link androidx.preference.SeekBarPreference} should continuously save
++     *                            the {@link SeekBar} value while it is being dragged
++     * @see #getUpdatesContinuously()
++     */
++    public void setUpdatesContinuously(boolean updatesContinuously) {
++        mUpdatesContinuously = updatesContinuously;
++    }
++
++    /**
++     * Gets whether the current {@link SeekBar} value is displayed to the user.
++     *
++     * @return Whether the current {@link SeekBar} value is displayed to the user
++     * @see #setShowSeekBarValue(boolean)
++     */
++    public boolean getShowSeekBarValue() {
++        return mShowSeekBarValue;
++    }
++
++    /**
++     * Sets whether the current {@link SeekBar} value is displayed to the user.
++     *
++     * @param showSeekBarValue Whether the current {@link SeekBar} value is displayed to the user
++     * @see #getShowSeekBarValue()
++     */
++    public void setShowSeekBarValue(boolean showSeekBarValue) {
++        mShowSeekBarValue = showSeekBarValue;
++        notifyChanged();
++    }
++
++    private void setValueInternal(int seekBarValue, boolean notifyChanged) {
++        if (seekBarValue < mMin) {
++            seekBarValue = mMin;
++        }
++        if (seekBarValue > mMax) {
++            seekBarValue = mMax;
++        }
++
++        if (seekBarValue != mSeekBarValue) {
++            mSeekBarValue = seekBarValue;
++            updateLabelValue(mSeekBarValue);
++            updateExampleTextValue(mSeekBarValue);
++            persistInt(seekBarValue);
++            if (notifyChanged) {
++                notifyChanged();
++            }
++        }
++    }
++
++    /**
++     * Gets the current progress of the {@link SeekBar}.
++     *
++     * @return The current progress of the {@link SeekBar}
++     */
++    public int getValue() {
++        return mSeekBarValue;
++    }
++
++    /**
++     * Sets the current progress of the {@link SeekBar}.
++     *
++     * @param seekBarValue The current progress of the {@link SeekBar}
++     */
++    public void setValue(int seekBarValue) {
++        setValueInternal(seekBarValue, true);
++    }
++
++    /**
++     * Persist the {@link SeekBar}'s SeekBar value if callChangeListener returns true, otherwise
++     * set the {@link SeekBar}'s value to the stored value.
++     */
++    @SuppressWarnings("WeakerAccess") /* synthetic access */
++    void syncValueInternal(SeekBar seekBar) {
++        int seekBarValue = mMin + seekBar.getProgress();
++        if (seekBarValue != mSeekBarValue) {
++            if (callChangeListener(seekBarValue)) {
++                setValueInternal(seekBarValue, false);
++            } else {
++                seekBar.setProgress(mSeekBarValue - mMin);
++                updateLabelValue(mSeekBarValue);
++                updateExampleTextValue(mSeekBarValue);
++            }
++        }
++    }
++
++    /**
++     * Attempts to update the TextView label that displays the current value.
++     *
++     * @param value the value to display next to the {@link SeekBar}
++     */
++    @SuppressWarnings("WeakerAccess") /* synthetic access */
++    void updateLabelValue(int value) {
++        if (mSeekBarValueTextView != null) {
++            double m = value / 100d;
++            final String percentage = NumberFormat.getPercentInstance().format(m);
++            mSeekBarValueTextView.setText(percentage);
++        }
++    }
++
++    /**
++     * Attempts to update the example TextView text to given text scale size.
++     *
++     * @param value the value of text size
++     */
++    @SuppressWarnings("WeakerAccess") /* synthetic access */
++    void updateExampleTextValue(int value) {
++        if (mExampleTextTextView != null) {
++            float decimal = value / 100f;
++            final float textsize = 16f * decimal;
++            mExampleTextTextView.setTextSize(TypedValue.COMPLEX_UNIT_SP, textsize);
++        }
++    }
++
++    @Override
++    protected Parcelable onSaveInstanceState() {
++        final Parcelable superState = super.onSaveInstanceState();
++        if (isPersistent()) {
++            // No need to save instance state since it's persistent
++            return superState;
++        }
++
++        // Save the instance state
++        final SavedState myState = new SavedState(superState);
++        myState.mSeekBarValue = mSeekBarValue;
++        myState.mMin = mMin;
++        myState.mMax = mMax;
++        return myState;
++    }
++
++    @Override
++    protected void onRestoreInstanceState(Parcelable state) {
++        if (!state.getClass().equals(SavedState.class)) {
++            // Didn't save state for us in onSaveInstanceState
++            super.onRestoreInstanceState(state);
++            return;
++        }
++
++        // Restore the instance state
++        SavedState myState = (SavedState) state;
++        super.onRestoreInstanceState(myState.getSuperState());
++        mSeekBarValue = myState.mSeekBarValue;
++        mMin = myState.mMin;
++        mMax = myState.mMax;
++        notifyChanged();
++    }
++
++    /**
++     * SavedState, a subclass of {@link BaseSavedState}, will store the state of this preference.
++     *
++     * <p>It is important to always call through to super methods.
++     */
++    private static class SavedState extends BaseSavedState {
++        public static final Parcelable.Creator<SavedState> CREATOR =
++                new Parcelable.Creator<SavedState>() {
++                    @Override
++                    public SavedState createFromParcel(Parcel in) {
++                        return new SavedState(in);
++                    }
++
++                    @Override
++                    public SavedState[] newArray(int size) {
++                        return new SavedState[size];
++                    }
++                };
++
++        int mSeekBarValue;
++        int mMin;
++        int mMax;
++
++        SavedState(Parcel source) {
++            super(source);
++
++            // Restore the click counter
++            mSeekBarValue = source.readInt();
++            mMin = source.readInt();
++            mMax = source.readInt();
++        }
++
++        SavedState(Parcelable superState) {
++            super(superState);
++        }
++
++        @Override
++        public void writeToParcel(Parcel dest, int flags) {
++            super.writeToParcel(dest, flags);
++
++            // Save the click counter
++            dest.writeInt(mSeekBarValue);
++            dest.writeInt(mMin);
++            dest.writeInt(mMax);
++        }
++    }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt b/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
+index 8a43b5fe86f4..7c96d08b614d 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
+@@ -77,6 +77,17 @@ class Settings private constructor(context: Context) {
+         ).apply()
+     }
+ 
++    fun setFontSizeFactor(newValue: Float) {
++        preferences.edit().putFloat(appContext.getPreferenceKey(R.string.pref_key_accessibility_font_scale), newValue)
++            .apply()
++    }
++
++    val fontSizeFactor: Float
++        get() = preferences.getFloat(
++            appContext.getPreferenceKey(R.string.pref_key_accessibility_font_scale),
++            1f
++        )
++
+     val shouldShowVisitedSitesBookmarks: Boolean
+         get() = preferences.getBoolean(
+             appContext.getPreferenceKey(R.string.pref_key_show_visited_sites_bookmarks),
+diff --git a/fenix/app/src/main/res/layout/layout_percentage_seek_bar.xml b/fenix/app/src/main/res/layout/layout_percentage_seek_bar.xml
+new file mode 100644
+index 000000000000..4f3b9a5079d5
+--- /dev/null
++++ b/fenix/app/src/main/res/layout/layout_percentage_seek_bar.xml
+@@ -0,0 +1,80 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:baselineAligned="false"
++    android:paddingStart="@dimen/radio_button_preference_horizontal"
++    android:paddingTop="@dimen/radio_button_preference_vertical"
++    android:paddingEnd="@dimen/radio_button_preference_horizontal"
++    android:paddingBottom="@dimen/radio_button_preference_vertical">
++
++    <TextView
++        android:id="@android:id/title"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:textAppearance="?android:attr/textAppearanceListItem"
++        app:layout_constraintTop_toTopOf="parent"
++        tools:text="Font size" />
++
++    <TextView
++        android:id="@android:id/summary"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:paddingTop="6dp"
++        android:textAppearance="?android:attr/textAppearanceSmall"
++        android:textColor="?android:attr/textColorSecondary"
++        app:layout_constraintTop_toBottomOf="@android:id/title"
++        tools:layout_editor_absoluteX="16dp"
++        tools:text="Make text on websites larger or smaller" />
++
++    <SeekBar
++        android:id="@+id/seekbar"
++        android:layout_width="0dp"
++        android:layout_height="wrap_content"
++        android:paddingEnd="75dp"
++        app:layout_constraintBottom_toBottomOf="@+id/seekbar_value"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toTopOf="@+id/seekbar_value" />
++
++    <TextView
++        android:id="@+id/seekbar_value"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="30dp"
++        android:layout_marginBottom="30dp"
++        android:gravity="end|center_vertical"
++        android:paddingStart="16dp"
++        android:text="200%"
++        android:textSize="16sp"
++        app:layout_constraintBottom_toTopOf="@+id/sampleText"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintTop_toBottomOf="@android:id/summary" />
++
++    <View
++        android:layout_width="0dp"
++        android:layout_height="0dp"
++        android:alpha="0.2"
++        android:background="?accentBright"
++        app:layout_constraintBottom_toBottomOf="@+id/sampleText"
++        app:layout_constraintEnd_toEndOf="@+id/sampleText"
++        app:layout_constraintStart_toStartOf="@+id/sampleText"
++        app:layout_constraintTop_toTopOf="@+id/sampleText" />
++
++    <TextView
++        android:id="@+id/sampleText"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent"
++        android:layout_marginTop="33dp"
++        android:padding="16dp"
++        android:text="@string/accessibility_text_size_sample_text"
++        android:textSize="16sp"
++        app:layout_constraintBottom_toBottomOf="parent"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="parent" />
++</androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/fenix/app/src/main/res/values/preference_keys.xml b/fenix/app/src/main/res/values/preference_keys.xml
+index adc51660f132..a11921aed29a 100644
+--- a/fenix/app/src/main/res/values/preference_keys.xml
++++ b/fenix/app/src/main/res/values/preference_keys.xml
+@@ -9,6 +9,7 @@
+     <string name="pref_key_credit_cards_addresses" translatable="false">pref_key_credit_cards_addresses</string>
+     <string name="pref_key_site_permissions" translatable="false">pref_key_site_permissions</string>
+     <string name="pref_key_accessibility" translatable="false">pref_key_accessibility</string>
++    <string name="pref_key_accessibility_font_scale" translatable="false">pref_key_accessibility_font_scale</string>
+     <string name="pref_key_language" translatable="false">pref_key_language</string>
+     <string name="pref_key_data_choices" translatable="false">pref_key_data_choices</string>
+     <string name="pref_key_help" translatable="false">pref_key_help</string>
+diff --git a/fenix/app/src/main/res/values/strings.xml b/fenix/app/src/main/res/values/strings.xml
+index 5f93e1d67f1c..de330cdda0bb 100644
+--- a/fenix/app/src/main/res/values/strings.xml
++++ b/fenix/app/src/main/res/values/strings.xml
+@@ -485,4 +485,7 @@
+     <string name="full_screen_notification">Entering full screen mode</string>
+     <!-- Message for copying the URL via long press on the toolbar -->
+     <string name="url_copied">URL copied</string>
++    <string name="accessibility_text_size_sample_text">The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.</string>
++    <string name="preference_accessibility_text_size_summary">Make text on websites larger or smaller</string>
++    <string name="preference_accessibility_font_size_title">Font Size</string>
+ </resources>
+diff --git a/fenix/app/src/main/res/xml/accessibility_preferences.xml b/fenix/app/src/main/res/xml/accessibility_preferences.xml
+index fab8cd571157..76d97ceba15b 100644
+--- a/fenix/app/src/main/res/xml/accessibility_preferences.xml
++++ b/fenix/app/src/main/res/xml/accessibility_preferences.xml
+@@ -3,5 +3,18 @@
+    - License, v. 2.0. If a copy of the MPL was not distributed with this
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+ 
+-<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android">
+-</PreferenceScreen>
+\ No newline at end of file
++<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto">
++    <org.mozilla.fenix.settings.PercentageSeekBarPreference
++        android:layout="@layout/layout_percentage_seek_bar"
++        android:defaultValue="100"
++        android:key="@string/pref_key_accessibility_font_scale"
++        android:max="200"
++        android:summary="@string/preference_accessibility_text_size_summary"
++        android:title="@string/preference_accessibility_font_size_title"
++        app:adjustable="true"
++        app:iconSpaceReserved="false"
++        app:min="1"
++        app:seekBarIncrement="1"
++        app:showSeekBarValue="true" />
++</PreferenceScreen>
+diff --git a/fenix/app/src/main/res/xml/preferences.xml b/fenix/app/src/main/res/xml/preferences.xml
+index 004b9240305c..19a1a4721b3f 100644
+--- a/fenix/app/src/main/res/xml/preferences.xml
++++ b/fenix/app/src/main/res/xml/preferences.xml
+@@ -7,6 +7,7 @@
+     xmlns:app="http://schemas.android.com/apk/res-auto">
+ 
+     <androidx.preference.Preference
++        app:allowDividerBelow="false"
+         android:key="@string/pref_key_sign_in"
+         android:layout="@layout/sign_in_preference"
+         android:summary="@string/preferences_sign_in_description"
+@@ -37,6 +38,11 @@
+             android:key="@string/pref_key_theme"
+             android:title="@string/preferences_theme" />
+ 
++        <androidx.preference.Preference
++            android:icon="@drawable/ic_accessibility"
++            android:key="@string/pref_key_accessibility"
++            android:title="@string/preferences_accessibility" />
++
+         <org.mozilla.fenix.settings.DefaultBrowserPreference
+             android:key="@string/pref_key_make_default_browser"
+             android:title="@string/preferences_set_as_default_browser" />

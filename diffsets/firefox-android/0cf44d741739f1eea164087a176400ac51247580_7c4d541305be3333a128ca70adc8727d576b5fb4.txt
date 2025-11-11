@@ -1,0 +1,399 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt
+index 17c30b5c8ed6..f48a62226ad4 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt
+@@ -160,7 +160,8 @@ class BrowserFragment : Fragment(), BackHandler, CoroutineScope,
+             QuickActionState(
+                 readable = getSessionById()?.readerable ?: false,
+                 bookmarked = findBookmarkedURL(getSessionById()),
+-                readerActive = getSessionById()?.readerMode ?: false
++                readerActive = getSessionById()?.readerMode ?: false,
++                bounceNeeded = false
+             )
+         )
+ 
+@@ -699,11 +700,13 @@ class BrowserFragment : Fragment(), BackHandler, CoroutineScope,
+     private fun subscribeToSession(): Session.Observer {
+         val observer = object : Session.Observer {
+             override fun onLoadingStateChanged(session: Session, loading: Boolean) {
+-                super.onLoadingStateChanged(session, loading)
+                 if (!loading) {
+                     updateBookmarkState(session)
++                    getManagedEmitter<QuickActionChange>().onNext(QuickActionChange.BounceNeededChange)
+                 }
++
+                 setToolbarBehavior(loading)
++                super.onLoadingStateChanged(session, loading)
+             }
+         }
+         getSessionById()?.register(observer)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/ToolbarUIView.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/ToolbarUIView.kt
+index f6776a94ed20..cad790a37d7a 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/ToolbarUIView.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/ToolbarUIView.kt
+@@ -52,7 +52,7 @@ class ToolbarUIView(
+ 
+             setOnUrlCommitListener {
+                 actionEmitter.onNext(SearchAction.UrlCommitted(it, sessionId, state?.engine))
+-                false
++            false
+             }
+             onUrlClicked = {
+                 actionEmitter.onNext(SearchAction.ToolbarClicked)
+@@ -63,12 +63,8 @@ class ToolbarUIView(
+ 
+             val isCustomTabSession = (session?.isCustomTabSession() == true)
+ 
+-            urlBoxView = if (isCustomTabSession) {
+-                null
+-            } else urlBackground
+-            progressBarGravity = if (isCustomTabSession) {
+-                PROGRESS_BOTTOM
+-            } else PROGRESS_TOP
++            urlBoxView = if (isCustomTabSession) { null } else urlBackground
++            progressBarGravity = if (isCustomTabSession) { PROGRESS_BOTTOM } else PROGRESS_TOP
+ 
+             textColor = ContextCompat.getColor(context, R.color.photonGrey30)
+ 
+@@ -79,7 +75,6 @@ class ToolbarUIView(
+                     actionEmitter.onNext(SearchAction.EditingCanceled)
+                     return false
+                 }
+-
+                 override fun onTextChanged(text: String) {
+                     url = text
+                     actionEmitter.onNext(SearchAction.TextChanged(text))
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/quickactionsheet/QuickActionComponent.kt b/fenix/app/src/main/java/org/mozilla/fenix/quickactionsheet/QuickActionComponent.kt
+index 862f987b4f4d..cbf14dc9f4fe 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/quickactionsheet/QuickActionComponent.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/quickactionsheet/QuickActionComponent.kt
+@@ -25,7 +25,8 @@ class QuickActionComponent(
+     override var initialState: QuickActionState = QuickActionState(
+         readable = false,
+         bookmarked = false,
+-        readerActive = false
++        readerActive = false,
++        bounceNeeded = false
+     )
+ ) : UIComponent<QuickActionState, QuickActionAction, QuickActionChange>(
+     owner,
+@@ -46,7 +47,12 @@ class QuickActionComponent(
+     }
+ }
+ 
+-data class QuickActionState(val readable: Boolean, val bookmarked: Boolean, val readerActive: Boolean) : ViewState
++data class QuickActionState(
++    val readable: Boolean,
++    val bookmarked: Boolean,
++    val readerActive: Boolean,
++    val bounceNeeded: Boolean
++) : ViewState
+ 
+ sealed class QuickActionAction : Action {
+     object Opened : QuickActionAction()
+@@ -62,6 +68,7 @@ sealed class QuickActionChange : Change {
+     data class BookmarkedStateChange(val bookmarked: Boolean) : QuickActionChange()
+     data class ReadableStateChange(val readable: Boolean) : QuickActionChange()
+     data class ReaderActiveStateChange(val active: Boolean) : QuickActionChange()
++    object BounceNeededChange : QuickActionChange()
+ }
+ 
+ class QuickActionViewModel(initialState: QuickActionState, changesObservable: Observable<QuickActionChange>) :
+@@ -83,6 +90,9 @@ class QuickActionViewModel(initialState: QuickActionState, changesObservable: Ob
+     companion object {
+         val reducer: Reducer<QuickActionState, QuickActionChange> = { state, change ->
+             when (change) {
++                is QuickActionChange.BounceNeededChange -> {
++                    state.copy(bounceNeeded = true)
++                }
+                 is QuickActionChange.BookmarkedStateChange -> {
+                     state.copy(bookmarked = change.bookmarked)
+                 }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/quickactionsheet/QuickActionSheet.kt b/fenix/app/src/main/java/org/mozilla/fenix/quickactionsheet/QuickActionSheet.kt
+index aba487c41d5c..665366715822 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/quickactionsheet/QuickActionSheet.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/quickactionsheet/QuickActionSheet.kt
+@@ -4,22 +4,27 @@
+ 
+ package org.mozilla.fenix.quickactionsheet
+ 
+-import android.animation.ValueAnimator
+ import android.content.Context
+-import android.os.Bundle
+ import android.util.AttributeSet
+ import android.view.View
+-import android.view.accessibility.AccessibilityEvent
+-import android.view.accessibility.AccessibilityNodeInfo
+-import android.widget.ImageButton
+ import android.widget.LinearLayout
+ import androidx.coordinatorlayout.widget.CoordinatorLayout
+ import androidx.core.widget.NestedScrollView
+-import androidx.interpolator.view.animation.FastOutSlowInInterpolator
+ import com.google.android.material.bottomsheet.BottomSheetBehavior
+ import mozilla.components.browser.toolbar.BrowserToolbar
+ import org.mozilla.fenix.R
++import android.os.Bundle
++import android.view.accessibility.AccessibilityEvent
++import android.view.accessibility.AccessibilityNodeInfo
++import android.widget.ImageButton
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Dispatchers.Main
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.delay
+ import org.mozilla.fenix.utils.Settings
++import kotlin.coroutines.CoroutineContext
+ 
+ const val POSITION_SNAP_BUFFER = 1f
+ 
+@@ -28,7 +33,15 @@ class QuickActionSheet @JvmOverloads constructor(
+     attrs: AttributeSet? = null,
+     defStyle: Int = 0,
+     defStyleRes: Int = 0
+-) : LinearLayout(context, attrs, defStyle, defStyleRes) {
++) : LinearLayout(context, attrs, defStyle, defStyleRes), CoroutineScope {
++
++    private lateinit var job: Job
++    override val coroutineContext: CoroutineContext
++        get() = Dispatchers.Main + job
++
++    private lateinit var handle: ImageButton
++    private lateinit var linearLayout: LinearLayout
++    private lateinit var quickActionSheetBehavior: QuickActionSheetBehavior
+ 
+     init {
+         inflate(getContext(), R.layout.layout_quick_action_sheet, this)
+@@ -36,72 +49,55 @@ class QuickActionSheet @JvmOverloads constructor(
+ 
+     override fun onAttachedToWindow() {
+         super.onAttachedToWindow()
++        job = Job()
++        handle = findViewById(R.id.quick_action_sheet_handle)
++        linearLayout = findViewById(R.id.quick_action_sheet)
++        quickActionSheetBehavior = BottomSheetBehavior.from(linearLayout.parent as View) as QuickActionSheetBehavior
+         setupHandle()
+     }
+ 
+-    private fun setupHandle() {
+-        val handle = findViewById<ImageButton>(R.id.quick_action_sheet_handle)
+-        val linearLayout = findViewById<LinearLayout>(R.id.quick_action_sheet)
+-        val quickActionSheetBehavior = BottomSheetBehavior.from(linearLayout.parent as View) as QuickActionSheetBehavior
++    override fun onDetachedFromWindow() {
++        super.onDetachedFromWindow()
++        job.cancel()
++    }
+ 
++    private fun setupHandle() {
+         handle.setOnClickListener {
+-            bounceSheet(quickActionSheetBehavior)
++            quickActionSheetBehavior.state = when (quickActionSheetBehavior.state) {
++                BottomSheetBehavior.STATE_EXPANDED -> BottomSheetBehavior.STATE_COLLAPSED
++                else -> BottomSheetBehavior.STATE_EXPANDED
++            }
+         }
+ 
+         handle.setAccessibilityDelegate(HandleAccessibilityDelegate(quickActionSheetBehavior))
+-
+-        val settings = Settings.getInstance(context)
+-        if (settings.shouldAutoBounceQuickActionSheet) {
+-            settings.incrementAutomaticBounceQuickActionSheetCount()
+-            bounceSheet(quickActionSheetBehavior, demoBounceAnimationLength)
+-        }
+     }
+ 
+-    private fun bounceSheet(
+-        quickActionSheetBehavior: QuickActionSheetBehavior,
+-        duration: Long = bounceAnimationLength
+-    ) {
+-        val overlay = findViewById<View>(R.id.overlay)
+-        overlay.alpha = 0F
+-
+-        val normalPeekHeight = quickActionSheetBehavior.peekHeight
+-
+-        val peakHeightMultiplier = if (duration == demoBounceAnimationLength)
+-            demoBounceAnimationPeekHeightMultiplier else bounceAnimationPeekHeightMultiplier
+-
+-        ValueAnimator.ofFloat(
+-            normalPeekHeight.toFloat(),
+-            normalPeekHeight * peakHeightMultiplier
+-        )?.let {
+-
+-            it.addUpdateListener {
+-                quickActionSheetBehavior.peekHeight = (it.animatedValue as Float).toInt()
+-            }
+-
+-            it.repeatMode = ValueAnimator.REVERSE
+-            it.repeatCount = 1
+-            it.interpolator = FastOutSlowInInterpolator()
+-            it.duration = duration
+-            it.start()
++    fun bounceSheet() {
++        launch(Main) {
++            delay(BOUNCE_ANIMATION_DELAY_LENGTH)
++            quickActionSheetBehavior.state = BottomSheetBehavior.STATE_EXPANDED
++            delay(BOUNCE_ANIMATION_PAUSE_LENGTH)
++            quickActionSheetBehavior.state = BottomSheetBehavior.STATE_COLLAPSED
+         }
++        Settings.getInstance(context).incrementAutomaticBounceQuickActionSheetCount()
+     }
+ 
+     class HandleAccessibilityDelegate(
+         private val quickActionSheetBehavior: QuickActionSheetBehavior
+     ) : View.AccessibilityDelegate() {
+         private var finalState = BottomSheetBehavior.STATE_COLLAPSED
+-            get() = when (quickActionSheetBehavior.state) {
+-                BottomSheetBehavior.STATE_EXPANDED,
+-                BottomSheetBehavior.STATE_HIDDEN,
+-                BottomSheetBehavior.STATE_COLLAPSED -> {
+-                    quickActionSheetBehavior.state
+-                }
+-                else -> field
+-            }
+-            set(value) {
+-                field = value
+-                quickActionSheetBehavior.state = value
++        get() = when (quickActionSheetBehavior.state) {
++            BottomSheetBehavior.STATE_EXPANDED,
++            BottomSheetBehavior.STATE_HIDDEN,
++            BottomSheetBehavior.STATE_COLLAPSED -> {
++                quickActionSheetBehavior.state
+             }
++            else -> field
++        }
++        set(value) {
++            field = value
++            quickActionSheetBehavior.state = value
++        }
+ 
+         override fun performAccessibilityAction(host: View?, action: Int, args: Bundle?): Boolean {
+             when (action) {
+@@ -125,21 +121,17 @@ class QuickActionSheet @JvmOverloads constructor(
+ 
+         override fun onInitializeAccessibilityNodeInfo(host: View?, info: AccessibilityNodeInfo?) {
+             super.onInitializeAccessibilityNodeInfo(host, info)
+-            info?.addAction(
+-                when (finalState) {
+-                    BottomSheetBehavior.STATE_COLLAPSED,
+-                    BottomSheetBehavior.STATE_HIDDEN -> AccessibilityNodeInfo.AccessibilityAction.ACTION_EXPAND
+-                    else -> AccessibilityNodeInfo.AccessibilityAction.ACTION_COLLAPSE
+-                }
+-            )
++            info?.addAction(when (finalState) {
++                BottomSheetBehavior.STATE_COLLAPSED,
++                BottomSheetBehavior.STATE_HIDDEN -> AccessibilityNodeInfo.AccessibilityAction.ACTION_EXPAND
++                else -> AccessibilityNodeInfo.AccessibilityAction.ACTION_COLLAPSE
++            })
+         }
+     }
+ 
+     companion object {
+-        const val demoBounceAnimationLength = 600L
+-        const val bounceAnimationLength = 400L
+-        const val demoBounceAnimationPeekHeightMultiplier = 4.5f
+-        const val bounceAnimationPeekHeightMultiplier = 3f
++        const val BOUNCE_ANIMATION_DELAY_LENGTH = 1000L
++        const val BOUNCE_ANIMATION_PAUSE_LENGTH = 2000L
+     }
+ }
+ 
+@@ -171,17 +163,11 @@ class QuickActionSheetBehavior(
+     }
+ 
+     private fun repositionQuickActionSheet(quickActionSheetContainer: NestedScrollView, toolbar: BrowserToolbar) {
+-        val handleHeight = quickActionSheetContainer.findViewById<ImageButton>(R.id.quick_action_sheet_handle).height
+         if (toolbar.translationY >= toolbar.height.toFloat() - POSITION_SNAP_BUFFER) {
+-            quickActionSheetContainer.translationY = toolbar.translationY + toolbar.height * -1.0f + handleHeight
+-            peekHeight = handleHeight
+-            state = STATE_COLLAPSED
+-            return
++            state = STATE_HIDDEN
+         } else if (state == STATE_HIDDEN || state == STATE_SETTLING) {
+-            peekHeight = handleHeight
+             state = STATE_COLLAPSED
+         }
+-
+         quickActionSheetContainer.translationY = toolbar.translationY + toolbar.height * -1.0f
+     }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/quickactionsheet/QuickActionUIView.kt b/fenix/app/src/main/java/org/mozilla/fenix/quickactionsheet/QuickActionUIView.kt
+index b5e49afe17fb..975f73389af5 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/quickactionsheet/QuickActionUIView.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/quickactionsheet/QuickActionUIView.kt
+@@ -7,7 +7,6 @@ package org.mozilla.fenix.quickactionsheet
+ import android.view.LayoutInflater
+ import android.view.View
+ import android.view.ViewGroup
+-import android.widget.ImageButton
+ import android.widget.LinearLayout
+ import androidx.core.widget.NestedScrollView
+ import com.google.android.material.bottomsheet.BottomSheetBehavior
+@@ -17,11 +16,11 @@ import io.reactivex.functions.Consumer
+ import kotlinx.android.synthetic.main.fragment_browser.*
+ import kotlinx.android.synthetic.main.layout_quick_action_sheet.*
+ import kotlinx.android.synthetic.main.layout_quick_action_sheet.view.*
+-import mozilla.components.support.ktx.android.content.res.pxToDp
+ import org.mozilla.fenix.R
+ import org.mozilla.fenix.components.metrics.Event
+ import org.mozilla.fenix.ext.components
+ import org.mozilla.fenix.mvi.UIView
++import org.mozilla.fenix.utils.Settings
+ 
+ class QuickActionUIView(
+     container: ViewGroup,
+@@ -33,15 +32,12 @@ class QuickActionUIView(
+         .inflate(R.layout.component_quick_action_sheet, container, true)
+         .findViewById(R.id.nestedScrollQuickAction) as NestedScrollView
+ 
++    val quickActionSheet = view.quick_action_sheet as QuickActionSheet
++
+     init {
+         val quickActionSheetBehavior =
+             BottomSheetBehavior.from(nestedScrollQuickAction as View) as QuickActionSheetBehavior
+ 
+-        // set initial state
+-        animateOverlay(initialOverlayAlpha)
+-        quickActionSheetBehavior.isHideable = false
+-        quickActionSheetBehavior.peekHeight = view.resources.pxToDp(initialPeekHeightInDps)
+-
+         quickActionSheetBehavior.setBottomSheetCallback(object : BottomSheetBehavior.BottomSheetCallback() {
+             override fun onStateChanged(v: View, state: Int) {
+                 updateImportantForAccessibility(state)
+@@ -54,8 +50,6 @@ class QuickActionUIView(
+             }
+ 
+             override fun onSlide(bottomSheet: View, slideOffset: Float) {
+-                quickActionSheetBehavior.peekHeight =
+-                    bottomSheet.findViewById<ImageButton>(R.id.quick_action_sheet_handle).height
+                 animateOverlay(slideOffset)
+             }
+         })
+@@ -93,10 +87,10 @@ class QuickActionUIView(
+ 
+     private fun updateImportantForAccessibility(state: Int) {
+         view.findViewById<LinearLayout>(R.id.quick_action_buttons_layout).importantForAccessibility =
+-            if (state == BottomSheetBehavior.STATE_COLLAPSED || state == BottomSheetBehavior.STATE_HIDDEN)
+-                View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+-            else
+-                View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
++                if (state == BottomSheetBehavior.STATE_COLLAPSED || state == BottomSheetBehavior.STATE_HIDDEN)
++                    View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
++                else
++                    View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+     }
+ 
+     private fun sendTelemetryEvent(state: Int) {
+@@ -120,10 +114,9 @@ class QuickActionUIView(
+         }
+         view.quick_action_read_appearance.visibility = if (it.readerActive) View.VISIBLE else View.GONE
+         view.quick_action_bookmark.isSelected = it.bookmarked
+-    }
+ 
+-    companion object {
+-        const val initialOverlayAlpha = 0.5f
+-        const val initialPeekHeightInDps = 30
++        if (it.bounceNeeded && Settings.getInstance(view.context).shouldAutoBounceQuickActionSheet) {
++            quickActionSheet.bounceSheet()
++        }
+     }
+ }

@@ -1,0 +1,461 @@
+diff --git a/fenix/automation/taskcluster/androidTest/ui-test.sh b/fenix/automation/taskcluster/androidTest/ui-test.sh
+index 6f158a3bea0c..f840cf4568f5 100755
+--- a/fenix/automation/taskcluster/androidTest/ui-test.sh
++++ b/fenix/automation/taskcluster/androidTest/ui-test.sh
+@@ -48,14 +48,7 @@ fi
+ JAVA_BIN="/usr/bin/java"
+ PATH_TEST="./automation/taskcluster/androidTest"
+ PATH_APK="./app/build/outputs/apk/geckoNightly/debug"
+-FLANK_BIN="/build/test-tools/flank.jar"
+-
+-echo
+-echo "RETRIEVE SERVICE ACCT TOKEN"
+-echo
+-python automation/taskcluster/helper/get-secret.py --json -s project/mobile/fenix/firebase -k firebaseToken  -f $GOOGLE_APPLICATION_CREDENTIALS
+-echo
+-echo
++FLANK_BIN="/builds/worker/test-tools/flank.jar"
+ 
+ echo
+ echo "ACTIVATE SERVICE ACCT"
+diff --git a/fenix/automation/taskcluster/decision_task.py b/fenix/automation/taskcluster/decision_task.py
+index 80e0a5001023..9b042e29da4a 100644
+--- a/fenix/automation/taskcluster/decision_task.py
++++ b/fenix/automation/taskcluster/decision_task.py
+@@ -33,15 +33,6 @@ def pr(builder):
+     tasks.append(builder.craft_assemble_pr_task(variant))
+     tasks.append(builder.craft_test_pr_task(variant))
+ 
+-    for craft_function in (
+-        builder.craft_detekt_task,
+-        builder.craft_ktlint_task,
+-        builder.craft_lint_task,
+-        builder.craft_compare_locales_task,
+-        builder.craft_ui_tests_task,
+-    ):
+-        tasks.append(craft_function())
+-
+     for task in tasks:
+         task['attributes']['code-review'] = True
+ 
+diff --git a/fenix/automation/taskcluster/helper/get-secret.py b/fenix/automation/taskcluster/helper/get-secret.py
+old mode 100644
+new mode 100755
+index 8dd9f3d5a67a..c10af239a886
+--- a/fenix/automation/taskcluster/helper/get-secret.py
++++ b/fenix/automation/taskcluster/helper/get-secret.py
+@@ -1,3 +1,5 @@
++#!/usr/bin/env python
++
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+@@ -28,7 +30,17 @@ def write_secret_to_file(path, data, key, base64decode=False, json_secret=False,
+ 
+ 
+ def fetch_secret_from_taskcluster(name):
+-    secrets = taskcluster.Secrets({'baseUrl': 'http://taskcluster/secrets/v1'})
++    try:
++        secrets = taskcluster.Secrets({
++            # BaseUrl is still needed for tasks that haven't migrated to taskgraph yet.
++            'baseUrl': 'http://taskcluster/secrets/v1',
++        })
++    except taskcluster.exceptions.TaskclusterFailure:
++        # taskcluster library >=5 errors out when `baseUrl` is used
++        secrets = taskcluster.Secrets({
++            'rootUrl': os.environ.get('TASKCLUSTER_PROXY_URL', 'https://taskcluster.net'),
++        })
++
+     return secrets.get(name)
+ 
+ 
+diff --git a/fenix/automation/taskcluster/lib/tasks.py b/fenix/automation/taskcluster/lib/tasks.py
+index 8079605aa2cc..d0538ec4ad5f 100644
+--- a/fenix/automation/taskcluster/lib/tasks.py
++++ b/fenix/automation/taskcluster/lib/tasks.py
+@@ -156,121 +156,47 @@ def craft_assemble_pr_task(self, variant):
+ 
+     def craft_test_pr_task(self, variant):
+         # upload coverage only once, if the variant is arm64
+-        test_gradle_command = \
+-            '-Pcoverage jacocoGeckoNightlyDebugTestReport && automation/taskcluster/upload_coverage_report.sh'
+-
+-        return self._craft_clean_gradle_task(
+-            name='test: {}'.format(variant.name),
+-            description='Building and testing variant {}'.format(variant.name),
+-            gradle_task=test_gradle_command,
+-            treeherder={
+-                'groupSymbol': variant.build_type,
+-                'jobKind': 'test',
+-                'machine': {
+-                  'platform': 'android-all',
+-                },
+-                'symbol': 'T',
+-                'tier': 1,
+-            },
+-            scopes=[
+-                'secrets:get:project/mobile/fenix/public-tokens'
+-            ]
++        secret_index = 'project/mobile/fenix/public-tokens'
++        pre_gradle_commands = (
++            'python automation/taskcluster/helper/get-secret.py -s {} -k {} -f {}'.format(
++                secret_index, key, target_file
++            )
++            for key, target_file in (
++                ('codecov', '.cc_token'),
++            )
+         )
+ 
+-    def craft_ui_tests_task(self):
+-        artifacts = {
+-            "public": {
+-                "type": "directory",
+-                "path": "/build/fenix/results",
+-                "expires": taskcluster.stringDate(taskcluster.fromNow(DEFAULT_EXPIRES_IN))
+-            }
+-        }
+-
+-        env_vars = {
+-            "GOOGLE_PROJECT": "moz-fenix",
+-            "GOOGLE_APPLICATION_CREDENTIALS": ".firebase_token.json"
+-        }
+-
+         gradle_commands = (
+-            './gradlew --no-daemon clean assemble assembleAndroidTest',
++            './gradlew --no-daemon clean -Pcoverage jacocoGeckoNightlyDebugTestReport',
+         )
+ 
+-        test_commands = (
+-            'automation/taskcluster/androidTest/ui-test.sh x86 -1',
++        post_gradle_commands = (
++            'automation/taskcluster/upload_coverage_report.sh',
+         )
+ 
+         command = ' && '.join(
+             cmd
+-            for commands in (gradle_commands, test_commands)
++            for commands in (pre_gradle_commands, gradle_commands, post_gradle_commands)
+             for cmd in commands
+             if cmd
+         )
+ 
+-        treeherder = {
+-            'jobKind': 'test',
+-            'machine': {
+-                'platform': 'ui-test',
+-            },
+-            'symbol': 'ui-test',
+-            'tier': 2,
+-        }
+-
+         return self._craft_build_ish_task(
+-            name='Fenix - UI test',
+-            description='Execute Gradle tasks for UI tests',
++            name='test: {}'.format(variant.name),
++            description='Building and testing variant {}'.format(variant.name),
+             command=command,
+-            scopes=[
+-                'secrets:get:project/mobile/fenix/firebase'
+-            ],
+-            artifacts=artifacts,
+-            env_vars=env_vars,
+-            treeherder=treeherder,
+-        )
+-
+-    def craft_detekt_task(self):
+-        return self._craft_clean_gradle_task(
+-            name='detekt',
+-            description='Running detekt code quality checks',
+-            gradle_task='detekt',
+-            treeherder={
+-                'jobKind': 'test',
+-                'machine': {
+-                  'platform': 'lint',
+-                },
+-                'symbol': 'detekt',
+-                'tier': 1,
+-            }
+-
+-        )
+-
+-    def craft_ktlint_task(self):
+-        return self._craft_clean_gradle_task(
+-            name='ktlint',
+-            description='Running ktlint code quality checks',
+-            gradle_task='ktlint',
+-            treeherder={
+-                'jobKind': 'test',
+-                'machine': {
+-                  'platform': 'lint',
+-                },
+-                'symbol': 'ktlint',
+-                'tier': 1,
+-            }
+-        )
+-
+-    def craft_lint_task(self):
+-        return self._craft_clean_gradle_task(
+-            name='lint',
+-            description='Running lint for aarch64 release variant',
+-            gradle_task='lintDebug',
+             treeherder={
++                'groupSymbol': variant.build_type,
+                 'jobKind': 'test',
+                 'machine': {
+-                  'platform': 'lint',
++                  'platform': 'android-all',
+                 },
+-                'symbol': 'lint',
++                'symbol': 'T',
+                 'tier': 1,
+             },
++            scopes=[
++                'secrets:get:{}'.format(secret_index)
++            ]
+         )
+ 
+     def _craft_clean_gradle_task(
+@@ -286,24 +212,6 @@ def _craft_clean_gradle_task(
+             scopes=scopes,
+         )
+ 
+-    def craft_compare_locales_task(self):
+-        return self._craft_build_ish_task(
+-            name='compare-locales',
+-            description='Validate strings.xml with compare-locales',
+-            command=(
+-                'pip install "compare-locales>=5.0.2,<6.0" && '
+-                'compare-locales --validate l10n.toml .'
+-            ),
+-            treeherder={
+-                'jobKind': 'test',
+-                'machine': {
+-                  'platform': 'lint',
+-                },
+-                'symbol': 'compare-locale',
+-                'tier': 2,
+-            }
+-        )
+-
+     def _craft_build_ish_task(
+         self, name, description, command, dependencies=None, artifacts=None,
+         routes=None, treeherder=None, env_vars=None, scopes=None, attributes=None
+diff --git a/fenix/automation/taskcluster/upload_coverage_report.sh b/fenix/automation/taskcluster/upload_coverage_report.sh
+index 7e9cabd4c51f..7ff204d3d22f 100755
+--- a/fenix/automation/taskcluster/upload_coverage_report.sh
++++ b/fenix/automation/taskcluster/upload_coverage_report.sh
+@@ -5,12 +5,6 @@
+ # If a command fails then do not proceed and fail this script too.
+ set -ex
+ 
+-# Get token for uploading to codecov and append it to codecov.yml
+-python automation/taskcluster/helper/get-secret.py \
+-    -s project/mobile/fenix/public-tokens \
+-    -k codecov \
+-    -f .cc_token \
+-
+ # Set some environment variables that will help codecov detect the CI
+ export CI_BUILD_URL="https://tools.taskcluster.net/tasks/$TASK_ID"
+ 
+diff --git a/fenix/taskcluster/ci/docker-image/kind.yml b/fenix/taskcluster/ci/docker-image/kind.yml
+index db2e9969b787..c807d30153db 100644
+--- a/fenix/taskcluster/ci/docker-image/kind.yml
++++ b/fenix/taskcluster/ci/docker-image/kind.yml
+@@ -16,3 +16,6 @@ jobs:
+     nimbledroid:
+         parent: base
+         symbol: I(nimbledroid)
++    ui-tests:
++        parent: base
++        symbol: I(ui-tests)
+diff --git a/fenix/taskcluster/ci/lint/kind.yml b/fenix/taskcluster/ci/lint/kind.yml
+new file mode 100644
+index 000000000000..fb10492a9d82
+--- /dev/null
++++ b/fenix/taskcluster/ci/lint/kind.yml
+@@ -0,0 +1,44 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++---
++
++loader: taskgraph.loader.transform:loader
++
++transforms:
++    - taskgraph.transforms.job:transforms
++    - taskgraph.transforms.task:transforms
++
++job-defaults:
++    attributes:
++        code-review: true
++    worker-type: b-android
++    worker:
++        docker-image: {in-tree: base}
++        max-run-time: 7200
++    run:
++        use-caches: false
++    run-on-tasks-for: [github-pull-request, github-push]
++
++jobs:
++    detekt:
++        description: 'Running detekt over all modules'
++        run:
++            using: gradlew
++            gradlew: [detekt]
++    ktlint:
++        description: 'Running ktlint over all modules'
++        run:
++            using: gradlew
++            gradlew: [ktlint]
++    compare-locales:
++        description: 'Validate strings.xml with compare-locales'
++        run:
++            using: run-task
++            cwd: '{checkout}'
++            command: 'pip install --user "compare-locales>=5.0.2,<6.0" && compare-locales --validate l10n.toml .'
++    lint:
++        description: 'Running tlint over all modules'
++        run:
++            using: gradlew
++            gradlew: [lintDebug]
+diff --git a/fenix/taskcluster/ci/pr/kind.yml b/fenix/taskcluster/ci/pr/kind.yml
+index a2f0c5da35ad..36d7e1927a7a 100644
+--- a/fenix/taskcluster/ci/pr/kind.yml
++++ b/fenix/taskcluster/ci/pr/kind.yml
+@@ -6,6 +6,7 @@ loader: taskgraph.loader.transform:loader
+ 
+ kind-dependencies:
+     - old-decision
++    - test
+ 
+ transforms:
+     - taskgraph.transforms.code_review:transforms
+diff --git a/fenix/taskcluster/ci/test/kind.yml b/fenix/taskcluster/ci/test/kind.yml
+new file mode 100644
+index 000000000000..0fa11c5cfc05
+--- /dev/null
++++ b/fenix/taskcluster/ci/test/kind.yml
+@@ -0,0 +1,50 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++---
++loader: taskgraph.loader.transform:loader
++
++transforms:
++    - taskgraph.transforms.job:transforms
++    - taskgraph.transforms.task:transforms
++
++job-defaults:
++    description: Test Reference Browser
++    treeherder:
++        kind: test
++        tier: 2
++    worker-type: b-android
++    worker:
++        max-run-time: 7200
++    run:
++        using: gradlew
++        use-caches: false
++
++jobs:
++    ui:
++        attributes:
++            build-type: debug
++            code-review: true
++        treeherder:
++            symbol: ui
++            platform: 'ui-test/opt'
++        run-on-tasks-for: [github-pull-request, github-push]
++        run:
++            # TODO Generate APKs in a build task instead
++            gradlew: ['clean', 'assembleDebug', 'assembleAndroidTest']
++            post-gradlew:
++                - ['automation/taskcluster/androidTest/ui-test.sh', 'x86', '-1']
++            secrets:
++                - name: project/mobile/fenix/firebase
++                  key: firebaseToken
++                  path: .firebase_token.json
++                  json: true
++        worker:
++            docker-image: {in-tree: ui-tests}
++            env:
++                GOOGLE_APPLICATION_CREDENTIALS: '.firebase_token.json'
++                GOOGLE_PROJECT: moz-fenix
++            artifacts:
++                - name: public
++                  path: /build/fenix/results
++                  type: directory
+diff --git a/fenix/taskcluster/docker/base/Dockerfile b/fenix/taskcluster/docker/base/Dockerfile
+index 44f3587d8561..93fac01c911c 100644
+--- a/fenix/taskcluster/docker/base/Dockerfile
++++ b/fenix/taskcluster/docker/base/Dockerfile
+@@ -48,6 +48,7 @@ RUN apt-get update -qq \
+     && apt-get clean
+ 
+ RUN pip install --upgrade pip
++RUN pip install taskcluster
+ 
+ RUN locale-gen en_US.UTF-8
+ 
+diff --git a/fenix/taskcluster/docker/nimbledroid/Dockerfile b/fenix/taskcluster/docker/nimbledroid/Dockerfile
+index aea2727d07e8..61588d849dc1 100644
+--- a/fenix/taskcluster/docker/nimbledroid/Dockerfile
++++ b/fenix/taskcluster/docker/nimbledroid/Dockerfile
+@@ -3,4 +3,4 @@ FROM $DOCKER_IMAGE_PARENT
+ 
+ MAINTAINER Kate Glazko <kglazko@mozilla.com>
+ 
+-RUN pip install taskcluster requests
++RUN pip install requests
+diff --git a/fenix/taskcluster/docker/ui-tests/Dockerfile b/fenix/taskcluster/docker/ui-tests/Dockerfile
+new file mode 100644
+index 000000000000..babaad64ae2a
+--- /dev/null
++++ b/fenix/taskcluster/docker/ui-tests/Dockerfile
+@@ -0,0 +1,32 @@
++# %ARG DOCKER_IMAGE_PARENT
++FROM $DOCKER_IMAGE_PARENT
++MAINTAINER Richard Pappalardo <rpappalax@gmail.com>
++
++#----------------------------------------------------------------------------------------------------------------------
++#-- Test tools --------------------------------------------------------------------------------------------------------
++#----------------------------------------------------------------------------------------------------------------------
++
++USER worker:worker
++
++ENV GOOGLE_SDK_DOWNLOAD ./gcloud.tar.gz
++ENV GOOGLE_SDK_VERSION 233
++
++ENV TEST_TOOLS /builds/worker/test-tools
++ENV PATH ${PATH}:${TEST_TOOLS}:${TEST_TOOLS}/google-cloud-sdk/bin
++
++RUN mkdir -p ${TEST_TOOLS} && \
++    mkdir -p ${HOME}/.config/gcloud
++
++RUN curl https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-${GOOGLE_SDK_VERSION}.0.0-linux-x86_64.tar.gz --output ${GOOGLE_SDK_DOWNLOAD} \
++    && tar -xvf ${GOOGLE_SDK_DOWNLOAD} -C ${TEST_TOOLS} \
++    && rm -f ${GOOGLE_SDK_DOWNLOAD} \
++    && ${TEST_TOOLS}/google-cloud-sdk/install.sh --quiet \
++    && ${TEST_TOOLS}/google-cloud-sdk/bin/gcloud --quiet components update
++
++RUN URL_FLANK_BIN=$(curl -s "https://api.github.com/repos/TestArmada/flank/releases/latest" | grep "browser_download_url*" | sed -r "s/\"//g" | cut -d ":" -f3) \
++    && wget "https:${URL_FLANK_BIN}" -O ${TEST_TOOLS}/flank.jar \
++    && chmod +x ${TEST_TOOLS}/flank.jar
++
++
++# run-task expects to run as root
++USER root
+diff --git a/fenix/taskcluster/fenix_taskgraph/job.py b/fenix/taskcluster/fenix_taskgraph/job.py
+index 33b058b6ef2b..cc5b97aa5617 100644
+--- a/fenix/taskcluster/fenix_taskgraph/job.py
++++ b/fenix/taskcluster/fenix_taskgraph/job.py
+@@ -68,7 +68,7 @@ def _extract_command(run):
+ 
+ def _generate_secret_command(secret):
+     secret_command = [
+-        "taskcluster/scripts/get-secret.py",
++        "automation/taskcluster/helper/get-secret.py",
+         "-s", secret["name"],
+         "-k", secret["key"],
+         "-f", secret["path"],

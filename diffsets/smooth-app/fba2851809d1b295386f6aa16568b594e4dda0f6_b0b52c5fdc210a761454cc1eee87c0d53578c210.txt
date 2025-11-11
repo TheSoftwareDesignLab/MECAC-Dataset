@@ -1,0 +1,1998 @@
+diff --git a/packages/smooth_app/lib/background/background_task_details.dart b/packages/smooth_app/lib/background/background_task_details.dart
+index 2cf6d3232634..d7d57aca961e 100644
+--- a/packages/smooth_app/lib/background/background_task_details.dart
++++ b/packages/smooth_app/lib/background/background_task_details.dart
+@@ -124,6 +124,7 @@ class BackgroundTaskDetails extends AbstractBackgroundTask {
+     final Map<String, dynamic> productMap =
+         json.decode(inputMap) as Map<String, dynamic>;
+ 
++    // TODO(AshAman999): check returned Status
+     await OpenFoodAPIClient.saveProduct(
+       getUser(),
+       Product.fromJson(productMap),
+diff --git a/packages/smooth_app/lib/background/background_task_image.dart b/packages/smooth_app/lib/background/background_task_image.dart
+index 9e7c68376984..c620f854f274 100644
+--- a/packages/smooth_app/lib/background/background_task_image.dart
++++ b/packages/smooth_app/lib/background/background_task_image.dart
+@@ -5,7 +5,10 @@ import 'package:flutter/material.dart';
+ import 'package:flutter_gen/gen_l10n/app_localizations.dart';
+ import 'package:openfoodfacts/openfoodfacts.dart';
+ import 'package:openfoodfacts/utils/CountryHelper.dart';
++import 'package:provider/provider.dart';
+ import 'package:smooth_app/background/abstract_background_task.dart';
++import 'package:smooth_app/database/local_database.dart';
++import 'package:smooth_app/database/transient_file.dart';
+ import 'package:smooth_app/generic_lib/duration_constants.dart';
+ import 'package:smooth_app/query/product_query.dart';
+ import 'package:task_manager/task_manager.dart';
+@@ -74,6 +77,7 @@ class BackgroundTaskImage extends AbstractBackgroundTask {
+     required final File imageFile,
+     required final State<StatefulWidget> widget,
+   }) async {
++    final LocalDatabase localDatabase = widget.context.read<LocalDatabase>();
+     // For "OTHER" images we randomize the id with timestamp
+     // so that it runs separately.
+     final String uniqueId = AbstractBackgroundTask.generateUniqueId(
+@@ -81,7 +85,8 @@ class BackgroundTaskImage extends AbstractBackgroundTask {
+       imageField.value,
+       appendTimestamp: imageField == ImageField.OTHER,
+     );
+-    final BackgroundTaskImage backgroundImageInputData = BackgroundTaskImage._(
++    TransientFile.putImage(imageField, barcode, localDatabase, imageFile);
++    final BackgroundTaskImage backgroundTask = BackgroundTaskImage._(
+       uniqueId: uniqueId,
+       barcode: barcode,
+       processName: _PROCESS_NAME,
+@@ -91,12 +96,8 @@ class BackgroundTaskImage extends AbstractBackgroundTask {
+       user: jsonEncode(ProductQuery.getUser().toJson()),
+       country: ProductQuery.getCountry()!.iso2Code,
+     );
+-    await TaskManager().addTask(
+-      Task(
+-        data: backgroundImageInputData.toJson(),
+-        uniqueId: uniqueId,
+-      ),
+-    );
++    // TODO(monsieurtanuki): currently we run the task immediately and just once - if it fails we rollback the changes.
++    backgroundTask.execute(localDatabase); // async
+     if (!widget.mounted) {
+       return;
+     }
+@@ -110,6 +111,23 @@ class BackgroundTaskImage extends AbstractBackgroundTask {
+     );
+   }
+ 
++  @override
++  Future<TaskResult> execute(final LocalDatabase localDatabase) async {
++    try {
++      await super.execute(localDatabase);
++    } catch (e) {
++      //
++    } finally {
++      TransientFile.removeImage(
++        ImageFieldExtension.getType(imageField),
++        barcode,
++        localDatabase,
++      );
++      localDatabase.notifyListeners();
++    }
++    return TaskResult.success;
++  }
++
+   /// Uploads the product image.
+   @override
+   Future<void> upload() async {
+@@ -122,8 +140,5 @@ class BackgroundTaskImage extends AbstractBackgroundTask {
+ 
+     // TODO(AshAman999): check returned Status
+     await OpenFoodAPIClient.addProductImage(getUser(), image);
+-
+-    // Go to the file system and delete the file that was uploaded
+-    File(imagePath).deleteSync();
+   }
+ }
+diff --git a/packages/smooth_app/lib/cards/data_cards/image_upload_card.dart b/packages/smooth_app/lib/cards/data_cards/image_upload_card.dart
+index 0b1d1ae2b865..4f5cd0b50111 100644
+--- a/packages/smooth_app/lib/cards/data_cards/image_upload_card.dart
++++ b/packages/smooth_app/lib/cards/data_cards/image_upload_card.dart
+@@ -1,10 +1,11 @@
+-import 'dart:io';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_gen/gen_l10n/app_localizations.dart';
+ import 'package:openfoodfacts/openfoodfacts.dart';
++import 'package:provider/provider.dart';
+ import 'package:smooth_app/data_models/product_image_data.dart';
++import 'package:smooth_app/database/local_database.dart';
++import 'package:smooth_app/database/transient_file.dart';
+ import 'package:smooth_app/pages/image_crop_page.dart';
+-import 'package:smooth_app/pages/product/confirm_and_upload_picture.dart';
+ import 'package:smooth_app/pages/product/product_image_gallery_view.dart';
+ 
+ // TODO(monsieurtanuki): rename that class, like `ProductImageCarouselItem`
+@@ -16,126 +17,67 @@ class ImageUploadCard extends StatefulWidget {
+   const ImageUploadCard({
+     required this.product,
+     required this.productImageData,
+-    required this.onUpload,
+   });
+ 
+   final Product product;
+   final ProductImageData productImageData;
+-  final Function(BuildContext) onUpload;
+ 
+   @override
+   State<ImageUploadCard> createState() => _ImageUploadCardState();
+ }
+ 
+ class _ImageUploadCardState extends State<ImageUploadCard> {
+-  /// Normal size image to display in carousel
+-  ImageProvider? _imageProvider;
+-
+-  /// Full resolution image to display in image page
+-  ImageProvider? _imageFullProvider;
+-
+-  Future<void> _getImage() async {
+-    final File? croppedImageFile = await startImageCropping(this);
+-
+-    if (croppedImageFile != null) {
+-      if (widget.productImageData.imageField != ImageField.OTHER) {
+-        setState(() {
+-          // Update the image to load the new image file
+-          // The same full resolution image is used for both the carousel and the image page
+-          _imageProvider = FileImage(croppedImageFile);
+-          _imageFullProvider = _imageProvider;
+-        });
+-      }
+-      if (!mounted) {
+-        return;
+-      }
+-      await Navigator.push<File>(
+-        context,
+-        MaterialPageRoute<File>(
+-          builder: (BuildContext context) => ConfirmAndUploadPicture(
+-            barcode: widget.product.barcode!,
+-            imageField: widget.productImageData.imageField,
+-            initialPhoto: croppedImageFile,
+-          ),
+-        ),
+-      );
+-    }
+-  }
+-
+   @override
+   Widget build(BuildContext context) {
+     final Size screenSize = MediaQuery.of(context).size;
+     final AppLocalizations appLocalizations = AppLocalizations.of(context);
++    context.watch<LocalDatabase>();
++    final ImageProvider? imageProvider = TransientFile.getImageProvider(
++      widget.productImageData,
++      widget.product.barcode!,
++    );
+ 
+-    // We can already have an _imageProvider for a file that is going to be uploaded
+-    // or an imageUrl for a network image
+-    // or no image yet
+-    if (widget.productImageData.imageUrl != null) {
+-      _imageProvider = NetworkImage(widget.productImageData.imageUrl!);
+-    } else {
+-      if (_imageProvider != null) {
+-        //Refresh when image has been deselected on server side
+-        _imageProvider = null;
+-        _imageFullProvider = null;
+-      }
+-    }
+-
+-    if (_imageProvider != null) {
+-      return GestureDetector(
+-        child: Center(
+-          child: Image(
+-            image: _imageProvider!,
+-            fit: BoxFit.cover,
+-            height: 1000,
+-            errorBuilder: (BuildContext context, Object exception,
+-                StackTrace? stackTrace) {
+-              return Column(
+-                children: <Widget>[
+-                  Icon(
+-                    Icons.cloud_off_sharp,
+-                    size: screenSize.width / 4,
+-                  ),
+-                  Text(appLocalizations.no_internet_connection),
+-                ],
+-              );
+-            },
+-          ),
+-        ),
+-        onTap: () async {
+-          // if _imageFullProvider is null, we are displaying a small network image in the carousel
+-          // we need to load the full resolution image
+-
+-          if (_imageFullProvider == null) {
+-            final String? imageFullUrl =
+-                widget.productImageData.getImageUrl(ImageSize.ORIGINAL);
+-            if (imageFullUrl != null) {
+-              _imageFullProvider = NetworkImage(imageFullUrl);
+-            }
+-          }
+-
+-          // TODO(monsieurtanuki): careful, waiting for pop'ed value
+-          final bool? refreshed = await Navigator.push<bool>(
+-            context,
+-            MaterialPageRoute<bool>(
+-              builder: (BuildContext context) => ProductImageGalleryView(
+-                product: widget.product,
+-              ),
+-            ),
+-          );
+-          if (!mounted) {
+-            return;
+-          }
+-          if (refreshed ?? false) {
+-            await widget.onUpload(context);
+-          }
+-        },
+-      );
+-    } else {
++    if (imageProvider == null) {
+       return ElevatedButton.icon(
+-        onPressed: _getImage,
++        onPressed: () async => confirmAndUploadNewPicture(
++          this,
++          barcode: widget.product.barcode!,
++          imageField: widget.productImageData.imageField,
++        ),
+         icon: const Icon(Icons.add_a_photo),
+         label: Text(widget.productImageData.buttonText),
+       );
+     }
++    return GestureDetector(
++      child: Center(
++        child: Image(
++          image: imageProvider,
++          fit: BoxFit.cover,
++          height: 1000,
++          errorBuilder: (
++            BuildContext context,
++            Object exception,
++            StackTrace? stackTrace,
++          ) =>
++              Column(
++            children: <Widget>[
++              Icon(
++                Icons.cloud_off_sharp,
++                size: screenSize.width / 4,
++              ),
++              Text(appLocalizations.no_internet_connection),
++            ],
++          ),
++        ),
++      ),
++      onTap: () async => Navigator.push<void>(
++        context,
++        MaterialPageRoute<bool>(
++          builder: (BuildContext context) => ProductImageGalleryView(
++            product: widget.product,
++          ),
++        ),
++      ),
++    );
+   }
+ }
+diff --git a/packages/smooth_app/lib/cards/product_cards/product_image_carousel.dart b/packages/smooth_app/lib/cards/product_cards/product_image_carousel.dart
+index 03e6de2b7ad7..7f1319bdc1d7 100644
+--- a/packages/smooth_app/lib/cards/product_cards/product_image_carousel.dart
++++ b/packages/smooth_app/lib/cards/product_cards/product_image_carousel.dart
+@@ -10,13 +10,11 @@ class ProductImageCarousel extends StatelessWidget {
+   const ProductImageCarousel(
+     this.product, {
+     required this.height,
+-    this.onUpload,
+     this.alternateImageUrl,
+   });
+ 
+   final Product product;
+   final double height;
+-  final Function(BuildContext)? onUpload;
+   final String? alternateImageUrl;
+ 
+   @override
+@@ -49,7 +47,6 @@ class ProductImageCarousel extends StatelessWidget {
+             child: ImageUploadCard(
+               product: product,
+               productImageData: data,
+-              onUpload: onUpload ?? (_) {},
+             ),
+           );
+         },
+diff --git a/packages/smooth_app/lib/database/transient_file.dart b/packages/smooth_app/lib/database/transient_file.dart
+new file mode 100644
+index 000000000000..940c7b7d144b
+--- /dev/null
++++ b/packages/smooth_app/lib/database/transient_file.dart
+@@ -0,0 +1,103 @@
++import 'dart:io';
++
++import 'package:flutter/material.dart';
++import 'package:openfoodfacts/model/ProductImage.dart';
++import 'package:smooth_app/data_models/product_image_data.dart';
++import 'package:smooth_app/database/local_database.dart';
++
++/// Helper class about transient files (= not fully uploaded yet).
++class TransientFile {
++  TransientFile._();
++
++  /// {File "key": file path} map.
++  static final Map<String, String> _transientFiles = <String, String>{};
++
++  /// Stores locally [file] as a transient image for [imageField] and [barcode].
++  static void putImage(
++    final ImageField imageField,
++    final String barcode,
++    final LocalDatabase localDatabase,
++    final File file,
++  ) {
++    _transientFiles[_getImageKey(imageField, barcode)] = file.path;
++    localDatabase.notifyListeners();
++  }
++
++  /// Removes the current transient image for [imageField] and [barcode].
++  ///
++  /// It will also delete the actual local file.
++  static void removeImage(
++    final ImageField imageField,
++    final String barcode,
++    final LocalDatabase localDatabase,
++  ) {
++    final String key = _getImageKey(imageField, barcode);
++    final String? path = _transientFiles[key];
++    if (path == null) {
++      return;
++    }
++    _transientFiles.remove(key);
++    File(path).deleteSync();
++    localDatabase.notifyListeners();
++  }
++
++  /// Returns the transient image for [imageField] and [barcode].
++  static File? getImage(
++    final ImageField imageField,
++    final String barcode,
++  ) {
++    final String? path = _transientFiles[_getImageKey(imageField, barcode)];
++    if (path == null) {
++      return null;
++    }
++    return File(path);
++  }
++
++  /// Returns the key of the transient image for [imageField] and [barcode].
++  static String _getImageKey(
++    final ImageField imageField,
++    final String barcode,
++  ) =>
++      '$barcode;$imageField';
++
++  /// Returns a way to display the image, either locally or from the server.
++  static ImageProvider? getImageProvider(
++    final ProductImageData imageData,
++    final String barcode,
++  ) {
++    final File? file = getImage(imageData.imageField, barcode);
++    if (file != null) {
++      return FileImage(file);
++    }
++    if (imageData.imageUrl != null) {
++      return NetworkImage(imageData.imageUrl!);
++    }
++    return null;
++  }
++
++  /// Returns true if an image is available, locally or on the server.
++  ///
++  /// That's the same as [getImageProvider] `!= null`, without its possible
++  /// side-effects.
++  static bool isImageAvailable(
++    final ProductImageData imageData,
++    final String barcode,
++  ) =>
++      getImage(imageData.imageField, barcode) != null ||
++      imageData.imageUrl != null;
++
++  /// Returns true if the displayed image comes from the server.
++  ///
++  /// Typical use-case: for OCR methods.
++  /// In those cases we don't provide an image parameter, we just ask the
++  /// server: "Use the packaging image you have and run the OCR on it!"
++  /// That means that it's important to know what we are displaying on the app:
++  /// if it's a local image, when we run the OCR we run it on another image -
++  /// the one stored on the server. Which makes no sense.
++  static bool isServerImage(
++    final ProductImageData imageData,
++    final String barcode,
++  ) =>
++      getImage(imageData.imageField, barcode) == null &&
++      imageData.imageUrl != null;
++}
+diff --git a/packages/smooth_app/lib/generic_lib/widgets/smooth_product_image.dart b/packages/smooth_app/lib/generic_lib/widgets/smooth_product_image.dart
+index b6a7fe3e88e3..6b19373a4a1b 100644
+--- a/packages/smooth_app/lib/generic_lib/widgets/smooth_product_image.dart
++++ b/packages/smooth_app/lib/generic_lib/widgets/smooth_product_image.dart
+@@ -1,6 +1,11 @@
+ import 'package:flutter/material.dart';
+-import 'package:openfoodfacts/model/Product.dart';
++import 'package:flutter_gen/gen_l10n/app_localizations.dart';
++import 'package:openfoodfacts/openfoodfacts.dart';
++import 'package:provider/provider.dart';
++import 'package:smooth_app/database/local_database.dart';
++import 'package:smooth_app/database/transient_file.dart';
+ import 'package:smooth_app/generic_lib/widgets/images/smooth_image.dart';
++import 'package:smooth_app/helpers/product_cards_helper.dart';
+ 
+ /// Main product image on a product card.
+ class SmoothMainProductImage extends StatelessWidget {
+@@ -16,16 +21,20 @@ class SmoothMainProductImage extends StatelessWidget {
+ 
+   @override
+   Widget build(BuildContext context) {
+-    final NetworkImage? child = _buildFromUrl(product.imageFrontSmallUrl) ??
+-        _buildFromUrl(product.imageFrontUrl);
++    context.watch<LocalDatabase>();
++    final ImageProvider? imageProvider = TransientFile.getImageProvider(
++      getProductImageData(
++        product,
++        AppLocalizations.of(context),
++        ImageField.FRONT,
++      ),
++      product.barcode!,
++    );
+ 
+     return SmoothImage(
+       width: width,
+       height: height,
+-      imageProvider: child,
++      imageProvider: imageProvider,
+     );
+   }
+-
+-  NetworkImage? _buildFromUrl(final String? url) =>
+-      url == null || url.isEmpty ? null : NetworkImage(url);
+ }
+diff --git a/packages/smooth_app/lib/helpers/product_cards_helper.dart b/packages/smooth_app/lib/helpers/product_cards_helper.dart
+index 147d166f2bd8..e26efb5bd7b7 100644
+--- a/packages/smooth_app/lib/helpers/product_cards_helper.dart
++++ b/packages/smooth_app/lib/helpers/product_cards_helper.dart
+@@ -113,35 +113,80 @@ List<ProductImageData> getProductMainImagesData(
+   final bool includeOther = true,
+ }) =>
+     <ProductImageData>[
+-      ProductImageData(
+-        imageField: ImageField.FRONT,
+-        imageUrl: product.imageFrontUrl,
+-        title: appLocalizations.product,
+-        buttonText: appLocalizations.front_photo,
+-      ),
+-      ProductImageData(
+-        imageField: ImageField.INGREDIENTS,
+-        imageUrl: product.imageIngredientsUrl,
+-        title: appLocalizations.ingredients,
+-        buttonText: appLocalizations.ingredients_photo,
+-      ),
+-      ProductImageData(
+-        imageField: ImageField.NUTRITION,
+-        imageUrl: product.imageNutritionUrl,
+-        title: appLocalizations.nutrition,
+-        buttonText: appLocalizations.nutrition_facts_photo,
+-      ),
+-      ProductImageData(
+-        imageField: ImageField.PACKAGING,
+-        imageUrl: product.imagePackagingUrl,
+-        title: appLocalizations.packaging_information,
+-        buttonText: appLocalizations.packaging_information_photo,
+-      ),
++      getProductImageData(product, appLocalizations, ImageField.FRONT),
++      getProductImageData(product, appLocalizations, ImageField.INGREDIENTS),
++      getProductImageData(product, appLocalizations, ImageField.NUTRITION),
++      getProductImageData(product, appLocalizations, ImageField.PACKAGING),
+       if (includeOther)
+-        ProductImageData(
+-          imageField: ImageField.OTHER,
+-          imageUrl: null,
+-          title: appLocalizations.more_photos,
+-          buttonText: appLocalizations.more_photos,
+-        ),
++        getProductImageData(product, appLocalizations, ImageField.OTHER),
+     ];
++
++ProductImageData getProductImageData(
++  final Product product,
++  final AppLocalizations? appLocalizations,
++  final ImageField imageField,
++) =>
++    ProductImageData(
++      imageField: imageField,
++      imageUrl: getProductImageUrl(product, imageField),
++      title: appLocalizations == null
++          ? ''
++          : getProductImageTitle(appLocalizations, imageField),
++      buttonText: appLocalizations == null
++          ? ''
++          : getProductImageButtonText(appLocalizations, imageField),
++    );
++
++String? getProductImageUrl(
++  final Product product,
++  final ImageField imageField,
++) {
++  switch (imageField) {
++    case ImageField.FRONT:
++      return product.imageFrontUrl;
++    case ImageField.INGREDIENTS:
++      return product.imageIngredientsUrl;
++    case ImageField.NUTRITION:
++      return product.imageNutritionUrl;
++    case ImageField.PACKAGING:
++      return product.imagePackagingUrl;
++    case ImageField.OTHER:
++      return null;
++  }
++}
++
++String getProductImageTitle(
++  final AppLocalizations appLocalizations,
++  final ImageField imageField,
++) {
++  switch (imageField) {
++    case ImageField.FRONT:
++      return appLocalizations.product;
++    case ImageField.INGREDIENTS:
++      return appLocalizations.ingredients;
++    case ImageField.NUTRITION:
++      return appLocalizations.nutrition;
++    case ImageField.PACKAGING:
++      return appLocalizations.packaging_information;
++    case ImageField.OTHER:
++      return appLocalizations.more_photos;
++  }
++}
++
++String getProductImageButtonText(
++  final AppLocalizations appLocalizations,
++  final ImageField imageField,
++) {
++  switch (imageField) {
++    case ImageField.FRONT:
++      return appLocalizations.front_photo;
++    case ImageField.INGREDIENTS:
++      return appLocalizations.ingredients_photo;
++    case ImageField.NUTRITION:
++      return appLocalizations.nutrition_facts_photo;
++    case ImageField.PACKAGING:
++      return appLocalizations.packaging_information_photo;
++    case ImageField.OTHER:
++      return appLocalizations.more_photos;
++  }
++}
+diff --git a/packages/smooth_app/lib/l10n/app_en.arb b/packages/smooth_app/lib/l10n/app_en.arb
+index b918724fc3ff..2162a92f0793 100644
+--- a/packages/smooth_app/lib/l10n/app_en.arb
++++ b/packages/smooth_app/lib/l10n/app_en.arb
+@@ -1172,6 +1172,10 @@
+     "@edit_packaging_refresh_photo_btn_text": {
+         "description": "Packaging edition - Refresh photo"
+     },
++    "edit_ocr_extract_failed": "Failed to detect text in image.",
++    "@edit_ocr_extract_failed": {
++        "description": "OCR extraction - message for failed"
++    },
+     "user_list_dialog_new_title": "New list of products",
+     "@user_list_dialog_new_title": {
+         "description": "Title of the 'new user list' dialog"
+diff --git a/packages/smooth_app/lib/l10n/app_fr.arb b/packages/smooth_app/lib/l10n/app_fr.arb
+index 211fcd2054c3..75442410eb77 100644
+--- a/packages/smooth_app/lib/l10n/app_fr.arb
++++ b/packages/smooth_app/lib/l10n/app_fr.arb
+@@ -1172,6 +1172,10 @@
+     "@edit_packaging_refresh_photo_btn_text": {
+         "description": "Packaging edition - Refresh photo"
+     },
++    "edit_ocr_extract_failed": "Impossible de trouver du texte dans l'image.",
++    "@edit_ocr_extract_failed": {
++        "description": "OCR extraction - message for failed"
++    },
+     "user_list_dialog_new_title": "Nouvelle liste de produits",
+     "@user_list_dialog_new_title": {
+         "description": "Title of the 'new user list' dialog"
+diff --git a/packages/smooth_app/lib/pages/hunger_games/question_card.dart b/packages/smooth_app/lib/pages/hunger_games/question_card.dart
+index 9c03b9935d3a..265161037694 100644
+--- a/packages/smooth_app/lib/pages/hunger_games/question_card.dart
++++ b/packages/smooth_app/lib/pages/hunger_games/question_card.dart
+@@ -42,7 +42,6 @@ class QuestionCard extends StatelessWidget {
+                 ProductImageCarousel(
+                   product,
+                   height: screenSize.height / 6,
+-                  onUpload: (_) {},
+                   alternateImageUrl: question.imageUrl,
+                 ),
+                 Padding(
+diff --git a/packages/smooth_app/lib/pages/image_crop_page.dart b/packages/smooth_app/lib/pages/image_crop_page.dart
+index 6f560804b5fc..23469bb77110 100644
+--- a/packages/smooth_app/lib/pages/image_crop_page.dart
++++ b/packages/smooth_app/lib/pages/image_crop_page.dart
+@@ -3,11 +3,13 @@ import 'dart:io';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_gen/gen_l10n/app_localizations.dart';
+ import 'package:image_picker/image_picker.dart';
++import 'package:openfoodfacts/openfoodfacts.dart';
+ import 'package:provider/provider.dart';
+ import 'package:smooth_app/data_models/user_preferences.dart';
+ import 'package:smooth_app/generic_lib/dialogs/smooth_alert_dialog.dart';
+ import 'package:smooth_app/helpers/camera_helper.dart';
+ import 'package:smooth_app/pages/crop_helper.dart';
++import 'package:smooth_app/pages/product/confirm_and_upload_picture.dart';
+ 
+ /// Picks an image file from gallery or camera.
+ Future<XFile?> _pickImageFile(final State<StatefulWidget> widget) async {
+@@ -78,8 +80,45 @@ Future<UserPictureSource?> _getUserPictureSource(
+   );
+ }
+ 
++Future<File?> confirmAndUploadNewPicture(
++  final State<StatefulWidget> widget, {
++  required final ImageField imageField,
++  required final String barcode,
++}) async {
++  final File? croppedPhoto = await startNewImageCropping(widget);
++  if (croppedPhoto == null) {
++    return null;
++  }
++  if (!widget.mounted) {
++    return null;
++  }
++  return Navigator.push<File>(
++    widget.context,
++    MaterialPageRoute<File>(
++      builder: (BuildContext context) => ConfirmAndUploadPicture(
++        barcode: barcode,
++        imageField: imageField,
++        initialPhoto: croppedPhoto,
++      ),
++    ),
++  );
++}
++
++/// Crops an image picked from the gallery or camera.
++Future<File?> startNewImageCropping(
++  final State<StatefulWidget> widget,
++) async =>
++    _startImageCropping(widget);
++
++/// Crops an existing image.
++Future<File?> startExistingImageCropping(
++  final State<StatefulWidget> widget,
++  final File? existingImage,
++) async =>
++    _startImageCropping(widget, existingImage: existingImage);
++
+ /// Crops an image, either existing or picked from the gallery or camera.
+-Future<File?> startImageCropping(
++Future<File?> _startImageCropping(
+   final State<StatefulWidget> widget, {
+   final File? existingImage,
+ }) async {
+diff --git a/packages/smooth_app/lib/pages/product/add_basic_details_page.dart b/packages/smooth_app/lib/pages/product/add_basic_details_page.dart
+index a6c0df130e03..15fcfd3b99d1 100644
+--- a/packages/smooth_app/lib/pages/product/add_basic_details_page.dart
++++ b/packages/smooth_app/lib/pages/product/add_basic_details_page.dart
+@@ -87,7 +87,6 @@ class _AddBasicDetailsPageState extends State<AddBasicDetailsPage> {
+               child: ProductImageCarousel(
+                 _product,
+                 height: size.height * 0.20,
+-                onUpload: (_) {},
+               ),
+             ),
+             SizedBox(height: _heightSpace),
+diff --git a/packages/smooth_app/lib/pages/product/add_new_product_page.dart b/packages/smooth_app/lib/pages/product/add_new_product_page.dart
+index 24a278ab0009..469a360eac7a 100644
+--- a/packages/smooth_app/lib/pages/product/add_new_product_page.dart
++++ b/packages/smooth_app/lib/pages/product/add_new_product_page.dart
+@@ -5,13 +5,11 @@ import 'package:flutter_gen/gen_l10n/app_localizations.dart';
+ import 'package:openfoodfacts/model/Product.dart';
+ import 'package:openfoodfacts/model/ProductImage.dart';
+ import 'package:provider/provider.dart';
+-import 'package:smooth_app/database/dao_product.dart';
+ import 'package:smooth_app/database/local_database.dart';
+ import 'package:smooth_app/generic_lib/buttons/smooth_large_button_with_icon.dart';
+ import 'package:smooth_app/generic_lib/design_constants.dart';
+ import 'package:smooth_app/pages/image_crop_page.dart';
+ import 'package:smooth_app/pages/product/add_basic_details_page.dart';
+-import 'package:smooth_app/pages/product/confirm_and_upload_picture.dart';
+ import 'package:smooth_app/pages/product/nutrition_page_loaded.dart';
+ import 'package:smooth_app/pages/product/ordered_nutrients_cache.dart';
+ import 'package:smooth_app/widgets/smooth_scaffold.dart';
+@@ -40,8 +38,10 @@ class AddNewProductPage extends StatefulWidget {
+ }
+ 
+ class _AddNewProductPageState extends State<AddNewProductPage> {
+-  final Map<ImageField, List<File>> _uploadedImages =
+-      <ImageField, List<File>>{};
++  // Just one file per main image field
++  final Map<ImageField, File> _uploadedImages = <ImageField, File>{};
++  // Many possible files for "other" image field
++  final List<File> _otherUploadedImages = <File>[];
+ 
+   late Product _product;
+   late final Product _initialProduct;
+@@ -71,33 +71,14 @@ class _AddNewProductPageState extends State<AddNewProductPage> {
+     context.watch<LocalDatabase>();
+     final ThemeData themeData = Theme.of(context);
+     _product = _localDatabase.upToDate.getLocalUpToDate(_initialProduct);
++    final bool empty = _uploadedImages.isEmpty && _otherUploadedImages.isEmpty;
+     return SmoothScaffold(
+       appBar: AppBar(
+-          title: Text(appLocalizations.new_product),
+-          automaticallyImplyLeading: _uploadedImages.isEmpty),
++        title: Text(appLocalizations.new_product),
++        automaticallyImplyLeading: empty,
++      ),
+       floatingActionButton: FloatingActionButton.extended(
+-        onPressed: () async {
+-          if (_basicDetailsAdded ||
+-              _nutritionFactsAdded ||
+-              _uploadedImages.isNotEmpty) {
+-            // Tricky situation: we've launched background tasks,
+-            // but is at least one of them completed?
+-            final DaoProduct daoProduct = DaoProduct(_localDatabase);
+-            final Product? localProduct = await daoProduct.get(widget.barcode);
+-            // No background task was completed yet: we create a dummy product,
+-            // so that the pending changes can go on top of something.
+-            if (localProduct == null) {
+-              await daoProduct.put(_initialProduct);
+-              _localDatabase.upToDate
+-                  .setLatestDownloadedProduct(_initialProduct);
+-              _localDatabase.notifyListeners();
+-            }
+-          }
+-          if (!mounted) {
+-            return;
+-          }
+-          await Navigator.maybePop(context);
+-        },
++        onPressed: () async => Navigator.maybePop(context),
+         label: Text(appLocalizations.finish),
+         icon: const Icon(Icons.done),
+       ),
+@@ -118,7 +99,7 @@ class _AddNewProductPageState extends State<AddNewProductPage> {
+               ),
+               ..._buildImageCaptureRows(context),
+               _buildNutritionInputButton(),
+-              _buildaddInputDetailsButton()
++              _buildAddInputDetailsButton()
+             ],
+           ),
+         ),
+@@ -129,30 +110,29 @@ class _AddNewProductPageState extends State<AddNewProductPage> {
+   List<Widget> _buildImageCaptureRows(BuildContext context) {
+     final List<Widget> rows = <Widget>[];
+     // First build rows for buttons to ask user to upload images.
+-    for (final ImageField imageType in _SORTED_IMAGE_FIELD_LIST) {
++    for (final ImageField imageField in _SORTED_IMAGE_FIELD_LIST) {
+       // Always add a button to "Add other photos" because there can be multiple
+       // "other photos" uploaded by the user.
+-      if (imageType == ImageField.OTHER) {
+-        rows.add(_buildAddImageButton(context, imageType));
+-        if (_uploadedImages[imageType] != null) {
+-          for (final File image in _uploadedImages[imageType]!) {
+-            rows.add(_buildImageUploadedRow(context, imageType, image));
+-          }
++      if (imageField == ImageField.OTHER) {
++        rows.add(_buildAddImageButton(context, imageField));
++        for (final File image in _otherUploadedImages) {
++          rows.add(_buildImageUploadedRow(context, imageField, image));
+         }
+         continue;
+       }
+ 
+       // Everything else can only be uploaded once
+-      if (_isImageUploadedForType(imageType)) {
++      final File? imageFile = _uploadedImages[imageField];
++      if (imageFile != null) {
+         rows.add(
+           _buildImageUploadedRow(
+             context,
+-            imageType,
+-            _uploadedImages[imageType]![0],
++            imageField,
++            imageFile,
+           ),
+         );
+       } else {
+-        rows.add(_buildAddImageButton(context, imageType));
++        rows.add(_buildAddImageButton(context, imageField));
+       }
+     }
+     return rows;
+@@ -165,28 +145,19 @@ class _AddNewProductPageState extends State<AddNewProductPage> {
+         text: _getAddPhotoButtonText(context, imageField),
+         icon: Icons.camera_alt,
+         onPressed: () async {
+-          final File? initialPhoto = await startImageCropping(this);
+-          if (initialPhoto == null) {
+-            return;
+-          }
+-          // Photo can change in the ConfirmAndUploadPicture widget, the user
+-          // may choose to retake the image.
+-          // TODO(monsieurtanuki): careful, waiting for pop'ed value
+-          //ignore: use_build_context_synchronously
+-          final File? finalPhoto = await Navigator.push<File>(
+-            context,
+-            MaterialPageRoute<File>(
+-              builder: (BuildContext context) => ConfirmAndUploadPicture(
+-                barcode: widget.barcode,
+-                imageField: imageField,
+-                initialPhoto: initialPhoto,
+-              ),
+-            ),
++          final File? finalPhoto = await confirmAndUploadNewPicture(
++            this,
++            barcode: widget.barcode,
++            imageField: imageField,
+           );
+           if (finalPhoto != null) {
+-            _uploadedImages[imageField] =
+-                _uploadedImages[imageField] ?? <File>[];
+-            _uploadedImages[imageField]!.add(initialPhoto);
++            setState(() {
++              if (imageField == ImageField.OTHER) {
++                _otherUploadedImages.add(finalPhoto);
++              } else {
++                _uploadedImages[imageField] = finalPhoto;
++              }
++            });
+           }
+         },
+       ),
+@@ -217,10 +188,6 @@ class _AddNewProductPageState extends State<AddNewProductPage> {
+     }
+   }
+ 
+-  bool _isImageUploadedForType(ImageField imageType) {
+-    return (_uploadedImages[imageType] ?? <File>[]).isNotEmpty;
+-  }
+-
+   Widget _buildNutritionInputButton() {
+     // if the nutrition image is null, ie no image , we return nothing
+     if (_product.imageNutritionUrl == null) {
+@@ -267,7 +234,7 @@ class _AddNewProductPageState extends State<AddNewProductPage> {
+     );
+   }
+ 
+-  Widget _buildaddInputDetailsButton() {
++  Widget _buildAddInputDetailsButton() {
+     if (_basicDetailsAdded) {
+       return _InfoAddedRow(
+           text: AppLocalizations.of(context).basic_details_add_success);
+diff --git a/packages/smooth_app/lib/pages/product/confirm_and_upload_picture.dart b/packages/smooth_app/lib/pages/product/confirm_and_upload_picture.dart
+index e6dfeed2751a..0e298b7b77b8 100644
+--- a/packages/smooth_app/lib/pages/product/confirm_and_upload_picture.dart
++++ b/packages/smooth_app/lib/pages/product/confirm_and_upload_picture.dart
+@@ -11,6 +11,12 @@ import 'package:smooth_app/generic_lib/design_constants.dart';
+ import 'package:smooth_app/pages/image_crop_page.dart';
+ import 'package:smooth_app/widgets/smooth_scaffold.dart';
+ 
++/// Display of a full size picture with edit tools.
++///
++/// That's the only place where we upload images to the server.
++/// Picture is captured, shown it to the user one last time and ask for
++/// confirmation before uploading. Also present an option to retake the
++/// picture as sometimes the picture can be blurry.
+ class ConfirmAndUploadPicture extends StatefulWidget {
+   const ConfirmAndUploadPicture({
+     required this.barcode,
+@@ -28,6 +34,7 @@ class ConfirmAndUploadPicture extends StatefulWidget {
+ }
+ 
+ class _ConfirmAndUploadPictureState extends State<ConfirmAndUploadPicture> {
++  // The local up-to-date photo, before any upload.
+   late File photo;
+ 
+   @override
+@@ -41,12 +48,6 @@ class _ConfirmAndUploadPictureState extends State<ConfirmAndUploadPicture> {
+   @override
+   Widget build(BuildContext context) {
+     final AppLocalizations appLocalizations = AppLocalizations.of(context);
+-    final ThemeData themeData = Theme.of(context);
+-    File? retakenPhoto;
+-
+-    // Picture is captured, show it to the user one last time and ask for
+-    // confirmation before uploading. Also present an option to retake the
+-    // picture as sometimes the picture can be blurry.
+     return SmoothScaffold(
+       backgroundColor: Colors.black,
+       appBar: AppBar(
+@@ -69,83 +70,39 @@ class _ConfirmAndUploadPictureState extends State<ConfirmAndUploadPicture> {
+                   spacing: MEDIUM_SPACE,
+                   alignment: WrapAlignment.center,
+                   children: <Widget>[
+-                    OutlinedButton.icon(
+-                      icon: const Icon(Icons.camera_alt),
+-                      style: ButtonStyle(
+-                        backgroundColor: MaterialStateProperty.all(
+-                          themeData.colorScheme.background,
+-                        ),
+-                        shape: MaterialStateProperty.all(
+-                          const RoundedRectangleBorder(
+-                            borderRadius: ROUNDED_BORDER_RADIUS,
+-                          ),
+-                        ),
+-                      ),
++                    _OutlinedButton(
++                      iconData: Icons.camera_alt,
++                      label: appLocalizations.capture,
+                       onPressed: () async {
+-                        retakenPhoto = await startImageCropping(this);
++                        final File? retakenPhoto =
++                            await startNewImageCropping(this);
+                         if (retakenPhoto == null) {
+-                          if (!mounted) {
+-                            return;
+-                          }
+-                          // User chose not to upload the image.
+-                          Navigator.pop(context);
+                           return;
+                         }
+-                        setState(
+-                          () {
+-                            photo = retakenPhoto!;
+-                          },
+-                        );
++                        if (!mounted) {
++                          return;
++                        }
++                        setState(() => photo = retakenPhoto);
+                       },
+-                      label: Text(appLocalizations.capture),
+                     ),
+-                    OutlinedButton.icon(
+-                      icon: const Icon(Icons.edit),
+-                      style: ButtonStyle(
+-                        backgroundColor: MaterialStateProperty.all(
+-                          themeData.colorScheme.background,
+-                        ),
+-                        shape: MaterialStateProperty.all(
+-                          const RoundedRectangleBorder(
+-                            borderRadius: ROUNDED_BORDER_RADIUS,
+-                          ),
+-                        ),
+-                      ),
++                    _OutlinedButton(
++                      iconData: Icons.edit,
++                      label: appLocalizations.edit_photo_button_label,
+                       onPressed: () async {
+-                        retakenPhoto = await startImageCropping(
+-                          this,
+-                          existingImage: photo,
+-                        );
+-                        if (retakenPhoto == null) {
+-                          if (!mounted) {
+-                            return;
+-                          }
+-                          // User chose not to upload the image.
+-                          Navigator.pop(context);
++                        final File? croppedPhoto =
++                            await startExistingImageCropping(this, photo);
++                        if (croppedPhoto == null) {
+                           return;
+                         }
+-                        setState(
+-                          () {
+-                            photo = retakenPhoto!;
+-                          },
+-                        );
++                        if (!mounted) {
++                          return;
++                        }
++                        setState(() => photo = croppedPhoto);
+                       },
+-                      label: Text(
+-                        appLocalizations.edit_photo_button_label,
+-                      ),
+                     ),
+-                    OutlinedButton.icon(
+-                      icon: const Icon(Icons.check),
+-                      style: ButtonStyle(
+-                        backgroundColor: MaterialStateProperty.all(
+-                          themeData.colorScheme.background,
+-                        ),
+-                        shape: MaterialStateProperty.all(
+-                          const RoundedRectangleBorder(
+-                            borderRadius: ROUNDED_BORDER_RADIUS,
+-                          ),
+-                        ),
+-                      ),
++                    _OutlinedButton(
++                      iconData: Icons.check,
++                      label: appLocalizations.confirm_button_label,
+                       onPressed: () async {
+                         await _uploadCapturedPicture(
+                           widget: this,
+@@ -156,14 +113,8 @@ class _ConfirmAndUploadPictureState extends State<ConfirmAndUploadPicture> {
+                         if (!mounted) {
+                           return;
+                         }
+-                        Navigator.pop(
+-                          context,
+-                          photo,
+-                        );
++                        Navigator.pop(context, photo);
+                       },
+-                      label: Text(
+-                        appLocalizations.confirm_button_label,
+-                      ),
+                     ),
+                   ],
+                 ),
+@@ -215,3 +166,34 @@ class _ConfirmAndUploadPictureState extends State<ConfirmAndUploadPicture> {
+     await model.onCreateProduct(barcode); // TODO(monsieurtanuki): a bit fishy
+   }
+ }
++
++/// Standard button for this page.
++class _OutlinedButton extends StatelessWidget {
++  const _OutlinedButton({
++    required this.iconData,
++    required this.label,
++    required this.onPressed,
++  });
++
++  final IconData iconData;
++  final String label;
++  final VoidCallback onPressed;
++
++  @override
++  Widget build(BuildContext context) {
++    final ThemeData themeData = Theme.of(context);
++    return OutlinedButton.icon(
++      icon: Icon(iconData),
++      style: ButtonStyle(
++        backgroundColor: MaterialStateProperty.all(
++          themeData.colorScheme.background,
++        ),
++        shape: MaterialStateProperty.all(
++          const RoundedRectangleBorder(borderRadius: ROUNDED_BORDER_RADIUS),
++        ),
++      ),
++      onPressed: onPressed,
++      label: Text(label),
++    );
++  }
++}
+diff --git a/packages/smooth_app/lib/pages/product/edit_ingredients_page.dart b/packages/smooth_app/lib/pages/product/edit_ingredients_page.dart
+index 316219fe02a8..d33bc9b1d28f 100644
+--- a/packages/smooth_app/lib/pages/product/edit_ingredients_page.dart
++++ b/packages/smooth_app/lib/pages/product/edit_ingredients_page.dart
+@@ -1,4 +1,3 @@
+-import 'dart:io';
+ import 'dart:ui' show ImageFilter;
+ 
+ import 'package:flutter/material.dart';
+@@ -6,14 +5,15 @@ import 'package:flutter_gen/gen_l10n/app_localizations.dart';
+ import 'package:openfoodfacts/openfoodfacts.dart';
+ import 'package:provider/provider.dart';
+ import 'package:smooth_app/background/background_task_details.dart';
++import 'package:smooth_app/data_models/product_image_data.dart';
+ import 'package:smooth_app/database/local_database.dart';
++import 'package:smooth_app/database/transient_file.dart';
+ import 'package:smooth_app/generic_lib/design_constants.dart';
+-import 'package:smooth_app/generic_lib/dialogs/smooth_alert_dialog.dart';
+-import 'package:smooth_app/generic_lib/duration_constants.dart';
++import 'package:smooth_app/generic_lib/loading_dialog.dart';
++import 'package:smooth_app/helpers/product_cards_helper.dart';
+ import 'package:smooth_app/pages/image_crop_page.dart';
+-import 'package:smooth_app/pages/product/confirm_and_upload_picture.dart';
+-import 'package:smooth_app/pages/product/explanation_widget.dart';
+ import 'package:smooth_app/pages/product/ocr_helper.dart';
++import 'package:smooth_app/pages/product/ocr_widget.dart';
+ import 'package:smooth_app/widgets/smooth_app_bar.dart';
+ import 'package:smooth_app/widgets/smooth_scaffold.dart';
+ 
+@@ -36,15 +36,11 @@ class EditOcrPage extends StatefulWidget {
+ 
+ class _EditOcrPageState extends State<EditOcrPage> {
+   final TextEditingController _controller = TextEditingController();
+-  ImageProvider? _imageProvider;
+-  // TODO(monsieurtanuki): probably not relevant as relying on background task
+-  bool _updatingImage = false;
+-  // TODO(monsieurtanuki): probably not relevant as relying on background task
+-  bool _updatingText = false;
+   late Product _product;
+   late final Product _initialProduct;
+   late final LocalDatabase _localDatabase;
+-  late OcrHelper _helper;
++
++  OcrHelper get _helper => widget.helper;
+ 
+   @override
+   void initState() {
+@@ -52,7 +48,6 @@ class _EditOcrPageState extends State<EditOcrPage> {
+     _initialProduct = widget.product;
+     _localDatabase = context.read<LocalDatabase>();
+     _localDatabase.upToDate.showInterest(_initialProduct.barcode!);
+-    _helper = widget.helper;
+     _controller.text = _helper.getText(_initialProduct);
+   }
+ 
+@@ -62,77 +57,44 @@ class _EditOcrPageState extends State<EditOcrPage> {
+     super.dispose();
+   }
+ 
+-  Future<void> _onSubmitField(ImageField imageField) async {
+-    setState(() => _updatingText = true);
+-    await _updateText(_controller.text, imageField);
+-    setState(() => _updatingText = false);
+-  }
++  Future<void> _onSubmitField(ImageField imageField) async =>
++      _updateText(_controller.text, imageField);
+ 
+-  Future<void> _onTapGetImage(bool isNewImage) async {
+-    setState(() => _updatingImage = true);
++  /// Opens a page to upload a new image.
++  Future<void> _newImage() async => confirmAndUploadNewPicture(
++        this,
++        barcode: _product.barcode!,
++        imageField: _helper.getImageField(),
++      );
+ 
++  /// Extracts data with OCR from the image stored on the server.
++  ///
++  /// When done, populates the related page field.
++  Future<void> _extractData() async {
++    // TODO(monsieurtanuki): hide the "extract" button while extracting, or display a loading dialog on top
+     try {
+-      await _getImage(isNewImage);
+-    } catch (error) {
+-      final AppLocalizations appLocalizations = AppLocalizations.of(context);
+-      _showError(_helper.getImageError(appLocalizations));
+-    }
+-
+-    setState(() => _updatingImage = false);
+-  }
+-
+-  // Show the given error message to the user in a SnackBar.
+-  void _showError(String error) {
+-    ScaffoldMessenger.of(context).showSnackBar(
+-      SnackBar(
+-        content: Text(error),
+-        duration: SnackBarDuration.medium,
+-      ),
+-    );
+-  }
+-
+-  // Get an image from the camera, run OCR on it, and update the product's
+-  // ingredients.
+-  //
+-  // Returns a Future that resolves successfully only if everything succeeds,
+-  // otherwise it will resolve with the relevant error.
+-  Future<void> _getImage(bool isNewImage) async {
+-    if (isNewImage) {
+-      final File? croppedImageFile = await startImageCropping(this);
+-
+-      // If the user cancels.
+-      if (croppedImageFile == null) {
++      final String? extractedText = await _helper.getExtractedText(_product);
++      if (!mounted) {
+         return;
+       }
+ 
+-      // Update the image to load the new image file.
+-      setState(() => _imageProvider = FileImage(croppedImageFile));
+-      if (!mounted) {
++      if (extractedText == null || extractedText.isEmpty) {
++        await LoadingDialog.error(
++          context: context,
++          title: AppLocalizations.of(context).edit_ocr_extract_failed,
++        );
+         return;
+       }
+-      await Navigator.push<File>(
+-        context,
+-        MaterialPageRoute<File>(
+-          builder: (BuildContext context) => ConfirmAndUploadPicture(
+-            barcode: _product.barcode!,
+-            imageField: _helper.getImageField(),
+-            initialPhoto: croppedImageFile,
+-          ),
+-        ),
+-      );
+-    }
+-
+-    final String? extractedText = await _helper.getExtractedText(_product);
+-    if (extractedText == null || extractedText.isEmpty) {
+-      throw Exception('Failed to detect text in image.');
+-    }
+ 
+-    // Save the product's ingredients if needed.
+-    if (_controller.text != extractedText) {
+-      setState(() => _controller.text = extractedText);
++      if (_controller.text != extractedText) {
++        setState(() => _controller.text = extractedText);
++      }
++    } catch (e) {
++      //
+     }
+   }
+ 
++  /// Updates the product field on the server.
+   Future<void> _updateText(
+     final String text,
+     final ImageField imageField,
+@@ -147,69 +109,11 @@ class _EditOcrPageState extends State<EditOcrPage> {
+     final AppLocalizations appLocalizations = AppLocalizations.of(context);
+     context.watch<LocalDatabase>();
+     _product = _localDatabase.upToDate.getLocalUpToDate(_initialProduct);
+-    final Size size = MediaQuery.of(context).size;
+-    final List<Widget> children = <Widget>[];
+-
+-    if (_imageProvider != null) {
+-      children.add(
+-        ConstrainedBox(
+-          constraints: const BoxConstraints.expand(),
+-          child: _buildZoomableImage(_imageProvider!),
+-        ),
+-      );
+-    } else {
+-      final String? imageUrl = _helper.getImageUrl(_product);
+-      if (imageUrl != null) {
+-        children.add(
+-          ConstrainedBox(
+-            constraints: const BoxConstraints.expand(),
+-            child: _buildZoomableImage(NetworkImage(imageUrl)),
+-          ),
+-        );
+-      } else {
+-        children.add(
+-          Container(
+-            alignment: Alignment.center,
+-            margin: EdgeInsets.only(bottom: size.height * 0.25),
+-            child: Column(
+-              mainAxisAlignment: MainAxisAlignment.center,
+-              crossAxisAlignment: CrossAxisAlignment.center,
+-              children: <Widget>[
+-                Icon(
+-                  Icons.image_not_supported,
+-                  size: size.height / 4,
+-                ),
+-                Text(
+-                  appLocalizations.ocr_image_upload_instruction,
+-                  style: Theme.of(context).textTheme.bodyText2,
+-                  textAlign: TextAlign.center,
+-                )
+-              ],
+-            ),
+-          ),
+-        );
+-      }
+-    }
+-
+-    if (_updatingImage) {
+-      children.add(
+-        const Center(
+-          child: CircularProgressIndicator.adaptive(),
+-        ),
+-      );
+-    } else {
+-      children.add(
+-        _OcrWidget(
+-          controller: _controller,
+-          onTapGetImage: _onTapGetImage,
+-          onSubmitField: _onSubmitField,
+-          updatingText: _updatingText,
+-          hasImageProvider: _imageProvider != null,
+-          product: _product,
+-          helper: _helper,
+-        ),
+-      );
+-    }
++    final ProductImageData productImageData = getProductImageData(
++      _product,
++      appLocalizations,
++      _helper.getImageField(),
++    );
+ 
+     return SmoothScaffold(
+       extendBodyBehindAppBar: true,
+@@ -233,143 +137,66 @@ class _EditOcrPageState extends State<EditOcrPage> {
+         ),
+       ),
+       body: Stack(
+-        children: children,
++        children: <Widget>[
++          _getImageWidget(productImageData),
++          OcrWidget(
++            controller: _controller,
++            onTapNewImage: _newImage,
++            onTapExtractData: _extractData,
++            onSubmitField: _onSubmitField,
++            productImageData: productImageData,
++            product: _product,
++            helper: _helper,
++          ),
++        ],
+       ),
+     );
+   }
+ 
+-  Widget _buildZoomableImage(ImageProvider imageSource) {
+-    return InteractiveViewer(
+-      boundaryMargin: const EdgeInsets.only(
+-        left: VERY_LARGE_SPACE,
+-        top: 10,
+-        right: VERY_LARGE_SPACE,
+-        bottom: 200,
+-      ),
+-      minScale: 0.1,
+-      maxScale: 5,
+-      child: Image(
+-        fit: BoxFit.contain,
+-        image: imageSource,
+-      ),
++  Widget _getImageWidget(final ProductImageData productImageData) {
++    final Size size = MediaQuery.of(context).size;
++    final AppLocalizations appLocalizations = AppLocalizations.of(context);
++    final ImageProvider? imageProvider = TransientFile.getImageProvider(
++      productImageData,
++      _initialProduct.barcode!,
+     );
+-  }
+-}
+ 
+-class _OcrWidget extends StatelessWidget {
+-  const _OcrWidget({
+-    required this.controller,
+-    required this.onSubmitField,
+-    required this.onTapGetImage,
+-    required this.updatingText,
+-    required this.hasImageProvider,
+-    required this.product,
+-    required this.helper,
+-  });
+-
+-  final TextEditingController controller;
+-  final bool updatingText;
+-  final Future<void> Function(bool) onTapGetImage;
+-  final Future<void> Function(ImageField) onSubmitField;
+-  final bool hasImageProvider;
+-  final Product product;
+-  final OcrHelper helper;
++    if (imageProvider != null) {
++      return ConstrainedBox(
++        constraints: const BoxConstraints.expand(),
++        child: InteractiveViewer(
++          boundaryMargin: const EdgeInsets.only(
++            left: VERY_LARGE_SPACE,
++            top: 10,
++            right: VERY_LARGE_SPACE,
++            bottom: 200,
++          ),
++          minScale: 0.1,
++          maxScale: 5,
++          child: Image(
++            fit: BoxFit.contain,
++            image: imageProvider,
++          ),
++        ),
++      );
++    }
+ 
+-  @override
+-  Widget build(BuildContext context) {
+-    final AppLocalizations appLocalizations = AppLocalizations.of(context);
+-    return Align(
+-      alignment: AlignmentDirectional.bottomStart,
++    return Container(
++      alignment: Alignment.center,
++      margin: EdgeInsets.only(bottom: size.height * 0.25),
+       child: Column(
+-        mainAxisAlignment: MainAxisAlignment.end,
++        mainAxisAlignment: MainAxisAlignment.center,
++        crossAxisAlignment: CrossAxisAlignment.center,
+         children: <Widget>[
+-          Flexible(
+-            flex: 1,
+-            child: Align(
+-              alignment: Alignment.bottomRight,
+-              child: Padding(
+-                padding: const EdgeInsetsDirectional.only(
+-                  bottom: LARGE_SPACE,
+-                  start: LARGE_SPACE,
+-                  end: LARGE_SPACE,
+-                ),
+-                child: SmoothActionButtonsBar(
+-                  positiveAction: SmoothActionButton(
+-                    text: (hasImageProvider ||
+-                            helper.getImageUrl(product) != null)
+-                        ? helper.getActionRefreshPhoto(appLocalizations)
+-                        : appLocalizations.upload_image,
+-                    onPressed: () => onTapGetImage(true),
+-                  ),
+-                ),
+-              ),
+-            ),
+-          ),
+-          Flexible(
+-            flex: 1,
+-            child: SingleChildScrollView(
+-              child: Container(
+-                decoration: BoxDecoration(
+-                    color: Theme.of(context).colorScheme.background,
+-                    borderRadius: const BorderRadius.only(
+-                      topLeft: ANGULAR_RADIUS,
+-                      topRight: ANGULAR_RADIUS,
+-                    )),
+-                child: Padding(
+-                  padding: const EdgeInsets.all(LARGE_SPACE),
+-                  child: Column(
+-                    children: <Widget>[
+-                      if (hasImageProvider ||
+-                          helper.getImageUrl(product) != null)
+-                        SmoothActionButtonsBar.single(
+-                          action: SmoothActionButton(
+-                            text: helper.getActionExtractText(appLocalizations),
+-                            onPressed: () => onTapGetImage(false),
+-                          ),
+-                        ),
+-                      const SizedBox(height: MEDIUM_SPACE),
+-                      TextField(
+-                        enabled: !updatingText,
+-                        controller: controller,
+-                        decoration: InputDecoration(
+-                          fillColor: Colors.white.withOpacity(0.2),
+-                          filled: true,
+-                          enabledBorder: const OutlineInputBorder(
+-                            borderRadius: ANGULAR_BORDER_RADIUS,
+-                          ),
+-                        ),
+-                        maxLines: null,
+-                        textInputAction: TextInputAction.done,
+-                        onSubmitted: (_) =>
+-                            onSubmitField(helper.getImageField()),
+-                      ),
+-                      const SizedBox(height: SMALL_SPACE),
+-                      ExplanationWidget(
+-                        helper.getInstructions(appLocalizations),
+-                      ),
+-                      const SizedBox(height: MEDIUM_SPACE),
+-                      SmoothActionButtonsBar(
+-                        axis: Axis.horizontal,
+-                        negativeAction: SmoothActionButton(
+-                          text: appLocalizations.cancel,
+-                          onPressed: () => Navigator.pop(context),
+-                        ),
+-                        positiveAction: SmoothActionButton(
+-                          text: appLocalizations.save,
+-                          onPressed: () async {
+-                            await onSubmitField(helper.getImageField());
+-                            //ignore: use_build_context_synchronously
+-                            Navigator.pop(context);
+-                          },
+-                        ),
+-                      ),
+-                      const SizedBox(height: MEDIUM_SPACE),
+-                    ],
+-                  ),
+-                ),
+-              ),
+-            ),
++          Icon(
++            Icons.image_not_supported,
++            size: size.height / 4,
+           ),
++          Text(
++            appLocalizations.ocr_image_upload_instruction,
++            style: Theme.of(context).textTheme.bodyText2,
++            textAlign: TextAlign.center,
++          )
+         ],
+       ),
+     );
+diff --git a/packages/smooth_app/lib/pages/product/new_product_page.dart b/packages/smooth_app/lib/pages/product/new_product_page.dart
+index 328fe872e713..0757991a690b 100644
+--- a/packages/smooth_app/lib/pages/product/new_product_page.dart
++++ b/packages/smooth_app/lib/pages/product/new_product_page.dart
+@@ -126,12 +126,6 @@ class _ProductPageState extends State<ProductPage> with TraceableClientMixin {
+     );
+   }
+ 
+-  Future<void> _refreshProduct(BuildContext context) async =>
+-      ProductRefresher().fetchAndRefresh(
+-        barcode: _barcode,
+-        widget: this,
+-      );
+-
+   Future<void> _updateLocalDatabaseWithProductHistory(
+     final BuildContext context,
+   ) async {
+@@ -148,7 +142,10 @@ class _ProductPageState extends State<ProductPage> with TraceableClientMixin {
+     final LocalDatabase localDatabase = context.read<LocalDatabase>();
+     final DaoProductList daoProductList = DaoProductList(localDatabase);
+     return RefreshIndicator(
+-      onRefresh: () => _refreshProduct(context),
++      onRefresh: () => ProductRefresher().fetchAndRefresh(
++        barcode: _barcode,
++        widget: this,
++      ),
+       child: ListView(
+         // /!\ Smart Dart
+         // `physics: const AlwaysScrollableScrollPhysics()`
+@@ -164,7 +161,6 @@ class _ProductPageState extends State<ProductPage> with TraceableClientMixin {
+             child: ProductImageCarousel(
+               _product,
+               height: 200,
+-              onUpload: _refreshProduct,
+             ),
+           ),
+           Padding(
+diff --git a/packages/smooth_app/lib/pages/product/ocr_widget.dart b/packages/smooth_app/lib/pages/product/ocr_widget.dart
+new file mode 100644
+index 000000000000..4dc10c478e41
+--- /dev/null
++++ b/packages/smooth_app/lib/pages/product/ocr_widget.dart
+@@ -0,0 +1,136 @@
++import 'package:flutter/material.dart';
++import 'package:flutter_gen/gen_l10n/app_localizations.dart';
++import 'package:openfoodfacts/openfoodfacts.dart';
++import 'package:smooth_app/data_models/product_image_data.dart';
++import 'package:smooth_app/database/transient_file.dart';
++import 'package:smooth_app/generic_lib/design_constants.dart';
++import 'package:smooth_app/generic_lib/dialogs/smooth_alert_dialog.dart';
++import 'package:smooth_app/pages/product/explanation_widget.dart';
++import 'package:smooth_app/pages/product/ocr_helper.dart';
++
++/// Widget dedicated to OCR, with 3 actions: upload image, extract data, save.
++class OcrWidget extends StatelessWidget {
++  const OcrWidget({
++    required this.controller,
++    required this.onSubmitField,
++    required this.onTapNewImage,
++    required this.onTapExtractData,
++    required this.productImageData,
++    required this.product,
++    required this.helper,
++  });
++
++  final TextEditingController controller;
++  final Future<void> Function() onTapNewImage;
++  final Future<void> Function() onTapExtractData;
++  final Future<void> Function(ImageField) onSubmitField;
++  final ProductImageData productImageData;
++  final Product product;
++  final OcrHelper helper;
++
++  @override
++  Widget build(BuildContext context) {
++    final AppLocalizations appLocalizations = AppLocalizations.of(context);
++    return Align(
++      alignment: AlignmentDirectional.bottomStart,
++      child: Column(
++        mainAxisAlignment: MainAxisAlignment.end,
++        children: <Widget>[
++          Flexible(
++            flex: 1,
++            child: Align(
++              alignment: Alignment.bottomRight,
++              child: Padding(
++                padding: const EdgeInsetsDirectional.only(
++                  bottom: LARGE_SPACE,
++                  start: LARGE_SPACE,
++                  end: LARGE_SPACE,
++                ),
++                child: SmoothActionButtonsBar(
++                  positiveAction: SmoothActionButton(
++                    text: (TransientFile.isImageAvailable(
++                      productImageData,
++                      product.barcode!,
++                    ))
++                        ? helper.getActionRefreshPhoto(appLocalizations)
++                        : appLocalizations.upload_image,
++                    onPressed: () async => onTapNewImage(),
++                  ),
++                ),
++              ),
++            ),
++          ),
++          Flexible(
++            flex: 1,
++            child: SingleChildScrollView(
++              child: Container(
++                decoration: BoxDecoration(
++                    color: Theme.of(context).colorScheme.background,
++                    borderRadius: const BorderRadius.only(
++                      topLeft: ANGULAR_RADIUS,
++                      topRight: ANGULAR_RADIUS,
++                    )),
++                child: Padding(
++                  padding: const EdgeInsets.all(LARGE_SPACE),
++                  child: Column(
++                    children: <Widget>[
++                      if (TransientFile.isServerImage(
++                        productImageData,
++                        product.barcode!,
++                      ))
++                        SmoothActionButtonsBar.single(
++                          action: SmoothActionButton(
++                            text: helper.getActionExtractText(appLocalizations),
++                            onPressed: () async => onTapExtractData(),
++                          ),
++                        )
++                      else
++                        // TODO(monsieurtanuki): what if slow upload? text instead?
++                        const CircularProgressIndicator.adaptive(),
++                      const SizedBox(height: MEDIUM_SPACE),
++                      TextField(
++                        controller: controller,
++                        decoration: InputDecoration(
++                          fillColor: Colors.white.withOpacity(0.2),
++                          filled: true,
++                          enabledBorder: const OutlineInputBorder(
++                            borderRadius: ANGULAR_BORDER_RADIUS,
++                          ),
++                        ),
++                        maxLines: null,
++                        textInputAction: TextInputAction.done,
++                        onSubmitted: (_) =>
++                            onSubmitField(helper.getImageField()),
++                      ),
++                      const SizedBox(height: SMALL_SPACE),
++                      ExplanationWidget(
++                        helper.getInstructions(appLocalizations),
++                      ),
++                      const SizedBox(height: MEDIUM_SPACE),
++                      SmoothActionButtonsBar(
++                        axis: Axis.horizontal,
++                        negativeAction: SmoothActionButton(
++                          text: appLocalizations.cancel,
++                          onPressed: () => Navigator.pop(context),
++                        ),
++                        positiveAction: SmoothActionButton(
++                          text: appLocalizations.save,
++                          onPressed: () async {
++                            await onSubmitField(helper.getImageField());
++                            ////ignore: use_build_context_synchronously
++                            Navigator.pop(context);
++                          },
++                        ),
++                      ),
++                      const SizedBox(height: MEDIUM_SPACE),
++                    ],
++                  ),
++                ),
++              ),
++            ),
++          ),
++        ],
++      ),
++    );
++  }
++}
+diff --git a/packages/smooth_app/lib/pages/product/product_image_gallery_view.dart b/packages/smooth_app/lib/pages/product/product_image_gallery_view.dart
+index d3a23d426898..13c5c56f1388 100644
+--- a/packages/smooth_app/lib/pages/product/product_image_gallery_view.dart
++++ b/packages/smooth_app/lib/pages/product/product_image_gallery_view.dart
+@@ -1,18 +1,16 @@
+-import 'dart:io';
+-
+ import 'package:flutter/material.dart';
+ import 'package:flutter_gen/gen_l10n/app_localizations.dart';
+ import 'package:openfoodfacts/openfoodfacts.dart';
+ import 'package:provider/provider.dart';
+ import 'package:smooth_app/data_models/product_image_data.dart';
+ import 'package:smooth_app/database/local_database.dart';
++import 'package:smooth_app/database/transient_file.dart';
+ import 'package:smooth_app/generic_lib/design_constants.dart';
+ import 'package:smooth_app/generic_lib/widgets/images/smooth_images_sliver_list.dart';
+ import 'package:smooth_app/generic_lib/widgets/smooth_back_button.dart';
+ import 'package:smooth_app/helpers/product_cards_helper.dart';
+ import 'package:smooth_app/pages/image_crop_page.dart';
+ import 'package:smooth_app/pages/product/common/product_refresher.dart';
+-import 'package:smooth_app/pages/product/confirm_and_upload_picture.dart';
+ import 'package:smooth_app/pages/product/product_image_viewer.dart';
+ import 'package:smooth_app/widgets/smooth_app_bar.dart';
+ import 'package:smooth_app/widgets/smooth_scaffold.dart';
+@@ -37,10 +35,8 @@ class _ProductImageGalleryViewState extends State<ProductImageGalleryView> {
+ 
+   late Map<ProductImageData, ImageProvider?> _selectedImages;
+ 
+-  bool _isRefreshed = false;
+-
+   ImageProvider? _provideImage(ProductImageData imageData) =>
+-      imageData.imageUrl == null ? null : NetworkImage(imageData.imageUrl!);
++      TransientFile.getImageProvider(imageData, _barcode);
+ 
+   String get _barcode => _initialProduct.barcode!;
+ 
+@@ -84,7 +80,7 @@ class _ProductImageGalleryViewState extends State<ProductImageGalleryView> {
+               )
+             : null,
+         leading: SmoothBackButton(
+-          onPressed: () => Navigator.maybePop(context, _isRefreshed),
++          onPressed: () => Navigator.maybePop(context),
+         ),
+       ),
+       body: RefreshIndicator(
+@@ -102,7 +98,9 @@ class _ProductImageGalleryViewState extends State<ProductImageGalleryView> {
+               SmoothImagesSliverList(
+                 imagesData: _selectedImages,
+                 onTap: (ProductImageData data, _) =>
+-                    data.imageUrl != null ? _openImage(data) : _newImage(data),
++                    TransientFile.isImageAvailable(data, _barcode)
++                        ? _openImage(data)
++                        : _newImage(data),
+               ),
+             ],
+           ),
+@@ -133,38 +131,10 @@ class _ProductImageGalleryViewState extends State<ProductImageGalleryView> {
+         ),
+       );
+ 
+-  Future<void> _newImage(ProductImageData data) async {
+-    final File? croppedImageFile = await startImageCropping(this);
+-    if (croppedImageFile == null) {
+-      return;
+-    }
+-    if (!mounted) {
+-      return;
+-    }
+-    setState(() {
+-      final FileImage fileImage = FileImage(croppedImageFile);
+-      final ImageField imageField = data.imageField;
+-      for (final ProductImageData productImageData in _selectedImages.keys) {
+-        if (productImageData.imageField == imageField) {
+-          _selectedImages[productImageData] = fileImage;
+-          return;
+-        }
+-      }
+-    });
+-    final File? uploaded = await Navigator.push<File>(
+-      context,
+-      MaterialPageRoute<File>(
+-        builder: (BuildContext context) => ConfirmAndUploadPicture(
+-          barcode: _barcode,
+-          imageField: data.imageField,
+-          initialPhoto: croppedImageFile,
+-        ),
+-      ),
+-    );
+-    final bool isUploaded = uploaded != null;
+-
+-    if (isUploaded) {
+-      _isRefreshed = true;
+-    }
+-  }
++  Future<void> _newImage(ProductImageData data) async =>
++      confirmAndUploadNewPicture(
++        this,
++        barcode: _barcode,
++        imageField: data.imageField,
++      );
+ }
+diff --git a/packages/smooth_app/lib/pages/product/product_image_viewer.dart b/packages/smooth_app/lib/pages/product/product_image_viewer.dart
+index 6368dd50440d..c4ee7dda474c 100644
+--- a/packages/smooth_app/lib/pages/product/product_image_viewer.dart
++++ b/packages/smooth_app/lib/pages/product/product_image_viewer.dart
+@@ -10,14 +10,16 @@ import 'package:provider/provider.dart';
+ import 'package:smooth_app/data_models/product_image_data.dart';
+ import 'package:smooth_app/database/dao_int.dart';
+ import 'package:smooth_app/database/local_database.dart';
++import 'package:smooth_app/database/transient_file.dart';
+ import 'package:smooth_app/generic_lib/design_constants.dart';
+ import 'package:smooth_app/generic_lib/loading_dialog.dart';
+ import 'package:smooth_app/generic_lib/widgets/smooth_back_button.dart';
+ import 'package:smooth_app/helpers/database_helper.dart';
++import 'package:smooth_app/pages/image_crop_page.dart';
+ import 'package:smooth_app/pages/product/confirm_and_upload_picture.dart';
+ import 'package:smooth_app/widgets/smooth_scaffold.dart';
+ 
+-/// Displays a full-screen image with an edit floating button
++/// Displays a full-screen image with an "edit" floating button.
+ class ProductImageViewer extends StatefulWidget {
+   const ProductImageViewer({
+     required this.barcode,
+@@ -32,112 +34,121 @@ class ProductImageViewer extends StatefulWidget {
+ }
+ 
+ class _ProductImageViewerState extends State<ProductImageViewer> {
+-  late final ProductImageData imageData;
+-  late final AppLocalizations appLocalizations = AppLocalizations.of(context);
+-
+-  /// When the image is edited, this is the new image
+-  late ImageProvider imageProvider;
+-  bool _isEdited = false;
+-
+   @override
+-  void initState() {
+-    imageData = widget.imageData;
+-    imageProvider = NetworkImage(imageData.imageUrl!);
+-
+-    super.initState();
+-  }
+-
+-  @override
+-  Widget build(BuildContext context) => SmoothScaffold(
+-        extendBodyBehindAppBar: true,
++  Widget build(BuildContext context) {
++    final AppLocalizations appLocalizations = AppLocalizations.of(context);
++    context.watch<LocalDatabase>();
++    final ImageProvider? imageProvider = TransientFile.getImageProvider(
++      widget.imageData,
++      widget.barcode,
++    );
++    return SmoothScaffold(
++      extendBodyBehindAppBar: true,
++      backgroundColor: Colors.black,
++      floatingActionButton: FloatingActionButton.extended(
++        label: Text(appLocalizations.edit_photo_button_label),
++        icon: const Icon(Icons.edit),
++        backgroundColor: Theme.of(context).colorScheme.primary,
++        onPressed: () async => _editImage(),
++      ),
++      appBar: AppBar(
+         backgroundColor: Colors.black,
+-        floatingActionButton: FloatingActionButton.extended(
+-          label: Text(appLocalizations.edit_photo_button_label),
+-          icon: const Icon(Icons.edit),
+-          backgroundColor: Theme.of(context).colorScheme.primary,
+-          onPressed: () {
+-            final DaoInt daoInt = DaoInt(context.read<LocalDatabase>());
+-            _editImage(daoInt);
+-          },
++        foregroundColor: WHITE_COLOR,
++        elevation: 0,
++        title: Text(widget.imageData.title),
++        leading: SmoothBackButton(
++          iconColor: Colors.white,
++          onPressed: () => Navigator.maybePop(context),
+         ),
+-        appBar: AppBar(
+-          backgroundColor: Colors.black,
+-          foregroundColor: WHITE_COLOR,
+-          elevation: 0,
+-          title: Text(imageData.title),
+-          leading: SmoothBackButton(
+-            iconColor: Colors.white,
+-            onPressed: () => Navigator.maybePop(context, _isEdited),
+-          ),
+-        ),
+-        body: Column(
+-          mainAxisAlignment: MainAxisAlignment.center,
+-          children: <Widget>[
+-            ConstrainedBox(
+-              constraints: BoxConstraints.tight(
+-                Size(double.infinity, MediaQuery.of(context).size.height / 2),
++      ),
++      body: Column(
++        mainAxisAlignment: MainAxisAlignment.center,
++        children: <Widget>[
++          ConstrainedBox(
++            constraints: BoxConstraints.tight(
++              Size(double.infinity, MediaQuery.of(context).size.height / 2),
++            ),
++            child: PhotoView(
++              minScale: 0.2,
++              imageProvider:
++                  imageProvider, // TODO(monsieurtanuki): what if null?
++              heroAttributes: PhotoViewHeroAttributes(
++                tag: imageProvider ??
++                    Object(), // TODO(monsieurtanuki): what if null?
+               ),
+-              child: PhotoView(
+-                minScale: 0.2,
+-                imageProvider: imageProvider,
+-                heroAttributes: PhotoViewHeroAttributes(
+-                  tag: imageProvider,
+-                ),
+-                backgroundDecoration: const BoxDecoration(
+-                  color: Colors.black,
+-                ),
++              backgroundDecoration: const BoxDecoration(
++                color: Colors.black,
+               ),
+             ),
+-          ],
+-        ),
+-      );
++          ),
++        ],
++      ),
++    );
++  }
+ 
+-  Future<void> _editImage(final DaoInt daoInt) async {
+-    final String? imageUrl = imageData.getImageUrl(ImageSize.ORIGINAL);
+-    if (imageUrl == null) {
+-      await _showDownloadFailedDialog(appLocalizations.image_edit_url_error);
++  Future<void> _editImage() async {
++    // we have no image at all here: we need to create one.
++    if (!TransientFile.isImageAvailable(widget.imageData, widget.barcode)) {
++      await confirmAndUploadNewPicture(
++        this,
++        imageField: widget.imageData.imageField,
++        barcode: widget.barcode,
++      );
+       return;
+     }
+ 
+-    final File? imageFile = await LoadingDialog.run<File?>(
+-        context: context, future: _downloadImageFile(daoInt, imageUrl));
++    // best option: use the transient file.
++    File? imageFile = TransientFile.getImage(
++      widget.imageData.imageField,
++      widget.barcode,
++    );
+ 
++    // but if not possible, get the best picture from the server.
+     if (imageFile == null) {
+-      await _showDownloadFailedDialog(appLocalizations.image_download_error);
+-      return;
++      final AppLocalizations appLocalizations = AppLocalizations.of(context);
++      final String? imageUrl = widget.imageData.getImageUrl(ImageSize.ORIGINAL);
++      if (imageUrl == null) {
++        await LoadingDialog.error(
++          context: context,
++          title: appLocalizations.image_edit_url_error,
++        );
++        return;
++      }
++
++      final DaoInt daoInt = DaoInt(context.read<LocalDatabase>());
++      imageFile = await LoadingDialog.run<File?>(
++        context: context,
++        future: _downloadImageFile(daoInt, imageUrl),
++      );
++
++      if (imageFile == null) {
++        await LoadingDialog.error(
++          context: context,
++          title: appLocalizations.image_download_error,
++        );
++        return;
++      }
+     }
+ 
+     if (!mounted) {
+       return;
+     }
+ 
+-    final File? photoUploaded = await Navigator.push<File>(
++    await Navigator.push<void>(
+       context,
+-      MaterialPageRoute<File>(
++      MaterialPageRoute<void>(
+         builder: (BuildContext context) => ConfirmAndUploadPicture(
+           barcode: widget.barcode,
+-          imageField: imageData.imageField,
+-          initialPhoto: imageFile,
++          imageField: widget.imageData.imageField,
++          initialPhoto: imageFile!,
+         ),
+       ),
+     );
+-    if (photoUploaded != null) {
+-      _isEdited = true;
+-      if (!mounted) {
+-        return;
+-      }
+-
+-      setState(() {
+-        imageProvider = FileImage(photoUploaded);
+-      });
+-    }
+   }
+ 
+-  Future<void> _showDownloadFailedDialog(String? title) =>
+-      LoadingDialog.error(context: context, title: title);
+-
+   static const String _CROP_IMAGE_SEQUENCE_KEY = 'crop_image_sequence';
+ 
++  /// Downloads an image from the server and stores it locally in temp folder.
+   Future<File?> _downloadImageFile(DaoInt daoInt, String url) async {
+     final Uri uri = Uri.parse(url);
+     final http.Response response = await http.get(uri);

@@ -1,0 +1,164 @@
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationViewController.m b/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
+index 4846dc0d2f6..cac13441f4d 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
++++ b/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
+@@ -3893,7 +3893,6 @@ - (void)tryToSendTextMessage:(NSString *)text updateKeyboardState:(BOOL)updateKe
+     //
+     // We convert large text messages to attachments
+     // which are presented as normal text messages.
+-    const NSUInteger kOversizeTextMessageSizeThreshold = 16 * 1024;
+     BOOL didAddToProfileWhitelist = [ThreadUtil addThreadToProfileWhitelistIfEmptyContactThread:self.thread];
+     TSOutgoingMessage *message;
+     if ([text lengthOfBytesUsingEncoding:NSUTF8StringEncoding] >= kOversizeTextMessageSizeThreshold) {
+diff --git a/SignalMessaging/attachments/SharingThreadPickerViewController.m b/SignalMessaging/attachments/SharingThreadPickerViewController.m
+index 7028148f43b..870e80ccf7f 100644
+--- a/SignalMessaging/attachments/SharingThreadPickerViewController.m
++++ b/SignalMessaging/attachments/SharingThreadPickerViewController.m
+@@ -193,39 +193,63 @@ - (void)tryToSendAttachment:(SignalAttachment *)attachment fromViewController:(U
+     }
+ #endif
+ 
+-    void (^sendCompletion)(NSError *_Nullable, TSOutgoingMessage *message) = ^(
++    void (^sendCompletion)(NSError *_Nullable, TSOutgoingMessage *) = ^(
+         NSError *_Nullable error, TSOutgoingMessage *message) {
+-        AssertIsOnMainThread();
+-
+-        if (error) {
+-            [fromViewController
+-                dismissViewControllerAnimated:YES
+-                                   completion:^(void) {
+-                                       DDLogInfo(@"%@ Sending attachment failed with error: %@", self.logTag, error);
+-                                       [self showSendFailureAlertWithError:error
+-                                                                   message:message
+-                                                        fromViewController:fromViewController];
+-                                   }];
+-            return;
+-        }
+ 
+-        DDLogInfo(@"%@ Sending attachment succeeded.", self.logTag);
+-        [self.shareViewDelegate shareViewWasCompleted];
++        dispatch_async(dispatch_get_main_queue(), ^{
++            if (error) {
++                [fromViewController
++                    dismissViewControllerAnimated:YES
++                                       completion:^(void) {
++                                           DDLogInfo(
++                                               @"%@ Sending attachment failed with error: %@", self.logTag, error);
++                                           [self showSendFailureAlertWithError:error
++                                                                       message:message
++                                                            fromViewController:fromViewController];
++                                       }];
++                return;
++            }
++
++            DDLogInfo(@"%@ Sending attachment succeeded.", self.logTag);
++            [self.shareViewDelegate shareViewWasCompleted];
++        });
+     };
+ 
+-    [fromViewController presentViewController:progressAlert
+-                                     animated:YES
+-                                   completion:^(void) {
+-                                       __block TSOutgoingMessage *outgoingMessage =
+-                                           [ThreadUtil sendMessageWithAttachment:self.attachment
+-                                                                        inThread:self.thread
+-                                                                   messageSender:self.messageSender
+-                                                                      completion:^(NSError *_Nullable error) {
+-                                                                          sendCompletion(error, outgoingMessage);
+-                                                                      }];
+-
+-                                       self.outgoingMessage = outgoingMessage;
++    [fromViewController
++        presentViewController:progressAlert
++                     animated:YES
++                   completion:^(void) {
++                       __block TSOutgoingMessage *outgoingMessage = nil;
++                       if (self.attachment.isOversizeText
++                           && self.attachment.dataLength <= kOversizeTextMessageSizeThreshold) {
++                           // Try to unpack oversize text messages and send them as regular
++                           // text messages if possible.
++                           NSData *_Nullable data = self.attachment.data;
++                           if (!data) {
++                               DDLogError(@"%@ couldn't load data for oversize text attachment", self.logTag);
++                           } else {
++                               NSString *messageText =
++                                   [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
++                               outgoingMessage = [ThreadUtil sendMessageWithText:messageText
++                                   inThread:self.thread
++                                   messageSender:self.messageSender
++                                   success:^{
++                                       sendCompletion(nil, outgoingMessage);
++                                   }
++                                   failure:^(NSError *_Nonnull error) {
++                                       sendCompletion(error, outgoingMessage);
+                                    }];
++                               return;
++                           }
++                       }
++
++                       outgoingMessage = [ThreadUtil sendMessageWithAttachment:self.attachment
++                                                                      inThread:self.thread
++                                                                 messageSender:self.messageSender
++                                                                    completion:^(NSError *_Nullable error) {
++                                                                        sendCompletion(error, outgoingMessage);
++                                                                    }];
++                   }];
+ }
+ 
+ - (void)showSendFailureAlertWithError:(NSError *)error
+diff --git a/SignalServiceKit/src/Messages/OWSMessageSender.h b/SignalServiceKit/src/Messages/OWSMessageSender.h
+index 601a5828bb5..a3ac8cbc968 100644
+--- a/SignalServiceKit/src/Messages/OWSMessageSender.h
++++ b/SignalServiceKit/src/Messages/OWSMessageSender.h
+@@ -1,11 +1,13 @@
+ //
+-//  Copyright (c) 2017 Open Whisper Systems. All rights reserved.
++//  Copyright (c) 2018 Open Whisper Systems. All rights reserved.
+ //
+ 
+ #import "DataSource.h"
+ 
+ NS_ASSUME_NONNULL_BEGIN
+ 
++extern const NSUInteger kOversizeTextMessageSizeThreshold;
++
+ @class ContactsUpdater;
+ @class OWSBlockingManager;
+ @class OWSUploadingService;
+diff --git a/SignalServiceKit/src/Messages/OWSMessageSender.m b/SignalServiceKit/src/Messages/OWSMessageSender.m
+index 5a492ce6316..8657cf54d02 100644
+--- a/SignalServiceKit/src/Messages/OWSMessageSender.m
++++ b/SignalServiceKit/src/Messages/OWSMessageSender.m
+@@ -45,6 +45,8 @@
+ 
+ NS_ASSUME_NONNULL_BEGIN
+ 
++const NSUInteger kOversizeTextMessageSizeThreshold = 16 * 1024;
++
+ void AssertIsOnSendingQueue()
+ {
+ #ifdef DEBUG
+@@ -383,6 +385,9 @@ - (void)enqueueMessage:(TSOutgoingMessage *)message
+                failure:(void (^)(NSError *error))failureHandler
+ {
+     OWSAssert(message);
++    if (message.body.length > 0) {
++        OWSAssert([message.body lengthOfBytesUsingEncoding:NSUTF8StringEncoding] <= kOversizeTextMessageSizeThreshold);
++    }
+ 
+     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+         // This method will use a read/write transaction. This transaction
+diff --git a/SignalShareExtension/ShareViewController.swift b/SignalShareExtension/ShareViewController.swift
+index 2f4377807dc..f79cc1ba7d4 100644
+--- a/SignalShareExtension/ShareViewController.swift
++++ b/SignalShareExtension/ShareViewController.swift
+@@ -584,6 +584,9 @@ public class ShareViewController: UINavigationController, ShareViewDelegate, SAE
+             var rawDataSource: DataSource?
+             if utiType == (kUTTypeURL as String) {
+                 // Share URLs as oversize text messages whose text content is the URL.
++                //
++                // NOTE: SharingThreadPickerViewController will try to unpack them
++                //       and send them as normal text messages if possible.
+                 let urlString = url.absoluteString
+                 rawDataSource = DataSourceValue.dataSource(withOversizeText:urlString)
+             } else {

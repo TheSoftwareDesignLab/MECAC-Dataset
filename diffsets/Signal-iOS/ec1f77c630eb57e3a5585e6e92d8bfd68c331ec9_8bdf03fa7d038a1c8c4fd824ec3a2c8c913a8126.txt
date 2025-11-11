@@ -1,0 +1,230 @@
+diff --git a/Signal/src/call/CallService.swift b/Signal/src/call/CallService.swift
+index 50223f18c72..9491d15f3eb 100644
+--- a/Signal/src/call/CallService.swift
++++ b/Signal/src/call/CallService.swift
+@@ -166,6 +166,15 @@ protocol CallServiceObserver: class {
+             fireDidUpdateVideoTracks()
+         }
+     }
++    var isRemoteVideoEnabled = false {
++        didSet {
++            assertOnSignalingQueue()
++
++            Logger.info("\(self.TAG) \(#function)")
++
++            fireDidUpdateVideoTracks()
++        }
++    }
+ 
+     required init(accountManager: AccountManager, contactsManager: OWSContactsManager, messageSender: MessageSender, notificationsAdapter: CallNotificationsAdapter) {
+         self.accountManager = accountManager
+@@ -834,6 +843,8 @@ protocol CallServiceObserver: class {
+         } else if message.hasVideoStreamingStatus() {
+             Logger.debug("\(TAG) remote participant sent VideoStreamingStatus via data channel")
+ 
++            self.isRemoteVideoEnabled = message.videoStreamingStatus.enabled()
++
+             // TODO: translate from java
+             //   Intent intent = new Intent(this, WebRtcCallService.class);
+             //   intent.setAction(ACTION_REMOTE_VIDEO_MUTE);
+@@ -977,6 +988,7 @@ protocol CallServiceObserver: class {
+         peerConnectionClient = nil
+         localVideoTrack = nil
+         remoteVideoTrack = nil
++        isRemoteVideoEnabled = false
+         call?.removeAllObservers()
+         call = nil
+         thread = nil
+@@ -1031,9 +1043,26 @@ protocol CallServiceObserver: class {
+         // It's only safe to access the class properties on the signaling queue, so
+         // we dispatch there...
+         CallService.signalingQueue.async {
+-            Logger.info("\(self.TAG) \(#function): \(self.shouldHaveLocalVideoTrack())")
++            guard let call = self.call else {
++                return
++            }
++            guard let peerConnectionClient = self.peerConnectionClient else {
++                return
++            }
++
++            let shouldHaveLocalVideoTrack = self.shouldHaveLocalVideoTrack()
++
++            Logger.info("\(self.TAG) \(#function): \(shouldHaveLocalVideoTrack)")
++
++            self.peerConnectionClient?.setLocalVideoEnabled(enabled: shouldHaveLocalVideoTrack)
++
++            let message = DataChannelMessage.forVideoStreamingStatus(callId: call.signalingId, enabled:shouldHaveLocalVideoTrack)
++            if peerConnectionClient.sendDataChannelMessage(data: message.asData()) {
++                Logger.debug("\(self.TAG) sendDataChannelMessage returned true")
++            } else {
++                Logger.warn("\(self.TAG) sendDataChannelMessage returned false")
++            }
+ 
+-            self.peerConnectionClient?.setLocalVideoEnabled(enabled: self.shouldHaveLocalVideoTrack())
+         }
+     }
+ 
+@@ -1051,7 +1080,7 @@ protocol CallServiceObserver: class {
+         // we dispatch there...
+         CallService.signalingQueue.async {
+             let localVideoTrack = self.localVideoTrack
+-            let remoteVideoTrack = self.remoteVideoTrack
++            let remoteVideoTrack = self.isRemoteVideoEnabled ? self.remoteVideoTrack : nil
+             // Then dispatch back to the main thread.
+             DispatchQueue.main.async {
+                 observer.didUpdateVideoTracks(localVideoTrack:localVideoTrack,
+@@ -1080,7 +1109,7 @@ protocol CallServiceObserver: class {
+         assertOnSignalingQueue()
+ 
+         let localVideoTrack = self.localVideoTrack
+-        let remoteVideoTrack = self.remoteVideoTrack
++        let remoteVideoTrack = self.isRemoteVideoEnabled ? self.remoteVideoTrack : nil
+ 
+         DispatchQueue.main.async { [weak self] in
+             if let strongSelf = self {
+diff --git a/Signal/src/call/PeerConnectionClient.swift b/Signal/src/call/PeerConnectionClient.swift
+index d441c8caf6e..13a98eba8f0 100644
+--- a/Signal/src/call/PeerConnectionClient.swift
++++ b/Signal/src/call/PeerConnectionClient.swift
+@@ -76,9 +76,7 @@ class PeerConnectionClient: NSObject, RTCPeerConnectionDelegate, RTCDataChannelD
+ 
+     // DataChannel
+ 
+-    // `dataChannel` is public because on incoming calls, we don't explicitly create the channel, rather `CallService`
+-    // assigns it when the channel is discovered due to the caller having created it.
+-    public var dataChannel: RTCDataChannel?
++    private var dataChannel: RTCDataChannel?
+ 
+     // Audio
+ 
+@@ -127,6 +125,7 @@ class PeerConnectionClient: NSObject, RTCPeerConnectionDelegate, RTCDataChannelD
+                                                      configuration: RTCDataChannelConfiguration())
+         dataChannel.delegate = self
+ 
++        assert(self.dataChannel == nil)
+         self.dataChannel = dataChannel
+     }
+ 
+@@ -435,7 +434,9 @@ class PeerConnectionClient: NSObject, RTCPeerConnectionDelegate, RTCDataChannelD
+         Logger.debug("\(TAG) didOpen dataChannel:\(dataChannel)")
+         CallService.signalingQueue.async {
+             Logger.debug("\(self.TAG) set dataChannel")
++            assert(self.dataChannel == nil)
+             self.dataChannel = dataChannel
++            dataChannel.delegate = self
+         }
+     }
+ 
+diff --git a/Signal/src/view controllers/CallViewController.swift b/Signal/src/view controllers/CallViewController.swift
+index a295ec9fc9f..81f5cf3a066 100644
+--- a/Signal/src/view controllers/CallViewController.swift	
++++ b/Signal/src/view controllers/CallViewController.swift	
+@@ -65,7 +65,8 @@ class CallViewController: UIViewController, CallObserver, CallServiceObserver, R
+     weak var localVideoTrack: RTCVideoTrack?
+     weak var remoteVideoTrack: RTCVideoTrack?
+     var remoteVideoSize: CGSize! = CGSize.zero
+-    var videoViewConstraints: [NSLayoutConstraint] = []
++    var remoteVideoConstraints: [NSLayoutConstraint] = []
++    var localVideoConstraints: [NSLayoutConstraint] = []
+ 
+     // MARK: Control Groups
+ 
+@@ -343,7 +344,6 @@ class CallViewController: UIViewController, CallObserver, CallServiceObserver, R
+             // Dark blurred background.
+             blurView.autoPinEdgesToSuperviewEdges()
+ 
+-            // TODO: Prevent overlap of localVideoView and contact views.
+             localVideoView.autoPinEdge(toSuperviewEdge:.right, withInset:videoPreviewHMargin)
+             localVideoView.autoPinEdge(toSuperviewEdge:.top, withInset:topMargin)
+             let localVideoSize = ScaleFromIPhone5To7Plus(80, 100)
+@@ -351,11 +351,11 @@ class CallViewController: UIViewController, CallObserver, CallServiceObserver, R
+             localVideoView.autoSetDimension(.height, toSize:localVideoSize)
+ 
+             contactNameLabel.autoPinEdge(toSuperviewEdge:.top, withInset:topMargin)
+-            contactNameLabel.autoPinWidthToSuperview(withMargin:contactHMargin)
++            contactNameLabel.autoPinEdge(toSuperviewEdge:.left, withInset:contactHMargin)
+             contactNameLabel.setContentHuggingVerticalHigh()
+ 
+             callStatusLabel.autoPinEdge(.top, to:.bottom, of:contactNameLabel, withOffset:contactVSpacing)
+-            callStatusLabel.autoPinWidthToSuperview(withMargin:contactHMargin)
++            callStatusLabel.autoPinEdge(toSuperviewEdge:.left, withInset:contactHMargin)
+             callStatusLabel.setContentHuggingVerticalHigh()
+ 
+             contactAvatarView.autoPinEdge(.top, to:.bottom, of:callStatusLabel, withOffset:+avatarTopSpacing)
+@@ -378,13 +378,14 @@ class CallViewController: UIViewController, CallObserver, CallServiceObserver, R
+             incomingCallView.setContentHuggingVerticalHigh()
+         }
+ 
+-        updateVideoViewLayout()
++        updateRemoteVideoLayout()
++        updateLocalVideoLayout()
+ 
+         super.updateViewConstraints()
+     }
+ 
+-    internal func updateVideoViewLayout() {
+-        NSLayoutConstraint.deactivate(self.videoViewConstraints)
++    internal func updateRemoteVideoLayout() {
++        NSLayoutConstraint.deactivate(self.remoteVideoConstraints)
+ 
+         var constraints: [NSLayoutConstraint] = []
+ 
+@@ -419,7 +420,26 @@ class CallViewController: UIViewController, CallObserver, CallServiceObserver, R
+             remoteVideoView.isHidden = true
+         }
+ 
+-        self.videoViewConstraints = constraints
++        self.remoteVideoConstraints = constraints
++    }
++
++    internal func updateLocalVideoLayout() {
++
++        NSLayoutConstraint.deactivate(self.localVideoConstraints)
++
++        var constraints: [NSLayoutConstraint] = []
++
++        if localVideoView.isHidden {
++            let contactHMargin = CGFloat(30)
++            constraints.append(contactNameLabel.autoPinEdge(toSuperviewEdge:.right, withInset:contactHMargin))
++            constraints.append(callStatusLabel.autoPinEdge(toSuperviewEdge:.right, withInset:contactHMargin))
++        } else {
++            let spacing = CGFloat(10)
++            constraints.append(contactNameLabel.autoPinEdge(.right, to:.left, of:localVideoView, withOffset:-spacing))
++            constraints.append(callStatusLabel.autoPinEdge(.right, to:.left, of:localVideoView, withOffset:-spacing))
++        }
++
++        self.localVideoConstraints = constraints
+     }
+ 
+     func traverseViewHierarchy(view: UIView!, visitor: (UIView) -> Void) {
+@@ -669,7 +689,7 @@ class CallViewController: UIViewController, CallObserver, CallServiceObserver, R
+         Logger.info("\(TAG) \(#function) isHidden: \(isHidden)")
+         localVideoView.isHidden = isHidden
+ 
+-        updateVideoViewLayout()
++        updateLocalVideoLayout()
+     }
+ 
+     internal func updateRemoteVideoTrack(remoteVideoTrack: RTCVideoTrack?) {
+@@ -684,9 +704,11 @@ class CallViewController: UIViewController, CallObserver, CallServiceObserver, R
+         self.remoteVideoTrack = remoteVideoTrack
+         self.remoteVideoTrack?.add(remoteVideoView)
+ 
+-        // TODO: We need to figure out how to observe start/stop of remote video.
++        if remoteVideoTrack == nil {
++            remoteVideoSize = CGSize.zero
++        }
+ 
+-        updateVideoViewLayout()
++        updateRemoteVideoLayout()
+     }
+ 
+     // MARK: - CallServiceObserver
+@@ -711,6 +733,6 @@ class CallViewController: UIViewController, CallObserver, CallServiceObserver, R
+         Logger.info("\(TAG) \(#function): \(size)")
+ 
+         remoteVideoSize = size
+-        updateVideoViewLayout()
++        updateRemoteVideoLayout()
+     }
+ }

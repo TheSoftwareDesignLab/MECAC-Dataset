@@ -1,0 +1,140 @@
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
+index 058410e0e656..d4cf85618134 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
+@@ -96,31 +96,24 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+         }
+         setContentView(R.layout.activity_main)
+ 
+-        val isTheFirstLaunch = settings.getAppLaunchCount() == 0
+-        if (isTheFirstLaunch) {
+-            setSplashScreenPreDrawListener()
+-        }
+-
+         startupPathProvider.attachOnActivityOnCreate(lifecycle, intent)
+         startupTypeTelemetry = StartupTypeTelemetry(components.startupStateProvider, startupPathProvider).apply {
+             attachOnMainActivityOnCreate(lifecycle)
+         }
+ 
+-        val intent = SafeIntent(intent)
+-
+-        // The performance check was added after the shouldShowFirstRun to take as much of the
+-        // code path as possible
+-        if (settings.isFirstRun() &&
+-            !Performance.processIntentIfPerformanceTest(intent, this)
+-        ) {
+-            components.appStore.dispatch(AppAction.ShowFirstRun)
++        val safeIntent = SafeIntent(intent)
++        val isTheFirstLaunch = settings.getAppLaunchCount() == 0
++        if (isTheFirstLaunch) {
++            setSplashScreenPreDrawListener(safeIntent)
++        } else {
++            showFirstScreen(safeIntent)
+         }
+ 
+         if (intent.hasExtra(HomeScreen.ADD_TO_HOMESCREEN_TAG)) {
+-            intentProcessor.handleNewIntent(this, intent)
++            intentProcessor.handleNewIntent(this, safeIntent)
+         }
+ 
+-        if (intent.isLauncherIntent) {
++        if (safeIntent.isLauncherIntent) {
+             AppOpened.fromIcons.record(AppOpened.FromIconsExtra(AppOpenType.LAUNCH.type))
+ 
+             TelemetryWrapper.openFromIconEvent()
+@@ -132,18 +125,16 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+             .putInt(getString(R.string.app_launch_count), launchCount + 1)
+             .apply()
+ 
+-        lifecycle.addObserver(navigator)
+-
+         AppReviewUtils.showAppReview(this)
+     }
+ 
+-    private fun setSplashScreenPreDrawListener() {
++    private fun setSplashScreenPreDrawListener(safeIntent: SafeIntent) {
+         val content: View = findViewById(android.R.id.content)
+         val endTime = System.currentTimeMillis() + REQUEST_TIME_OUT
+         content.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
+             override fun onPreDraw(): Boolean {
+                 return if (System.currentTimeMillis() >= endTime) {
+-                    components.experiments.applyPendingExperiments()
++                    showFirstScreen(safeIntent)
+                     content.viewTreeObserver.removeOnPreDrawListener(this)
+                     true
+                 } else {
+@@ -154,6 +145,17 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+         )
+     }
+ 
++    private fun showFirstScreen(safeIntent: SafeIntent) {
++        // The performance check was added after the shouldShowFirstRun to take as much of the
++        // code path as possible
++        if (settings.isFirstRun() &&
++            !Performance.processIntentIfPerformanceTest(safeIntent, this)
++        ) {
++            components.appStore.dispatch(AppAction.ShowFirstRun)
++        }
++        lifecycle.addObserver(navigator)
++    }
++
+     private fun checkAndExitPiP() {
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode && intent != null) {
+             // Exit PiP mode
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/experiments/NimbusSetup.kt b/focus-android/app/src/main/java/org/mozilla/focus/experiments/NimbusSetup.kt
+index 8d923c57fa52..71836671887e 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/experiments/NimbusSetup.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/experiments/NimbusSetup.kt
+@@ -13,12 +13,14 @@ import mozilla.components.service.nimbus.NimbusDisabled
+ import mozilla.components.service.nimbus.NimbusServerSettings
+ import mozilla.components.support.base.log.logger.Logger
+ import org.mozilla.experiments.nimbus.NimbusInterface
++import org.mozilla.experiments.nimbus.internal.EnrolledExperiment
+ import org.mozilla.experiments.nimbus.internal.NimbusException
+ import org.mozilla.focus.BuildConfig
+ import org.mozilla.focus.GleanMetrics.NimbusExperiments
+ import org.mozilla.focus.R
+ import org.mozilla.focus.ext.components
+ import org.mozilla.focus.ext.settings
++import org.mozilla.focus.nimbus.FocusNimbus
+ 
+ @Suppress("TooGenericExceptionCaught")
+ fun createNimbus(context: Context, url: String?): NimbusApi {
+@@ -66,6 +68,7 @@ fun createNimbus(context: Context, url: String?): NimbusApi {
+             channel = BuildConfig.BUILD_TYPE
+         )
+         Nimbus(context, appInfo, serverSettings, errorReporter).apply {
++            register(EventsObserver)
+             // This performs the minimal amount of work required to load branch and enrolment data
+             // into memory. If `getExperimentBranch` is called from another thread between here
+             // and the next nimbus disk write (setting `globalUserParticipation` or
+@@ -83,12 +86,12 @@ fun createNimbus(context: Context, url: String?): NimbusApi {
+                 setExperimentsLocally(R.raw.initial_experiments)
+             }
+ 
+-            applyPendingExperiments()
+             NimbusExperiments.nimbusInitialFetch.start()
+             fetchExperiments()
+ 
+             register(object : NimbusInterface.Observer {
+                 override fun onExperimentsFetched() {
++                    applyPendingExperiments()
+                     NimbusExperiments.nimbusInitialFetch.stop()
+                     // Remove lingering observer when we're done fetching experiments on startup.
+                     unregister(this)
+@@ -124,3 +127,15 @@ fun NimbusException.isReportableError(): Boolean {
+         else -> true
+     }
+ }
++
++/**
++ * Focus specific observer of Nimbus events.
++ *
++ * The generated code `FocusNimbus` provides a cache which should be invalidated
++ * when the experiments recipes are updated.
++ */
++private object EventsObserver : NimbusInterface.Observer {
++    override fun onUpdatesApplied(updated: List<EnrolledExperiment>) {
++        FocusNimbus.invalidateCachedValues()
++    }
++}

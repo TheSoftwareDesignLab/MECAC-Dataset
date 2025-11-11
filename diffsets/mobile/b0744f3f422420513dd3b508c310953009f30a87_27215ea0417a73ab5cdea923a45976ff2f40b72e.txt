@@ -1,0 +1,1086 @@
+diff --git a/mobile-app/lib/service/audio/audio_service.dart b/mobile-app/lib/service/audio/audio_service.dart
+index 2022b71cd..f07961211 100644
+--- a/mobile-app/lib/service/audio/audio_service.dart
++++ b/mobile-app/lib/service/audio/audio_service.dart
+@@ -1,3 +1,4 @@
++import 'dart:async';
+ import 'dart:developer';
+ import 'dart:io';
+ 
+@@ -8,6 +9,7 @@ import 'package:freecodecamp/models/podcasts/episodes_model.dart';
+ import 'package:freecodecamp/models/podcasts/podcasts_model.dart';
+ import 'package:just_audio/just_audio.dart';
+ import 'package:path_provider/path_provider.dart';
++import 'package:shared_preferences/shared_preferences.dart';
+ 
+ class AppAudioService {
+   static final AppAudioService _appAudioService = AppAudioService._internal();
+@@ -39,6 +41,8 @@ class AudioPlayerHandler extends BaseAudioHandler {
+   String _episodeId = '';
+   String _audioType = '';
+ 
++  StreamSubscription? cacheSub;
++
+   String get episodeId => _episodeId;
+   set setEpisodeId(String state) {
+     _episodeId = state;
+@@ -73,11 +77,34 @@ class AudioPlayerHandler extends BaseAudioHandler {
+     return super.stop();
+   }
+ 
++  @override
++  Future<int> fastForward() async {
++    await _audioPlayer.seek(
++      Duration(seconds: _audioPlayer.position.inSeconds + 30),
++    );
++
++    return _audioPlayer.position.inSeconds;
++  }
++
++  @override
++  Future<int> rewind() async {
++    await _audioPlayer.seek(
++      Duration(seconds: _audioPlayer.position.inSeconds - 10),
++    );
++
++    return _audioPlayer.position.inSeconds;
++  }
++
+   @override
+   Future<void> seek(Duration position) async {
+     await _audioPlayer.seek(position);
+   }
+ 
++  @override
++  Future<void> setSpeed(double speed) async {
++    await _audioPlayer.setSpeed(speed);
++  }
++
+   @override
+   Future<void> onTaskRemoved() async {
+     await _audioPlayer.stop();
+@@ -88,6 +115,10 @@ class AudioPlayerHandler extends BaseAudioHandler {
+     return _audioPlayer.duration;
+   }
+ 
++  double getSpeed() {
++    return _audioPlayer.speed;
++  }
++
+   Future<void> loadEpisode(
+     Episodes episode,
+     bool isDownloaded,
+@@ -122,9 +153,32 @@ class AudioPlayerHandler extends BaseAudioHandler {
+         );
+       }
+       await _audioPlayer.load();
++
++      SharedPreferences prefs = await SharedPreferences.getInstance();
++      int? possibleValue = prefs.getInt('${episode.id}_progress');
++      if (possibleValue != null) {
++        _audioPlayer.seek(Duration(seconds: possibleValue));
++      } else {
++        _audioPlayer.seek(Duration(seconds: 0));
++      }
++
+       _audioType = 'episode';
+       queue.add([audioMediaItem]);
+       mediaItem.add(audioMediaItem);
++
++      if (cacheSub != null) {
++        cacheSub!.cancel();
++      }
++
++      cacheSub = _audioPlayer.positionStream.listen((pos) async {
++        // position stream has an initial value of zero before seeking
++        // to the position that is stored in the cache. Which means
++        // "seconds" needs to be bigger than zero.
++        if (pos.inSeconds > 1) {
++          SharedPreferences prefs = await SharedPreferences.getInstance();
++          prefs.setInt('${episode.id}_progress', pos.inSeconds);
++        }
++      });
+     } catch (e) {
+       log('Cannot play audio: $e');
+     }
+diff --git a/mobile-app/lib/ui/views/podcast/episode/episode_view.dart b/mobile-app/lib/ui/views/podcast/episode/episode_view.dart
+index 964e6bbbb..bc39cac36 100644
+--- a/mobile-app/lib/ui/views/podcast/episode/episode_view.dart
++++ b/mobile-app/lib/ui/views/podcast/episode/episode_view.dart
+@@ -4,9 +4,6 @@ import 'package:freecodecamp/models/podcasts/episodes_model.dart';
+ import 'package:freecodecamp/models/podcasts/podcasts_model.dart';
+ import 'package:freecodecamp/ui/views/news/html_handler/html_handler.dart';
+ import 'package:freecodecamp/ui/views/podcast/episode/episode_viewmodel.dart';
+-import 'package:freecodecamp/ui/widgets/drawer_widget/drawer_widget_view.dart';
+-import 'package:freecodecamp/ui/widgets/podcast_widgets/podcast_progressbar_widget.dart';
+-import 'package:freecodecamp/ui/widgets/podcast_widgets/podcast_title_widget.dart';
+ import 'package:stacked/stacked.dart';
+ 
+ class EpisodeView extends StatelessWidget {
+@@ -23,6 +20,17 @@ class EpisodeView extends StatelessWidget {
+   Widget build(BuildContext context) {
+     return ViewModelBuilder<EpisodeViewModel>.reactive(
+       viewModelBuilder: () => EpisodeViewModel(),
++      onViewModelReady: (model) {
++        model.loadEpisode(episode, podcast);
++        model.hasDownloadedEpisode(episode);
++        model.initProgressListener(episode);
++        model.initDownloadListener();
++        model.initPlaybackListener();
++        model.initPlayBackSpeed();
++      },
++      onDispose: (model) {
++        model.disposeProgressListener();
++      },
+       builder: (context, model, child) => Scaffold(
+         appBar: AppBar(),
+         body: ListView(
+@@ -64,21 +72,145 @@ class EpisodeView extends StatelessWidget {
+                   textAlign: TextAlign.center,
+                   style: const TextStyle(fontSize: 16),
+                 ),
+-                buildDivider(),
+-                PodcastTile(
+-                    podcast: podcast,
+-                    episode: episode,
+-                    isFromEpisodeView: true,
+-                    isFromDownloadView: false),
+-                if (episode.duration != null)
+-                  Padding(
+-                    padding: const EdgeInsets.all(8.0),
+-                    child: PodcastProgressBar(
+-                      duration: episode.duration!,
+-                      episodeId: episode.id,
+-                    ),
++                Slider(
++                  onChangeStart: (_) {
++                    model.audioService.pause();
++                  },
++                  onChanged: (value) {
++                    model.setSliderValue = value;
++                    model.handleTimeVortex(
++                      episode.duration!.inSeconds,
++                      (episode.duration!.inSeconds * value).toInt(),
++                    );
++                  },
++                  onChangeEnd: (value) {
++                    model.setAudioProgress(value, episode);
++                    model.audioService.play();
++                  },
++                  value: model.sliderValue,
++                ),
++                Padding(
++                  padding:
++                      const EdgeInsets.symmetric(vertical: 0, horizontal: 20),
++                  child: Row(
++                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
++                    children: [
++                      Text(
++                        model.timeElapsed,
++                        style: const TextStyle(fontSize: 16),
++                      ),
++                      Text(
++                        '-${model.timeLeft}',
++                        style: const TextStyle(fontSize: 16),
++                      ),
++                    ],
+                   ),
+-                buildDivider(),
++                ),
++                Row(
++                  mainAxisAlignment: MainAxisAlignment.center,
++                  children: [
++                    DropdownButtonHideUnderline(
++                      child: DropdownButton(
++                        value: model.playBackSpeed,
++                        dropdownColor: const Color(0xFF0a0a23),
++                        icon: const SizedBox.shrink(),
++                        items: model.speedOptions
++                            .map(
++                              (speed) => DropdownMenuItem(
++                                onTap: () => model.handlePlayBackSpeed(speed),
++                                value: speed,
++                                child: Text(
++                                  '${speed}x',
++                                  style: const TextStyle(
++                                    color: Colors.white,
++                                  ),
++                                ),
++                              ),
++                            )
++                            .toList(),
++                        onChanged: (_) {},
++                      ),
++                    ),
++                    const SizedBox(width: 8),
++                    IconButton(
++                      iconSize: 45,
++                      icon: const Icon(Icons.replay_10_rounded),
++                      onPressed: () {
++                        model.rewind(episode);
++                      },
++                    ),
++                    IconButton(
++                      iconSize: 80,
++                      onPressed: () {
++                        model.playOrPause(episode);
++                      },
++                      icon: model.isPlaying
++                          ? const Icon(Icons.pause)
++                          : const Icon(Icons.play_arrow_rounded),
++                    ),
++                    IconButton(
++                      iconSize: 45,
++                      icon: const Icon(
++                        Icons.forward_30_rounded,
++                      ),
++                      onPressed: () {
++                        model.forward(episode);
++                      },
++                    ),
++                    IconButton(
++                      iconSize: 30,
++                      onPressed: model.isDownloading
++                          ? null
++                          : () {
++                              if (!model.isDownloaded) {
++                                model.setIsDownloading = true;
++                              }
++
++                              model.downloadService.setDownloadId = episode.id;
++                              model.downloadBtnClick(episode, podcast);
++                            },
++                      icon: model.isDownloading &&
++                              model.downloadService.downloadId == episode.id
++                          ? StreamBuilder<String>(
++                              stream: model.downloadService.progress,
++                              builder: (context, snapshot) {
++                                double? val = double.tryParse(
++                                  snapshot.data ?? '0',
++                                );
++
++                                if (snapshot.hasData) {
++                                  return Stack(
++                                    alignment: Alignment.center,
++                                    children: [
++                                      Text(
++                                        '${snapshot.data}%',
++                                        style: const TextStyle(fontSize: 16),
++                                      ),
++                                      CircularProgressIndicator(
++                                        color: Colors.white,
++                                        strokeWidth: 2,
++                                        value: snapshot.hasData && val != null
++                                            ? val / 100
++                                            : 0,
++                                      )
++                                    ],
++                                  );
++                                }
++
++                                return const CircularProgressIndicator(
++                                  color: Colors.white,
++                                  strokeWidth: 2,
++                                  value: 0,
++                                );
++                              })
++                          : Icon(
++                              model.isDownloaded
++                                  ? Icons.download_done
++                                  : Icons.arrow_circle_down_outlined,
++                            ),
++                    )
++                  ],
++                ),
+                 Container(
+                   padding: const EdgeInsets.fromLTRB(8, 16, 8, 8),
+                   child: description(model, context),
+diff --git a/mobile-app/lib/ui/views/podcast/episode/episode_viewmodel.dart b/mobile-app/lib/ui/views/podcast/episode/episode_viewmodel.dart
+index 6ef4c7e66..55e386618 100644
+--- a/mobile-app/lib/ui/views/podcast/episode/episode_viewmodel.dart
++++ b/mobile-app/lib/ui/views/podcast/episode/episode_viewmodel.dart
+@@ -1,3 +1,222 @@
++import 'dart:async';
++import 'dart:io';
++
++import 'package:audio_service/audio_service.dart';
++import 'package:freecodecamp/app/app.locator.dart';
++import 'package:freecodecamp/models/podcasts/episodes_model.dart';
++import 'package:freecodecamp/models/podcasts/podcasts_model.dart';
++import 'package:freecodecamp/service/audio/audio_service.dart';
++import 'package:freecodecamp/service/podcast/download_service.dart';
++import 'package:freecodecamp/service/podcast/podcasts_service.dart';
++import 'package:path_provider/path_provider.dart';
+ import 'package:stacked/stacked.dart';
+ 
+-class EpisodeViewModel extends BaseViewModel {}
++class EpisodeViewModel extends BaseViewModel {
++  final audioService = locator<AppAudioService>().audioHandler;
++  final _databaseService = locator<PodcastsDatabaseService>();
++  final DownloadService downloadService = locator<DownloadService>();
++
++  StreamSubscription<Duration>? _progressListener;
++  StreamSubscription<Duration>? get progressListener => _progressListener;
++
++  double _sliderValue = 0.0;
++  double get sliderValue => _sliderValue;
++
++  bool _isPlaying = false;
++  bool get isPlaying => _isPlaying;
++
++  double _playBackSpeed = 1.0;
++  double get playBackSpeed => _playBackSpeed;
++
++  String _timeElapsed = '--:--';
++  String get timeElapsed => _timeElapsed;
++
++  String _timeLeft = '--:--';
++  String get timeLeft => _timeLeft;
++
++  bool _isDownloading = false;
++  bool get isDownloading => _isDownloading;
++
++  bool _isDownloaded = false;
++  bool get isDownloaded => _isDownloaded;
++
++  final List<double> speedOptions = [0.75, 1.0, 1.25, 1.5, 2.0];
++
++  set setSliderValue(double value) {
++    _sliderValue = value;
++    notifyListeners();
++  }
++
++  set setTimeElapsed(String value) {
++    _timeElapsed = value;
++    notifyListeners();
++  }
++
++  set setTimeLeft(String value) {
++    _timeLeft = value;
++    notifyListeners();
++  }
++
++  set setProgressListener(StreamSubscription<Duration>? value) {
++    _progressListener = value;
++    notifyListeners();
++  }
++
++  set setPlayBackSpeed(double value) {
++    _playBackSpeed = value;
++    notifyListeners();
++  }
++
++  set setIsDownloading(bool value) {
++    _isDownloading = value;
++    notifyListeners();
++  }
++
++  set setIsDownloaded(bool value) {
++    _isDownloaded = value;
++    notifyListeners();
++  }
++
++  set setIsPlaying(bool value) {
++    _isPlaying = value;
++    notifyListeners();
++  }
++
++  void initProgressListener(Episodes episode) {
++    setProgressListener = AudioService.position.listen(
++      (event) {
++        int duration = episode.duration!.inSeconds;
++        double sliderValue = event.inSeconds / duration;
++        setSliderValue = sliderValue;
++        handleTimeVortex(duration, event.inSeconds);
++      },
++    );
++  }
++
++  void handleTimeVortex(int duration, int inSeconds) {
++    setTimeElapsed = timeDisplay(inSeconds);
++    setTimeLeft = timeDisplay(duration - inSeconds - 1);
++  }
++
++  String timeDisplay(int totalSeconds) {
++    int hours = totalSeconds ~/ 3600;
++    int minutes = (totalSeconds % 3600) ~/ 60;
++    int seconds = totalSeconds % 60;
++
++    String twoDigits(int n) => n.toString().padLeft(2, '0');
++
++    if (hours > 0) {
++      return '$hours:${twoDigits(minutes)}:${twoDigits(seconds)}';
++    } else {
++      return '$minutes:${twoDigits(seconds)}';
++    }
++  }
++
++  void removeEpisode(Episodes episode, Podcasts podcast) async {
++    await _databaseService.removeEpisode(episode);
++    await _databaseService.removePodcast(podcast);
++    setIsDownloaded = false;
++  }
++
++  void downloadBtnClick(Episodes episode, Podcasts podcast) async {
++    Directory appDir = await getApplicationSupportDirectory();
++
++    if (!isDownloaded && isDownloading) {
++      downloadService.download(episode, podcast);
++    } else if (isDownloaded) {
++      File audioFile =
++          File('${appDir.path}/episodes/${podcast.id}/${episode.id}.mp3');
++      if (audioFile.existsSync()) {
++        audioFile.deleteSync();
++      }
++
++      removeEpisode(episode, podcast);
++    }
++  }
++
++  void hasDownloadedEpisode(Episodes episode) async {
++    setIsDownloaded = await _databaseService.episodeExists(episode);
++  }
++
++  void downloadComplete() {
++    setIsDownloading = false;
++    setIsDownloaded = true;
++    downloadService.setDownloadId = '';
++  }
++
++  void initDownloadListener() {
++    downloadService.downloadingStream.listen(
++      (event) {
++        setIsDownloading = event;
++
++        if (event == false) {
++          setIsDownloaded = true;
++          setIsDownloading = false;
++        }
++      },
++    );
++  }
++
++  void initPlaybackListener() {
++    audioService.playbackState.listen((event) {
++      if (event.playing && !isPlaying) {
++        setIsPlaying = true;
++      } else if (!event.playing && isPlaying) {
++        setIsPlaying = false;
++      }
++    });
++  }
++
++  void setAudioProgress(double value, Episodes episode) {
++    audioService.seek(
++      Duration(seconds: (value * episode.duration!.inSeconds).toInt()),
++    );
++    setSliderValue = value.toDouble();
++  }
++
++  void disposeProgressListener() {
++    progressListener!.cancel();
++  }
++
++  void forward(Episodes episode) async {
++    int newPos = await audioService.fastForward();
++
++    double value = newPos / episode.duration!.inSeconds;
++
++    setSliderValue = value < 1 ? value : 1.0;
++  }
++
++  void rewind(Episodes episode) async {
++    int newPos = await audioService.rewind();
++
++    double value = newPos / episode.duration!.inSeconds;
++
++    setSliderValue = value > 0 ? value : 0.0;
++  }
++
++  void playOrPause(Episodes episode) {
++    if (audioService.isPlaying('podcast', episodeId: episode.id)) {
++      audioService.pause();
++    } else {
++      audioService.play();
++    }
++  }
++
++  void handlePlayBackSpeed(speed) {
++    setPlayBackSpeed = speed;
++    audioService.setSpeed(speed);
++  }
++
++  void initPlayBackSpeed() {
++    setPlayBackSpeed = audioService.getSpeed();
++  }
++
++  void loadEpisode(Episodes episode, Podcasts podcast) async {
++    bool downloaded = await _databaseService.episodeExists(episode);
++
++    if (audioService.episodeId != episode.id) {
++      audioService.setEpisodeId = episode.id;
++      audioService.loadEpisode(episode, downloaded, podcast);
++    }
++  }
++}
+diff --git a/mobile-app/lib/ui/widgets/podcast_widgets/podcast_progressbar_widget.dart b/mobile-app/lib/ui/widgets/podcast_widgets/podcast_progressbar_widget.dart
+deleted file mode 100644
+index f785263a7..000000000
+--- a/mobile-app/lib/ui/widgets/podcast_widgets/podcast_progressbar_widget.dart
++++ /dev/null
+@@ -1,213 +0,0 @@
+-import 'dart:async';
+-
+-import 'package:audio_service/audio_service.dart';
+-import 'package:flutter/material.dart';
+-import 'package:freecodecamp/app/app.locator.dart';
+-import 'package:freecodecamp/service/audio/audio_service.dart';
+-import 'package:shared_preferences/shared_preferences.dart';
+-
+-// ignore: must_be_immutable
+-class PodcastProgressBar extends StatefulWidget {
+-  final Duration duration;
+-  final String episodeId;
+-
+-  PodcastProgressBar({
+-    super.key,
+-    required this.duration,
+-    required this.episodeId,
+-  });
+-
+-  final _audioService = locator<AppAudioService>().audioHandler;
+-
+-  final double ball = 15;
+-
+-  double _barWidth = 0.0;
+-  double get barWidth => _barWidth;
+-
+-  Duration _progress = Duration.zero;
+-  Duration get progress => _progress;
+-
+-  StreamSubscription<Duration>? progressListener;
+-
+-  @override
+-  PodcastProgressBarState createState() => PodcastProgressBarState();
+-}
+-
+-class PodcastProgressBarState extends State<PodcastProgressBar> {
+-  void setBarWidthAndAudio(double value, double maxBarWidth) {
+-    value = value - MediaQuery.of(context).size.width * 0.1;
+-    setState(() {
+-      double newDuration = (value / maxBarWidth) * widget.duration.inSeconds;
+-
+-      setProgress = Duration(seconds: newDuration.toInt());
+-
+-      if (widget._audioService.episodeId == widget.episodeId) {
+-        widget._audioService.seek(Duration(seconds: newDuration.toInt()));
+-      }
+-    });
+-
+-    storeProgressAfterDispose();
+-  }
+-
+-  String printDuration(Duration duration) {
+-    String twoDigits(int n) => n.toString().padLeft(2, '0');
+-    String twoDigitMinutes = twoDigits(duration.inMinutes.remainder(60));
+-    String twoDigitSeconds = twoDigits(duration.inSeconds.remainder(60));
+-    return '${twoDigits(duration.inHours)}:$twoDigitMinutes:$twoDigitSeconds';
+-  }
+-
+-  void storeProgressAfterDispose() async {
+-    SharedPreferences prefs = await SharedPreferences.getInstance();
+-
+-    prefs.setInt('${widget.episodeId}_progress', widget.progress.inSeconds);
+-  }
+-
+-  set setProgress(Duration value) {
+-    setState(() {
+-      double maxBarWidth = MediaQuery.of(context).size.width * 0.8;
+-
+-      double newWidth =
+-          (value.inSeconds / widget.duration.inSeconds) * maxBarWidth;
+-
+-      bool shouldSetNewWidth = newWidth * 0.95 + widget.ball < maxBarWidth;
+-      if (newWidth < widget.ball / 12) {
+-        widget._barWidth = widget.ball / 12;
+-      } else if (shouldSetNewWidth) {
+-        widget._barWidth = newWidth * 0.95;
+-      }
+-
+-      if (value.isNegative || newWidth.isNegative) {
+-        widget._progress = const Duration(milliseconds: 1);
+-        widget._audioService.seek(const Duration(milliseconds: 1));
+-      } else if (newWidth > maxBarWidth) {
+-        widget._progress = widget.duration;
+-        widget._audioService.seek(widget.duration);
+-      } else if (value.inSeconds <= widget.duration.inSeconds) {
+-        widget._progress = value;
+-      }
+-    });
+-  }
+-
+-  @override
+-  void initState() {
+-    super.initState();
+-
+-    Future.delayed(Duration.zero, () async {
+-      SharedPreferences prefs = await SharedPreferences.getInstance();
+-      if (prefs.getInt('${widget.episodeId}_progress') != null) {
+-        setProgress = Duration(
+-            seconds: prefs.getInt('${widget.episodeId}_progress') as int);
+-        if (widget.episodeId == widget._audioService.episodeId) {
+-          widget._audioService.seek(widget._progress);
+-        }
+-      } else {
+-        widget._barWidth = 0.0;
+-        setProgress = Duration.zero;
+-      }
+-    });
+-
+-    widget.progressListener = AudioService.position.listen((event) {
+-      if (widget._audioService.episodeId == widget.episodeId) {
+-        setProgress = event;
+-      }
+-    });
+-  }
+-
+-  @override
+-  void dispose() {
+-    super.dispose();
+-    storeProgressAfterDispose();
+-    widget.progressListener?.cancel();
+-  }
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    double screenWidth = MediaQuery.of(context).size.width;
+-    double getMaxPorgressBarWidth = screenWidth * 0.8;
+-
+-    return SizedBox(
+-      width: getMaxPorgressBarWidth,
+-      child: Column(
+-        children: [
+-          GestureDetector(
+-            onTapDown: (details) {
+-              setBarWidthAndAudio(
+-                details.globalPosition.dx,
+-                getMaxPorgressBarWidth,
+-              );
+-            },
+-            child: Stack(
+-              children: [
+-                Padding(
+-                  padding: const EdgeInsets.all(5.0),
+-                  child: Container(
+-                    width: getMaxPorgressBarWidth,
+-                    height: 5,
+-                    decoration: BoxDecoration(
+-                      borderRadius: BorderRadius.circular(5),
+-                      color: const Color(0xFF0a0a23),
+-                    ),
+-                  ),
+-                ),
+-                Row(
+-                  children: [
+-                    Container(
+-                      width: widget.barWidth,
+-                      height: 5,
+-                      decoration: BoxDecoration(
+-                        color: Colors.grey[300],
+-                      ),
+-                    ),
+-                    GestureDetector(
+-                      onHorizontalDragUpdate: (details) => {
+-                        setBarWidthAndAudio(
+-                          details.globalPosition.dx,
+-                          getMaxPorgressBarWidth,
+-                        ),
+-                      },
+-                      child: Container(
+-                        alignment: Alignment.centerRight,
+-                        height: widget.ball,
+-                        width: widget.ball,
+-                        decoration: BoxDecoration(
+-                          borderRadius: BorderRadius.circular(100),
+-                          color: Colors.grey[300],
+-                        ),
+-                      ),
+-                    ),
+-                  ],
+-                ),
+-              ],
+-            ),
+-          ),
+-          Row(
+-            children: [
+-              Expanded(
+-                  flex: 1,
+-                  child: Align(
+-                      alignment: Alignment.centerLeft,
+-                      child: Padding(
+-                        padding: const EdgeInsets.all(8.0),
+-                        child: Text(
+-                          printDuration(widget._progress),
+-                          style: const TextStyle(height: 1.2),
+-                        ),
+-                      ))),
+-              Expanded(
+-                  flex: 1,
+-                  child: Align(
+-                      alignment: Alignment.centerRight,
+-                      child: Padding(
+-                        padding: const EdgeInsets.all(8.0),
+-                        child: Text(
+-                          printDuration(widget.duration),
+-                          style: const TextStyle(height: 1.2),
+-                        ),
+-                      ))),
+-            ],
+-          ),
+-        ],
+-      ),
+-    );
+-  }
+-}
+diff --git a/mobile-app/lib/ui/widgets/podcast_widgets/podcast_title_widget.dart b/mobile-app/lib/ui/widgets/podcast_widgets/podcast_title_widget.dart
+index 86db15610..f8b70e156 100644
+--- a/mobile-app/lib/ui/widgets/podcast_widgets/podcast_title_widget.dart
++++ b/mobile-app/lib/ui/widgets/podcast_widgets/podcast_title_widget.dart
+@@ -16,22 +16,20 @@ import 'package:freecodecamp/ui/views/podcast/episode/episode_view.dart';
+ import 'package:html/parser.dart';
+ import 'package:jiffy/jiffy.dart';
+ import 'package:path_provider/path_provider.dart';
+-import 'package:shared_preferences/shared_preferences.dart';
+ 
+ // ignore: must_be_immutable
+ class PodcastTile extends StatefulWidget {
+-  PodcastTile(
+-      {super.key,
+-      required this.podcast,
+-      required this.episode,
+-      required this.isFromDownloadView,
+-      this.isFromEpisodeView = false});
++  PodcastTile({
++    super.key,
++    required this.podcast,
++    required this.episode,
++    required this.isFromDownloadView,
++  });
+ 
+   final Podcasts podcast;
+   final Episodes episode;
+ 
+   final bool isFromDownloadView;
+-  final bool isFromEpisodeView;
+ 
+   final _audioService = locator<AppAudioService>().audioHandler;
+   final _databaseService = locator<PodcastsDatabaseService>();
+@@ -94,11 +92,6 @@ class PodcastTileState extends State<PodcastTile> {
+     Future.delayed(const Duration(seconds: 0), () async => {init()});
+   }
+ 
+-  @override
+-  void dispose() {
+-    super.dispose();
+-  }
+-
+   Future<void> init() async {
+     Directory appDir = await getApplicationDocumentsDirectory();
+ 
+@@ -125,14 +118,6 @@ class PodcastTileState extends State<PodcastTile> {
+       }
+     });
+ 
+-    AudioService.position.listen((event) async {
+-      if (widget._playing &&
+-          widget._audioService.episodeId == widget.episode.id) {
+-        SharedPreferences prefs = await SharedPreferences.getInstance();
+-        prefs.setInt('${widget.episode.id}_progress', event.inSeconds);
+-      }
+-    });
+-
+     if (widget._audioService.episodeId == widget.episode.id && mounted) {
+       setIsPlaying = true;
+     }
+@@ -159,22 +144,16 @@ class PodcastTileState extends State<PodcastTile> {
+   }
+ 
+   Future<void> playBtnClick() async {
+-    SharedPreferences prefs = await SharedPreferences.getInstance();
+-    int progress = prefs.getInt('${widget.episode.id}_progress') ?? 0;
+     if (!widget.loading) {
+       if (!widget.playing) {
+         widget._audioService.setEpisodeId = widget.episode.id;
+         setIsLoading = true;
+ 
+-        if (progress > 0) {
+-          await widget._audioService
+-              .loadEpisode(widget.episode, widget.downloaded, widget.podcast);
+-
+-          widget._audioService.seek(Duration(seconds: progress));
+-        } else {
+-          await widget._audioService
+-              .loadEpisode(widget.episode, widget.downloaded, widget.podcast);
+-        }
++        await widget._audioService.loadEpisode(
++          widget.episode,
++          widget.downloaded,
++          widget.podcast,
++        );
+ 
+         await widget._audioService.play();
+       } else {
+@@ -224,82 +203,54 @@ class PodcastTileState extends State<PodcastTile> {
+ 
+   @override
+   Widget build(BuildContext context) {
+-    return !widget.isFromEpisodeView
+-        ? widget.playing
+-            ? Card(
+-                margin: const EdgeInsets.all(8),
+-                elevation: 10,
+-                shadowColor: Colors.black,
+-                color: const Color.fromRGBO(0x1b, 0x1b, 0x32, 1),
+-                child: podcastTile(context))
+-            : podcastTile(context)
++    return widget.playing
++        ? Card(
++            margin: const EdgeInsets.all(8),
++            elevation: 10,
++            shadowColor: Colors.black,
++            color: const Color.fromRGBO(0x1b, 0x1b, 0x32, 1),
++            child: podcastTile(context),
++          )
+         : podcastTile(context);
+   }
+ 
+   ListTile podcastTile(BuildContext context) {
+     return ListTile(
+-        title: !widget.isFromEpisodeView
+-            ? Row(
+-                children: [
+-                  Expanded(
+-                    child: Padding(
+-                      padding: const EdgeInsets.all(8.0),
+-                      child: Text(
+-                        widget.episode.title,
+-                        style: const TextStyle(fontWeight: FontWeight.w700),
+-                      ),
+-                    ),
+-                  ),
+-                ],
+-              )
+-            : Container(),
+-        onTap: !widget.isFromEpisodeView
+-            ? () {
+-                Navigator.push(
+-                  context,
+-                  MaterialPageRoute(
+-                    builder: (context) => EpisodeView(
+-                      episode: widget.episode,
+-                      podcast: widget.podcast,
+-                    ),
+-                    settings: RouteSettings(
+-                        name: '/podcasts-episode/${widget.episode.title}'),
+-                  ),
+-                );
+-              }
+-            : null,
+-        minVerticalPadding: !widget.isFromEpisodeView ? 16 : 0,
+-        isThreeLine: true,
+-        subtitle: subtitle(context));
+-  }
+-
+-  Widget subtitle(BuildContext context) {
+-    return Column(
+-      children: [
+-        if (!widget.isFromEpisodeView) descriptionWidget(),
+-        if (widget.isFromEpisodeView)
+-          Row(
+-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+-            children: [
+-              widget._audioService.playbackState.value.processingState ==
+-                          AudioProcessingState.loading ||
+-                      widget._audioService.playbackState.value
+-                              .processingState ==
+-                          AudioProcessingState.buffering
+-                  ? Padding(
+-                      padding: const EdgeInsets.all(8.0),
+-                      child: SizedBox(
+-                          height: MediaQuery.of(context).size.height * 0.075,
+-                          width: MediaQuery.of(context).size.height * 0.075,
+-                          child: const CircularProgressIndicator()),
+-                    )
+-                  : playbuttonWidget(context),
+-              downloadbuttonWidget()
+-            ],
+-          )
+-        else
+-          footerWidget(context)
+-      ],
++      title: Row(
++        children: [
++          Expanded(
++            child: Padding(
++              padding: const EdgeInsets.all(8.0),
++              child: Text(
++                widget.episode.title,
++                style: const TextStyle(fontWeight: FontWeight.w700),
++              ),
++            ),
++          ),
++        ],
++      ),
++      onTap: () {
++        Navigator.push(
++          context,
++          MaterialPageRoute(
++            builder: (context) => EpisodeView(
++              episode: widget.episode,
++              podcast: widget.podcast,
++            ),
++            settings: RouteSettings(
++              name: '/podcasts-episode/${widget.episode.title}',
++            ),
++          ),
++        );
++      },
++      minVerticalPadding: 16,
++      isThreeLine: true,
++      subtitle: Column(
++        children: [
++          descriptionWidget(),
++          footerWidget(context),
++        ],
++      ),
+     );
+   }
+ 
+@@ -372,63 +323,61 @@ class PodcastTileState extends State<PodcastTile> {
+ 
+   Widget downloadbuttonWidget() {
+     return IconButton(
+-        onPressed: widget.isDownloading
+-            ? null
+-            : () {
+-                widget._downloadService.setDownloadId = widget.episode.id;
+-                downloadBtnClick();
+-              },
+-        iconSize: !widget.isFromEpisodeView
+-            ? MediaQuery.of(context).size.height * 0.0375
+-            : MediaQuery.of(context).size.height * 0.075,
+-        icon: widget.isDownloading &&
+-                widget._downloadService.downloadId == widget.episode.id
+-            ? StreamBuilder<String>(
+-                stream: widget._downloadService.progress,
+-                builder: (context, snapshot) {
+-                  if (snapshot.data == '100') {
+-                    SchedulerBinding.instance.addPostFrameCallback((timeStamp) {
+-                      setIsDownloaded = true;
+-                    });
+-                  }
+-
+-                  if (snapshot.hasData) {
+-                    return Stack(alignment: Alignment.center, children: [
+-                      Text(
+-                        '${snapshot.data}%',
+-                        style: const TextStyle(fontSize: 16),
+-                      ),
+-                      CircularProgressIndicator(
+-                          color: Colors.white,
+-                          strokeWidth: 2,
+-                          value: double.parse(snapshot.data as String) / 100),
+-                    ]);
+-                  }
+-
+-                  return const CircularProgressIndicator(
+-                    color: Colors.white,
+-                    strokeWidth: 2,
+-                    value: 0,
+-                  );
+-                })
+-            : Icon(
+-                widget.downloaded
+-                    ? Icons.download_done
+-                    : Icons.arrow_circle_down_outlined,
+-              ));
++      onPressed: widget.isDownloading
++          ? null
++          : () {
++              widget._downloadService.setDownloadId = widget.episode.id;
++              downloadBtnClick();
++            },
++      iconSize: MediaQuery.of(context).size.height * 0.0375,
++      icon: widget.isDownloading &&
++              widget._downloadService.downloadId == widget.episode.id
++          ? StreamBuilder<String>(
++              stream: widget._downloadService.progress,
++              builder: (context, snapshot) {
++                if (snapshot.data == '100') {
++                  SchedulerBinding.instance.addPostFrameCallback((timeStamp) {
++                    setIsDownloaded = true;
++                  });
++                }
++
++                if (snapshot.hasData) {
++                  return Stack(alignment: Alignment.center, children: [
++                    Text(
++                      '${snapshot.data}%',
++                      style: const TextStyle(fontSize: 16),
++                    ),
++                    CircularProgressIndicator(
++                        color: Colors.white,
++                        strokeWidth: 2,
++                        value: double.parse(snapshot.data as String) / 100),
++                  ]);
++                }
++
++                return const CircularProgressIndicator(
++                  color: Colors.white,
++                  strokeWidth: 2,
++                  value: 0,
++                );
++              })
++          : Icon(
++              widget.downloaded
++                  ? Icons.download_done
++                  : Icons.arrow_circle_down_outlined,
++            ),
++    );
+   }
+ 
+   IconButton playbuttonWidget(BuildContext context) {
+     return IconButton(
+-        onPressed: () {
+-          playBtnClick();
+-        },
+-        iconSize: !widget.isFromEpisodeView
+-            ? MediaQuery.of(context).size.height * 0.05
+-            : MediaQuery.of(context).size.height * 0.075,
+-        icon: Icon(
+-          widget.playing ? Icons.pause_circle : Icons.play_circle_sharp,
+-        ));
++      onPressed: () {
++        playBtnClick();
++      },
++      iconSize: MediaQuery.of(context).size.height * 0.05,
++      icon: Icon(
++        widget.playing ? Icons.pause : Icons.play_arrow,
++      ),
++    );
+   }
+ 
+   Padding descriptionWidget() {
+diff --git a/mobile-app/pubspec.yaml b/mobile-app/pubspec.yaml
+index c4fa63b3c..77e2ee4a1 100644
+--- a/mobile-app/pubspec.yaml
++++ b/mobile-app/pubspec.yaml
+@@ -34,7 +34,7 @@ dependencies:
+   html: ^0.15.5+1
+   infinite_scroll_pagination: ^5.0.0
+   jiffy: ^6.3.2
+-  just_audio: ^0.10.0
++  just_audio: ^0.10.2
+   path: ^1.9.1
+   path_provider: ^2.1.5
+   phone_ide: ^1.5.1

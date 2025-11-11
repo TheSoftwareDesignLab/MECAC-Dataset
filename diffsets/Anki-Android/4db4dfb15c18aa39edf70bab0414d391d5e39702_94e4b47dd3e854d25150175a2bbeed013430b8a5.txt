@@ -1,0 +1,567 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/CardBrowser.kt b/AnkiDroid/src/main/java/com/ichi2/anki/CardBrowser.kt
+index bc1f66ad7fd3..a09b793278d5 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/CardBrowser.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/CardBrowser.kt
+@@ -68,6 +68,8 @@ import com.ichi2.anki.browser.CardBrowserViewModel.SearchState.Searching
+ import com.ichi2.anki.browser.CardOrNoteId
+ import com.ichi2.anki.browser.ColumnHeading
+ import com.ichi2.anki.browser.PreviewerIdsFile
++import com.ichi2.anki.browser.RepositionCardFragment
++import com.ichi2.anki.browser.RepositionCardFragment.Companion.REQUEST_REPOSITION_NEW_CARDS
+ import com.ichi2.anki.browser.RepositionCardsRequest.ContainsNonNewCardsError
+ import com.ichi2.anki.browser.RepositionCardsRequest.RepositionData
+ import com.ichi2.anki.browser.SaveSearchResult
+@@ -83,7 +85,6 @@ import com.ichi2.anki.dialogs.DeckSelectionDialog
+ import com.ichi2.anki.dialogs.DeckSelectionDialog.Companion.newInstance
+ import com.ichi2.anki.dialogs.DeckSelectionDialog.DeckSelectionListener
+ import com.ichi2.anki.dialogs.DeckSelectionDialog.SelectableDeck
+-import com.ichi2.anki.dialogs.IntegerDialog
+ import com.ichi2.anki.dialogs.SimpleMessageDialog
+ import com.ichi2.anki.dialogs.tags.TagsDialog
+ import com.ichi2.anki.dialogs.tags.TagsDialogFactory
+@@ -447,6 +448,14 @@ open class CardBrowser :
+ 
+         setupFlows()
+         registerOnForgetHandler { viewModel.queryAllSelectedCardIds() }
++        supportFragmentManager.setFragmentResultListener(REQUEST_REPOSITION_NEW_CARDS, this) { _, bundle ->
++            repositionCardsNoValidation(
++                position = bundle.getInt(RepositionCardFragment.ARG_POSITION),
++                step = bundle.getInt(RepositionCardFragment.ARG_STEP),
++                shuffle = bundle.getBoolean(RepositionCardFragment.ARG_RANDOM),
++                shift = bundle.getBoolean(RepositionCardFragment.ARG_SHIFT),
++            )
++        }
+     }
+ 
+     override fun setupBackPressedCallbacks() {
+@@ -1311,19 +1320,19 @@ open class CardBrowser :
+                     return@launchCatchingTask
+                 }
+                 is RepositionData -> {
+-                    // TODO: This dialog is missing:
+-                    // Randomize order
+-                    // Shift position of existing cards
++                    val top = repositionCardsResult.queueTop
++                    val bottom = repositionCardsResult.queueBottom
++                    if (top == null || bottom == null) {
++                        showSnackbar(R.string.something_wrong)
++                        return@launchCatchingTask
++                    }
+                     val repositionDialog =
+-                        IntegerDialog().apply {
+-                            setArgs(
+-                                title = this@CardBrowser.getString(R.string.reposition_card_dialog_title),
+-                                prompt = TR.browsingStartPosition(),
+-                                content = repositionCardsResult.toHumanReadableContent(),
+-                                digits = 5,
+-                            )
+-                            setCallbackRunnable(::repositionCardsNoValidation)
+-                        }
++                        RepositionCardFragment.newInstance(
++                            queueTop = top,
++                            queueBottom = bottom,
++                            random = repositionCardsResult.random,
++                            shift = repositionCardsResult.shift,
++                        )
+                     showDialogFragment(repositionDialog)
+                 }
+             }
+@@ -1370,18 +1379,26 @@ open class CardBrowser :
+     }
+ 
+     @VisibleForTesting
+-    fun repositionCardsNoValidation(position: Int) =
+-        launchCatchingTask {
+-            val count = withProgress { viewModel.repositionSelectedRows(position) }
+-            showSnackbar(
+-                resources.getQuantityString(
+-                    R.plurals.reposition_card_dialog_acknowledge,
+-                    count,
+-                    count,
+-                ),
+-                Snackbar.LENGTH_SHORT,
+-            )
+-        }
++    fun repositionCardsNoValidation(
++        position: Int,
++        step: Int,
++        shuffle: Boolean,
++        shift: Boolean,
++    ) = launchCatchingTask {
++        val count =
++            withProgress {
++                viewModel.repositionSelectedRows(
++                    position = position,
++                    step = step,
++                    shuffle = shuffle,
++                    shift = shift,
++                )
++            }
++        showSnackbar(
++            TR.browsingChangedNewPosition(count),
++            Snackbar.LENGTH_SHORT,
++        )
++    }
+ 
+     private fun onPreview() {
+         launchCatchingTask {
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/browser/CardBrowserViewModel.kt b/AnkiDroid/src/main/java/com/ichi2/anki/browser/CardBrowserViewModel.kt
+index 24a22b37acca..f4a8064d1d41 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/browser/CardBrowserViewModel.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/browser/CardBrowserViewModel.kt
+@@ -727,6 +727,7 @@ class CardBrowserViewModel(
+     /**
+      * Obtains data to be displayed to the user then sent to [repositionSelectedRows]
+      */
++    @NeedsTest("verify behavior for repositioning with 'Randomize order'")
+     suspend fun prepareToRepositionCards(): RepositionCardsRequest {
+         val selectedCardIds = queryAllSelectedCardIds()
+         // Only new cards may be repositioned (If any non-new found show error dialog and return false)
+@@ -737,17 +738,22 @@ class CardBrowserViewModel(
+         // query obtained from Anki Desktop
+         // https://github.com/ankitects/anki/blob/1fb1cbbf85c48a54c05cb4442b1b424a529cac60/qt/aqt/operations/scheduling.py#L117
+         try {
+-            val (min, max) =
+-                withCol {
+-                    db.query("select min(due), max(due) from cards where type=? and odid=0", CardType.New.code).use {
+-                        it.moveToNext()
+-                        return@withCol Pair(max(0, it.getInt(0)), it.getInt(1))
+-                    }
+-                }
+-            return RepositionData(
+-                min = min,
+-                max = max,
+-            )
++            return withCol {
++                val (min, max) =
++                    db
++                        .query("select min(due), max(due) from cards where type=? and odid=0", CardType.New.code)
++                        .use {
++                            it.moveToNext()
++                            Pair(max(0, it.getInt(0)), it.getInt(1))
++                        }
++                val defaults = sched.repositionDefaults()
++                RepositionData(
++                    min = min,
++                    max = max,
++                    random = defaults.random,
++                    shift = defaults.shift,
++                )
++            }
+         } catch (e: Exception) {
+             // TODO: Remove this once we've verified no production errors
+             Timber.w(e, "getting min/max position")
+@@ -763,11 +769,16 @@ class CardBrowserViewModel(
+      * @see [com.ichi2.libanki.sched.Scheduler.sortCards]
+      * @return the number of cards which were repositioned
+      */
+-    suspend fun repositionSelectedRows(position: Int): Int {
++    suspend fun repositionSelectedRows(
++        position: Int,
++        step: Int,
++        shuffle: Boolean,
++        shift: Boolean,
++    ): Int {
+         val ids = queryAllSelectedCardIds()
+         Timber.d("repositioning %d cards to %d", ids.size, position)
+         return undoableOp {
+-            sched.sortCards(cids = ids, position, step = 1, shuffle = false, shift = true)
++            sched.sortCards(cids = ids, position, step = step, shuffle = shuffle, shift = shift)
+         }.count
+     }
+ 
+@@ -1149,6 +1160,8 @@ sealed class RepositionCardsRequest {
+     class RepositionData(
+         val min: Int?,
+         val max: Int?,
++        val random: Boolean = false,
++        val shift: Boolean = false,
+     ) : RepositionCardsRequest() {
+         val queueTop: Int?
+         val queueBottom: Int?
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/browser/RepositionCardFragment.kt b/AnkiDroid/src/main/java/com/ichi2/anki/browser/RepositionCardFragment.kt
+new file mode 100644
+index 000000000000..f2de06fef111
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/browser/RepositionCardFragment.kt
+@@ -0,0 +1,121 @@
++/****************************************************************************************
++ * Copyright (c) 2025 lukstbit <52494258+lukstbit@users.noreply.github.com>             *
++ *                                                                                      *
++ * This program is free software; you can redistribute it and/or modify it under        *
++ * the terms of the GNU General Public License as published by the Free Software        *
++ * Foundation; either version 3 of the License, or (at your option) any later           *
++ * version.                                                                             *
++ *                                                                                      *
++ * This program is distributed in the hope that it will be useful, but WITHOUT ANY      *
++ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A      *
++ * PARTICULAR PURPOSE. See the GNU General Public License for more details.             *
++ *                                                                                      *
++ * You should have received a copy of the GNU General Public License along with         *
++ * this program.  If not, see <http://www.gnu.org/licenses/>.                           *
++ ****************************************************************************************/
++package com.ichi2.anki.browser
++
++import android.app.Dialog
++import android.os.Bundle
++import android.widget.CheckBox
++import android.widget.TextView
++import androidx.appcompat.app.AlertDialog
++import androidx.core.os.bundleOf
++import androidx.fragment.app.DialogFragment
++import androidx.fragment.app.setFragmentResult
++import com.google.android.material.textfield.TextInputEditText
++import com.google.android.material.textfield.TextInputLayout
++import com.ichi2.anki.CardBrowser
++import com.ichi2.anki.CollectionManager.TR
++import com.ichi2.anki.R
++import com.ichi2.anki.ui.internationalization.toSentenceCase
++import com.ichi2.utils.create
++import com.ichi2.utils.customView
++import com.ichi2.utils.negativeButton
++import com.ichi2.utils.positiveButton
++import com.ichi2.utils.textAsIntOrNull
++import com.ichi2.utils.title
++
++/**
++ * Follows desktop implementation to show the same ui with all the options to reposition new
++ * (currently selected) cards in [CardBrowser].
++ * See https://github.com/ankitects/anki/blob/44e01ea063e6d1b812ace9c001f7ba4a8ccf4479/qt/aqt/forms/reposition.ui#L14
++ * See https://github.com/ankitects/anki/blob/1fb1cbbf85c48a54c05cb4442b1b424a529cac60/qt/aqt/operations/scheduling.py#L107
++ */
++class RepositionCardFragment : DialogFragment() {
++    override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
++        val dialogView = layoutInflater.inflate(R.layout.fragment_reposition_card, null)
++        dialogView.findViewById<TextView>(R.id.queue_limits_label).text =
++            """
++            ${TR.browsingQueueTop(requireArguments().getInt(ARG_QUEUE_TOP))}
++            ${TR.browsingQueueTop(requireArguments().getInt(ARG_QUEUE_BOTTOM))} 
++            """.trimIndent()
++        dialogView.findViewById<TextInputLayout>(R.id.start_input_layout).hint =
++            TR.browsingStartPosition().removeSuffix(":")
++        dialogView.findViewById<TextInputLayout>(R.id.step_input_layout).hint =
++            TR.browsingStep().removeSuffix(":")
++        val randomCheck =
++            dialogView.findViewById<CheckBox>(R.id.randomize_order_check)?.apply {
++                text = TR.browsingRandomizeOrder()
++                isChecked = requireArguments().getBoolean(ARG_RANDOM)
++            } ?: error("Unexpected missing random checkbox!")
++        val shiftPositionCheck =
++            dialogView.findViewById<CheckBox>(R.id.shift_position_check)?.apply {
++                text = TR.browsingShiftPositionOfExistingCards()
++                isChecked = requireArguments().getBoolean(ARG_SHIFT)
++            } ?: error("Unexpected missing shift position checkbox!")
++        val title =
++            TR
++                .browsingRepositionNewCards()
++                .toSentenceCase(requireContext(), R.string.sentence_reposition_new_cards)
++        return AlertDialog.Builder(requireContext()).create {
++            title(text = title)
++            customView(dialogView)
++            negativeButton(R.string.dialog_cancel)
++            positiveButton(R.string.dialog_ok) {
++                val position =
++                    dialogView
++                        .findViewById<TextInputEditText>(R.id.start_input)
++                        .textAsIntOrNull() ?: return@positiveButton
++                val step =
++                    dialogView
++                        .findViewById<TextInputEditText>(R.id.step_input)
++                        ?.textAsIntOrNull() ?: return@positiveButton
++                setFragmentResult(
++                    REQUEST_REPOSITION_NEW_CARDS,
++                    bundleOf(
++                        ARG_POSITION to position,
++                        ARG_STEP to step,
++                        ARG_RANDOM to randomCheck.isChecked,
++                        ARG_SHIFT to shiftPositionCheck.isChecked,
++                    ),
++                )
++            }
++        }
++    }
++
++    companion object {
++        const val REQUEST_REPOSITION_NEW_CARDS = "request_repositions_new_cards"
++        private const val ARG_QUEUE_TOP = "arg_queue_top"
++        private const val ARG_QUEUE_BOTTOM = "arg_queue_bottom"
++        const val ARG_POSITION = "arg_position"
++        const val ARG_STEP = "arg_step"
++        const val ARG_RANDOM = "arg_random"
++        const val ARG_SHIFT = "arg_shift"
++
++        fun newInstance(
++            queueTop: Int,
++            queueBottom: Int,
++            random: Boolean,
++            shift: Boolean,
++        ) = RepositionCardFragment().apply {
++            arguments =
++                bundleOf(
++                    ARG_QUEUE_TOP to queueTop,
++                    ARG_QUEUE_BOTTOM to queueBottom,
++                    ARG_RANDOM to random,
++                    ARG_SHIFT to shift,
++                )
++        }
++    }
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/libanki/sched/Scheduler.kt b/AnkiDroid/src/main/java/com/ichi2/libanki/sched/Scheduler.kt
+index c0cb9303f98f..dad3ee8d6510 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/libanki/sched/Scheduler.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/libanki/sched/Scheduler.kt
+@@ -33,6 +33,7 @@ import anki.scheduler.CongratsInfoResponse
+ import anki.scheduler.CustomStudyDefaultsResponse
+ import anki.scheduler.CustomStudyRequest
+ import anki.scheduler.QueuedCards
++import anki.scheduler.RepositionDefaultsResponse
+ import anki.scheduler.SchedTimingTodayResponse
+ import anki.scheduler.SchedulingContext
+ import anki.scheduler.SchedulingState
+@@ -484,6 +485,9 @@ open class Scheduler(
+     @CheckResult
+     fun customStudyDefaults(deckId: DeckId): CustomStudyDefaultsResponse = col.backend.customStudyDefaults(deckId)
+ 
++    @CheckResult
++    fun repositionDefaults(): RepositionDefaultsResponse = col.backend.repositionDefaults()
++
+     /**
+      * @return Number of new card in current deck and its descendants. Capped at [REPORT_LIMIT]
+      */
+diff --git a/AnkiDroid/src/main/res/layout/fragment_reposition_card.xml b/AnkiDroid/src/main/res/layout/fragment_reposition_card.xml
+new file mode 100644
+index 000000000000..334ea67ab908
+--- /dev/null
++++ b/AnkiDroid/src/main/res/layout/fragment_reposition_card.xml
+@@ -0,0 +1,88 @@
++<?xml version="1.0" encoding="utf-8"?>
++<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:padding="16dp"
++    android:orientation="vertical">
++
++    <TextView
++        android:id="@+id/queue_limits_label"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toTopOf="parent"
++        app:layout_constraintEnd_toEndOf="parent"
++        android:layout_marginStart="4dp"
++        app:layout_constraintHorizontal_bias="0.0"
++        tools:text="Queue top: 1\nQueue bottom: 1656546754"/>
++
++    <com.google.android.material.textfield.TextInputLayout
++        android:id="@+id/start_input_layout"
++        android:imeOptions="actionDone"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:paddingStart="24dp"
++        android:paddingEnd="24dp"
++        android:layout_marginTop="8dp"
++        app:errorEnabled="true"
++        app:layout_constraintTop_toBottomOf="@id/queue_limits_label">
++
++        <com.google.android.material.textfield.TextInputEditText
++            android:id="@+id/start_input"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:drawablePadding="8dp"
++            android:singleLine="true"
++            android:inputType="number"
++            android:text="0"
++            android:maxLines="1"
++            tools:ignore="HardcodedText" />
++    </com.google.android.material.textfield.TextInputLayout>
++
++    <com.google.android.material.textfield.TextInputLayout
++        android:id="@+id/step_input_layout"
++        android:imeOptions="actionDone"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:paddingStart="24dp"
++        android:paddingEnd="24dp"
++        android:layout_marginTop="8dp"
++        app:errorEnabled="true"
++        app:layout_constraintTop_toBottomOf="@id/start_input_layout"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintEnd_toEndOf="parent">
++
++        <com.google.android.material.textfield.TextInputEditText
++            android:id="@+id/step_input"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:drawablePadding="8dp"
++            android:singleLine="true"
++            android:inputType="number"
++            android:text="1"
++            android:maxLines="1"
++            tools:ignore="HardcodedText" />
++    </com.google.android.material.textfield.TextInputLayout>
++
++    <CheckBox
++        android:id="@+id/randomize_order_check"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:checked="false"
++        tools:text="Randomize order"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintTop_toBottomOf="@id/step_input_layout"/>
++
++    <CheckBox
++        android:id="@+id/shift_position_check"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:checked="false"
++        tools:text="Shift position of existing cards"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintTop_toBottomOf="@id/randomize_order_check"/>
++</androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/AnkiDroid/src/main/res/values/03-dialogs.xml b/AnkiDroid/src/main/res/values/03-dialogs.xml
+index aa70ba3bab57..25a5547f826b 100644
+--- a/AnkiDroid/src/main/res/values/03-dialogs.xml
++++ b/AnkiDroid/src/main/res/values/03-dialogs.xml
+@@ -30,13 +30,7 @@
+     <string name="no_tts_available_message">No text-to-speech language available</string>
+     <string name="tts_no_tts">Don’t speak</string>
+ 
+-    <string name="reposition_card_dialog_title">Reposition new card</string>
+     <string name="reposition_card_not_new_error">Only new cards can be repositioned</string>
+-
+-    <plurals name="reposition_card_dialog_acknowledge">
+-        <item quantity="one">%d card repositioned</item>
+-        <item quantity="other">%d cards repositioned</item>
+-    </plurals>
+     <string name="reset_card_dialog_title">Reset card progress</string>
+     <plurals name="reset_cards_dialog_acknowledge">
+         <item quantity="one">%d card reset</item>
+diff --git a/AnkiDroid/src/main/res/values/sentence-case.xml b/AnkiDroid/src/main/res/values/sentence-case.xml
+index 63653a540e91..e739a67cbff3 100644
+--- a/AnkiDroid/src/main/res/values/sentence-case.xml
++++ b/AnkiDroid/src/main/res/values/sentence-case.xml
+@@ -43,5 +43,5 @@ undoActionUndone()
+     <string name="sentence_custom_study">Custom study</string>
+     <string name="sentence_empty_cards">Empty cards</string>
+     <string name="tag_missing">Tag missing</string>
+-
++    <string name="sentence_reposition_new_cards">Reposition new cards</string>
+ </resources>
+\ No newline at end of file
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/CardBrowserTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/CardBrowserTest.kt
+index cf6721e2a995..5bcbcbe4cca0 100644
+--- a/AnkiDroid/src/test/java/com/ichi2/anki/CardBrowserTest.kt
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/CardBrowserTest.kt
+@@ -558,7 +558,7 @@ class CardBrowserTest : RobolectricTest() {
+                 startsWith("New #\u20681\u2069"),
+             )
+ 
+-            b.viewModel.repositionSelectedRows(2)
++            b.viewModel.repositionSelectedRows(2, 1, shuffle = false, shift = false)
+ 
+             assertThat(
+                 "Position of checked card after reposition",
+@@ -567,6 +567,90 @@ class CardBrowserTest : RobolectricTest() {
+             )
+         }
+ 
++    @Test
++    fun `reposition without shift has expected outcome`() =
++        runTest {
++            val browser = getBrowserWithNotes(5)
++            // without shifting when repositioning we end up with the same due if there's already a
++            // card with that value
++            // see https://docs.ankiweb.net/browsing.html#cards
++            browser.assertRepositionOutcomeFor(
++                selectedBrowserPosition = 3,
++                currentDuePosition = 4,
++                targetDuePosition = 1,
++                expectedCardsDuePositions = listOf(1, 2, 3, 1, 5),
++                shift = false,
++            )
++            browser.viewModel.selectNone()
++            // same due because we don't shift
++            browser.assertRepositionOutcomeFor(
++                selectedBrowserPosition = 4,
++                currentDuePosition = 5,
++                targetDuePosition = 1,
++                expectedCardsDuePositions = listOf(1, 2, 3, 1, 1),
++                shift = false,
++            )
++        }
++
++    @Test
++    fun `reposition with shift has expected outcome`() =
++        runTest {
++            val browser = getBrowserWithNotes(5)
++            browser.assertRepositionOutcomeFor(
++                selectedBrowserPosition = 4,
++                currentDuePosition = 5,
++                targetDuePosition = 2,
++                expectedCardsDuePositions = listOf(1, 3, 4, 5, 2),
++                shift = true,
++            )
++            browser.viewModel.selectNone()
++            // dues are shifted for new repositioning with shift
++            browser.assertRepositionOutcomeFor(
++                selectedBrowserPosition = 3,
++                currentDuePosition = 5,
++                targetDuePosition = 1,
++                expectedCardsDuePositions = listOf(2, 4, 5, 1, 3),
++                shift = true,
++            )
++        }
++
++    private suspend fun CardBrowser.assertRepositionOutcomeFor(
++        selectedBrowserPosition: Int,
++        currentDuePosition: Int,
++        targetDuePosition: Int,
++        expectedCardsDuePositions: List<Int>,
++        shift: Boolean,
++    ) {
++        selectRowsWithPositions(selectedBrowserPosition)
++        val card = getCheckedCard(this)
++
++        assertThat(
++            "Unexpected due for currently selected card",
++            card.getColumnHeaderText(CardBrowserColumn.DUE),
++            startsWith("New #\u2068$currentDuePosition\u2069"),
++        )
++
++        viewModel.repositionSelectedRows(targetDuePosition, 1, shuffle = false, shift = shift)
++        // with shift, moving to a position will not result in the same due as the cards with
++        // that position will be shifted
++        viewModel.cards.forEachIndexed { index, entry ->
++            assertThat(
++                "Unexpected due position at index: $index",
++                getDueHeaderText(entry.cardOrNoteId),
++                startsWith("New #\u2068${expectedCardsDuePositions[index]}\u2069"),
++            )
++        }
++    }
++
++    private fun getDueHeaderText(cardOrNoteId: Long): String? {
++        // There's currently a minimum of 2 columns
++        col.backend.setActiveBrowserColumns(listOf(CardBrowserColumn.DUE.ankiColumnKey, "answer"))
++        return col
++            .browserRowForId(cardOrNoteId)
++            .getCells(0)
++            .text
++    }
++
+     @Test
+     @Config(qualifiers = "en")
+     @SuppressLint("DirectCalendarInstanceUsage")
+@@ -625,7 +709,7 @@ class CardBrowserTest : RobolectricTest() {
+                 equalTo("1"),
+             )
+ 
+-            b.repositionCardsNoValidation(2)
++            b.repositionCardsNoValidation(2, 1, shuffle = false, shift = false)
+ 
+             assertThat(
+                 "Position of checked card after reposition",

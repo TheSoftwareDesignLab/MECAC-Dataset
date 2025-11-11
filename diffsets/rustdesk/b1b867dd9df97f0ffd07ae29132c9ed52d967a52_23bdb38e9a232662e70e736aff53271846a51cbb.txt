@@ -1,0 +1,182 @@
+diff --git a/flutter/lib/plugin/model.dart b/flutter/lib/plugin/model.dart
+index 5fdc426c729..eb5fa78b7d2 100644
+--- a/flutter/lib/plugin/model.dart
++++ b/flutter/lib/plugin/model.dart
+@@ -3,17 +3,19 @@ import './common.dart';
+ import './desc.dart';
+ 
+ final Map<String, LocationModel> locationModels = {};
+-final Map<String, KvModel> kvModels = {};
++final Map<String, OptionModel> optionModels = {};
+ 
+-class KvModel with ChangeNotifier {
+-  final Map<String, String> kv = {};
++class OptionModel with ChangeNotifier {
++  String? v;
+ 
+-  String? get(String key) => kv.remove(key);
+-
+-  void set(String key, String value) {
+-    kv[key] = value;
++  String? get value => v;
++  set value(String? v) {
++    this.v = v;
+     notifyListeners();
+   }
++
++  static String key(String location, PluginId id, String peer, String k) =>
++      '$location|$id|$peer|$k';
+ }
+ 
+ class PluginModel with ChangeNotifier {
+@@ -58,19 +60,17 @@ LocationModel addLocation(String location) {
+   return locationModels[location]!;
+ }
+ 
+-String makeKvModelInstance(String location, PluginId id, String peer) =>
+-    '$location|$id|$peer';
+-
+-KvModel addKvModel(String location, PluginId pluginId, String peer) {
+-  final instance = makeKvModelInstance(location, pluginId, peer);
+-  if (kvModels[instance] == null) {
+-    kvModels[instance] = KvModel();
++OptionModel addOptionModel(
++    String location, PluginId pluginId, String peer, String key) {
++  final k = OptionModel.key(location, pluginId, peer, key);
++  if (optionModels[k] == null) {
++    optionModels[k] = OptionModel();
+   }
+-  return kvModels[instance]!;
++  return optionModels[k]!;
+ }
+ 
+ void updateOption(
+     String location, PluginId id, String peer, String key, String value) {
+-  final instance = makeKvModelInstance(location, id, peer);
+-  kvModels[instance]?.set(key, value);
++  final k = OptionModel.key(location, id, peer, key);
++  optionModels[k]?.value = value;
+ }
+diff --git a/flutter/lib/plugin/widget.dart b/flutter/lib/plugin/widget.dart
+index ebd3d082ee5..feda1801ff3 100644
+--- a/flutter/lib/plugin/widget.dart
++++ b/flutter/lib/plugin/widget.dart
+@@ -66,7 +66,6 @@ class PluginItem extends StatelessWidget {
+   final FFI ffi;
+   final String location;
+   final PluginModel pluginModel;
+-  final KvModel kvModel;
+ 
+   PluginItem({
+     Key? key,
+@@ -75,20 +74,16 @@ class PluginItem extends StatelessWidget {
+     required this.ffi,
+     required this.location,
+     required this.pluginModel,
+-  })  : kvModel = addKvModel(location, pluginId, peerId),
+-        super(key: key);
++  }) : super(key: key);
+ 
+   bool get isEmpty => pluginModel.isEmpty;
+ 
+   @override
+   Widget build(BuildContext context) {
+-    return MultiProvider(
+-      providers: [
+-        ChangeNotifierProvider.value(value: pluginModel),
+-        ChangeNotifierProvider.value(value: kvModel),
+-      ],
+-      child: Consumer2<PluginModel, KvModel>(
+-        builder: (context, pluginModel, kvModel, child) {
++    return ChangeNotifierProvider.value(
++      value: pluginModel,
++      child: Consumer<PluginModel>(
++        builder: (context, pluginModel, child) {
+           return Column(
+             children: pluginModel.uiList.map((ui) => _buildItem(ui)).toList(),
+           );
+@@ -144,34 +139,50 @@ class PluginItem extends StatelessWidget {
+     );
+   }
+ 
+-  Widget _buildCheckboxMenuButton(UiCheckbox ui) {
+-    var v = kvModel.get(ui.key);
++  String? getOption(OptionModel model, String key) {
++    var v = model.value;
+     if (v == null) {
+       if (peerId.isEmpty) {
+-        v = bind.pluginGetLocalOption(id: pluginId, key: ui.key);
++        v = bind.pluginGetLocalOption(id: pluginId, key: key);
+       } else {
+-        v = bind.pluginGetSessionOption(
+-            id: pluginId, peer: peerId, key: ui.key);
++        v = bind.pluginGetSessionOption(id: pluginId, peer: peerId, key: key);
+       }
+     }
+-    if (v == null) {
+-      // session or plugin not found
+-      return Container();
++    return v;
++  }
++
++  Widget _buildCheckboxMenuButton(UiCheckbox ui) {
++    getChild(OptionModel model) {
++      final v = getOption(model, ui.key);
++      if (v == null) {
++        // session or plugin not found
++        return Container();
++      }
++      return CkbMenuButton(
++        value: ConfigItem.isTrue(v),
++        onChanged: (v) {
++          if (v != null) {
++            bind.pluginEvent(
++              id: pluginId,
++              peer: peerId,
++              event: _makeEvent(ui.key, v: v),
++            );
++          }
++        },
++        // to-do: RustDesk translate or plugin translate ?
++        child: Text(ui.text),
++        ffi: ffi,
++      );
+     }
+-    return CkbMenuButton(
+-      value: ConfigItem.isTrue(v),
+-      onChanged: (v) {
+-        if (v != null) {
+-          bind.pluginEvent(
+-            id: pluginId,
+-            peer: peerId,
+-            event: _makeEvent(ui.key, v: v),
+-          );
+-        }
+-      },
+-      // to-do: RustDesk translate or plugin translate ?
+-      child: Text(ui.text),
+-      ffi: ffi,
++
++    final optionModel = addOptionModel(location, pluginId, peerId, ui.key);
++    return ChangeNotifierProvider.value(
++      value: optionModel,
++      child: Consumer<OptionModel>(
++        builder: (context, model, child) {
++          return getChild(model);
++        },
++      ),
+     );
+   }
+ }
+diff --git a/src/plugin/callback_msg.rs b/src/plugin/callback_msg.rs
+index 23d7392e910..95372ce96ca 100644
+--- a/src/plugin/callback_msg.rs
++++ b/src/plugin/callback_msg.rs
+@@ -107,6 +107,7 @@ pub fn callback_msg(
+             if let Ok(s) =
+                 std::str::from_utf8(unsafe { std::slice::from_raw_parts(content as _, len) })
+             {
++                // No need to merge the msgs. Handling the msg one by one is ok.
+                 if let Ok(msg) = serde_json::from_str::<MsgToConfig>(s) {
+                     match &msg.r#type as _ {
+                         config::CONFIG_TYPE_LOCAL => {

@@ -1,0 +1,232 @@
+diff --git a/Signal/src/ViewControllers/GifPicker/GifPickerCell.swift b/Signal/src/ViewControllers/GifPicker/GifPickerCell.swift
+index a0faeeacef3..cca501de764 100644
+--- a/Signal/src/ViewControllers/GifPicker/GifPickerCell.swift
++++ b/Signal/src/ViewControllers/GifPicker/GifPickerCell.swift
+@@ -3,11 +3,16 @@
+ //
+ 
+ import Foundation
++import PromiseKit
+ 
+ class GifPickerCell: UICollectionViewCell {
+     let TAG = "[GifPickerCell]"
+ 
+     // MARK: Properties
++    enum GifPickerCellError: Error {
++        case assertionError(description: String)
++        case fetchFailure
++    }
+ 
+     var imageInfo: GiphyImageInfo? {
+         didSet {
+@@ -35,6 +40,9 @@ class GifPickerCell: UICollectionViewCell {
+     var animatedAsset: GiphyAsset?
+     var imageView: YYAnimatedImageView?
+ 
++    // As another bandwidth saving measure, we only fetch the full sized GIF when the user selects it.
++    private var renditionForSending: GiphyRendition?
++
+     // MARK: Initializers
+ 
+     deinit {
+@@ -93,6 +101,16 @@ class GifPickerCell: UICollectionViewCell {
+             clearAssetRequests()
+             return
+         }
++
++        // Record high quality animated rendition, but to save bandwidth, don't start downloading
++        // until it's selected.
++        guard let highQualityAnimatedRendition = imageInfo.pickHighQualityAnimatedRendition() else {
++            Logger.warn("\(TAG) could not pick gif rendition: \(imageInfo.giphyId)")
++            clearAssetRequests()
++            return
++        }
++        self.renditionForSending = highQualityAnimatedRendition
++
+         // The Giphy API returns a slew of "renditions" for a given image. 
+         // It's critical that we carefully "pick" the best rendition to use.
+         guard let animatedRendition = imageInfo.pickAnimatedRendition() else {
+@@ -190,6 +208,31 @@ class GifPickerCell: UICollectionViewCell {
+         self.backgroundColor = nil
+     }
+ 
++    public func fetchRenditionForSending() -> Promise<GiphyAsset> {
++        guard let renditionForSending = self.renditionForSending else {
++            owsFail("\(TAG) renditionForSending was unexpectedly nil")
++            return Promise(error: GifPickerCellError.assertionError(description: "renditionForSending was unexpectedly nil"))
++        }
++
++        let (promise, fulfill, reject) = Promise<GiphyAsset>.pending()
++
++        // We don't retain a handle on the asset request, since there will only ever
++        // be one selected asset, and we never want to cancel it.
++        _ = GiphyDownloader.sharedInstance.requestAsset(rendition: renditionForSending,
++                                                    priority: .high,
++                                                    success: { _, asset in
++                                                        fulfill(asset)
++        },
++                                                    failure: { _ in
++                                                        // TODO GiphyDownloader API shoudl pass through a useful failing error
++                                                        // so we can pass it through here
++                                                        reject(GifPickerCellError.fetchFailure)
++
++        })
++
++        return promise
++    }
++
+     private func clearViewState() {
+         imageView?.image = nil
+         self.backgroundColor = UIColor(white:0.95, alpha:1.0)
+diff --git a/Signal/src/ViewControllers/GifPicker/GifPickerViewController.swift b/Signal/src/ViewControllers/GifPicker/GifPickerViewController.swift
+index 25cb0fe37a8..ad0d60a77cc 100644
+--- a/Signal/src/ViewControllers/GifPicker/GifPickerViewController.swift
++++ b/Signal/src/ViewControllers/GifPicker/GifPickerViewController.swift
+@@ -31,8 +31,8 @@ class GifPickerViewController: OWSViewController, UISearchBarDelegate, UICollect
+ 
+     public weak var delegate: GifPickerViewControllerDelegate?
+ 
+-    var thread: TSThread?
+-    var messageSender: MessageSender?
++    let thread: TSThread
++    let messageSender: MessageSender
+ 
+     let searchBar: UISearchBar
+     let layout: GifPickerLayout
+@@ -40,7 +40,7 @@ class GifPickerViewController: OWSViewController, UISearchBarDelegate, UICollect
+     var noResultsView: UILabel?
+     var searchErrorView: UILabel?
+     var activityIndicator: UIActivityIndicatorView?
+-
++    var selectedCell: UICollectionViewCell?
+     var imageInfos = [GiphyImageInfo]()
+ 
+     var reachability: Reachability?
+@@ -53,15 +53,7 @@ class GifPickerViewController: OWSViewController, UISearchBarDelegate, UICollect
+ 
+     @available(*, unavailable, message:"use other constructor instead.")
+     required init?(coder aDecoder: NSCoder) {
+-        self.thread = nil
+-        self.messageSender = nil
+-
+-        self.searchBar = UISearchBar()
+-        self.layout = GifPickerLayout()
+-        self.collectionView = UICollectionView(frame: CGRect.zero, collectionViewLayout: self.layout)
+-
+-        super.init(coder: aDecoder)
+-        owsFail("\(self.TAG) invalid constructor")
++        fatalError("\(#function) is unimplemented.")
+     }
+ 
+     required init(thread: TSThread, messageSender: MessageSender) {
+@@ -295,36 +287,36 @@ class GifPickerViewController: OWSViewController, UISearchBarDelegate, UICollect
+     // MARK: - UICollectionViewDelegate
+ 
+     public func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
++
+         guard let cell = collectionView.cellForItem(at: indexPath) as? GifPickerCell else {
+             owsFail("\(TAG) unexpected cell.")
+             return
+         }
+-        guard let asset = cell.animatedAsset else {
+-            Logger.info("\(TAG) unload cell selected.")
+-            return
+-        }
+-        let filePath = asset.filePath
+-        guard let dataSource = DataSourcePath.dataSource(withFilePath: filePath) else {
+-            owsFail("\(TAG) couldn't load asset.")
+-            return
+-        }
+-        let attachment = SignalAttachment(dataSource: dataSource, dataUTI: asset.rendition.utiType)
+-        guard let thread = thread else {
+-            owsFail("\(TAG) Missing thread.")
+-            return
+-        }
+-        guard let messageSender = messageSender else {
+-            owsFail("\(TAG) Missing messageSender.")
++
++        guard self.selectedCell == nil else {
++            owsFail("\(TAG) Already selected cell")
+             return
+         }
++        self.selectedCell = cell
++
++        // TODO disable collection view scroll/selection
++        // TODO show loading
++        cell.fetchRenditionForSending().then { (asset: GiphyAsset) -> Void in
++            let filePath = asset.filePath
++            guard let dataSource = DataSourcePath.dataSource(withFilePath: filePath) else {
++                owsFail("\(self.TAG) couldn't load asset.")
++                return
++            }
++            let attachment = SignalAttachment(dataSource: dataSource, dataUTI: asset.rendition.utiType)
+ 
+-        self.delegate?.gifPickerWillSend()
++            self.delegate?.gifPickerWillSend()
+ 
+-        let outgoingMessage = ThreadUtil.sendMessage(with: attachment, in: thread, messageSender: messageSender)
++            let outgoingMessage = ThreadUtil.sendMessage(with: attachment, in: self.thread, messageSender: self.messageSender)
+ 
+-        self.delegate?.gifPickerDidSend(outgoingMessage: outgoingMessage)
++            self.delegate?.gifPickerDidSend(outgoingMessage: outgoingMessage)
+ 
+-        dismiss(animated: true, completion: nil)
++            self.dismiss(animated: true, completion: nil)
++        }.retainUntilComplete()
+     }
+ 
+     public func collectionView(_ collectionView: UICollectionView, willDisplay cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
+diff --git a/Signal/src/network/GiphyAPI.swift b/Signal/src/network/GiphyAPI.swift
+index aa552da8a17..351fae07377 100644
+--- a/Signal/src/network/GiphyAPI.swift
++++ b/Signal/src/network/GiphyAPI.swift
+@@ -89,8 +89,9 @@ enum GiphyFormat {
+ 
+     // TODO: We may need to tweak these constants.
+     let kMaxDimension = UInt(618)
+-    let kMinDimension = UInt(101)
+-    let kMaxFileSize = UInt(3 * 1024 * 1024)
++    let kMinDimension = UInt(60)
++    let kPreferedPreviewFileSize = UInt(256 * 1024)
++    let kPreferedSendingFileSize = UInt(3 * 1024 * 1024)
+ 
+     private enum PickingStrategy {
+         case smallerIsBetter, largerIsBetter
+@@ -105,20 +106,33 @@ enum GiphyFormat {
+ 
+     public func pickStillRendition() -> GiphyRendition? {
+         // Stills are just temporary placeholders, so use the smallest still possible.
+-        return pickRendition(isStill:true, pickingStrategy:.smallerIsBetter, maxFileSize:kMaxFileSize)
++        return pickRendition(isStill:true, pickingStrategy:.smallerIsBetter, maxFileSize:kPreferedPreviewFileSize)
+     }
+ 
+     public func pickAnimatedRendition() -> GiphyRendition? {
+         // Try to pick a small file...
+-        if let rendition = pickRendition(isStill:false, pickingStrategy:.largerIsBetter, maxFileSize:kMaxFileSize) {
++        if let rendition = pickRendition(isStill:false, pickingStrategy:.largerIsBetter, maxFileSize:kPreferedPreviewFileSize) {
+             return rendition
+         }
+         // ...but gradually relax the file restriction...
+-        if let rendition = pickRendition(isStill:false, pickingStrategy:.smallerIsBetter, maxFileSize:kMaxFileSize * 2) {
++        if let rendition = pickRendition(isStill:false, pickingStrategy:.smallerIsBetter, maxFileSize:kPreferedPreviewFileSize * 2) {
+             return rendition
+         }
+         // ...and relax even more until we find an animated rendition.
+-        return pickRendition(isStill:false, pickingStrategy:.smallerIsBetter, maxFileSize:kMaxFileSize * 3)
++        return pickRendition(isStill:false, pickingStrategy:.smallerIsBetter, maxFileSize:kPreferedPreviewFileSize * 3)
++    }
++
++    public func pickHighQualityAnimatedRendition() -> GiphyRendition? {
++        // Try to pick a small file...
++        if let rendition = pickRendition(isStill:false, pickingStrategy:.largerIsBetter, maxFileSize:kPreferedSendingFileSize) {
++            return rendition
++        }
++        // ...but gradually relax the file restriction...
++        if let rendition = pickRendition(isStill:false, pickingStrategy:.smallerIsBetter, maxFileSize:kPreferedSendingFileSize * 2) {
++            return rendition
++        }
++        // ...and relax even more until we find an animated rendition.
++        return pickRendition(isStill:false, pickingStrategy:.smallerIsBetter, maxFileSize:kPreferedSendingFileSize * 3)
+     }
+ 
+     // Picking a rendition must be done very carefully.

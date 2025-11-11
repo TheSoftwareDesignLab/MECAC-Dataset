@@ -1,0 +1,614 @@
+diff --git a/lib/model/internal_link.dart b/lib/model/internal_link.dart
+index ef2684ae5c..26ac1c8cb5 100644
+--- a/lib/model/internal_link.dart
++++ b/lib/model/internal_link.dart
+@@ -1,9 +1,12 @@
+ import 'package:flutter/foundation.dart';
++import 'package:json_annotation/json_annotation.dart';
+ 
+ import '../api/model/narrow.dart';
+ import 'narrow.dart';
+ import 'store.dart';
+ 
++part 'internal_link.g.dart';
++
+ const _hashReplacements = {
+   "%": ".",
+   "(": ".28",
+@@ -106,3 +109,177 @@ Uri? tryResolveOnRealmUrl(String urlString, Uri realmUrl) {
+     return null;
+   }
+ }
++
++/// A [Narrow] from a given URL, on `store`'s realm.
++///
++/// `url` must already be passed through [tryResolveOnRealmUrl].
++///
++/// Returns `null` if any of the operator/operand pairs are invalid.
++///
++/// Since narrow links can combine operators in ways our [Narrow] type can't
++/// represent, this can also return null for valid narrow links.
++///
++/// This can also return null for some valid narrow links that our Narrow
++/// type *could* accurately represent. We should try to understand these
++/// better, but some kinds will be rare, even unheard-of:
++///   #narrow/stream/1-announce/stream/1-announce (duplicated operator)
++// TODO(#252): handle all valid narrow links, returning a search narrow
++Narrow? parseInternalLink(Uri url, PerAccountStore store) {
++  if (!_isInternalLink(url, store.account.realmUrl)) return null;
++
++  final (category, segments) = _getCategoryAndSegmentsFromFragment(url.fragment);
++  switch (category) {
++    case 'narrow':
++      if (segments.isEmpty || !segments.length.isEven) return null;
++      return _interpretNarrowSegments(segments, store);
++  }
++  return null;
++}
++
++/// Check if `url` is an internal link on the given `realmUrl`.
++bool _isInternalLink(Uri url, Uri realmUrl) {
++  try {
++    if (url.origin != realmUrl.origin) return false;
++  } on StateError {
++    return false;
++  }
++  return (url.hasEmptyPath || url.path == '/')
++    && !url.hasQuery
++    && url.hasFragment;
++}
++
++/// Split `fragment` of arbitrary segments and handle trailing slashes
++(String, List<String>) _getCategoryAndSegmentsFromFragment(String fragment) {
++  final [category, ...segments] = fragment.split('/');
++  if (segments.length > 1 && segments.last == '') segments.removeLast();
++  return (category, segments);
++}
++
++Narrow? _interpretNarrowSegments(List<String> segments, PerAccountStore store) {
++  assert(segments.isNotEmpty);
++  assert(segments.length.isEven);
++
++  ApiNarrowStream? streamElement;
++  ApiNarrowTopic? topicElement;
++  ApiNarrowDm? dmElement;
++
++  for (var i = 0; i < segments.length; i += 2) {
++    final (operator, negated) = _parseOperator(segments[i]);
++    if (negated) return null;
++    final operand = segments[i + 1];
++    switch (operator) {
++      case _NarrowOperator.stream:
++        if (streamElement != null) return null;
++        final streamId = _parseStreamOperand(operand, store);
++        if (streamId == null) return null;
++        streamElement = ApiNarrowStream(streamId, negated: negated);
++
++      case _NarrowOperator.topic:
++      case _NarrowOperator.subject:
++        if (topicElement != null) return null;
++        final String? topic = decodeHashComponent(operand);
++        if (topic == null) return null;
++        topicElement = ApiNarrowTopic(topic, negated: negated);
++
++      case _NarrowOperator.dm:
++      case _NarrowOperator.pmWith:
++        if (dmElement != null) return null;
++        final dmIds = _parseDmOperand(operand);
++        if (dmIds == null) return null;
++        dmElement = ApiNarrowDm(dmIds, negated: negated);
++
++      case _NarrowOperator.near:
++        continue; // TODO(#82): support for near
++
++      case _NarrowOperator.unknown:
++        return null;
++    }
++  }
++
++  if (dmElement != null) {
++    if (streamElement != null || topicElement != null) return null;
++    return DmNarrow.withUsers(dmElement.operand, selfUserId: store.account.userId);
++  } else if (streamElement != null) {
++    final streamId = streamElement.operand;
++    if (topicElement != null) {
++      return TopicNarrow(streamId, topicElement.operand);
++    } else {
++      return StreamNarrow(streamId);
++    }
++  }
++  return null;
++}
++
++@JsonEnum(fieldRename: FieldRename.kebab, alwaysCreate: true)
++enum _NarrowOperator {
++  // 'dm' is new in server-7.0; means the same as 'pm-with'
++  dm,
++  near,
++  pmWith,
++  stream,
++  subject,
++  topic,
++  unknown;
++
++  static _NarrowOperator fromRawString(String raw) => _byRawString[raw] ?? unknown;
++
++  static final _byRawString = _$_NarrowOperatorEnumMap.map((key, value) => MapEntry(value, key));
++}
++
++(_NarrowOperator, bool) _parseOperator(String input) {
++  final String operator;
++  final bool negated;
++  if (input.startsWith('-')) {
++    operator = input.substring(1);
++    negated = true;
++  } else {
++    operator = input;
++    negated = false;
++  }
++  return (_NarrowOperator.fromRawString(operator), negated);
++}
++
++/// Parse the operand of a `stream` operator, returning a stream ID.
++///
++/// The ID might point to a stream that's hidden from our user (perhaps
++/// doesn't exist). If so, most likely the user doesn't have permission to
++/// see the stream's existence -- like with a guest user for any stream
++/// they're not in, or any non-admin with a private stream they're not in.
++/// Could be that whoever wrote the link just made something up.
++///
++/// Returns null if the operand has an unexpected shape, or has the old shape
++/// (stream name but no ID) and we don't know of a stream by the given name.
++int? _parseStreamOperand(String operand, PerAccountStore store) {
++  // "New" (2018) format: ${stream_id}-${stream_name} .
++  final match = RegExp(r'^(\d+)(?:-.*)?$').firstMatch(operand);
++  final newFormatStreamId = (match != null) ? int.parse(match.group(1)!, radix: 10) : null;
++  if (newFormatStreamId != null && store.streams.containsKey(newFormatStreamId)) {
++    return newFormatStreamId;
++  }
++
++  // Old format: just stream name.  This case is relevant indefinitely,
++  // so that links in old conversations continue to work.
++  final String? streamName = decodeHashComponent(operand);
++  if (streamName == null) return null;
++  final stream = store.streamsByName[streamName];
++  if (stream != null) return stream.streamId;
++
++  if (newFormatStreamId != null) {
++    // Neither format found a stream, so it's hidden or doesn't exist. But
++    // at least we have a stream ID; give that to the caller.
++    return newFormatStreamId;
++  }
++
++  // Unexpected shape, or the old shape and we don't know of a stream with
++  // the given name.
++  return null;
++}
++
++List<int>? _parseDmOperand(String operand) {
++  final rawIds = operand.split('-')[0].split(',');
++  try {
++    return rawIds.map((rawId) => int.parse(rawId, radix: 10)).toList();
++  } on FormatException {
++    return null;
++  }
++}
+diff --git a/lib/model/internal_link.g.dart b/lib/model/internal_link.g.dart
+new file mode 100644
+index 0000000000..7a6952c5d5
+--- /dev/null
++++ b/lib/model/internal_link.g.dart
+@@ -0,0 +1,19 @@
++// GENERATED CODE - DO NOT MODIFY BY HAND
++
++// ignore_for_file: constant_identifier_names, unnecessary_cast
++
++part of 'internal_link.dart';
++
++// **************************************************************************
++// JsonSerializableGenerator
++// **************************************************************************
++
++const _$_NarrowOperatorEnumMap = {
++  _NarrowOperator.dm: 'dm',
++  _NarrowOperator.near: 'near',
++  _NarrowOperator.pmWith: 'pm-with',
++  _NarrowOperator.stream: 'stream',
++  _NarrowOperator.subject: 'subject',
++  _NarrowOperator.topic: 'topic',
++  _NarrowOperator.unknown: 'unknown',
++};
+diff --git a/test/model/internal_link_test.dart b/test/model/internal_link_test.dart
+new file mode 100644
+index 0000000000..c80c41ca76
+--- /dev/null
++++ b/test/model/internal_link_test.dart
+@@ -0,0 +1,388 @@
++
++import 'package:checks/checks.dart';
++import 'package:test/scaffolding.dart';
++import 'package:zulip/api/model/model.dart';
++import 'package:zulip/model/internal_link.dart';
++import 'package:zulip/model/narrow.dart';
++import 'package:zulip/model/store.dart';
++
++import '../example_data.dart' as eg;
++import 'test_store.dart';
++
++PerAccountStore setupStore({
++  required Uri realmUrl,
++  List<ZulipStream>? streams,
++  List<User>? users,
++}) {
++  final account = eg.selfAccount.copyWith(realmUrl: realmUrl);
++  final store = eg.store(account: account);
++  if (streams != null) {
++    store.addStreams(streams);
++  }
++  store.addUser(eg.selfUser);
++  if (users != null) {
++    store.addUsers(users);
++  }
++  return store;
++}
++
++void main() {
++  final realmUrl = Uri.parse('https://example.com/');
++
++  void testExpectedNarrows(List<(String, Narrow?)> testCases, {
++    List<ZulipStream>? streams,
++    PerAccountStore? store,
++    List<User>? users,
++  }) {
++    assert((streams != null || users != null) ^ (store != null));
++    store ??= setupStore(realmUrl: realmUrl, streams: streams, users: users);
++    for (final testCase in testCases) {
++      final String urlString = testCase.$1;
++      final Uri url = tryResolveOnRealmUrl(urlString, realmUrl)!;
++      final Narrow? expected = testCase.$2;
++      test(urlString, () {
++        check(parseInternalLink(url, store!)).equals(expected);
++      });
++    }
++  }
++
++  group('parseInternalLink', () {
++    final streams = [
++      eg.stream(streamId: 1, name: 'check'),
++    ];
++    final testCases = [
++      (true, 'legacy: stream name, no ID',
++        '#narrow/stream/check', realmUrl),
++      (true, 'legacy: stream name, no ID, topic',
++        '#narrow/stream/check/topic/topic1', realmUrl),
++
++      (true, 'with numeric stream ID',
++        '#narrow/stream/123-check', realmUrl),
++      (true, 'with numeric stream ID and topic',
++        '#narrow/stream/123-a/topic/topic1', realmUrl),
++
++      (true, 'with numeric pm user IDs (new operator)',
++        '#narrow/dm/123-mark', realmUrl),
++      (true, 'with numeric pm user IDs (old operator)',
++        '#narrow/pm-with/123-mark', realmUrl),
++
++      (false, 'wrong fragment',
++        '#nope', realmUrl),
++      (false, 'wrong path',
++        'user_uploads/#narrow/stream/check', realmUrl),
++      (false, 'wrong domain',
++        'https://another.com/#narrow/stream/check', realmUrl),
++
++      (false, '#narrowly',
++        '#narrowly/stream/check', realmUrl),
++
++      (false, 'double slash',
++        'https://example.com//#narrow/stream/check', realmUrl),
++      (false, 'triple slash',
++        'https://example.com///#narrow/stream/check', realmUrl),
++
++      (true, 'with port',
++        'https://example.com:444/#narrow/stream/check',
++        Uri.parse('https://example.com:444/')),
++
++      // Dart's [Uri] currently lacks IDNA or Punycode support:
++      //   https://github.com/dart-lang/sdk/issues/26284
++      //   https://github.com/dart-lang/sdk/issues/29420
++
++      // (true, 'same domain, punycoded host',
++      //   'https://example.xn--h2brj9c/#narrow/stream/check',
++      //   Uri.parse('https://example.भारत/')), // FAILS
++
++      (true, 'punycodable host',
++        'https://example.भारत/#narrow/stream/check',
++        Uri.parse('https://example.भारत/')),
++
++      // (true, 'same domain, IDNA-mappable',
++      //   'https://ℯⅩªm🄿ₗℰ.ℭᴼⓂ/#narrow/stream/check',
++      //   Uri.parse('https://example.com')), // FAILS
++
++      (true, 'ipv4 address',
++        'http://192.168.0.1/#narrow/stream/check',
++        Uri.parse('http://192.168.0.1/')),
++
++      // (true, 'same IPv4 address, IDNA-mappable',
++      //   'http://１𝟗𝟚。①⁶🯸．₀｡𝟭/#narrow/stream/check',
++      //   Uri.parse('http://192.168.0.1/')), // FAILS
++
++      // TODO: Add tests for IPv6.
++
++      // These examples may seem weird, but a previous version of
++      // the zulip-mobile code accepted most of them.
++
++      // This one, except possibly the fragment, is a 100% realistic link
++      // for innocent normal use.  The buggy old version narrowly avoided
++      // accepting it... but would accept all the variations below.
++      (false, 'wrong domain, realm-like path, narrow-like fragment',
++        'https://web.archive.org/web/*/${realmUrl.resolve('#narrow/stream/check')}',
++        realmUrl),
++      (false, 'odd scheme, wrong domain, realm-like path, narrow-like fragment',
++        'ftp://web.archive.org/web/*/${realmUrl.resolve('#narrow/stream/check')}',
++        realmUrl),
++      (false, 'same domain, realm-like path, narrow-like fragment',
++        'web/*/${realmUrl.resolve('#narrow/stream/check')}',
++        realmUrl),
++    ];
++    for (final testCase in testCases) {
++      final bool expected = testCase.$1;
++      final String description = testCase.$2;
++      final String urlString = testCase.$3;
++      final Uri realmUrl = testCase.$4;
++      test('${expected ? 'accepts': 'rejects'} $description: $urlString', () {
++        final store = setupStore(realmUrl: realmUrl, streams: streams);
++        final url = tryResolveOnRealmUrl(urlString, realmUrl)!;
++        final result = parseInternalLink(url, store);
++        check(result != null).equals(expected);
++      });
++    }
++  });
++
++  group('parseInternalLink', () {
++    final streams = [
++      eg.stream(streamId: 1,   name: 'check'),
++      eg.stream(streamId: 3,   name: 'mobile'),
++      eg.stream(streamId: 5,   name: 'stream'),
++      eg.stream(streamId: 123, name: 'topic'),
++    ];
++
++    group('"/#narrow/stream/<...>" returns expected StreamNarrow', () {
++      const testCases = [
++        ('/#narrow/stream/check',   StreamNarrow(1)),
++        ('/#narrow/stream/stream/', StreamNarrow(5)),
++        ('/#narrow/stream/topic/',  StreamNarrow(123)),
++      ];
++      testExpectedNarrows(testCases, streams: streams);
++    });
++
++    group('"/#narrow/stream/<...>/topic/<...>" returns expected TopicNarrow', () {
++      const testCases = [
++        ('/#narrow/stream/check/topic/test',                 TopicNarrow(1, 'test')),
++        ('/#narrow/stream/mobile/subject/topic/near/378333', TopicNarrow(3, 'topic')),
++        ('/#narrow/stream/mobile/topic/topic/',              TopicNarrow(3, 'topic')),
++        ('/#narrow/stream/stream/topic/topic/near/1',        TopicNarrow(5, 'topic')),
++        ('/#narrow/stream/stream/subject/topic/near/1',      TopicNarrow(5, 'topic')),
++        ('/#narrow/stream/stream/subject/topic',             TopicNarrow(5, 'topic')),
++      ];
++      testExpectedNarrows(testCases, streams: streams);
++    });
++
++    group('"/#narrow/dm/<...>" returns expected DmNarrow', () {
++      final expectedNarrow = DmNarrow.withUsers([1, 2],
++        selfUserId: eg.selfUser.userId);
++      final testCases = [
++        ('/#narrow/dm/1,2-group',                        expectedNarrow),
++        ('/#narrow/dm/1,2-group/near/1',                 expectedNarrow),
++        ('/#narrow/dm/a.40b.2Ecom.2Ec.2Ed.2Ecom/near/3', null),
++      ];
++      testExpectedNarrows(testCases, streams: streams);
++    });
++
++    group('"/#narrow/pm-with/<...>" returns expected DmNarrow', () {
++      final expectedNarrow = DmNarrow.withUsers([1, 2],
++        selfUserId: eg.selfUser.userId);
++      final testCases = [
++        ('/#narrow/pm-with/1,2-group',                        expectedNarrow),
++        ('/#narrow/pm-with/1,2-group/near/1',                 expectedNarrow),
++        ('/#narrow/pm-with/a.40b.2Ecom.2Ec.2Ed.2Ecom/near/3', null),
++      ];
++      testExpectedNarrows(testCases, streams: streams);
++    });
++
++    group('unexpected link shapes are rejected', () {
++      final testCases = [
++        ('/#narrow/stream/name/topic/',           null), // missing operand
++        ('/#narrow/stream/name/unknown/operand/', null), // unknown operator
++      ];
++      testExpectedNarrows(testCases, streams: streams);
++    });
++  });
++
++  group('decodeHashComponent', () {
++    group('correctly decodes MediaWiki-style dot-encoded strings', () {
++      final testCases = [
++        ['some_text', 'some_text'],
++        ['some.20text', 'some text'],
++        ['some.2Etext', 'some.text'],
++
++        ['na.C3.AFvet.C3.A9', 'naïveté'],
++        ['.C2.AF.5C_(.E3.83.84)_.2F.C2.AF', r'¯\_(ツ)_/¯'],
++      ];
++      for (final [testCase, expected] in testCases) {
++        test('"$testCase"', () =>
++          check(decodeHashComponent(testCase)).equals(expected));
++      }
++
++      final malformedTestCases = [
++        // malformed dot-encoding
++        'some.text',
++        'some.2gtext',
++        'some.arbitrary_text',
++
++        // malformed UTF-8
++        '.88.99.AA.BB',
++      ];
++      for (final testCase in malformedTestCases) {
++        test('"$testCase"', () =>
++          check(decodeHashComponent(testCase)).isNull());
++      }
++    });
++
++    group('parses correctly in stream and topic operands', () {
++      final streams = [
++        eg.stream(streamId: 1, name: 'some_stream'),
++        eg.stream(streamId: 2, name: 'some stream'),
++        eg.stream(streamId: 3, name: 'some.stream'),
++      ];
++      const testCases = [
++        ('/#narrow/stream/some_stream',                    StreamNarrow(1)),
++        ('/#narrow/stream/some.20stream',                  StreamNarrow(2)),
++        ('/#narrow/stream/some.2Estream',                  StreamNarrow(3)),
++        ('/#narrow/stream/some_stream/topic/some_topic',   TopicNarrow(1, 'some_topic')),
++        ('/#narrow/stream/some_stream/topic/some.20topic', TopicNarrow(1, 'some topic')),
++        ('/#narrow/stream/some_stream/topic/some.2Etopic', TopicNarrow(1, 'some.topic')),
++      ];
++      testExpectedNarrows(testCases, streams: streams);
++    });
++  });
++
++  group('parseInternalLink edge cases', () {
++    void testExpectedStreamNarrow(String testCase, int? streamId) {
++      final streamNarrow = (streamId != null) ? StreamNarrow(streamId) : null;
++      testExpectedNarrows([(testCase, streamNarrow)], streams: [
++        eg.stream(streamId: 1, name: "general"),
++      ]);
++    }
++
++    group('basic', () {
++      testExpectedStreamNarrow('#narrow/stream/1-general',         1);
++    });
++
++    group('if stream not found, use stream ID anyway', () {
++      testExpectedStreamNarrow('#narrow/stream/123-topic',         123);
++    });
++
++    group('on stream link with wrong name, ID wins', () {
++      testExpectedStreamNarrow('#narrow/stream/1-nonsense',        1);
++      testExpectedStreamNarrow('#narrow/stream/1-',                1);
++    });
++
++    group('on malformed stream link: reject', () {
++      testExpectedStreamNarrow('#narrow/stream/-1',                null);
++      testExpectedStreamNarrow('#narrow/stream/1nonsense-general', null);
++      testExpectedStreamNarrow('#narrow/stream/-general',          null);
++    });
++  });
++
++  group('parseInternalLink with historic links', () {
++    group('for stream with hyphens or even looking like new-style', () {
++      final streams = [
++        eg.stream(streamId: 1, name: 'test-team'),
++        eg.stream(streamId: 2, name: '311'),
++        eg.stream(streamId: 3, name: '311-'),
++        eg.stream(streamId: 4, name: '311-help'),
++        eg.stream(streamId: 5, name: '--help'),
++      ];
++      const testCases = [
++        ('#narrow/stream/test-team/', StreamNarrow(1)),
++        ('#narrow/stream/311/',       StreamNarrow(2)),
++        ('#narrow/stream/311-/',      StreamNarrow(3)),
++        ('#narrow/stream/311-help/',  StreamNarrow(4)),
++        ('#narrow/stream/--help/',    StreamNarrow(5)),
++      ];
++      testExpectedNarrows(testCases, streams: streams);
++    });
++
++    group('on ambiguous new- or old-style: new wins', () {
++      final streams = [
++        eg.stream(streamId: 1,   name: '311'),
++        eg.stream(streamId: 2,   name: '311-'),
++        eg.stream(streamId: 3,   name: '311-help'),
++        eg.stream(streamId: 311, name: 'collider'),
++      ];
++      const testCases = [
++        ('#narrow/stream/311/',      StreamNarrow(311)),
++        ('#narrow/stream/311-/',     StreamNarrow(311)),
++        ('#narrow/stream/311-help/', StreamNarrow(311)),
++      ];
++      testExpectedNarrows(testCases, streams: streams);
++    });
++
++    group('on old stream link', () {
++      final streams = [
++        eg.stream(streamId: 1, name: 'check'),
++        eg.stream(streamId: 2, name: 'bot testing'),
++        eg.stream(streamId: 3, name: 'check.API'),
++        eg.stream(streamId: 4, name: 'stream'),
++        eg.stream(streamId: 5, name: 'topic'),
++      ];
++      const testCases = [
++        ('#narrow/stream/check/',         StreamNarrow(1)),
++        ('#narrow/stream/bot.20testing/', StreamNarrow(2)),
++        ('#narrow/stream/check.2EAPI/',   StreamNarrow(3)),
++        ('#narrow/stream/stream/',        StreamNarrow(4)),
++        ('#narrow/stream/topic/',         StreamNarrow(5)),
++
++        ('#narrow/stream/check.API/',     null),
++      ];
++      testExpectedNarrows(testCases, streams: streams);
++    });
++  });
++
++  group('parseInternalLink', () {
++    group('topic link parsing', () {
++      final stream = eg.stream(name: "general");
++
++      group('basic', () {
++        String mkUrlString(operand) {
++          return '#narrow/stream/${stream.streamId}-${stream.name}/topic/$operand';
++        }
++        final testCases = [
++          (mkUrlString('(no.20topic)'), TopicNarrow(stream.streamId, '(no topic)')),
++          (mkUrlString('lunch'),        TopicNarrow(stream.streamId, 'lunch')),
++        ];
++        testExpectedNarrows(testCases, streams: [stream]);
++      });
++
++      group('on old topic link, with dot-encoding', () {
++        String mkUrlString(operand) {
++          return '#narrow/stream/${stream.name}/topic/$operand';
++        }
++        final testCases = [
++          (mkUrlString('(no.20topic)'), TopicNarrow(stream.streamId, '(no topic)')),
++          (mkUrlString('google.2Ecom'), TopicNarrow(stream.streamId, 'google.com')),
++          (mkUrlString('google.com'),   null),
++          (mkUrlString('topic.20name'), TopicNarrow(stream.streamId, 'topic name')),
++          (mkUrlString('stream'),       TopicNarrow(stream.streamId, 'stream')),
++          (mkUrlString('topic'),        TopicNarrow(stream.streamId, 'topic')),
++        ];
++        testExpectedNarrows(testCases, streams: [stream]);
++      });
++    });
++
++    group('DM link parsing', () {
++      void testExpectedDmNarrow(String testCase) {
++        final expectedNarrow = DmNarrow.withUsers([1, 2],
++          selfUserId: eg.selfUser.userId);
++        testExpectedNarrows([(testCase, expectedNarrow)], users: [
++          eg.user(userId: 1),
++          eg.user(userId: 2),
++        ]);
++      }
++
++      group('on group PM link', () {
++        testExpectedDmNarrow('#narrow/dm/1,2-group');
++        testExpectedDmNarrow('#narrow/pm-with/1,2-group');
++      });
++
++      group('on group PM link including self', () {
++        // The webapp doesn't generate these, but best to handle them anyway.
++        testExpectedDmNarrow('#narrow/dm/1,2,${eg.selfUser.userId}-group');
++        testExpectedDmNarrow('#narrow/pm-with/1,2,${eg.selfUser.userId}-group');
++      });
++    });
++  });
++}

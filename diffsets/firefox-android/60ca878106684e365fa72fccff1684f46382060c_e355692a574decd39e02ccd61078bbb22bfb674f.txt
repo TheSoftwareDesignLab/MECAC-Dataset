@@ -1,0 +1,193 @@
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/Components.kt b/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
+index 45cd3201b7a7..7848b63df6a0 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
+@@ -7,9 +7,6 @@ package org.mozilla.focus
+ import android.app.PendingIntent
+ import android.content.Context
+ import android.content.Intent
+-import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.GlobalScope
+-import kotlinx.coroutines.launch
+ import mozilla.components.browser.state.engine.EngineMiddleware
+ import mozilla.components.browser.state.store.BrowserStore
+ import mozilla.components.concept.engine.DefaultSettings
+@@ -42,6 +39,7 @@ import org.mozilla.focus.downloads.DownloadService
+ import org.mozilla.focus.engine.ClientWrapper
+ import org.mozilla.focus.engine.LocalizedContentInterceptor
+ import org.mozilla.focus.engine.SanityCheckMiddleware
++import org.mozilla.focus.exceptions.ExceptionMigrationMiddleware
+ import org.mozilla.focus.locale.LocaleManager
+ import org.mozilla.focus.notification.PrivateNotificationMiddleware
+ import org.mozilla.focus.search.SearchFilterMiddleware
+@@ -106,6 +104,7 @@ class Components(
+     val store by lazy {
+         BrowserStore(
+             middleware = listOf(
++                ExceptionMigrationMiddleware(context),
+                 PrivateNotificationMiddleware(context),
+                 TelemetryMiddleware(),
+                 DownloadMiddleware(context, DownloadService::class.java),
+@@ -148,20 +147,6 @@ class Components(
+     val crashReporter: CrashReporter by lazy { createCrashReporter(context) }
+ 
+     val metrics: GleanMetricsService by lazy { GleanMetricsService(context) }
+-
+-    fun migrateTrackingProtectionExceptions(context: Context) {
+-        if (engineOverride != null) {
+-            // If there's an engine override (for testing) then we do not want to migrate any
+-            // exceptions and potentially try to launch GeckoView on a plain JVM (which will blow up).
+-            return
+-        }
+-
+-        val exceptionsMigrator = EngineProvider.provideTrackingProtectionMigrator(context)
+-
+-        GlobalScope.launch(Dispatchers.IO) {
+-            exceptionsMigrator.start(context)
+-        }
+-    }
+ }
+ 
+ private fun determineInitialScreen(context: Context): Screen {
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt b/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
+index bb8e8b0e6e6e..99c867b74522 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
+@@ -60,8 +60,6 @@ open class FocusApplication : LocaleAwareApplication(), CoroutineScope {
+             storeLink.start()
+ 
+             ProcessLifecycleOwner.get().lifecycle.addObserver(lockObserver)
+-
+-            components.migrateTrackingProtectionExceptions(this@FocusApplication)
+         }
+     }
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/exceptions/ExceptionMigrationMiddleware.kt b/focus-android/app/src/main/java/org/mozilla/focus/exceptions/ExceptionMigrationMiddleware.kt
+new file mode 100644
+index 000000000000..e01f02d87e08
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/exceptions/ExceptionMigrationMiddleware.kt
+@@ -0,0 +1,64 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.exceptions
++
++import android.content.Context
++import kotlinx.coroutines.runBlocking
++import mozilla.components.browser.state.action.BrowserAction
++import mozilla.components.browser.state.action.TabListAction
++import mozilla.components.browser.state.selector.privateTabs
++import mozilla.components.browser.state.state.BrowserState
++import mozilla.components.lib.state.Middleware
++import mozilla.components.lib.state.MiddlewareContext
++import org.mozilla.focus.components.EngineProvider
++
++/**
++ * [Middleware] implementation for migrating the tracking protection exceptions: Loading the list of
++ * exceptions from SharedPreferences and passing them to GeckoView.
++ *
++ * This is a workaround until GeckoView can permanently save tracking protection exceptions for
++ * private tabs. Otherwise they get dropped once the last GeckoSession gets closed or the process
++ * shuts down.
++ */
++class ExceptionMigrationMiddleware(
++    private val context: Context
++) : Middleware<BrowserState, BrowserAction> {
++    private val migrator by lazy { EngineProvider.provideTrackingProtectionMigrator(context) }
++    private var hasTabs = false
++
++    override fun invoke(
++        context: MiddlewareContext<BrowserState, BrowserAction>,
++        next: (BrowserAction) -> Unit,
++        action: BrowserAction
++    ) {
++        next(action)
++
++        if (action is TabListAction) {
++            checkIfMigrationIsNeeded(context.state)
++        }
++    }
++
++    private fun checkIfMigrationIsNeeded(state: BrowserState) {
++        if (state.privateTabs.isEmpty() && hasTabs) {
++            // All tabs have been removed, let's remember this state, so that we can migrate the
++            // tracking protection exceptions again, once the first new tab gets added. We have to
++            // delay the migration because we do not know when the matching GeckoSession will get
++            // closed, because that happens asynchronously.
++            hasTabs = false
++        } else if (state.privateTabs.isNotEmpty() && !hasTabs) {
++            // There are tabs now, let's migrate the exceptions again.
++            migrateTrackingProtectionExceptions()
++            hasTabs = true
++        }
++    }
++
++    private fun migrateTrackingProtectionExceptions() {
++        // We migrate the tracking protection exceptions blocking the store thread, because we want
++        // to make sure this has happened before the first GeckoSession gets created.
++        runBlocking {
++            migrator.start(context)
++        }
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/exceptions/GeckoExceptionsMigrator.kt b/focus-android/app/src/main/java/org/mozilla/focus/exceptions/GeckoExceptionsMigrator.kt
+index 2bf5a4aec329..7406717873f0 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/exceptions/GeckoExceptionsMigrator.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/exceptions/GeckoExceptionsMigrator.kt
+@@ -6,6 +6,8 @@ package org.mozilla.focus.exceptions
+ 
+ import android.content.Context
+ import android.content.SharedPreferences
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
+ import mozilla.components.support.base.log.logger.Logger
+ import org.mozilla.geckoview.GeckoRuntime
+ import org.mozilla.geckoview.GeckoSession.PermissionDelegate.ContentPermission.VALUE_ALLOW
+@@ -18,15 +20,18 @@ class GeckoExceptionsMigrator(
+     private val runtime: GeckoRuntime
+ ) {
+     private val logger = Logger("GeckoExceptionsMigrator")
+-    private val storageController = runtime.storageController
++    private val storageController by lazy { runtime.storageController }
+ 
+-    fun start(context: Context) {
++    suspend fun start(context: Context) {
+         if (!isOver(context)) {
+             logger.info("Starting tracking protection exceptions migration")
++
+             val exceptions = fetchExceptions(context)
+-            exceptions.forEach {
+-                migrate(it)
++
++            withContext(Dispatchers.Main) {
++                exceptions.forEach { migrate(it) }
+             }
++
+             logger.info("Finished tracking protection exceptions migration")
+ 
+             // We are not removing the domains yet because GeckoView does not seem to persist them.
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
+index f9013473e30b..1ac2ed86d553 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
+@@ -36,7 +36,6 @@ import mozilla.components.browser.state.state.SessionState
+ import mozilla.components.browser.state.state.content.DownloadState
+ import mozilla.components.browser.state.state.createTab
+ import mozilla.components.browser.toolbar.BrowserToolbar
+-import mozilla.components.concept.engine.Engine
+ import mozilla.components.concept.engine.EngineView
+ import mozilla.components.feature.contextmenu.ContextMenuCandidate
+ import mozilla.components.feature.contextmenu.ContextMenuFeature
+@@ -500,10 +499,6 @@ class BrowserFragment :
+         }
+ 
+         requireComponents.tabsUseCases.removeTab(tab.id)
+-
+-        // Temporary workaround until we get https://bugzilla.mozilla.org/show_bug.cgi?id=1644156
+-        // See comment in TabUtils.createTab().
+-        requireComponents.engine.clearData(Engine.BrowsingData.all())
+     }
+ 
+     private fun shareCurrentUrl() {

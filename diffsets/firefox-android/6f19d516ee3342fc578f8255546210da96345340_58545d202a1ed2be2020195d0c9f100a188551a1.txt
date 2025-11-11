@@ -1,0 +1,970 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkController.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkController.kt
+index 5a52f148c1c9..410b126cfcfb 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkController.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkController.kt
+@@ -11,13 +11,19 @@ import android.content.res.Resources
+ import androidx.core.content.getSystemService
+ import androidx.navigation.NavController
+ import androidx.navigation.NavDirections
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.launch
++import mozilla.appservices.places.BookmarkRoot
+ import mozilla.components.concept.engine.prompt.ShareData
+ import mozilla.components.concept.storage.BookmarkNode
++import mozilla.components.service.fxa.sync.SyncReason
+ import org.mozilla.fenix.BrowserDirection
+ import org.mozilla.fenix.HomeActivity
+ import org.mozilla.fenix.R
+ import org.mozilla.fenix.browser.browsingmode.BrowsingMode
+ import org.mozilla.fenix.components.metrics.Event
++import org.mozilla.fenix.ext.bookmarkStorage
++import org.mozilla.fenix.ext.components
+ import org.mozilla.fenix.ext.nav
+ 
+ /**
+@@ -26,16 +32,20 @@ import org.mozilla.fenix.ext.nav
+  */
+ @SuppressWarnings("TooManyFunctions")
+ interface BookmarkController {
++    fun handleBookmarkChanged(item: BookmarkNode)
+     fun handleBookmarkTapped(item: BookmarkNode)
+     fun handleBookmarkExpand(folder: BookmarkNode)
+     fun handleSelectionModeSwitch()
+     fun handleBookmarkEdit(node: BookmarkNode)
+     fun handleBookmarkSelected(node: BookmarkNode)
++    fun handleBookmarkDeselected(node: BookmarkNode)
++    fun handleAllBookmarksDeselected()
+     fun handleCopyUrl(item: BookmarkNode)
+     fun handleBookmarkSharing(item: BookmarkNode)
+     fun handleOpeningBookmark(item: BookmarkNode, mode: BrowsingMode)
+     fun handleBookmarkDeletion(nodes: Set<BookmarkNode>, eventType: Event)
+     fun handleBookmarkFolderDeletion(node: BookmarkNode)
++    fun handleRequestSync()
+     fun handleBackPressed()
+ }
+ 
+@@ -43,6 +53,10 @@ interface BookmarkController {
+ class DefaultBookmarkController(
+     private val context: Context,
+     private val navController: NavController,
++    private val scope: CoroutineScope,
++    private val store: BookmarkFragmentStore,
++    private val sharedViewModel: BookmarksSharedViewModel,
++    private val loadBookmarkNode: suspend (String) -> BookmarkNode?,
+     private val showSnackbar: (String) -> Unit,
+     private val deleteBookmarkNodes: (Set<BookmarkNode>, Event) -> Unit,
+     private val deleteBookmarkFolder: (BookmarkNode) -> Unit,
+@@ -52,12 +66,23 @@ class DefaultBookmarkController(
+     private val activity: HomeActivity = context as HomeActivity
+     private val resources: Resources = context.resources
+ 
++    override fun handleBookmarkChanged(item: BookmarkNode) {
++        sharedViewModel.selectedFolder = item
++        store.dispatch(BookmarkFragmentAction.Change(item))
++    }
++
+     override fun handleBookmarkTapped(item: BookmarkNode) {
+         openInNewTab(item.url!!, true, BrowserDirection.FromBookmarks, activity.browsingModeManager.mode)
+     }
+ 
+     override fun handleBookmarkExpand(folder: BookmarkNode) {
+-        navigate(BookmarkFragmentDirections.actionBookmarkFragmentSelf(folder.guid))
++        handleAllBookmarksDeselected()
++        invokePendingDeletion.invoke()
++        scope.launch {
++            val node = loadBookmarkNode.invoke(folder.guid) ?: return@launch
++            sharedViewModel.selectedFolder = node
++            store.dispatch(BookmarkFragmentAction.Change(node))
++        }
+     }
+ 
+     override fun handleSelectionModeSwitch() {
+@@ -69,7 +94,23 @@ class DefaultBookmarkController(
+     }
+ 
+     override fun handleBookmarkSelected(node: BookmarkNode) {
+-        showSnackbar(resources.getString(R.string.bookmark_cannot_edit_root))
++        if (store.state.mode is BookmarkFragmentState.Mode.Syncing) {
++            return
++        }
++
++        if (node.inRoots()) {
++            showSnackbar(resources.getString(R.string.bookmark_cannot_edit_root))
++        } else {
++            store.dispatch(BookmarkFragmentAction.Select(node))
++        }
++    }
++
++    override fun handleBookmarkDeselected(node: BookmarkNode) {
++        store.dispatch(BookmarkFragmentAction.Deselect(node))
++    }
++
++    override fun handleAllBookmarksDeselected() {
++        store.dispatch(BookmarkFragmentAction.DeselectAll)
+     }
+ 
+     override fun handleCopyUrl(item: BookmarkNode) {
+@@ -98,9 +139,36 @@ class DefaultBookmarkController(
+         deleteBookmarkFolder(node)
+     }
+ 
++    override fun handleRequestSync() {
++        scope.launch {
++            store.dispatch(BookmarkFragmentAction.StartSync)
++            invokePendingDeletion()
++            context.components.backgroundServices.accountManager.syncNowAsync(SyncReason.User).await()
++            // The current bookmark node we are viewing may be made invalid after syncing so we
++            // check if the current node is valid and if it isn't we find the nearest valid ancestor
++            // and open it
++            val validAncestorGuid = store.state.guidBackstack.findLast { guid ->
++                context.bookmarkStorage.getBookmark(guid) != null
++            } ?: BookmarkRoot.Mobile.id
++            val node = context.bookmarkStorage.getBookmark(validAncestorGuid)!!
++            handleBookmarkExpand(node)
++            store.dispatch(BookmarkFragmentAction.FinishSync)
++        }
++    }
++
+     override fun handleBackPressed() {
+         invokePendingDeletion.invoke()
+-        navController.popBackStack()
++        scope.launch {
++            val parentGuid = store.state.guidBackstack.findLast { guid ->
++                store.state.tree?.guid != guid && context.bookmarkStorage.getBookmark(guid) != null
++            }
++            if (parentGuid == null) {
++                navController.popBackStack()
++            } else {
++                val parent = context.bookmarkStorage.getBookmark(parentGuid)!!
++                handleBookmarkExpand(parent)
++            }
++        }
+     }
+ 
+     private fun openInNewTab(
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkFragment.kt
+index 02e434f4b8a2..eecd9923ecfc 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkFragment.kt
+@@ -13,18 +13,19 @@ import android.view.MenuItem
+ import android.view.View
+ import android.view.ViewGroup
+ import androidx.appcompat.app.AlertDialog
++import androidx.core.view.isVisible
+ import androidx.fragment.app.activityViewModels
+ import androidx.lifecycle.ViewModelProvider
+ import androidx.lifecycle.lifecycleScope
+ import androidx.navigation.NavDirections
+ import androidx.navigation.fragment.findNavController
++import androidx.navigation.fragment.navArgs
+ import kotlinx.android.synthetic.main.component_bookmark.view.*
+ import kotlinx.android.synthetic.main.fragment_bookmark.view.*
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers.IO
+ import kotlinx.coroutines.Dispatchers.Main
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+-import kotlinx.coroutines.Job
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.awaitAll
+ import kotlinx.coroutines.isActive
+@@ -59,7 +60,7 @@ class BookmarkFragment : LibraryPageFragment<BookmarkNode>(), UserInteractionHan
+     private lateinit var bookmarkStore: BookmarkFragmentStore
+     private lateinit var bookmarkView: BookmarkView
+     private var _bookmarkInteractor: BookmarkFragmentInteractor? = null
+-    protected val bookmarkInteractor: BookmarkFragmentInteractor
++    private val bookmarkInteractor: BookmarkFragmentInteractor
+         get() = _bookmarkInteractor!!
+ 
+     private val sharedViewModel: BookmarksSharedViewModel by activityViewModels {
+@@ -67,7 +68,6 @@ class BookmarkFragment : LibraryPageFragment<BookmarkNode>(), UserInteractionHan
+     }
+     private val desktopFolders by lazy { DesktopFolders(requireContext(), showMobileRoot = false) }
+ 
+-    lateinit var initialJob: Job
+     private var pendingBookmarkDeletionJob: (suspend () -> Unit)? = null
+     private var pendingBookmarksToDelete: MutableSet<BookmarkNode> = mutableSetOf()
+ 
+@@ -84,11 +84,13 @@ class BookmarkFragment : LibraryPageFragment<BookmarkNode>(), UserInteractionHan
+         }
+ 
+         _bookmarkInteractor = BookmarkFragmentInteractor(
+-            bookmarkStore = bookmarkStore,
+-            viewModel = sharedViewModel,
+             bookmarksController = DefaultBookmarkController(
+                 context = requireContext(),
+                 navController = findNavController(),
++                scope = viewLifecycleOwner.lifecycleScope,
++                store = bookmarkStore,
++                sharedViewModel = sharedViewModel,
++                loadBookmarkNode = ::loadBookmarkNode,
+                 showSnackbar = ::showSnackBarWithText,
+                 deleteBookmarkNodes = ::deleteMulti,
+                 deleteBookmarkFolder = ::showRemoveFolderDialog,
+@@ -124,8 +126,16 @@ class BookmarkFragment : LibraryPageFragment<BookmarkNode>(), UserInteractionHan
+     @ExperimentalCoroutinesApi
+     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+         super.onViewCreated(view, savedInstanceState)
++        val accountManager = requireComponents.backgroundServices.accountManager
+         consumeFrom(bookmarkStore) {
+             bookmarkView.update(it)
++
++            // Only display the sign-in prompt if we're inside of the virtual "Desktop Bookmarks" node.
++            // Don't want to pester user too much with it, and if there are lots of bookmarks present,
++            // it'll just get visually lost. Inside of the "Desktop Bookmarks" node, it'll nicely stand-out,
++            // since there are always only three other items in there. It's also the right place contextually.
++            bookmarkView.view.bookmark_folders_sign_in.isVisible =
++                it.tree?.guid == BookmarkRoot.Root.id && accountManager.authenticatedAccount() == null
+         }
+     }
+ 
+@@ -138,36 +148,24 @@ class BookmarkFragment : LibraryPageFragment<BookmarkNode>(), UserInteractionHan
+         super.onResume()
+ 
+         (activity as HomeActivity).getSupportActionBarAndInflateIfNecessary().show()
+-        val currentGuid = BookmarkFragmentArgs.fromBundle(requireArguments()).currentRoot.ifEmpty {
+-            BookmarkRoot.Mobile.id
+-        }
+-
+-        // Only display the sign-in prompt if we're inside of the virtual "Desktop Bookmarks" node.
+-        // Don't want to pester user too much with it, and if there are lots of bookmarks present,
+-        // it'll just get visually lost. Inside of the "Desktop Bookmarks" node, it'll nicely stand-out,
+-        // since there are always only three other items in there. It's also the right place contextually.
+-        if (currentGuid == BookmarkRoot.Root.id &&
+-            requireComponents.backgroundServices.accountManager.authenticatedAccount() == null
+-        ) {
+-            bookmarkView.view.bookmark_folders_sign_in.visibility = View.VISIBLE
+-        } else {
+-            bookmarkView.view.bookmark_folders_sign_in.visibility = View.GONE
+-        }
+ 
+-        initialJob = loadInitialBookmarkFolder(currentGuid)
++        // Reload bookmarks when returning to this fragment in case they have been edited
++        val args by navArgs<BookmarkFragmentArgs>()
++        val currentGuid = bookmarkStore.state.tree?.guid
++            ?: if (args.currentRoot.isNotEmpty()) {
++                args.currentRoot
++            } else {
++                BookmarkRoot.Mobile.id
++            }
++        loadInitialBookmarkFolder(currentGuid)
+     }
+ 
+-    private fun loadInitialBookmarkFolder(currentGuid: String): Job {
+-        return viewLifecycleOwner.lifecycleScope.launch(Main) {
+-            val currentRoot = withContext(IO) {
+-                requireContext().bookmarkStorage
+-                    .getTree(currentGuid)
+-                    ?.let { desktopFolders.withOptionalDesktopFolders(it) }!!
+-            }
++    private fun loadInitialBookmarkFolder(currentGuid: String) {
++        viewLifecycleOwner.lifecycleScope.launch(Main) {
++            val currentRoot = loadBookmarkNode(currentGuid)
+ 
+-            if (isActive) {
++            if (isActive && currentRoot != null) {
+                 bookmarkInteractor.onBookmarksChanged(currentRoot)
+-                sharedViewModel.selectedFolder = currentRoot
+             }
+         }
+     }
+@@ -249,14 +247,18 @@ class BookmarkFragment : LibraryPageFragment<BookmarkNode>(), UserInteractionHan
+         return bookmarkView.onBackPressed()
+     }
+ 
++    private suspend fun loadBookmarkNode(guid: String): BookmarkNode? = withContext(IO) {
++        requireContext().bookmarkStorage
++            .getTree(guid, false)
++            ?.let { desktopFolders.withOptionalDesktopFolders(it) }
++    }
++
+     private suspend fun refreshBookmarks() {
+         // The bookmark tree in our 'state' can be null - meaning, no bookmark tree has been selected.
+         // If that's the case, we don't know what node to refresh, and so we bail out.
+         // See https://github.com/mozilla-mobile/fenix/issues/4671
+         val currentGuid = bookmarkStore.state.tree?.guid ?: return
+-        context?.bookmarkStorage
+-            ?.getTree(currentGuid, false)
+-            ?.let { desktopFolders.withOptionalDesktopFolders(it) }
++        loadBookmarkNode(currentGuid)
+             ?.let { node ->
+                 val rootNode = node - pendingBookmarksToDelete
+                 bookmarkInteractor.onBookmarksChanged(rootNode)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentInteractor.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentInteractor.kt
+index e8fac64b49bb..1a9cc084233e 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentInteractor.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentInteractor.kt
+@@ -22,14 +22,12 @@ import org.mozilla.fenix.utils.Do
+  */
+ @SuppressWarnings("TooManyFunctions")
+ class BookmarkFragmentInteractor(
+-    private val bookmarkStore: BookmarkFragmentStore,
+-    private val viewModel: BookmarksSharedViewModel,
+     private val bookmarksController: BookmarkController,
+     private val metrics: MetricController
+ ) : BookmarkViewInteractor {
+ 
+     override fun onBookmarksChanged(node: BookmarkNode) {
+-        bookmarkStore.dispatch(BookmarkFragmentAction.Change(node))
++        bookmarksController.handleBookmarkChanged(node)
+     }
+ 
+     override fun onSelectionModeSwitch(mode: BookmarkFragmentState.Mode) {
+@@ -41,7 +39,7 @@ class BookmarkFragmentInteractor(
+     }
+ 
+     override fun onAllBookmarksDeselected() {
+-        bookmarkStore.dispatch(BookmarkFragmentAction.DeselectAll)
++        bookmarksController.handleAllBookmarksDeselected()
+     }
+ 
+     /**
+@@ -112,13 +110,14 @@ class BookmarkFragmentInteractor(
+     }
+ 
+     override fun select(item: BookmarkNode) {
+-        when (item.inRoots()) {
+-            true -> bookmarksController.handleBookmarkSelected(item)
+-            false -> bookmarkStore.dispatch(BookmarkFragmentAction.Select(item))
+-        }
++        bookmarksController.handleBookmarkSelected(item)
+     }
+ 
+     override fun deselect(item: BookmarkNode) {
+-        bookmarkStore.dispatch(BookmarkFragmentAction.Deselect(item))
++        bookmarksController.handleBookmarkDeselected(item)
++    }
++
++    override fun onRequestSync() {
++        bookmarksController.handleRequestSync()
+     }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentStore.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentStore.kt
+index 8bdcd4617cb9..d2c2341decef 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentStore.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentStore.kt
+@@ -20,10 +20,14 @@ class BookmarkFragmentStore(
+  * The complete state of the bookmarks tree and multi-selection mode
+  * @property tree The current tree of bookmarks, if one is loaded
+  * @property mode The current bookmark multi-selection mode
++ * @property guidBackstack A set of guids for bookmark nodes we have visited. Used to traverse back
++ *                  up the tree after a sync.
++ * @property isLoading true if bookmarks are still being loaded from disk
+  */
+ data class BookmarkFragmentState(
+     val tree: BookmarkNode?,
+     val mode: Mode = Mode.Normal(),
++    val guidBackstack: List<String> = emptyList(),
+     val isLoading: Boolean = true
+ ) : State {
+     sealed class Mode {
+@@ -31,6 +35,7 @@ data class BookmarkFragmentState(
+ 
+         data class Normal(val showMenu: Boolean = true) : Mode()
+         data class Selecting(override val selectedItems: Set<BookmarkNode>) : Mode()
++        object Syncing : Mode()
+     }
+ }
+ 
+@@ -42,6 +47,8 @@ sealed class BookmarkFragmentAction : Action {
+     data class Select(val item: BookmarkNode) : BookmarkFragmentAction()
+     data class Deselect(val item: BookmarkNode) : BookmarkFragmentAction()
+     object DeselectAll : BookmarkFragmentAction()
++    object StartSync : BookmarkFragmentAction()
++    object FinishSync : BookmarkFragmentAction()
+ }
+ 
+ /**
+@@ -56,16 +63,26 @@ private fun bookmarkFragmentStateReducer(
+ ): BookmarkFragmentState {
+     return when (action) {
+         is BookmarkFragmentAction.Change -> {
++            // If we change to a node we have already visited, we pop the backstack until the node
++            // is the last item. If we haven't visited the node yet, we just add it to the end of the
++            // backstack
++            val backstack = state.guidBackstack.takeWhile { guid ->
++                guid != action.tree.guid
++            } + action.tree.guid
++
+             val items = state.mode.selectedItems.filter { it in action.tree }
+             state.copy(
+                 tree = action.tree,
+-                mode = if (BookmarkRoot.Root.id == action.tree.guid) {
+-                    BookmarkFragmentState.Mode.Normal(false)
+-                } else if (items.isEmpty()) {
+-                    BookmarkFragmentState.Mode.Normal()
+-                } else {
+-                    BookmarkFragmentState.Mode.Selecting(items.toSet())
++                mode = when {
++                    state.mode is BookmarkFragmentState.Mode.Syncing -> {
++                        BookmarkFragmentState.Mode.Syncing
++                    }
++                    items.isEmpty() -> {
++                        BookmarkFragmentState.Mode.Normal(shouldShowMenu(action.tree.guid))
++                    }
++                    else -> BookmarkFragmentState.Mode.Selecting(items.toSet())
+                 },
++                guidBackstack = backstack,
+                 isLoading = false
+             )
+         }
+@@ -81,11 +98,30 @@ private fun bookmarkFragmentStateReducer(
+                 }
+             )
+         }
+-        BookmarkFragmentAction.DeselectAll ->
+-            state.copy(mode = BookmarkFragmentState.Mode.Normal())
++        is BookmarkFragmentAction.DeselectAll ->
++            state.copy(
++                mode = if (state.mode is BookmarkFragmentState.Mode.Syncing) {
++                    BookmarkFragmentState.Mode.Syncing
++                } else {
++                    BookmarkFragmentState.Mode.Normal()
++                }
++            )
++        is BookmarkFragmentAction.StartSync ->
++            state.copy(
++                mode = BookmarkFragmentState.Mode.Syncing
++            )
++        is BookmarkFragmentAction.FinishSync ->
++            state.copy(
++                mode = BookmarkFragmentState.Mode.Normal(
++                    showMenu = shouldShowMenu(state.tree?.guid)
++                )
++            )
+     }
+ }
+ 
++private fun shouldShowMenu(currentGuid: String?): Boolean =
++    BookmarkRoot.Root.id != currentGuid
++
+ operator fun BookmarkNode.contains(item: BookmarkNode): Boolean {
+     return children?.contains(item) ?: false
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkView.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkView.kt
+index bd8f6ca8de8b..2500f374ef8b 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkView.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkView.kt
+@@ -93,6 +93,12 @@ interface BookmarkViewInteractor : SelectionInteractor<BookmarkNode> {
+      *
+      */
+     fun onBackPressed()
++
++    /**
++     * Handles user requested sync of bookmarks.
++     *
++     */
++    fun onRequestSync()
+ }
+ 
+ class BookmarkView(
+@@ -106,7 +112,6 @@ class BookmarkView(
+ 
+     private var mode: BookmarkFragmentState.Mode = BookmarkFragmentState.Mode.Normal()
+     private var tree: BookmarkNode? = null
+-    private var canGoBack = false
+ 
+     private val bookmarkAdapter: BookmarkAdapter
+ 
+@@ -118,14 +123,18 @@ class BookmarkView(
+         view.bookmark_folders_sign_in.setOnClickListener {
+             navController.navigate(NavGraphDirections.actionGlobalTurnOnSync())
+         }
++        view.swipe_refresh.setOnRefreshListener {
++            interactor.onRequestSync()
++        }
+     }
+ 
+     fun update(state: BookmarkFragmentState) {
+-        canGoBack = BookmarkRoot.Root.matches(state.tree)
+         tree = state.tree
+         if (state.mode != mode) {
+             mode = state.mode
+-            interactor.onSelectionModeSwitch(mode)
++            if (mode is BookmarkFragmentState.Mode.Normal || mode is BookmarkFragmentState.Mode.Selecting) {
++                interactor.onSelectionModeSwitch(mode)
++            }
+         }
+ 
+         bookmarkAdapter.updateData(state.tree, mode)
+@@ -151,19 +160,21 @@ class BookmarkView(
+             }
+         }
+         view.bookmarks_progress_bar.isVisible = state.isLoading
++        view.swipe_refresh.isEnabled =
++            state.mode is BookmarkFragmentState.Mode.Normal || state.mode is BookmarkFragmentState.Mode.Syncing
++        view.swipe_refresh.isRefreshing = state.mode is BookmarkFragmentState.Mode.Syncing
+     }
+ 
+     override fun onBackPressed(): Boolean {
+-        return when {
+-            mode is BookmarkFragmentState.Mode.Selecting -> {
++        return when (mode) {
++            is BookmarkFragmentState.Mode.Selecting -> {
+                 interactor.onAllBookmarksDeselected()
+                 true
+             }
+-            canGoBack -> {
++            else -> {
+                 interactor.onBackPressed()
+                 true
+             }
+-            else -> false
+         }
+     }
+ 
+diff --git a/fenix/app/src/main/res/layout/component_bookmark.xml b/fenix/app/src/main/res/layout/component_bookmark.xml
+index b5bd21b504b3..ab4a742569d1 100644
+--- a/fenix/app/src/main/res/layout/component_bookmark.xml
++++ b/fenix/app/src/main/res/layout/component_bookmark.xml
+@@ -1,57 +1,62 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!-- This Source Code Form is subject to the terms of the Mozilla Public
++<?xml version="1.0" encoding="utf-8"?><!-- This Source Code Form is subject to the terms of the Mozilla Public
+    - License, v. 2.0. If a copy of the MPL was not distributed with this
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+-<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
++<androidx.swiperefreshlayout.widget.SwipeRefreshLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:app="http://schemas.android.com/apk/res-auto"
+     xmlns:tools="http://schemas.android.com/tools"
+-    android:id="@+id/bookmarks_wrapper"
++    android:id="@+id/swipe_refresh"
+     android:layout_width="match_parent"
+     android:layout_height="match_parent">
+ 
+-    <androidx.recyclerview.widget.RecyclerView
+-        android:id="@+id/bookmark_list"
++    <androidx.constraintlayout.widget.ConstraintLayout
++        android:id="@+id/bookmarks_wrapper"
+         android:layout_width="match_parent"
+-        android:layout_height="wrap_content"
+-        app:layoutManager="androidx.recyclerview.widget.LinearLayoutManager"
+-        app:layout_constraintEnd_toEndOf="parent"
+-        app:layout_constraintStart_toStartOf="parent"
+-        app:layout_constraintTop_toTopOf="parent"
+-        tools:listitem="@layout/library_site_item" />
++        android:layout_height="match_parent">
+ 
+-    <TextView
+-        android:id="@+id/bookmarks_empty_view"
+-        android:layout_width="wrap_content"
+-        android:layout_height="wrap_content"
+-        android:layout_gravity="center"
+-        android:text="@string/bookmarks_empty_message"
+-        android:textColor="?secondaryText"
+-        android:textSize="16sp"
+-        android:visibility="gone"
+-        app:layout_constraintBottom_toBottomOf="parent"
+-        app:layout_constraintEnd_toEndOf="parent"
+-        app:layout_constraintStart_toStartOf="parent"
+-        app:layout_constraintTop_toTopOf="parent" />
++        <androidx.recyclerview.widget.RecyclerView
++            android:id="@+id/bookmark_list"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            app:layoutManager="androidx.recyclerview.widget.LinearLayoutManager"
++            app:layout_constraintEnd_toEndOf="parent"
++            app:layout_constraintStart_toStartOf="parent"
++            app:layout_constraintTop_toTopOf="parent"
++            tools:listitem="@layout/library_site_item" />
+ 
+-    <com.google.android.material.button.MaterialButton
+-        android:id="@+id/bookmark_folders_sign_in"
+-        style="@style/NeutralButton"
+-        android:layout_width="wrap_content"
+-        android:layout_height="wrap_content"
+-        android:text="@string/bookmark_sign_in_button"
+-        app:layout_constraintBottom_toBottomOf="parent"
+-        app:layout_constraintEnd_toEndOf="parent"
+-        app:layout_constraintStart_toStartOf="parent"
+-        app:layout_constraintTop_toBottomOf="@id/bookmark_list"
+-        app:layout_constraintVertical_bias="0.0" />
++        <TextView
++            android:id="@+id/bookmarks_empty_view"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_gravity="center"
++            android:text="@string/bookmarks_empty_message"
++            android:textColor="?secondaryText"
++            android:textSize="16sp"
++            android:visibility="gone"
++            app:layout_constraintBottom_toBottomOf="parent"
++            app:layout_constraintEnd_toEndOf="parent"
++            app:layout_constraintStart_toStartOf="parent"
++            app:layout_constraintTop_toTopOf="parent" />
+ 
+-    <ProgressBar
+-        android:id="@+id/bookmarks_progress_bar"
+-        android:layout_width="wrap_content"
+-        android:layout_height="wrap_content"
+-        app:layout_constraintBottom_toBottomOf="parent"
+-        app:layout_constraintEnd_toEndOf="parent"
+-        app:layout_constraintStart_toStartOf="parent"
+-        app:layout_constraintTop_toTopOf="parent" />
++        <com.google.android.material.button.MaterialButton
++            android:id="@+id/bookmark_folders_sign_in"
++            style="@style/NeutralButton"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:text="@string/bookmark_sign_in_button"
++            app:layout_constraintBottom_toBottomOf="parent"
++            app:layout_constraintEnd_toEndOf="parent"
++            app:layout_constraintStart_toStartOf="parent"
++            app:layout_constraintTop_toBottomOf="@id/bookmark_list"
++            app:layout_constraintVertical_bias="0.0" />
+ 
+-</androidx.constraintlayout.widget.ConstraintLayout>
++        <ProgressBar
++            android:id="@+id/bookmarks_progress_bar"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            app:layout_constraintBottom_toBottomOf="parent"
++            app:layout_constraintEnd_toEndOf="parent"
++            app:layout_constraintStart_toStartOf="parent"
++            app:layout_constraintTop_toTopOf="parent" />
++
++    </androidx.constraintlayout.widget.ConstraintLayout>
++</androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/library/bookmarks/BookmarkControllerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/library/bookmarks/BookmarkControllerTest.kt
+index 71cf57e16f8d..bc2c29e440f8 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/library/bookmarks/BookmarkControllerTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/library/bookmarks/BookmarkControllerTest.kt
+@@ -12,16 +12,24 @@ import androidx.navigation.NavController
+ import androidx.navigation.NavDestination
+ import androidx.navigation.NavDirections
+ import io.mockk.Runs
++import io.mockk.called
++import io.mockk.coEvery
++import io.mockk.coVerify
+ import io.mockk.every
+ import io.mockk.just
+ import io.mockk.mockk
+ import io.mockk.mockkStatic
++import io.mockk.runs
+ import io.mockk.slot
++import io.mockk.spyk
+ import io.mockk.verify
+ import io.mockk.verifyOrder
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.test.TestCoroutineScope
+ import mozilla.appservices.places.BookmarkRoot
+ import mozilla.components.concept.storage.BookmarkNode
+ import mozilla.components.concept.storage.BookmarkNodeType
++import org.junit.After
+ import org.junit.Assert.assertEquals
+ import org.junit.Before
+ import org.junit.Test
+@@ -31,15 +39,21 @@ import org.mozilla.fenix.R
+ import org.mozilla.fenix.browser.browsingmode.BrowsingMode
+ import org.mozilla.fenix.components.Services
+ import org.mozilla.fenix.components.metrics.Event
++import org.mozilla.fenix.ext.bookmarkStorage
+ import org.mozilla.fenix.ext.components
+ 
+ @SuppressWarnings("TooManyFunctions", "LargeClass")
++@ExperimentalCoroutinesApi
+ class BookmarkControllerTest {
+ 
+     private lateinit var controller: BookmarkController
+ 
++    private val bookmarkStore = spyk(BookmarkFragmentStore(BookmarkFragmentState(null)))
+     private val context: Context = mockk(relaxed = true)
++    private val scope = TestCoroutineScope()
+     private val navController: NavController = mockk(relaxed = true)
++    private val sharedViewModel: BookmarksSharedViewModel = mockk()
++    private val loadBookmarkNode: suspend (String) -> BookmarkNode? = mockk(relaxed = true)
+     private val showSnackbar: (String) -> Unit = mockk(relaxed = true)
+     private val deleteBookmarkNodes: (Set<BookmarkNode>, Event) -> Unit = mockk(relaxed = true)
+     private val deleteBookmarkFolder: (BookmarkNode) -> Unit = mockk(relaxed = true)
+@@ -87,10 +101,16 @@ class BookmarkControllerTest {
+         every { navController.currentDestination } returns NavDestination("").apply {
+             id = R.id.bookmarkFragment
+         }
++        every { bookmarkStore.dispatch(any()) } returns mockk()
++        every { sharedViewModel.selectedFolder = any() } just runs
+ 
+         controller = DefaultBookmarkController(
+             context = homeActivity,
+             navController = navController,
++            scope = scope,
++            store = bookmarkStore,
++            sharedViewModel = sharedViewModel,
++            loadBookmarkNode = loadBookmarkNode,
+             showSnackbar = showSnackbar,
+             deleteBookmarkNodes = deleteBookmarkNodes,
+             deleteBookmarkFolder = deleteBookmarkFolder,
+@@ -98,6 +118,21 @@ class BookmarkControllerTest {
+         )
+     }
+ 
++    @After
++    fun cleanUp() {
++        scope.cleanupTestCoroutines()
++    }
++
++    @Test
++    fun `handleBookmarkChanged updates the selected bookmark node`() {
++        controller.handleBookmarkChanged(tree)
++
++        verify {
++            sharedViewModel.selectedFolder = tree
++            bookmarkStore.dispatch(BookmarkFragmentAction.Change(tree))
++        }
++    }
++
+     @Test
+     fun `handleBookmarkTapped should load the bookmark in a new tab`() {
+         controller.handleBookmarkTapped(item)
+@@ -124,15 +159,27 @@ class BookmarkControllerTest {
+     }
+ 
+     @Test
+-    fun `handleBookmarkExpand should navigate to the 'Bookmark' fragment`() {
++    fun `handleBookmarkExpand clears selection and invokes pending deletions`() {
++        coEvery { loadBookmarkNode.invoke(any()) } returns tree
++
+         controller.handleBookmarkExpand(tree)
+ 
+         verify {
+             invokePendingDeletion.invoke()
+-            navController.navigate(
+-                BookmarkFragmentDirections.actionBookmarkFragmentSelf(tree.guid),
+-                null
+-            )
++            controller.handleAllBookmarksDeselected()
++        }
++    }
++
++    @Test
++    fun `handleBookmarkExpand should refresh and change the active bookmark node`() {
++        coEvery { loadBookmarkNode.invoke(any()) } returns tree
++
++        controller.handleBookmarkExpand(tree)
++
++        coVerify {
++            loadBookmarkNode.invoke(tree.guid)
++            sharedViewModel.selectedFolder = tree
++            bookmarkStore.dispatch(BookmarkFragmentAction.Change(tree))
+         }
+     }
+ 
+@@ -161,7 +208,16 @@ class BookmarkControllerTest {
+     }
+ 
+     @Test
+-    fun `handleBookmarkSelected should show a toast when selecting a folder`() {
++    fun `handleBookmarkSelected dispatches Select action when selecting a non-root folder`() {
++        controller.handleBookmarkSelected(item)
++
++        verify {
++            bookmarkStore.dispatch(BookmarkFragmentAction.Select(item))
++        }
++    }
++
++    @Test
++    fun `handleBookmarkSelected should show a toast when selecting a root folder`() {
+         val errorMessage = context.getString(R.string.bookmark_cannot_edit_root)
+ 
+         controller.handleBookmarkSelected(root)
+@@ -171,6 +227,24 @@ class BookmarkControllerTest {
+         }
+     }
+ 
++    @Test
++    fun `handleBookmarkSelected does not select in Syncing mode`() {
++        every { bookmarkStore.state.mode } returns BookmarkFragmentState.Mode.Syncing
++
++        controller.handleBookmarkSelected(item)
++
++        verify { bookmarkStore.dispatch(BookmarkFragmentAction.Select(item)) wasNot called }
++    }
++
++    @Test
++    fun `handleBookmarkDeselected dispatches Deselect action`() {
++        controller.handleBookmarkDeselected(item)
++
++        verify {
++            bookmarkStore.dispatch(BookmarkFragmentAction.Deselect(item))
++        }
++    }
++
+     @Test
+     fun `handleCopyUrl should copy bookmark url to clipboard and show a toast`() {
+         val clipboardManager: ClipboardManager = mockk(relaxed = true)
+@@ -248,7 +322,24 @@ class BookmarkControllerTest {
+     }
+ 
+     @Test
+-    fun `handleBackPressed should trigger handleBackPressed in NavController`() {
++    fun `handleRequestSync dispatches actions in the correct order`() {
++        every { homeActivity.components.backgroundServices.accountManager } returns mockk(relaxed = true)
++        coEvery { homeActivity.bookmarkStorage.getBookmark(any()) } returns tree
++        coEvery { loadBookmarkNode.invoke(any()) } returns tree
++
++        controller.handleRequestSync()
++
++        verifyOrder {
++            bookmarkStore.dispatch(BookmarkFragmentAction.StartSync)
++            bookmarkStore.dispatch(BookmarkFragmentAction.FinishSync)
++        }
++    }
++
++    @Test
++    fun `handleBackPressed with one item in backstack should trigger handleBackPressed in NavController`() {
++        every { bookmarkStore.state.guidBackstack } returns listOf(tree.guid)
++        every { bookmarkStore.state.tree } returns tree
++
+         controller.handleBackPressed()
+ 
+         verify {
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentInteractorTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentInteractorTest.kt
+index c0129e961a51..6aba5b365e77 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentInteractorTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentInteractorTest.kt
+@@ -4,10 +4,7 @@
+ 
+ package org.mozilla.fenix.library.bookmarks
+ 
+-import io.mockk.called
+-import io.mockk.every
+ import io.mockk.mockk
+-import io.mockk.spyk
+ import io.mockk.verify
+ import io.mockk.verifyOrder
+ import mozilla.appservices.places.BookmarkRoot
+@@ -24,8 +21,6 @@ class BookmarkFragmentInteractorTest {
+ 
+     private lateinit var interactor: BookmarkFragmentInteractor
+ 
+-    private val bookmarkStore = spyk(BookmarkFragmentStore(BookmarkFragmentState(null)))
+-    private val sharedViewModel: BookmarksSharedViewModel = mockk(relaxed = true)
+     private val bookmarkController: DefaultBookmarkController = mockk(relaxed = true)
+     private val metrics: MetricController = mockk(relaxed = true)
+ 
+@@ -41,12 +36,8 @@ class BookmarkFragmentInteractorTest {
+ 
+     @Before
+     fun setup() {
+-        every { bookmarkStore.dispatch(any()) } returns mockk()
+-
+         interactor =
+             BookmarkFragmentInteractor(
+-                bookmarkStore = bookmarkStore,
+-                viewModel = sharedViewModel,
+                 bookmarksController = bookmarkController,
+                 metrics = metrics
+             )
+@@ -57,7 +48,7 @@ class BookmarkFragmentInteractorTest {
+         interactor.onBookmarksChanged(tree)
+ 
+         verify {
+-            bookmarkStore.dispatch(BookmarkFragmentAction.Change(tree))
++            bookmarkController.handleBookmarkChanged(tree)
+         }
+     }
+ 
+@@ -108,7 +99,7 @@ class BookmarkFragmentInteractorTest {
+         interactor.select(item)
+ 
+         verify {
+-            bookmarkStore.dispatch(BookmarkFragmentAction.Select(item))
++            bookmarkController.handleBookmarkSelected(item)
+         }
+     }
+ 
+@@ -117,7 +108,7 @@ class BookmarkFragmentInteractorTest {
+         interactor.deselect(item)
+ 
+         verify {
+-            bookmarkStore.dispatch(BookmarkFragmentAction.Deselect(item))
++            bookmarkController.handleBookmarkDeselected(item)
+         }
+     }
+ 
+@@ -126,17 +117,10 @@ class BookmarkFragmentInteractorTest {
+         interactor.onAllBookmarksDeselected()
+ 
+         verify {
+-            bookmarkStore.dispatch(BookmarkFragmentAction.DeselectAll)
++            bookmarkController.handleAllBookmarksDeselected()
+         }
+     }
+ 
+-    @Test
+-    fun `cannot select bookmark roots`() {
+-        interactor.select(root)
+-
+-        verify { bookmarkStore wasNot called }
+-    }
+-
+     @Test
+     fun `copy a bookmark item`() {
+         interactor.onCopyPressed(item)
+@@ -217,4 +201,13 @@ class BookmarkFragmentInteractorTest {
+             bookmarkController.handleBackPressed()
+         }
+     }
++
++    @Test
++    fun `request a sync`() {
++        interactor.onRequestSync()
++
++        verify {
++            bookmarkController.handleRequestSync()
++        }
++    }
+ }
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentStoreTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentStoreTest.kt
+index 03d49f141de2..f0e6f629cf25 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentStoreTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/library/bookmarks/BookmarkFragmentStoreTest.kt
+@@ -41,6 +41,30 @@ class BookmarkFragmentStoreTest {
+         assertEquals(store.state.mode, initialState.mode)
+     }
+ 
++    @Test
++    fun `changing the tree of bookmarks adds the tree to the visited nodes`() = runBlocking {
++        val initialState = BookmarkFragmentState(null)
++        val store = BookmarkFragmentStore(initialState)
++
++        store.dispatch(BookmarkFragmentAction.Change(tree)).join()
++        store.dispatch(BookmarkFragmentAction.Change(subfolder)).join()
++
++        assertEquals(listOf(tree.guid, subfolder.guid), store.state.guidBackstack)
++    }
++
++    @Test
++    fun `changing to a node that is in the backstack removes backstack items after that node`() = runBlocking {
++        val initialState = BookmarkFragmentState(
++            null,
++            guidBackstack = listOf(tree.guid, subfolder.guid, item.guid)
++        )
++        val store = BookmarkFragmentStore(initialState)
++
++        store.dispatch(BookmarkFragmentAction.Change(tree)).join()
++
++        assertEquals(listOf(tree.guid), store.state.guidBackstack)
++    }
++
+     @Test
+     fun `change the tree of bookmarks to the same value`() = runBlocking {
+         val initialState = BookmarkFragmentState(tree)
+@@ -177,6 +201,19 @@ class BookmarkFragmentStoreTest {
+         assertEquals(store.state.mode, BookmarkFragmentState.Mode.Normal(false))
+     }
+ 
++    @Test
++    fun `changing the tree or deselecting in Syncing mode should stay in Syncing mode`() = runBlocking {
++        val initialState = BookmarkFragmentState(tree)
++        val store = BookmarkFragmentStore(initialState)
++
++        store.dispatch(BookmarkFragmentAction.StartSync).join()
++        store.dispatch(BookmarkFragmentAction.Change(childItem))
++        assertEquals(BookmarkFragmentState.Mode.Syncing, store.state.mode)
++
++        store.dispatch(BookmarkFragmentAction.DeselectAll).join()
++        assertEquals(BookmarkFragmentState.Mode.Syncing, store.state.mode)
++    }
++
+     private val item = BookmarkNode(BookmarkNodeType.ITEM, "456", "123", 0, "Mozilla", "http://mozilla.org", null)
+     private val separator = BookmarkNode(BookmarkNodeType.SEPARATOR, "789", "123", 1, null, null, null)
+     private val subfolder = BookmarkNode(BookmarkNodeType.FOLDER, "987", "123", 0, "Subfolder", null, listOf())

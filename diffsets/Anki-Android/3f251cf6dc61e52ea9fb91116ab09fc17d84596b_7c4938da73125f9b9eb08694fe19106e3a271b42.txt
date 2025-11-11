@@ -1,0 +1,239 @@
+diff --git a/.idea/dictionaries/davidallison.xml b/.idea/dictionaries/davidallison.xml
+index 63a6761dabc9..22a23ad0eaf0 100644
+--- a/.idea/dictionaries/davidallison.xml
++++ b/.idea/dictionaries/davidallison.xml
+@@ -3,6 +3,7 @@
+     <words>
+       <w>Aedict</w>
+       <w>Affero</w>
++      <w>Awaitable</w>
+       <w>Beolingus</w>
+       <w>CROWDIN</w>
+       <w>CrowdIn</w>
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.kt b/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.kt
+index a5a9ebe3b1d2..bb1276b65610 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.kt
+@@ -42,6 +42,7 @@ import androidx.annotation.IdRes
+ import androidx.annotation.StringRes
+ import androidx.annotation.VisibleForTesting
+ import androidx.appcompat.app.AlertDialog
++import androidx.core.net.toFile
+ import androidx.core.view.isVisible
+ import androidx.webkit.WebViewAssetLoader
+ import anki.collection.OpChanges
+@@ -70,8 +71,11 @@ import com.ichi2.anki.servicelayer.AnkiMethod
+ import com.ichi2.anki.servicelayer.LanguageHintService.applyLanguageHint
+ import com.ichi2.anki.servicelayer.NoteService.isMarked
+ import com.ichi2.anki.servicelayer.SchedulerService.*
++import com.ichi2.anki.servicelayer.ScopedStorageService
+ import com.ichi2.anki.servicelayer.TaskListenerBuilder
+ import com.ichi2.anki.servicelayer.Undo
++import com.ichi2.anki.services.MigrationService
++import com.ichi2.anki.services.ServiceConnection
+ import com.ichi2.anki.snackbar.SnackbarBuilder
+ import com.ichi2.anki.snackbar.showSnackbar
+ import com.ichi2.annotations.NeedsTest
+@@ -115,6 +119,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
+ import java.util.function.Consumer
+ import java.util.function.Function
+ import java.util.function.Supplier
++import kotlin.collections.HashSet
+ import kotlin.math.abs
+ 
+ @KotlinCleanup("lots to deal with")
+@@ -280,6 +285,8 @@ abstract class AbstractFlashcardViewer :
+         displayCardAnswer()
+     }
+ 
++    private val migrationService = ServiceConnection<MigrationService>()
++
+     init {
+         ChangeManager.subscribe(this)
+     }
+@@ -544,6 +551,18 @@ abstract class AbstractFlashcardViewer :
+         mGestureDetectorImpl = LinkDetectingGestureDetector()
+     }
+ 
++    override fun onStart() {
++        super.onStart()
++        if (ScopedStorageService.userMigrationIsInProgress(this)) {
++            migrationService.bind(this, MigrationService::class.java)
++        }
++    }
++
++    override fun onStop() {
++        super.onStop()
++        migrationService.unbind(this)
++    }
++
+     protected open fun getContentViewAttr(fullscreenMode: FullScreenMode): Int {
+         return R.layout.reviewer
+     }
+@@ -1531,17 +1550,38 @@ abstract class AbstractFlashcardViewer :
+     }
+ 
+     private val soundErrorListener: Sound.OnErrorListener
+-        get() = Sound.OnErrorListener { _: MediaPlayer?, what: Int, extra: Int, path: String? ->
+-            Timber.w("Media Error: (%d, %d). Calling OnCompletionListener", what, extra)
+-            try {
+-                val file = File(path!!)
+-                if (!file.exists()) {
+-                    mMissingImageHandler.processMissingSound(file) { filename: String? -> displayCouldNotFindMediaSnackbar(filename) }
++        get() = object : Sound.OnErrorListener {
++            private var handledError: HashSet<String> = hashSetOf()
++
++            override fun onError(
++                mp: MediaPlayer?,
++                which: Int,
++                extra: Int,
++                path: String?
++            ): ErrorHandling {
++                Timber.w("Media Error: (%d, %d). Calling OnCompletionListener", which, extra)
++                try {
++                    val file = Uri.parse(path).toFile()
++                    if (!file.exists()) {
++                        if (handleStorageMigrationError(file)) {
++                            return ErrorHandling.RETRY_AUDIO
++                        }
++                        mMissingImageHandler.processMissingSound(file) { filename: String? -> displayCouldNotFindMediaSnackbar(filename) }
++                    }
++                } catch (e: Exception) {
++                    Timber.w(e)
+                 }
+-            } catch (e: Exception) {
+-                Timber.w(e)
++                return ErrorHandling.CONTINUE_AUDIO
++            }
++
++            private fun handleStorageMigrationError(file: File): Boolean {
++                val migrationService = migrationService.instance ?: return false
++                if (handledError.contains(file.absolutePath)) {
++                    return false
++                }
++                handledError.add(file.absolutePath)
++                return migrationService.migrateFileImmediately(file)
+             }
+-            ErrorHandling.CONTINUE_AUDIO
+         }
+ 
+     /**
+@@ -2230,8 +2270,11 @@ abstract class AbstractFlashcardViewer :
+                     return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(response.toByteArray()))
+                 }
+             }
+-            if (isLoadedFromProtocolRelativeUrl(request.url.toString())) {
+-                mMissingImageHandler.processInefficientImage { displayMediaUpgradeRequiredSnackbar() }
++            if (url.toString().startsWith("file://")) {
++                if (isLoadedFromProtocolRelativeUrl(request.url.toString())) {
++                    mMissingImageHandler.processInefficientImage { displayMediaUpgradeRequiredSnackbar() }
++                }
++                url.path?.let { path -> migrationService.instance?.migrateFileImmediately(File(path)) }
+             }
+             return null
+         }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/servicelayer/scopedstorage/migrateuserdata/MigrateUserData.kt b/AnkiDroid/src/main/java/com/ichi2/anki/servicelayer/scopedstorage/migrateuserdata/MigrateUserData.kt
+index 5f8bffb23ee9..2c01fd1fd350 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/servicelayer/scopedstorage/migrateuserdata/MigrateUserData.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/servicelayer/scopedstorage/migrateuserdata/MigrateUserData.kt
+@@ -25,6 +25,7 @@ import com.ichi2.anki.model.DiskFile
+ import com.ichi2.anki.model.RelativeFilePath
+ import com.ichi2.anki.servicelayer.scopedstorage.MigrateEssentialFiles
+ import com.ichi2.anki.servicelayer.scopedstorage.MoveConflictedFile
++import com.ichi2.anki.servicelayer.scopedstorage.MoveFile
+ import com.ichi2.anki.servicelayer.scopedstorage.MoveFileOrDirectory
+ import com.ichi2.anki.servicelayer.scopedstorage.migrateuserdata.MigrateUserData.Operation
+ import com.ichi2.anki.servicelayer.scopedstorage.migrateuserdata.MigrateUserData.SingleRetryDecorator
+@@ -32,6 +33,7 @@ import com.ichi2.compat.CompatHelper
+ import com.ichi2.exceptions.AggregateException
+ import timber.log.Timber
+ import java.io.File
++import java.util.concurrent.CountDownLatch
+ 
+ typealias NumberOfBytes = Long
+ 
+@@ -286,6 +288,19 @@ open class MigrateUserData protected constructor(val source: Directory, val dest
+         open val retryOperations get() = emptyList<Operation>()
+     }
+ 
++    class AwaitableOperation(private val operation: Operation) : Operation() {
++        private val completion = CountDownLatch(1)
++
++        override fun execute(context: MigrationContext): List<Operation> {
++            try {
++                return operation.execute(context)
++            } finally {
++                this.completion.countDown()
++            }
++        }
++        fun await() = completion.await()
++    }
++
+     /**
+      * A decorator for [Operation] which executes [standardOperation].
+      * When retried, executes [retryOperation].
+@@ -588,6 +603,37 @@ open class MigrateUserData protected constructor(val source: Directory, val dest
+ 
+         return true
+     }
++
++    /**
++     * Migrate a file to [expectedFileLocation] if it exists inside [source]
++     * @param expectedFileLocation A file which should exist inside [destination]
++     * */
++    fun migrateFileImmediately(expectedFileLocation: File) {
++        // It is possible, but unlikely that a file at the location already exists
++        if (expectedFileLocation.exists()) {
++            Timber.d("nothing to migrate: file already exists")
++            return
++        }
++
++        // convert to a relative path WRT the destination (our current collection)
++        val relativeDataPath = RelativeFilePath.fromPaths(destination.directory, expectedFileLocation)
++            ?: throw IllegalStateException("Could not create relative path between ${destination.directory} and $expectedFileLocation")
++
++        // get a reference to the source file
++        val sourceFile = DiskFile.createInstance(relativeDataPath.toFile(source))
++        if (sourceFile == null) {
++            Timber.w("couldn't migrate: source file not found or not a file. Maybe a bad card. Maybe already moved")
++            return
++        }
++
++        val moveFile = MoveFile(sourceFile, expectedFileLocation)
++        AwaitableOperation(moveFile).also { operation ->
++            this.executor.preempt(operation)
++            operation.await()
++        }
++
++        Timber.w("complete migration: %s $relativeDataPath $sourceFile", expectedFileLocation)
++    }
+ }
+ 
+ /**
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/services/MigrationService.kt b/AnkiDroid/src/main/java/com/ichi2/anki/services/MigrationService.kt
+index 4e4bf82767ff..eef643b78ddd 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/services/MigrationService.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/services/MigrationService.kt
+@@ -270,6 +270,22 @@ class MigrationService : Service() {
+     }
+ 
+     override fun onBind(intent: Intent): IBinder = LocalBinder()
++
++    /**
++     * A file was expected at the provided location, but wasn't found
++     * If it exists in the old location, attempt to migrate it.
++     * Block until migrated.
++     *
++     * @return Whether the migration was successful (or unnecessary)
++     */
++    fun migrateFileImmediately(expectedFileLocation: File): Boolean {
++        try {
++            migrateUserDataTask.migrateFileImmediately(expectedFileLocation)
++        } catch (e: Exception) {
++            Timber.w(e, "Failed to migrate file")
++        }
++        return expectedFileLocation.exists()
++    }
+ }
+ 
+ /** Hides a progress bar if previously shown on a notification */

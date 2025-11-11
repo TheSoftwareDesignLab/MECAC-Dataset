@@ -1,0 +1,395 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/Push.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/Push.kt
+index 26578388d086..27b10f0be6de 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/Push.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/Push.kt
+@@ -5,11 +5,14 @@
+ package org.mozilla.fenix.components
+ 
+ import android.content.Context
++import androidx.core.net.toUri
+ import mozilla.components.feature.push.AutoPushFeature
+ import mozilla.components.feature.push.PushConfig
++import mozilla.components.feature.push.Protocol
+ import mozilla.components.lib.crash.CrashReporter
+ import mozilla.components.support.base.log.logger.Logger
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ext.settings
+ import org.mozilla.fenix.perf.lazyMonitored
+ import org.mozilla.fenix.push.FirebasePushService
+ 
+@@ -17,7 +20,7 @@ import org.mozilla.fenix.push.FirebasePushService
+  * Component group for push services. These components use services that strongly depend on
+  * push messaging (e.g. WebPush, SendTab).
+  */
+-class Push(context: Context, crashReporter: CrashReporter) {
++class Push(val context: Context, crashReporter: CrashReporter) {
+     val feature by lazyMonitored {
+         pushConfig?.let { config ->
+             AutoPushFeature(
+@@ -40,7 +43,22 @@ class Push(context: Context, crashReporter: CrashReporter) {
+ 
+         logger.debug("Creating push configuration for autopush.")
+         val projectId = context.resources.getString(resId)
+-        PushConfig(projectId)
++        val serverOverride = context.settings().overridePushServer
++        if (serverOverride.isEmpty()) {
++            PushConfig(projectId)
++        } else {
++            val uri = serverOverride.toUri()
++            PushConfig(
++                projectId,
++                serverHost = uri.getHost() ?: "",
++                protocol = if (uri.getScheme() == "http") {
++                    Protocol.HTTP
++                } else {
++                    // Treat any non "http" value as HTTPS, since those are the only 2 options.
++                    Protocol.HTTPS
++                }
++            )
++        }
+     }
+ 
+     private val pushService by lazyMonitored { FirebasePushService() }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/SettingsFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/SettingsFragment.kt
+index e13a66d1eac9..a411bab33450 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/SettingsFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/SettingsFragment.kt
+@@ -97,7 +97,6 @@ class SettingsFragment : PreferenceFragmentCompat() {
+             scope = lifecycleScope,
+             accountManager = requireComponents.backgroundServices.accountManager,
+             httpClient = requireComponents.core.client,
+-            updateFxASyncOverrideMenu = ::updateFxASyncOverrideMenu,
+             updateFxAAllowDomesticChinaServerMenu = :: updateFxAAllowDomesticChinaServerMenu
+         )
+ 
+@@ -281,6 +280,9 @@ class SettingsFragment : PreferenceFragmentCompat() {
+             resources.getString(R.string.pref_key_data_choices) -> {
+                 SettingsFragmentDirections.actionSettingsFragmentToDataChoicesFragment()
+             }
++            resources.getString(R.string.pref_key_sync_debug) -> {
++                SettingsFragmentDirections.actionSettingsFragmentToSyncDebugFragment()
++            }
+             resources.getString(R.string.pref_key_help) -> {
+                 (activity as HomeActivity).openToBrowserAndLoad(
+                     searchTermOrURL = SupportUtils.getSumoURLForTopic(
+@@ -442,32 +444,6 @@ class SettingsFragment : PreferenceFragmentCompat() {
+ 
+         preferenceOpenLinksInExternalApp?.onPreferenceChangeListener = SharedPreferenceUpdater()
+ 
+-        val preferenceFxAOverride =
+-            findPreference<Preference>(getPreferenceKey(R.string.pref_key_override_fxa_server))
+-        val preferenceSyncOverride =
+-            findPreference<Preference>(getPreferenceKey(R.string.pref_key_override_sync_tokenserver))
+-
+-        val syncFxAOverrideUpdater = object : StringSharedPreferenceUpdater() {
+-            override fun onPreferenceChange(preference: Preference, newValue: Any?): Boolean {
+-                return super.onPreferenceChange(preference, newValue).also {
+-                    updateFxASyncOverrideMenu()
+-                    Toast.makeText(
+-                        context,
+-                        getString(R.string.toast_override_fxa_sync_server_done),
+-                        Toast.LENGTH_LONG
+-                    ).show()
+-                    Handler(Looper.getMainLooper()).postDelayed(
+-                        {
+-                            exitProcess(0)
+-                        },
+-                        FXA_SYNC_OVERRIDE_EXIT_DELAY
+-                    )
+-                }
+-            }
+-        }
+-        preferenceFxAOverride?.onPreferenceChangeListener = syncFxAOverrideUpdater
+-        preferenceSyncOverride?.onPreferenceChangeListener = syncFxAOverrideUpdater
+-
+         val preferenceStartProfiler =
+             findPreference<Preference>(getPreferenceKey(R.string.pref_key_start_profiler))
+ 
+@@ -481,6 +457,9 @@ class SettingsFragment : PreferenceFragmentCompat() {
+             findPreference<Preference>(
+                 getPreferenceKey(R.string.pref_key_secret_debug_info)
+             )?.isVisible = showSecretDebugMenuThisSession
++            findPreference<Preference>(
++                getPreferenceKey(R.string.pref_key_sync_debug)
++            )?.isVisible = showSecretDebugMenuThisSession
+             preferenceStartProfiler?.isVisible = showSecretDebugMenuThisSession &&
+                 (requireContext().components.core.engine.profiler?.isProfilerActive() != null)
+         }
+@@ -537,30 +516,6 @@ class SettingsFragment : PreferenceFragmentCompat() {
+         }
+     }
+ 
+-    private fun updateFxASyncOverrideMenu() {
+-        val preferenceFxAOverride =
+-            findPreference<Preference>(getPreferenceKey(R.string.pref_key_override_fxa_server))
+-        val preferenceSyncOverride =
+-            findPreference<Preference>(getPreferenceKey(R.string.pref_key_override_sync_tokenserver))
+-        val settings = requireContext().settings()
+-        val show = settings.overrideFxAServer.isNotEmpty() ||
+-            settings.overrideSyncTokenServer.isNotEmpty() ||
+-            settings.showSecretDebugMenuThisSession
+-        // Only enable changes to these prefs when the user isn't connected to an account.
+-        val enabled =
+-            requireComponents.backgroundServices.accountManager.authenticatedAccount() == null
+-        preferenceFxAOverride?.apply {
+-            isVisible = show
+-            isEnabled = enabled
+-            summary = settings.overrideFxAServer.ifEmpty { null }
+-        }
+-        preferenceSyncOverride?.apply {
+-            isVisible = show
+-            isEnabled = enabled
+-            summary = settings.overrideSyncTokenServer.ifEmpty { null }
+-        }
+-    }
+-
+     @VisibleForTesting
+     internal fun setupAmoCollectionOverridePreference(settings: Settings) {
+         val preferenceAmoCollectionOverride =
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/SyncDebugFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/SyncDebugFragment.kt
+new file mode 100644
+index 000000000000..1dbde6eabcfd
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/SyncDebugFragment.kt
+@@ -0,0 +1,81 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.settings
++
++import android.os.Bundle
++import androidx.preference.EditTextPreference
++import androidx.preference.Preference
++import androidx.preference.Preference.OnPreferenceClickListener
++import androidx.preference.PreferenceFragmentCompat
++import kotlin.system.exitProcess
++import mozilla.components.support.base.log.logger.Logger
++import org.mozilla.fenix.R
++import org.mozilla.fenix.ext.settings
++import org.mozilla.fenix.ext.showToolbar
++
++/**
++ * Lets the user customize Private browsing options.
++ */
++class SyncDebugFragment : PreferenceFragmentCompat() {
++    private val logger = Logger("SyncDebugFragment")
++    private var hasChanges = false
++
++    private val preferenceUpdater = object : StringSharedPreferenceUpdater() {
++        override fun onPreferenceChange(preference: Preference, newValue: Any?): Boolean {
++            return super.onPreferenceChange(preference, newValue).also {
++                hasChanges = true
++                updateMenu()
++            }
++        }
++    }
++
++    override fun onResume() {
++        super.onResume()
++        showToolbar(getString(R.string.preferences_sync_debug))
++    }
++
++    override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
++        setPreferencesFromResource(R.xml.sync_debug_preferences, rootKey)
++        requirePreference<EditTextPreference>(R.string.pref_key_override_fxa_server).let { pref ->
++            pref.setOnBindEditTextListener { it.setSingleLine() }
++            pref.onPreferenceChangeListener = preferenceUpdater
++        }
++        requirePreference<EditTextPreference>(R.string.pref_key_override_sync_tokenserver).let { pref ->
++            pref.setOnBindEditTextListener { it.setSingleLine() }
++            pref.onPreferenceChangeListener = preferenceUpdater
++        }
++        requirePreference<EditTextPreference>(R.string.pref_key_override_push_server).let { pref ->
++            pref.setOnBindEditTextListener { it.setSingleLine() }
++            pref.onPreferenceChangeListener = preferenceUpdater
++        }
++        requirePreference<Preference>(R.string.pref_key_sync_debug_quit).let { pref ->
++            pref.onPreferenceClickListener = OnPreferenceClickListener {
++                // Copied from StudiesView. This feels like a dramatic way to
++                // quit, is there a better way?
++                exitProcess(0)
++            }
++        }
++        updateMenu()
++    }
++
++    private fun updateMenu() {
++        val settings = requireContext().settings()
++        requirePreference<EditTextPreference>(R.string.pref_key_override_fxa_server).let {
++            it.summary = settings.overrideFxAServer.ifEmpty { null }
++        }
++        requirePreference<EditTextPreference>(R.string.pref_key_override_sync_tokenserver).let {
++            it.summary = settings.overrideSyncTokenServer.ifEmpty { null }
++        }
++        requirePreference<EditTextPreference>(R.string.pref_key_override_push_server).let {
++            it.summary = settings.overridePushServer.ifEmpty { null }
++        }
++        requirePreference<Preference>(R.string.pref_key_sync_debug_quit).let { pref ->
++            pref.isVisible = hasChanges
++        }
++
++        // val accountConnected =
++        //     requireComponents.backgroundServices.accountManager.authenticatedAccount() == null
++    }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/account/AccountUiView.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/account/AccountUiView.kt
+index c204fee61229..757d7fdf2e72 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/account/AccountUiView.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/account/AccountUiView.kt
+@@ -26,7 +26,6 @@ class AccountUiView(
+     private val scope: CoroutineScope,
+     private val accountManager: FxaAccountManager,
+     private val httpClient: Client,
+-    private val updateFxASyncOverrideMenu: () -> Unit,
+     private val updateFxAAllowDomesticChinaServerMenu: () -> Unit
+ ) {
+ 
+@@ -48,7 +47,6 @@ class AccountUiView(
+     fun updateAccountUIState(context: Context, profile: Profile?) {
+         val account = accountManager.authenticatedAccount()
+ 
+-        updateFxASyncOverrideMenu()
+         updateFxAAllowDomesticChinaServerMenu()
+ 
+         // Signed-in, no problems.
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt b/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
+index 7bccdddf4256..5033b8bd36e2 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
+@@ -1073,6 +1073,11 @@ class Settings(private val appContext: Context) : PreferencesHolder {
+         default = ""
+     )
+ 
++    var overridePushServer by stringPreference(
++        appContext.getPreferenceKey(R.string.pref_key_override_push_server),
++        default = ""
++    )
++
+     var overrideAmoUser by stringPreference(
+         appContext.getPreferenceKey(R.string.pref_key_override_amo_user),
+         default = ""
+diff --git a/fenix/app/src/main/res/navigation/nav_graph.xml b/fenix/app/src/main/res/navigation/nav_graph.xml
+index bfe337e02ae2..67cdcfd78b6d 100644
+--- a/fenix/app/src/main/res/navigation/nav_graph.xml
++++ b/fenix/app/src/main/res/navigation/nav_graph.xml
+@@ -660,6 +660,13 @@
+             app:exitAnim="@anim/slide_out_left"
+             app:popEnterAnim="@anim/slide_in_left"
+             app:popExitAnim="@anim/slide_out_right" />
++        <action
++            android:id="@+id/action_settingsFragment_to_syncDebugFragment"
++            app:destination="@id/syncDebugFragment"
++            app:enterAnim="@anim/slide_in_right"
++            app:exitAnim="@anim/slide_out_left"
++            app:popEnterAnim="@anim/slide_in_left"
++            app:popExitAnim="@anim/slide_out_right" />
+     </fragment>
+     <dialog
+         android:id="@+id/profilerStartDialogFragment"
+@@ -825,6 +832,10 @@
+         android:name="org.mozilla.fenix.exceptions.trackingprotection.TrackingProtectionExceptionsFragment"
+         android:label="@string/preference_exceptions"
+         tools:layout="@layout/fragment_exceptions" />
++    <fragment
++        android:id="@+id/syncDebugFragment"
++        android:name="org.mozilla.fenix.settings.SyncDebugFragment"
++        android:label="@string/preferences_sync_debug" />
+     <dialog
+         android:id="@+id/collectionCreationFragment"
+         android:name="org.mozilla.fenix.collections.CollectionCreationFragment"
+diff --git a/fenix/app/src/main/res/values/preference_keys.xml b/fenix/app/src/main/res/values/preference_keys.xml
+index fa889597abad..27818cef0d5b 100644
+--- a/fenix/app/src/main/res/values/preference_keys.xml
++++ b/fenix/app/src/main/res/values/preference_keys.xml
+@@ -47,8 +47,11 @@
+     <string name="pref_key_sign_in" translatable="false">pref_key_sign_in</string>
+     <string name="pref_key_account_auth_error" translatable="false">pref_key_account_auth_error</string>
+     <string name="pref_key_allow_domestic_china_fxa_server" translatable="false">pref_key_allow_domestic_china_fxa_server</string>
++    <string name="pref_key_sync_debug" translatable="false">pref_key_sync_debug</string>
+     <string name="pref_key_override_fxa_server" translatable="false">pref_key_override_fxa_server</string>
+     <string name="pref_key_override_sync_tokenserver" translatable="false">pref_key_override_sync_tokenserver</string>
++    <string name="pref_key_override_push_server" translatable="false">pref_key_override_push_server</string>
++    <string name="pref_key_sync_debug_quit" translatable="false">pref_key_sync_debug_quit</string>
+     <string name="pref_key_customize" translatable="false">pref_key_customize</string>
+     <string name="pref_key_private_browsing" translatable="false">pref_key_private_browsing</string>
+     <string name="pref_key_leakcanary" translatable="false">pref_key_leakcanary</string>
+diff --git a/fenix/app/src/main/res/values/static_strings.xml b/fenix/app/src/main/res/values/static_strings.xml
+index a3fda09ce5da..650a9d5d687c 100644
+--- a/fenix/app/src/main/res/values/static_strings.xml
++++ b/fenix/app/src/main/res/values/static_strings.xml
+@@ -43,6 +43,14 @@
+     <string name="preferences_debug_settings_task_continuity" translatable="false">Enable Task Continuity</string>
+     <!-- Label for enabling the Unified Search feature -->
+     <string name="preferences_debug_settings_unified_search" translatable="false">Enable Unified Search (requires restart)</string>
++    <!-- Title of preference for sync debugging (only shown in the when the secret debug menu is enabled) -->
++    <string name="preferences_sync_debug">Sync Debug</string>
++    <!-- Preference to override the Push server -->
++    <string name="preferences_override_push_server">Custom Push server</string>
++    <!-- Quit app button title for the Sync Debug preferences -->
++    <string name="preferences_sync_debug_quit_button_title">Stop Firefox</string>
++    <!-- Quit app button summary for the Sync Debug preferences -->
++    <string name="preferences_sync_debug_quit_button_summary">Custom server changes will take effect on the next Firefox run.</string>
+ 
+     <!-- A secret menu option in the tabs tray for making a tab inactive for testing. -->
+     <string name="inactive_tabs_menu_item">Make inactive</string>
+diff --git a/fenix/app/src/main/res/xml/preferences.xml b/fenix/app/src/main/res/xml/preferences.xml
+index 5cc4db58d75a..01c1bd7ff678 100644
+--- a/fenix/app/src/main/res/xml/preferences.xml
++++ b/fenix/app/src/main/res/xml/preferences.xml
+@@ -33,18 +33,10 @@
+             android:key="@string/pref_key_account_auth_error" />
+     </androidx.preference.PreferenceCategory>
+ 
+-    <androidx.preference.EditTextPreference
+-        android:key="@string/pref_key_override_fxa_server"
+-        android:title="@string/preferences_override_fxa_server"
+-        android:inputType="textUri"
+-        app:iconSpaceReserved="false"
+-        app:isPreferenceVisible="false" />
+-
+-    <androidx.preference.EditTextPreference
+-        android:key="@string/pref_key_override_sync_tokenserver"
+-        android:title="@string/preferences_override_sync_tokenserver"
+-        android:inputType="textUri"
++    <androidx.preference.Preference
+         app:iconSpaceReserved="false"
++        android:key="@string/pref_key_sync_debug"
++        android:title="@string/preferences_sync_debug"
+         app:isPreferenceVisible="false" />
+ 
+     <androidx.preference.PreferenceCategory
+diff --git a/fenix/app/src/main/res/xml/sync_debug_preferences.xml b/fenix/app/src/main/res/xml/sync_debug_preferences.xml
+new file mode 100644
+index 000000000000..36263fcefe5c
+--- /dev/null
++++ b/fenix/app/src/main/res/xml/sync_debug_preferences.xml
+@@ -0,0 +1,28 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto">
++    <androidx.preference.EditTextPreference
++        android:key="@string/pref_key_override_fxa_server"
++        android:title="@string/preferences_override_fxa_server"
++        android:inputType="textUri"
++        app:iconSpaceReserved="false" />
++    <androidx.preference.EditTextPreference
++        android:key="@string/pref_key_override_sync_tokenserver"
++        android:title="@string/preferences_override_sync_tokenserver"
++        android:inputType="textUri"
++        app:iconSpaceReserved="false" />
++    <androidx.preference.EditTextPreference
++        android:key="@string/pref_key_override_push_server"
++        android:title="@string/preferences_override_push_server"
++        android:inputType="textUri"
++        app:iconSpaceReserved="false" />
++    <androidx.preference.Preference
++        android:key="@string/pref_key_sync_debug_quit"
++        android:title="@string/preferences_sync_debug_quit_button_title"
++        android:summary="@string/preferences_sync_debug_quit_button_summary"
++        android:icon="@drawable/ic_close"
++        app:isPreferenceVisible="false" />
++</PreferenceScreen>

@@ -1,0 +1,189 @@
+diff --git a/Wikipedia/Code/SectionEditorViewController.swift b/Wikipedia/Code/SectionEditorViewController.swift
+index f63e3249a50..e0b7f2648b1 100644
+--- a/Wikipedia/Code/SectionEditorViewController.swift
++++ b/Wikipedia/Code/SectionEditorViewController.swift
+@@ -631,10 +631,14 @@ extension SectionEditorViewController: FocusNavigationViewDelegate {
+ 
+ extension SectionEditorViewController: SectionEditorWebViewMessagingControllerScrollDelegate {
+     func sectionEditorWebViewMessagingController(_ sectionEditorWebViewMessagingController: SectionEditorWebViewMessagingController, didReceiveScrollMessageWithNewContentOffset newContentOffset: CGPoint) {
+-        guard presentedViewController == nil else {
++        guard
++            presentedViewController == nil,
++            newContentOffset.x.isFinite,
++            newContentOffset.y.isFinite
++        else {
+             return
+         }
+-        self.webView.scrollView.wmf_safeSetContentOffset(newContentOffset, animated: true, completion: nil)
++        self.webView.scrollView.setContentOffset(newContentOffset, animated: true)
+     }
+ }
+ 
+diff --git a/Wikipedia/Code/UIScrollView+WMFContentOffsetUtils.h b/Wikipedia/Code/UIScrollView+WMFContentOffsetUtils.h
+index 8f083712284..0ae3b54ee4a 100644
+--- a/Wikipedia/Code/UIScrollView+WMFContentOffsetUtils.h
++++ b/Wikipedia/Code/UIScrollView+WMFContentOffsetUtils.h
+@@ -26,18 +26,4 @@
+  */
+ - (CGRect)wmf_contentFrame;
+ 
+-/**
+- *  Set offset if within bounds and valid (i.e. not NaN).
+- *
+- *  Use this when setting offsets that might have invalid values, e.g. those obtained from the
+- *  web view.
+- *
+- *  @param offset   The offset to apply.
+- *  @param animated Whether or not to animate scrolling to given offset.
+- *  @param completion Optional block to be executed after offset has been updated.
+- *
+- *  @see setContentOffset:animated:
+- */
+-- (void)wmf_safeSetContentOffset:(CGPoint)offset animated:(BOOL)animated completion:(void (^__nullable)(BOOL finished))completion;
+-
+ @end
+diff --git a/Wikipedia/Code/UIScrollView+WMFContentOffsetUtils.m b/Wikipedia/Code/UIScrollView+WMFContentOffsetUtils.m
+index bcc9c04a218..c67838ac5ae 100644
+--- a/Wikipedia/Code/UIScrollView+WMFContentOffsetUtils.m
++++ b/Wikipedia/Code/UIScrollView+WMFContentOffsetUtils.m
+@@ -15,33 +15,4 @@ - (CGRect)wmf_contentFrame {
+     return UIEdgeInsetsInsetRect(CGRectOffset(self.frame, 0, self.contentOffset.y), self.contentInset);
+ }
+ 
+-- (void)wmf_safeSetContentOffset:(CGPoint)offset animated:(BOOL)animated completion:(void (^__nullable)(BOOL finished))completion {
+-    if (!isnan(offset.x) && !isinf(offset.x) && !isnan(offset.y) && !isinf(offset.y)) {
+-#if DEBUG
+-        // log warning, but still scroll, if we get an out-of-bounds offset
+-        if (self.contentSize.width < offset.x || self.contentSize.height < offset.y) {
+-            DDLogDebug(@"Attempting to scroll to offset %@ which exceeds contentSize scroll view %@",
+-                       NSStringFromCGPoint(offset), self);
+-        }
+-#endif
+-        if (animated) {
+-            [UIView animateWithDuration:0.3
+-                             animations:^{
+-                                 [self setContentOffset:offset animated:YES];
+-                             }
+-                             completion:completion];
+-        } else {
+-            [self setContentOffset:offset animated:NO];
+-            if (completion) {
+-                completion(YES);
+-            }
+-        }
+-    } else {
+-        DDLogError(@"Ignoring invalid offset %@ for scroll view %@", NSStringFromCGPoint(offset), self);
+-        if (completion) {
+-            completion(NO);
+-        }
+-    }
+-}
+-
+ @end
+diff --git a/Wikipedia/Code/WebViewController.m b/Wikipedia/Code/WebViewController.m
+index 8f1316acca2..d496537f9d8 100644
+--- a/Wikipedia/Code/WebViewController.m
++++ b/Wikipedia/Code/WebViewController.m
+@@ -44,6 +44,8 @@ @interface WebViewController () <WKScriptMessageHandler, UIScrollViewDelegate, W
+ 
+ @property (nonatomic, getter=isAfterFirstUserScrollInteraction) BOOL afterFirstUserScrollInteraction;
+ 
++@property (nonatomic, strong) NSMutableArray<dispatch_block_t> *scrollViewAnimationCompletions;
++
+ @end
+ 
+ @implementation WebViewController
+@@ -59,6 +61,7 @@ - (instancetype)initWithCoder:(NSCoder *)aDecoder {
+     if (self) {
+         self.session = [SessionSingleton sharedInstance];
+         self.headerFadingEnabled = YES;
++        self.scrollViewAnimationCompletions = [NSMutableArray arrayWithCapacity:1];
+     }
+     return self;
+ }
+@@ -73,6 +76,7 @@ - (instancetype)initWithSession:(SessionSingleton *)aSession {
+     if (self) {
+         self.session = aSession;
+         self.headerFadingEnabled = YES;
++        self.scrollViewAnimationCompletions = [NSMutableArray arrayWithCapacity:1];
+     }
+     return self;
+ }
+@@ -514,6 +518,30 @@ - (void)moveFindInPageSelectedMatchIndexInDirection:(WMFFindInPageScrollDirectio
+     }
+ }
+ 
++- (void)scrollToOffset:(CGPoint)offset animated:(BOOL)animated completion:(dispatch_block_t)completion {
++    UIScrollView *scrollView = self.webView.scrollView;
++    dispatch_block_t done = ^{
++        if (completion) {
++            completion();
++        }
++    };
++    if (isnan(offset.x) || isinf(offset.x) || isnan(offset.y) || isinf(offset.y)) {
++        done();
++        return;
++    }
++    if (CGPointEqualToPoint(offset, scrollView.contentOffset)) {
++        done();
++        return;
++    }
++    if (!animated) {
++        [scrollView setContentOffset:offset animated:NO];
++        done();
++        return;
++    }
++    [self.scrollViewAnimationCompletions addObject:completion];
++    [scrollView setContentOffset:offset animated:YES];
++}
++
+ - (void)scrollToAndFocusOnSelectedMatch {
+     if (self.findInPageSelectedMatchIndex >= self.findInPageMatches.count) {
+         return;
+@@ -539,9 +567,9 @@ - (void)scrollToAndFocusOnSelectedMatch {
+                                                  }
+                                                  newOffsetY += [self.webView iOS12yOffsetHack];
+                                                  CGPoint centeredOffset = CGPointMake(self.webView.scrollView.contentOffset.x, newOffsetY);
+-                                                 [self.webView.scrollView wmf_safeSetContentOffset:centeredOffset
++                                                 [self scrollToOffset:centeredOffset
+                                                                                           animated:YES
+-                                                                                        completion:^(BOOL done) {
++                                                                                        completion:^ {
+                                                                                             self.disableMinimizeFindInPage = NO;
+                                                                                         }];
+                                              }];
+@@ -779,9 +807,9 @@ - (void)scrollToFragment:(NSString *)fragment animated:(BOOL)animated completion
+         [self.webView getScrollViewRectForHtmlElementWithId:fragment
+                                                  completion:^(CGRect rect) {
+                                                      if (!CGRectIsNull(rect)) {
+-                                                         [self.webView.scrollView wmf_safeSetContentOffset:CGPointMake(self.webView.scrollView.contentOffset.x, rect.origin.y + [self.webView iOS12yOffsetHack] + self.delegate.navigationBar.hiddenHeight)
++                                                         [self scrollToOffset:CGPointMake(self.webView.scrollView.contentOffset.x, rect.origin.y + [self.webView iOS12yOffsetHack] + self.delegate.navigationBar.hiddenHeight)
+                                                                                                   animated:animated
+-                                                                                                completion:^(BOOL finished) {
++                                                                                                completion:^ {
+                                                                                                     if (completion) {
+                                                                                                         completion();
+                                                                                                     }
+@@ -964,9 +992,9 @@ - (void)scrollTappedReferenceUpIfNecessaryWithReferencePageViewController:(WMFRe
+             }
+             CGFloat delta = self.webView.scrollView.contentOffset.y - newOffsetY;
+             CGPoint centeredOffset = CGPointMake(self.webView.scrollView.contentOffset.x, newOffsetY);
+-            [self.webView.scrollView wmf_safeSetContentOffset:centeredOffset
++            [self scrollToOffset:centeredOffset
+                                                      animated:YES
+-                                                   completion:^(BOOL finished) {
++                                                   completion:^ {
+                                                        controller.backgroundView.clearRect = CGRectOffset(windowCoordsRefGroupRect, 0, delta);
+                                                    }];
+         } else {
+@@ -1124,6 +1152,10 @@ - (void)scrollViewDidEndScrollingAnimation:(UIScrollView *)scrollView {
+     if ([self.delegate respondsToSelector:@selector(webViewController:scrollViewDidEndScrollingAnimation:)]) {
+         [self.delegate webViewController:self scrollViewDidEndScrollingAnimation:scrollView];
+     }
++    for (dispatch_block_t completion in self.scrollViewAnimationCompletions) {
++        completion();
++    }
++    [self.scrollViewAnimationCompletions removeAllObjects];
+ }
+ 
+ #pragma mark - WKNavigationDelegate

@@ -1,0 +1,523 @@
+diff --git a/Signal/src/AppDelegate.m b/Signal/src/AppDelegate.m
+index aceb8d0c03b..b97adf95bd0 100644
+--- a/Signal/src/AppDelegate.m
++++ b/Signal/src/AppDelegate.m
+@@ -176,7 +176,7 @@ - (UIViewController *)loadingRootViewController
+     // we need to bump this constant.
+     //
+     // We added a number of database views in v2.13.0.
+-    NSString *kLastVersionWithDatabaseViewChange = @"2.13.0";
++    NSString *kLastVersionWithDatabaseViewChange = @"2.16.0";
+     BOOL mayNeedUpgrade = ([TSAccountManager isRegistered] && lastLaunchedAppVersion
+         && (!lastCompletedLaunchAppVersion ||
+                [VersionMigrations isVersion:lastCompletedLaunchAppVersion
+diff --git a/Signal/src/Profiles/OWSProfileManager.h b/Signal/src/Profiles/OWSProfileManager.h
+index 5d3166b888f..c5ad52c072e 100644
+--- a/Signal/src/Profiles/OWSProfileManager.h
++++ b/Signal/src/Profiles/OWSProfileManager.h
+@@ -43,6 +43,12 @@ extern const NSUInteger kOWSProfileManager_MaxAvatarDiameter;
+ 
+ #pragma mark - Profile Whitelist
+ 
++#ifdef DEBUG
++// These methods are for debugging.
++- (void)clearProfileWhitelist;
++- (void)logProfileWhitelist;
++#endif
++
+ - (void)addThreadToProfileWhitelist:(TSThread *)thread;
+ 
+ - (BOOL)isThreadInProfileWhitelist:(TSThread *)thread;
+diff --git a/Signal/src/Profiles/OWSProfileManager.m b/Signal/src/Profiles/OWSProfileManager.m
+index c7156a265bf..45a35609c7a 100644
+--- a/Signal/src/Profiles/OWSProfileManager.m
++++ b/Signal/src/Profiles/OWSProfileManager.m
+@@ -595,6 +595,39 @@ - (void)updateServiceWithProfileName:(nullable NSString *)localProfileName
+ 
+ #pragma mark - Profile Whitelist
+ 
++#ifdef DEBUG
++- (void)clearProfileWhitelist
++{
++    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
++        @synchronized(self)
++        {
++            [self.userProfileWhitelistCache removeAllObjects];
++            [self.groupProfileWhitelistCache removeAllObjects];
++
++            [self.dbConnection purgeCollection:kOWSProfileManager_UserWhitelistCollection];
++            [self.dbConnection purgeCollection:kOWSProfileManager_GroupWhitelistCollection];
++            OWSAssert(0 == [self.dbConnection numberOfKeysInCollection:kOWSProfileManager_UserWhitelistCollection]);
++            OWSAssert(0 == [self.dbConnection numberOfKeysInCollection:kOWSProfileManager_GroupWhitelistCollection]);
++        }
++    });
++}
++
++- (void)logProfileWhitelist
++{
++    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
++        @synchronized(self)
++        {
++            DDLogError(@"userProfileWhitelistCache: %zd", self.userProfileWhitelistCache.count);
++            DDLogError(@"groupProfileWhitelistCache: %zd", self.groupProfileWhitelistCache.count);
++            DDLogError(@"kOWSProfileManager_UserWhitelistCollection: %zd",
++                [self.dbConnection numberOfKeysInCollection:kOWSProfileManager_UserWhitelistCollection]);
++            DDLogError(@"kOWSProfileManager_GroupWhitelistCollection: %zd",
++                [self.dbConnection numberOfKeysInCollection:kOWSProfileManager_GroupWhitelistCollection]);
++        }
++    });
++}
++#endif
++
+ - (void)addUserToProfileWhitelist:(NSString *)recipientId
+ {
+     OWSAssert(recipientId.length > 0);
+diff --git a/Signal/src/ViewControllers/ConversationView/MessagesViewController.m b/Signal/src/ViewControllers/ConversationView/MessagesViewController.m
+index 2d4a97c2acb..1930f91f11e 100644
+--- a/Signal/src/ViewControllers/ConversationView/MessagesViewController.m
++++ b/Signal/src/ViewControllers/ConversationView/MessagesViewController.m
+@@ -169,13 +169,16 @@ @interface MessagesViewController () <AVAudioPlayerDelegate,
+ 
+ // These two properties must be updated in lockstep.
+ //
+-// * The first step is to update uiDatabaseConnection using beginLongLivedReadTransaction.
+-// * The second step is to update messageMappings.
+-// * We can't do the first step without doing the second step soon afterward.
+-// * We can't do the second step without doing the first step first.
++// * The first (required) step is to update uiDatabaseConnection using beginLongLivedReadTransaction.
++// * The second (required) step is to update messageMappings.
++// * The third (optional) step is to update the messageMappings range using
++//   updateMessageMappingRangeOptions.
++// * The steps must be done in strict order.
++// * If we do any of the steps, we must do all of the required steps.
+ // * We can't use messageMappings in between the first and second steps; e.g.
+ //   we can't do any layout, since that uses numberOfItemsInSection: and
+ //   interactionAtIndexPath: which use the messageMappings.
++// * If we do the third step, we must call resetContentAndLayout afterward.
+ @property (nonatomic) YapDatabaseConnection *uiDatabaseConnection;
+ @property (nonatomic) YapDatabaseViewMappings *messageMappings;
+ 
+@@ -380,10 +383,10 @@ - (void)configureForThread:(TSThread *)thread
+         [[YapDatabaseViewMappings alloc] initWithGroups:@[ thread.uniqueId ] view:TSMessageDatabaseViewExtensionName];
+     // We need to impose the range restrictions on the mappings immediately to avoid
+     // doing a great deal of unnecessary work and causing a perf hotspot.
+-    [self updateMessageMappingRangeOptions];
+     [self.uiDatabaseConnection readWithBlock:^(YapDatabaseReadTransaction *transaction) {
+         [self.messageMappings updateWithTransaction:transaction];
+     }];
++    [self updateMessageMappingRangeOptions];
+     [self updateShouldObserveDBModifications];
+     self.page = 0;
+ 
+@@ -1466,21 +1469,19 @@ - (void)didPressSendButton:(UIButton *)button
+         // We convert large text messages to attachments
+         // which are presented as normal text messages.
+         const NSUInteger kOversizeTextMessageSizeThreshold = 16 * 1024;
++        BOOL didAddToProfileWhitelist = [ThreadUtil addThreadToProfileWhitelistIfEmptyContactThread:self.thread];
++        TSOutgoingMessage *message;
+         if ([text lengthOfBytesUsingEncoding:NSUTF8StringEncoding] >= kOversizeTextMessageSizeThreshold) {
+             SignalAttachment *attachment =
+                 [SignalAttachment attachmentWithData:[text dataUsingEncoding:NSUTF8StringEncoding]
+                                              dataUTI:SignalAttachment.kOversizeTextAttachmentUTI
+                                             filename:nil];
+-            [self updateLastVisibleTimestamp:[ThreadUtil sendMessageWithAttachment:attachment
+-                                                                          inThread:self.thread
+-                                                                     messageSender:self.messageSender]
+-                                                 .timestampForSorting];
++            message =
++                [ThreadUtil sendMessageWithAttachment:attachment inThread:self.thread messageSender:self.messageSender];
+         } else {
+-            [self updateLastVisibleTimestamp:[ThreadUtil sendMessageWithText:text
+-                                                                    inThread:self.thread
+-                                                               messageSender:self.messageSender]
+-                                                 .timestampForSorting];
++            message = [ThreadUtil sendMessageWithText:text inThread:self.thread messageSender:self.messageSender];
+         }
++        [self updateLastVisibleTimestamp:message.timestampForSorting];
+ 
+         self.lastMessageSentDate = [NSDate new];
+         [self clearUnreadMessagesIndicator];
+@@ -1491,6 +1492,9 @@ - (void)didPressSendButton:(UIButton *)button
+         [self clearDraft];
+         [self finishSendingMessage];
+         [((OWSMessagesToolbarContentView *)self.inputToolbar.contentView)ensureSubviews];
++        if (didAddToProfileWhitelist) {
++            [self ensureDynamicInteractions];
++        }
+     }
+ }
+ 
+@@ -2295,17 +2299,23 @@ - (void)updateLoadEarlierVisible
+ 
+ - (void)updateMessageMappingRangeOptions
+ {
+-    // The "page" length may have been increased by loading "prev" pages at the
+-    // top of the window.
+-    NSUInteger pageLength = kYapDatabasePageSize * (self.page + 1);
+-    // The "old" length may have been increased by insertions of new messages
++    // The "old" range length may have been increased by insertions of new messages
+     // at the bottom of the window.
+     NSUInteger oldLength = [self.messageMappings numberOfItemsInGroup:self.thread.uniqueId];
+-    NSUInteger newLength = MAX(pageLength, oldLength);
++    // The "page-based" range length may have been increased by loading "prev" pages at the
++    // top of the window.
++    NSUInteger rangeLength;
++    while (YES) {
++        rangeLength = kYapDatabasePageSize * (self.page + 1);
++        if (rangeLength >= oldLength) {
++            break;
++        }
++        self.page = self.page + 1;
++    }
+     YapDatabaseViewRangeOptions *rangeOptions =
+-        [YapDatabaseViewRangeOptions flexibleRangeWithLength:newLength offset:0 from:YapDatabaseViewEnd];
++        [YapDatabaseViewRangeOptions flexibleRangeWithLength:rangeLength offset:0 from:YapDatabaseViewEnd];
+ 
+-    rangeOptions.maxLength = MAX(newLength, kYapDatabaseRangeMaxLength);
++    rangeOptions.maxLength = MAX(rangeLength, kYapDatabaseRangeMaxLength);
+     rangeOptions.minLength = kYapDatabaseRangeMinLength;
+ 
+     [self.messageMappings setRangeOptions:rangeOptions forGroup:self.thread.uniqueId];
+@@ -3176,12 +3186,18 @@ - (void)sendMessageAttachment:(SignalAttachment *)attachment
+     DDLogVerbose(@"Sending attachment. Size in bytes: %lu, contentType: %@",
+         (unsigned long)attachment.data.length,
+         [attachment mimeType]);
+-    [self updateLastVisibleTimestamp:[ThreadUtil sendMessageWithAttachment:attachment
+-                                                                  inThread:self.thread
+-                                                             messageSender:self.messageSender]
+-                                         .timestampForSorting];
++    BOOL didAddToProfileWhitelist = [ThreadUtil addThreadToProfileWhitelistIfEmptyContactThread:self.thread];
++    TSOutgoingMessage *message =
++        [ThreadUtil sendMessageWithAttachment:attachment inThread:self.thread messageSender:self.messageSender];
++    [self.editingDatabaseConnection readWriteWithBlock:^(YapDatabaseReadWriteTransaction *transaction) {
++        [message saveWithTransaction:transaction];
++    }];
++    [self updateLastVisibleTimestamp:message.timestampForSorting];
+     self.lastMessageSentDate = [NSDate new];
+     [self clearUnreadMessagesIndicator];
++    if (didAddToProfileWhitelist) {
++        [self ensureDynamicInteractions];
++    }
+ }
+ 
+ - (NSURL *)videoTempFolder
+@@ -4244,10 +4260,10 @@ - (void)resetMappings
+         // We need to `beginLongLivedReadTransaction` before we update our
+         // mapping in order to jump to the most recent commit.
+         [self.uiDatabaseConnection beginLongLivedReadTransaction];
+-        [self updateMessageMappingRangeOptions];
+         [self.uiDatabaseConnection readWithBlock:^(YapDatabaseReadTransaction *transaction) {
+             [self.messageMappings updateWithTransaction:transaction];
+         }];
++        [self updateMessageMappingRangeOptions];
+     }
+ 
+     self.messageAdapterCache = [[NSCache alloc] init];
+diff --git a/Signal/src/ViewControllers/DebugUI/DebugUIMisc.m b/Signal/src/ViewControllers/DebugUI/DebugUIMisc.m
+index cdea5c066cb..e69b2a8168c 100644
+--- a/Signal/src/ViewControllers/DebugUI/DebugUIMisc.m
++++ b/Signal/src/ViewControllers/DebugUI/DebugUIMisc.m
+@@ -53,6 +53,16 @@ - (nullable OWSTableSection *)sectionForThread:(nullable TSThread *)thread
+                                      actionBlock:^{
+                                          [DebugUIMisc setManualCensorshipCircumventionEnabled:NO];
+                                      }]];
++#ifdef DEBUG
++    [items addObject:[OWSTableItem itemWithTitle:@"Clear Profile Whitelist"
++                                     actionBlock:^{
++                                         [OWSProfileManager.sharedManager clearProfileWhitelist];
++                                     }]];
++    [items addObject:[OWSTableItem itemWithTitle:@"Log Profile Whitelist"
++                                     actionBlock:^{
++                                         [OWSProfileManager.sharedManager logProfileWhitelist];
++                                     }]];
++#endif
+     return [OWSTableSection sectionWithTitle:self.name items:items];
+ }
+ 
+diff --git a/Signal/src/ViewControllers/SendExternalFileViewController.m b/Signal/src/ViewControllers/SendExternalFileViewController.m
+index 553aa76fd94..393adb45538 100644
+--- a/Signal/src/ViewControllers/SendExternalFileViewController.m
++++ b/Signal/src/ViewControllers/SendExternalFileViewController.m
+@@ -64,6 +64,7 @@ - (void)threadWasSelected:(TSThread *)thread
+         return;
+     }
+ 
++    [ThreadUtil addThreadToProfileWhitelistIfEmptyContactThread:thread];
+     [ThreadUtil sendMessageWithAttachment:self.attachment inThread:thread messageSender:self.messageSender];
+ 
+     [Environment messageThreadId:thread.uniqueId];
+diff --git a/Signal/src/util/ThreadUtil.h b/Signal/src/util/ThreadUtil.h
+index dafdad51003..6987fe81d04 100644
+--- a/Signal/src/util/ThreadUtil.h
++++ b/Signal/src/util/ThreadUtil.h
+@@ -38,6 +38,8 @@ NS_ASSUME_NONNULL_BEGIN
+ 
+ @property (nonatomic, readonly) BOOL hasMoreUnseenMessages;
+ 
++@property (nonatomic, readonly) BOOL didInsertDynamicInteractions;
++
+ - (void)clearUnreadIndicatorState;
+ 
+ @end
+@@ -94,6 +96,13 @@ NS_ASSUME_NONNULL_BEGIN
+                                   firstUnseenInteractionTimestamp:(nullable NSNumber *)firstUnseenInteractionTimestamp
+                                                      maxRangeSize:(int)maxRangeSize;
+ 
++// This method should be called right _before_ we send a message to a thread,
++// since we want to auto-add contact threads to the profile whitelist if the
++// conversation was initiated by the local user.
++//
++// Returns YES IFF the thread was just added to the profile whitelist.
+++ (BOOL)addThreadToProfileWhitelistIfEmptyContactThread:(TSThread *)thread;
++
+ @end
+ 
+ NS_ASSUME_NONNULL_END
+diff --git a/Signal/src/util/ThreadUtil.m b/Signal/src/util/ThreadUtil.m
+index 37ca8e2f65f..a19a1b7fcc3 100644
+--- a/Signal/src/util/ThreadUtil.m
++++ b/Signal/src/util/ThreadUtil.m
+@@ -4,6 +4,7 @@
+ 
+ #import "ThreadUtil.h"
+ #import "OWSContactsManager.h"
++#import "OWSProfileManager.h"
+ #import "Signal-Swift.h"
+ #import "TSUnreadIndicatorInteraction.h"
+ #import <SignalServiceKit/NSDate+millisecondTimeStamp.h>
+@@ -27,6 +28,8 @@ @interface ThreadDynamicInteractions ()
+ 
+ @property (nonatomic) BOOL hasMoreUnseenMessages;
+ 
++@property (nonatomic) BOOL didInsertDynamicInteractions;
++
+ @end
+ 
+ #pragma mark -
+@@ -397,6 +400,10 @@ + (ThreadDynamicInteractions *)ensureDynamicInteractionsForThread:(TSThread *)th
+         const int kAddToContactsOfferOffset = -2;
+         const int kUnreadIndicatorOfferOffset = -1;
+ 
++        // Ensure dynamic interactions have a non-negative timestamp even if the conversation was empty.
++        long long startOfConversationTimestamp
++            = (long long)(firstMessage ? firstMessage.timestampForSorting : 1000);
++
+         if (existingBlockOffer && !shouldHaveBlockOffer) {
+             DDLogInfo(@"%@ Removing block offer: %@ (%llu)",
+                 self.tag,
+@@ -409,7 +416,7 @@ + (ThreadDynamicInteractions *)ensureDynamicInteractionsForThread:(TSThread *)th
+             // We want the block offer to be the first interaction in their
+             // conversation's timeline, so we back-date it to slightly before
+             // the first incoming message (which we know is the first message).
+-            uint64_t blockOfferTimestamp = (uint64_t)((long long)firstMessage.timestampForSorting + kBlockOfferOffset);
++            uint64_t blockOfferTimestamp = (uint64_t)(startOfConversationTimestamp + kBlockOfferOffset);
+             NSString *recipientId = ((TSContactThread *)thread).contactIdentifier;
+ 
+             TSMessage *offerMessage =
+@@ -417,6 +424,7 @@ + (ThreadDynamicInteractions *)ensureDynamicInteractionsForThread:(TSThread *)th
+                                                                              thread:thread
+                                                                           contactId:recipientId];
+             [offerMessage saveWithTransaction:transaction];
++            result.didInsertDynamicInteractions = YES;
+ 
+             DDLogInfo(@"%@ Creating block offer: %@ (%llu)",
+                 self.tag,
+@@ -437,14 +445,14 @@ + (ThreadDynamicInteractions *)ensureDynamicInteractionsForThread:(TSThread *)th
+             // We want the offer to be the first interaction in their
+             // conversation's timeline, so we back-date it to slightly before
+             // the first incoming message (which we know is the first message).
+-            uint64_t offerTimestamp
+-                = (uint64_t)((long long)firstMessage.timestampForSorting + kAddToContactsOfferOffset);
++            uint64_t offerTimestamp = (uint64_t)(startOfConversationTimestamp + kAddToContactsOfferOffset);
+             NSString *recipientId = ((TSContactThread *)thread).contactIdentifier;
+ 
+             TSMessage *offerMessage = [OWSAddToContactsOfferMessage addToContactsOfferMessage:offerTimestamp
+                                                                                        thread:thread
+                                                                                     contactId:recipientId];
+             [offerMessage saveWithTransaction:transaction];
++            result.didInsertDynamicInteractions = YES;
+ 
+             DDLogInfo(@"%@ Creating 'add to contacts' offer: %@ (%llu)",
+                 self.tag,
+@@ -465,12 +473,12 @@ + (ThreadDynamicInteractions *)ensureDynamicInteractionsForThread:(TSThread *)th
+             // We want the offer to be the first interaction in their
+             // conversation's timeline, so we back-date it to slightly before
+             // the first incoming message (which we know is the first message).
+-            uint64_t offerTimestamp
+-                = (uint64_t)((long long)firstMessage.timestampForSorting + kAddToProfileWhitelistOfferOffset);
++            uint64_t offerTimestamp = (uint64_t)(startOfConversationTimestamp + kAddToProfileWhitelistOfferOffset);
+ 
+             TSMessage *offerMessage =
+                 [OWSAddToProfileWhitelistOfferMessage addToProfileWhitelistOfferMessage:offerTimestamp thread:thread];
+             [offerMessage saveWithTransaction:transaction];
++            result.didInsertDynamicInteractions = YES;
+ 
+             DDLogInfo(@"%@ Creating 'add to profile whitelist' offer: %@ (%llu)",
+                 self.tag,
+@@ -511,6 +519,7 @@ + (ThreadDynamicInteractions *)ensureDynamicInteractionsForThread:(TSThread *)th
+                                                       hasMoreUnseenMessages:result.hasMoreUnseenMessages
+                                        missingUnseenSafetyNumberChangeCount:missingUnseenSafetyNumberChangeCount];
+                 [indicator saveWithTransaction:transaction];
++                result.didInsertDynamicInteractions = YES;
+ 
+                 DDLogInfo(@"%@ Creating TSUnreadIndicatorInteraction: %@ (%llu)",
+                     self.tag,
+@@ -523,6 +532,24 @@ + (ThreadDynamicInteractions *)ensureDynamicInteractionsForThread:(TSThread *)th
+     return result;
+ }
+ 
+++ (BOOL)addThreadToProfileWhitelistIfEmptyContactThread:(TSThread *)thread
++{
++    OWSAssert(thread);
++
++    if (thread.isGroupThread) {
++        return NO;
++    }
++    if ([OWSProfileManager.sharedManager isThreadInProfileWhitelist:thread]) {
++        return NO;
++    }
++    if (!thread.hasEverHadMessage) {
++        [OWSProfileManager.sharedManager addThreadToProfileWhitelist:thread];
++        return YES;
++    } else {
++        return NO;
++    }
++}
++
+ #pragma mark - Logging
+ 
+ + (NSString *)tag
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSErrorMessage.m b/SignalServiceKit/src/Messages/Interactions/TSErrorMessage.m
+index a50327e406c..825ba1aa541 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSErrorMessage.m
++++ b/SignalServiceKit/src/Messages/Interactions/TSErrorMessage.m
+@@ -40,6 +40,10 @@ - (instancetype)initWithCoder:(NSCoder *)coder
+ 
+     _errorMessageSchemaVersion = TSErrorMessageSchemaVersion;
+ 
++    if (self.isDynamicInteraction) {
++        self.read = YES;
++    }
++
+     return self;
+ }
+ 
+@@ -70,6 +74,10 @@ - (instancetype)initWithTimestamp:(uint64_t)timestamp
+     _recipientId = recipientId;
+     _errorMessageSchemaVersion = TSErrorMessageSchemaVersion;
+ 
++    if (self.isDynamicInteraction) {
++        self.read = YES;
++    }
++
+     return self;
+ }
+ 
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSInfoMessage.m b/SignalServiceKit/src/Messages/Interactions/TSInfoMessage.m
+index d43ef15fd1c..48d43b625c4 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSInfoMessage.m
++++ b/SignalServiceKit/src/Messages/Interactions/TSInfoMessage.m
+@@ -35,6 +35,10 @@ - (instancetype)initWithCoder:(NSCoder *)coder
+ 
+     _infoMessageSchemaVersion = TSInfoMessageSchemaVersion;
+ 
++    if (self.isDynamicInteraction) {
++        self.read = YES;
++    }
++
+     return self;
+ }
+ 
+@@ -56,6 +60,10 @@ - (instancetype)initWithTimestamp:(uint64_t)timestamp
+     _messageType = infoMessage;
+     _infoMessageSchemaVersion = TSInfoMessageSchemaVersion;
+ 
++    if (self.isDynamicInteraction) {
++        self.read = YES;
++    }
++
+     return self;
+ }
+ 
+diff --git a/SignalServiceKit/src/Storage/TSDatabaseView.m b/SignalServiceKit/src/Storage/TSDatabaseView.m
+index 35ed412d5ef..8334be2d51e 100644
+--- a/SignalServiceKit/src/Storage/TSDatabaseView.m
++++ b/SignalServiceKit/src/Storage/TSDatabaseView.m
+@@ -125,7 +125,7 @@ + (void)registerUnreadDatabaseView
+ 
+     [self registerMessageDatabaseViewWithName:TSUnreadDatabaseViewExtensionName
+                                  viewGrouping:viewGrouping
+-                                      version:@"1"
++                                      version:@"2"
+                                         async:NO];
+ }
+ 
+@@ -144,7 +144,7 @@ + (void)asyncRegisterUnseenDatabaseView
+ 
+     [self registerMessageDatabaseViewWithName:TSUnseenDatabaseViewExtensionName
+                                  viewGrouping:viewGrouping
+-                                      version:@"1"
++                                      version:@"2"
+                                         async:YES];
+ }
+ 
+diff --git a/SignalServiceKit/src/Storage/TSStorageManager.m b/SignalServiceKit/src/Storage/TSStorageManager.m
+index f030b36b939..5b3534805f7 100644
+--- a/SignalServiceKit/src/Storage/TSStorageManager.m
++++ b/SignalServiceKit/src/Storage/TSStorageManager.m
+@@ -391,9 +391,7 @@ - (NSString *)createAndSetNewDatabasePassword
+ #pragma mark - convenience methods
+ 
+ - (void)purgeCollection:(NSString *)collection {
+-    [self.dbReadWriteConnection readWriteWithBlock:^(YapDatabaseReadWriteTransaction *transaction) {
+-        [transaction removeAllObjectsInCollection:collection];
+-    }];
++    [self.dbReadWriteConnection purgeCollection:collection];
+ }
+ 
+ - (void)setObject:(id)object forKey:(NSString *)key inCollection:(NSString *)collection {
+diff --git a/SignalServiceKit/src/Storage/YapDatabaseConnection+OWS.h b/SignalServiceKit/src/Storage/YapDatabaseConnection+OWS.h
+index d54ccb19f15..d6aac59cc48 100644
+--- a/SignalServiceKit/src/Storage/YapDatabaseConnection+OWS.h
++++ b/SignalServiceKit/src/Storage/YapDatabaseConnection+OWS.h
+@@ -24,6 +24,8 @@ NS_ASSUME_NONNULL_BEGIN
+ - (nullable PreKeyRecord *)preKeyRecordForKey:(NSString *)key inCollection:(NSString *)collection;
+ - (nullable SignedPreKeyRecord *)signedPreKeyRecordForKey:(NSString *)key inCollection:(NSString *)collection;
+ 
++- (NSUInteger)numberOfKeysInCollection:(NSString *)collection;
++
+ #pragma mark -
+ 
+ - (void)setObject:(id)object forKey:(NSString *)key inCollection:(NSString *)collection;
+@@ -31,9 +33,10 @@ NS_ASSUME_NONNULL_BEGIN
+ - (void)removeObjectForKey:(NSString *)string inCollection:(NSString *)collection;
+ - (void)setInt:(int)integer forKey:(NSString *)key inCollection:(NSString *)collection;
+ - (void)setDate:(NSDate *)value forKey:(NSString *)key inCollection:(NSString *)collection;
+-- (void)purgeCollection:(NSString *)collection;
+ - (int)incrementIntForKey:(NSString *)key inCollection:(NSString *)collection;
+ 
++- (void)purgeCollection:(NSString *)collection;
++
+ @end
+ 
+ NS_ASSUME_NONNULL_END
+diff --git a/SignalServiceKit/src/Storage/YapDatabaseConnection+OWS.m b/SignalServiceKit/src/Storage/YapDatabaseConnection+OWS.m
+index d01d846eed9..0a885dc82ba 100644
+--- a/SignalServiceKit/src/Storage/YapDatabaseConnection+OWS.m
++++ b/SignalServiceKit/src/Storage/YapDatabaseConnection+OWS.m
+@@ -94,6 +94,15 @@ - (nullable NSDate *)dateForKey:(NSString *)key inCollection:(NSString *)collect
+ 
+ #pragma mark -
+ 
++- (NSUInteger)numberOfKeysInCollection:(NSString *)collection
++{
++    __block NSUInteger result;
++    [self readWriteWithBlock:^(YapDatabaseReadWriteTransaction *transaction) {
++        result = [transaction numberOfKeysInCollection:collection];
++    }];
++    return result;
++}
++
+ - (void)purgeCollection:(NSString *)collection
+ {
+     [self readWriteWithBlock:^(YapDatabaseReadWriteTransaction *transaction) {

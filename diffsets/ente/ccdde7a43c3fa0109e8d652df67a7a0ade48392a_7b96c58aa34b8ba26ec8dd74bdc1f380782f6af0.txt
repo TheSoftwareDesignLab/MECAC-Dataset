@@ -1,0 +1,252 @@
+diff --git a/src/components/ExportModal.tsx b/src/components/ExportModal.tsx
+index 18e6e7d2053..74365d43322 100644
+--- a/src/components/ExportModal.tsx
++++ b/src/components/ExportModal.tsx
+@@ -72,6 +72,12 @@ export default function ExportModal(props: Props) {
+             setExportFolder(exportSettings?.folder);
+             setContinuousExport(exportSettings?.continuousExport);
+             syncFileCounts();
++            exportService.setUIUpdaters({
++                updateExportStage: updateExportStage,
++                updateExportProgress: setExportProgress,
++                updateFileExportStats: setFileExportStats,
++                updateLastExportTime: updateExportTime,
++            });
+         } catch (e) {
+             logError(e, 'error in exportModal');
+         }
+@@ -90,7 +96,7 @@ export default function ExportModal(props: Props) {
+     useEffect(() => {
+         try {
+             if (continuousExport) {
+-                exportService.enableContinuousExport(startExport);
++                exportService.enableContinuousExport();
+             } else {
+                 exportService.disableContinuousExport();
+             }
+@@ -162,7 +168,7 @@ export default function ExportModal(props: Props) {
+     // HELPER FUNCTIONS
+     // =======================
+ 
+-    const preExportRun = async () => {
++    const verifyExportFolderExists = () => {
+         const exportFolder = getData(LS_KEYS.EXPORT)?.folder;
+         const exportFolderExists = exportService.exists(exportFolder);
+         if (!exportFolderExists) {
+@@ -171,14 +177,6 @@ export default function ExportModal(props: Props) {
+             );
+             throw Error(CustomError.EXPORT_FOLDER_DOES_NOT_EXIST);
+         }
+-        await updateExportStage(ExportStage.INPROGRESS);
+-        setExportProgress({ current: 0, total: 0 });
+-    };
+-
+-    const postExportRun = async () => {
+-        await updateExportStage(ExportStage.FINISHED);
+-        await updateExportTime(Date.now());
+-        await syncFileCounts();
+     };
+ 
+     const syncFileCounts = async () => {
+@@ -211,15 +209,18 @@ export default function ExportModal(props: Props) {
+     };
+ 
+     const startExport = () => {
+-        void exportService.runExport(
+-            preExportRun,
+-            setExportProgress,
+-            postExportRun
+-        );
++        try {
++            verifyExportFolderExists();
++            exportService.runExport();
++        } catch (e) {
++            if (e.message !== CustomError.EXPORT_FOLDER_DOES_NOT_EXIST) {
++                logError(e, 'startExport failed');
++            }
++        }
+     };
+ 
+     const stopExport = () => {
+-        void exportService.stopRunningExport(postExportRun);
++        void exportService.stopRunningExport();
+     };
+ 
+     return (
+diff --git a/src/services/exportService.ts b/src/services/exportService.ts
+index 2c9b6772752..0615812b8a3 100644
+--- a/src/services/exportService.ts
++++ b/src/services/exportService.ts
+@@ -41,14 +41,14 @@ import { Collection } from 'types/collection';
+ import {
+     CollectionIDNameMap,
+     CollectionIDPathMap,
+-    ExportProgress,
+     ExportRecord,
+     ExportRecordV1,
++    ExportUIUpdaters,
+     FileExportStats,
+ } from 'types/export';
+ import { User } from 'types/user';
+ import { FILE_TYPE, TYPE_JPEG, TYPE_JPG } from 'constants/file';
+-import { RecordType } from 'constants/export';
++import { ExportStage, RecordType } from 'constants/export';
+ import { ElectronAPIs } from 'types/electron';
+ import { CustomError } from 'utils/error';
+ import { addLogLine } from 'utils/logging';
+@@ -69,12 +69,17 @@ class ExportService {
+     private allElectronAPIsExist: boolean = false;
+     private fileReader: FileReader = null;
+     private continuousExportEventHandler: () => void;
++    private uiUpdater: ExportUIUpdaters;
+ 
+     constructor() {
+         this.electronAPIs = runningInBrowser() && window['ElectronAPIs'];
+         this.allElectronAPIsExist = !!this.electronAPIs?.exists;
+     }
+ 
++    async setUIUpdaters(uiUpdater: ExportUIUpdaters) {
++        this.uiUpdater = uiUpdater;
++    }
++
+     async changeExportDirectory(callback: (newExportDir: string) => void) {
+         try {
+             const newRootDir = await this.electronAPIs.selectRootDirectory();
+@@ -97,13 +102,13 @@ class ExportService {
+         }
+     }
+ 
+-    enableContinuousExport(startExport: () => void) {
++    enableContinuousExport() {
+         try {
+             if (this.continuousExportEventHandler) {
+                 addLogLine('continuous export already enabled');
+                 return;
+             }
+-            this.continuousExportEventHandler = startExport;
++            this.continuousExportEventHandler = this.runExport;
+             this.continuousExportEventHandler();
+             eventBus.addListener(
+                 Events.LOCAL_FILES_UPDATED,
+@@ -150,20 +155,16 @@ class ExportService {
+         }
+     };
+ 
+-    async stopRunningExport(postExport: () => Promise<void>) {
++    async stopRunningExport() {
+         try {
+             this.stopExport = true;
+-            await postExport();
++            await this.postExport();
+         } catch (e) {
+             logError(e, 'stopRunningExport failed');
+         }
+     }
+ 
+-    runExport = async (
+-        preExport: () => Promise<void>,
+-        updateProgress: (progress: ExportProgress) => void,
+-        postExport: () => Promise<void>
+-    ) => {
++    runExport = async () => {
+         try {
+             if (this.exportInProgress) {
+                 addLogLine('export in progress, scheduling re-run');
+@@ -176,25 +177,18 @@ class ExportService {
+             try {
+                 addLogLine('starting export');
+                 this.exportInProgress = true;
+-                await preExport();
+-                await this.exportFiles(updateProgress);
++                await this.uiUpdater.updateExportStage(ExportStage.INPROGRESS);
++                this.uiUpdater.updateExportProgress({ current: 0, total: 0 });
++                await this.exportFiles();
+                 addLogLine('export completed');
+             } finally {
+                 this.exportInProgress = false;
+                 if (this.reRunNeeded) {
+                     this.reRunNeeded = false;
+                     addLogLine('re-running export');
+-                    setTimeout(
+-                        () =>
+-                            this.runExport(
+-                                preExport,
+-                                updateProgress,
+-                                postExport
+-                            ),
+-                        0
+-                    );
++                    setTimeout(this.runExport, 0);
+                 }
+-                await postExport();
++                await this.postExport();
+             }
+         } catch (e) {
+             if (e.message !== CustomError.EXPORT_FOLDER_DOES_NOT_EXIST) {
+@@ -203,9 +197,7 @@ class ExportService {
+         }
+     };
+ 
+-    private async exportFiles(
+-        updateProgress: (progress: ExportProgress) => void
+-    ) {
++    private async exportFiles() {
+         try {
+             const exportDir = getData(LS_KEYS.EXPORT)?.folder;
+             if (!exportDir) {
+@@ -260,7 +252,6 @@ class ExportService {
+                 collectionIDNameMap,
+                 renamedCollections,
+                 collectionIDPathMap,
+-                updateProgress,
+                 exportDir
+             );
+         } catch (e) {
+@@ -273,7 +264,6 @@ class ExportService {
+         collectionIDNameMap: CollectionIDNameMap,
+         renamedCollections: Collection[],
+         collectionIDPathMap: CollectionIDPathMap,
+-        updateProgress: (progress: ExportProgress) => void,
+         exportDir: string
+     ): Promise<void> {
+         try {
+@@ -319,7 +309,10 @@ class ExportService {
+                         RecordType.SUCCESS
+                     );
+                     success++;
+-                    updateProgress({ current: success, total: files.length });
++                    this.uiUpdater.updateExportProgress({
++                        current: success,
++                        total: files.length,
++                    });
+                 } catch (e) {
+                     logError(e, 'export failed for a file');
+                     if (
+@@ -346,6 +339,12 @@ class ExportService {
+         }
+     }
+ 
++    async postExport() {
++        await this.uiUpdater.updateExportStage(ExportStage.FINISHED);
++        await this.uiUpdater.updateLastExportTime(Date.now());
++        this.uiUpdater.updateFileExportStats(await this.getFileExportStats());
++    }
++
+     async addFileExportedRecord(
+         folder: string,
+         file: EnteFile,
+diff --git a/src/types/export/index.ts b/src/types/export/index.ts
+index b607e0c7770..c25497d9826 100644
+--- a/src/types/export/index.ts
++++ b/src/types/export/index.ts
+@@ -37,3 +37,10 @@ export interface ExportSettings {
+     folder: string;
+     continuousExport: boolean;
+ }
++
++export interface ExportUIUpdaters {
++    updateExportStage: (stage: ExportStage) => Promise<void>;
++    updateExportProgress: (progress: ExportProgress) => void;
++    updateFileExportStats: (fileExportStats: FileExportStats) => void;
++    updateLastExportTime: (exportTime: number) => Promise<void>;
++}

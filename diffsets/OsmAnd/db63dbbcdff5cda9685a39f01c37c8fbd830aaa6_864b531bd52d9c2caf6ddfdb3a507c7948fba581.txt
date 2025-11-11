@@ -1,0 +1,246 @@
+diff --git a/OsmAnd/src/net/osmand/plus/auto/SurfaceRenderer.java b/OsmAnd/src/net/osmand/plus/auto/SurfaceRenderer.java
+index 4e492cb9c20..247c65dff61 100644
+--- a/OsmAnd/src/net/osmand/plus/auto/SurfaceRenderer.java
++++ b/OsmAnd/src/net/osmand/plus/auto/SurfaceRenderer.java
+@@ -463,6 +463,12 @@ public void renderFrame(RotatedTileBox tileBox, DrawSettings drawSettings) {
+ 		}
+ 	}
+ 
++
++	@Nullable
++	public Rect getVisibleArea() {
++		return visibleArea;
++	}
++
+ 	public double getVisibleAreaWidth() {
+ 		return visibleArea != null ? visibleArea.width() : 0f;
+ 	}
+diff --git a/OsmAnd/src/net/osmand/plus/auto/screens/BaseAndroidAutoScreen.kt b/OsmAnd/src/net/osmand/plus/auto/screens/BaseAndroidAutoScreen.kt
+index e72e4bdeab7..544345c09b4 100644
+--- a/OsmAnd/src/net/osmand/plus/auto/screens/BaseAndroidAutoScreen.kt
++++ b/OsmAnd/src/net/osmand/plus/auto/screens/BaseAndroidAutoScreen.kt
+@@ -1,5 +1,7 @@
+ package net.osmand.plus.auto.screens
+ 
++import android.graphics.Rect
++import android.util.Log
+ import androidx.car.app.CarContext
+ import androidx.car.app.Screen
+ import androidx.car.app.constraints.ConstraintManager
+@@ -88,26 +90,17 @@ abstract class BaseAndroidAutoScreen(carContext: CarContext) : Screen(carContext
+ 		}
+ 	}
+ 
+-	protected fun adjustMapToRect(location: LatLon, mapRect: QuadRect) {
++	protected open fun adjustMapToRect(location: LatLon, mapRect: QuadRect) {
+ 		Algorithms.extendRectToContainPoint(mapRect, location.longitude, location.latitude)
+ 		app.carNavigationSession?.navigationCarSurface?.let { surfaceRenderer ->
+ 			if (!mapRect.hasInitialState()) {
+ 				val mapView = app.osmandMap.mapView
+-				val tileBox = mapView.rotatedTileBox
+-				val rectWidth = mapRect.right - mapRect.left
+-				val coef: Double = surfaceRenderer.visibleAreaWidth / tileBox.pixWidth
+-				val left = mapRect.left - rectWidth * coef
+-				val right = mapRect.right + rectWidth * coef
+-				mapView.fitRectToMap(
+-					left,
+-					right,
+-					mapRect.top,
+-					mapRect.bottom,
+-					tileBox.pixWidth,
+-					tileBox.pixHeight,
+-					0,
+-					0,
+-					true
++				app.mapViewTrackingUtilities.isMapLinkedToLocation = false
++				val tb = mapView.rotatedTileBox
++				tb.setCenterLocation(tb.centerPixelX.toFloat() / tb.pixWidth, 0.5f )
++				mapView.fitRectToMap(tb,
++					mapRect.left, mapRect.right, mapRect.top, mapRect.bottom,
++					0, 0, true
+ 				)
+ 				mapView.refreshMap()
+ 			}
+diff --git a/OsmAnd/src/net/osmand/plus/auto/screens/RoutePreviewScreen.java b/OsmAnd/src/net/osmand/plus/auto/screens/RoutePreviewScreen.java
+index eb99a577233..964ddcd68c4 100644
+--- a/OsmAnd/src/net/osmand/plus/auto/screens/RoutePreviewScreen.java
++++ b/OsmAnd/src/net/osmand/plus/auto/screens/RoutePreviewScreen.java
+@@ -19,22 +19,28 @@
+ import androidx.lifecycle.DefaultLifecycleObserver;
+ import androidx.lifecycle.LifecycleOwner;
+ 
++
++import net.osmand.PlatformUtil;
+ import net.osmand.plus.auto.TripUtils;
+ import net.osmand.plus.shared.SharedUtil;
+ import net.osmand.StateChangedListener;
++import net.osmand.data.LatLon;
+ import net.osmand.data.QuadRect;
+ import net.osmand.data.ValueHolder;
+-import net.osmand.shared.gpx.GpxFile;
+ import net.osmand.plus.OsmandApplication;
+ import net.osmand.plus.R;
+ import net.osmand.plus.routing.IRouteInformationListener;
+ import net.osmand.plus.routing.RoutingHelper;
+ import net.osmand.plus.routing.RoutingHelperUtils;
+ import net.osmand.plus.search.listitems.QuickSearchListItem;
++import net.osmand.plus.settings.enums.CompassMode;
++import net.osmand.plus.shared.SharedUtil;
+ import net.osmand.plus.track.data.GPXInfo;
+ import net.osmand.plus.track.helpers.GpxFileLoaderTask;
+ import net.osmand.plus.track.helpers.SelectedGpxFile;
++import net.osmand.plus.views.OsmandMapTileView;
+ import net.osmand.search.core.SearchResult;
++import net.osmand.shared.gpx.GpxFile;
+ import net.osmand.util.Algorithms;
+ 
+ import java.io.File;
+@@ -47,6 +53,8 @@
+ public final class RoutePreviewScreen extends BaseAndroidAutoScreen implements IRouteInformationListener,
+ 		DefaultLifecycleObserver {
+ 
++	private static final org.apache.commons.logging.Log LOG = PlatformUtil.getLog(RoutePreviewScreen.class);
++
+ 	@NonNull
+ 	private final Action settingsAction;
+ 	@NonNull
+@@ -57,6 +65,9 @@ public final class RoutePreviewScreen extends BaseAndroidAutoScreen implements I
+ 	@Nullable
+ 	private GpxFile routeGpxFile;
+ 
++	private CompassMode savedCompassMode = CompassMode.NORTH_IS_UP;
++	private float prevElevationAngle = 90;
++
+ 
+ 	private final StateChangedListener<Void> stateChangedListener = new StateChangedListener<Void>() {
+ 		@Override
+@@ -64,6 +75,7 @@ public void stateChanged(Void change) {
+ 			if (routeGpxFile != null) {
+ 				QuadRect mapRect = new QuadRect();
+ 				Algorithms.extendRectToContainRect(mapRect, SharedUtil.jQuadRect(routeGpxFile.getRect()));
++
+ 				adjustMapToRect(getApp().getMapViewTrackingUtilities().getDefaultLocation(), mapRect);
+ 			}
+ 		}
+@@ -136,6 +148,10 @@ private void updateRoute(boolean newRoute) {
+ 	public void onCreate(@NonNull LifecycleOwner owner) {
+ 		getApp().getRoutingHelper().addListener(this);
+ 		getApp().getTargetPointsHelper().addListener(stateChangedListener);
++		savedCompassMode = getApp().getSettings().getCompassMode();
++		getApp().getSettings().setCompassMode(CompassMode.NORTH_IS_UP);
++		OsmandMapTileView mapView = getApp().getOsmandMap().getMapView();
++		prevElevationAngle = mapView.normalizeElevationAngle(mapView.getElevationAngle());
+ 		if (getApp().getRoutingHelper().isRouteCalculated()) {
+ 			updateRoute(true);
+ 		} else {
+@@ -148,6 +164,9 @@ public void onDestroy(@NonNull LifecycleOwner owner) {
+ 		OsmandApplication app = getApp();
+ 		RoutingHelper routingHelper = app.getRoutingHelper();
+ 		routingHelper.removeListener(this);
++		app.getSettings().setCompassMode(savedCompassMode);
++		OsmandMapTileView mapView = getApp().getOsmandMap().getMapView();
++		mapView.setElevationAngle(prevElevationAngle);
+ 		if (routingHelper.isRoutePlanningMode()) {
+ 			app.stopNavigation();
+ 		}
+@@ -207,6 +226,7 @@ public void newRouteIsCalculated(boolean newRoute, ValueHolder<Boolean> showToas
+ 		RoutingHelper rh = getApp().getRoutingHelper();
+ 		QuadRect mapRect = RoutingHelperUtils.getRouteRect(getApp(), rh.getRoute());
+ 		if (mapRect != null) {
++			LOG.info("ZOOM Route " + mapRect);
+ 			adjustMapToRect(getApp().getMapViewTrackingUtilities().getDefaultLocation(), mapRect);
+ 		}
+ 		updateRoute(newRoute);
+@@ -228,4 +248,13 @@ public void tryToStartNavigation() {
+ 			onNavigate();
+ 		}
+ 	}
++
++	@Override
++	protected void adjustMapToRect(@NonNull LatLon location, @NonNull QuadRect mapRect) {
++		OsmandMapTileView mapView = getApp().getOsmandMap().getMapView();
++		mapView.setElevationAngle(90f);
++		getApp().getMapViewTrackingUtilities().setMapLinkedToLocation(false);
++		mapView.setRotate(0f, true);
++		super.adjustMapToRect(location, mapRect);
++	}
+ }
+diff --git a/OsmAnd/src/net/osmand/plus/views/OsmandMapTileView.java b/OsmAnd/src/net/osmand/plus/views/OsmandMapTileView.java
+index e71a3093463..8a438cbd597 100644
+--- a/OsmAnd/src/net/osmand/plus/views/OsmandMapTileView.java
++++ b/OsmAnd/src/net/osmand/plus/views/OsmandMapTileView.java
+@@ -1682,28 +1682,8 @@ public void fitRectToMap(double left, double right, double top, double bottom,
+ 
+ 	public void fitRectToMap(double left, double right, double top, double bottom,
+ 	                         int tileBoxWidthPx, int tileBoxHeightPx, int marginTopPx, int marginLeftPx) {
+-		fitRectToMap(left, right, top, bottom, tileBoxWidthPx, tileBoxHeightPx, marginTopPx, marginLeftPx, true);
+-	}
+-
+-	public boolean fullyContains(RotatedTileBox tb, double left, double top, double right, double bottom) {
+-		// if at least one point is not inside the boundary, return false
+-		if (!tb.containsLatLon(top, left)) {
+-			return false;
+-		} else if (!tb.containsLatLon(bottom, left)) {
+-			return false;
+-		} else if (!tb.containsLatLon(top, right)) {
+-			return false;
+-		} else if (!tb.containsLatLon(bottom, right)) {
+-			return false;
+-		}
+-		return true;
+-	}
+-
+-	public void fitRectToMap(double left, double right, double top, double bottom,
+-	                         int tileBoxWidthPx, int tileBoxHeightPx, int marginTopPx, int marginLeftPx, boolean useSmallZoom) {
+ 		RotatedTileBox tb = currentViewport.copy();
+-		float zoomStep = useSmallZoom ? 0.1f : 1f;
+-		double border = 0.8;
++		double border = 0.9;
+ 		int dx = 0;
+ 		int dy = 0;
+ 		int tbw = (int) (tb.getPixWidth() * border);
+@@ -1720,7 +1700,26 @@ public void fitRectToMap(double left, double right, double top, double bottom,
+ 		}
+ 		dy += tb.getCenterPixelY() - tb.getPixHeight() / 2;
+ 		tb.setPixelDimensions(tbw, tbh);
++		fitRectToMap(tb, left, right, top, bottom, dx, dy, true);
++	}
+ 
++	public boolean fullyContains(RotatedTileBox tb, double left, double top, double right, double bottom) {
++		// if at least one point is not inside the boundary, return false
++		if (!tb.containsLatLon(top, left)) {
++			return false;
++		} else if (!tb.containsLatLon(bottom, left)) {
++			return false;
++		} else if (!tb.containsLatLon(top, right)) {
++			return false;
++		} else if (!tb.containsLatLon(bottom, right)) {
++			return false;
++		}
++		return true;
++	}
++
++	public void fitRectToMap(RotatedTileBox tb, double left, double right, double top, double bottom,
++	                         int dx, int dy, boolean useSmallZoom) {
++		float zoomStep = useSmallZoom ? 0.1f : 1f;
+ 		double clat = bottom / 2 + top / 2;
+ 		double clon = left / 2 + right / 2;
+ 		tb.setLatLonCenter(clat, clon);
+@@ -1731,13 +1730,14 @@ public void fitRectToMap(double left, double right, double top, double bottom,
+ 			zoom.partialChangeZoom(-zoomStep);
+ 			tb.setZoomAndAnimation(zoom.getBaseZoom(), 0, zoom.getZoomFloatPart());
+ 		}
+-		zoom.partialChangeZoom(zoomStep);
+ 		while (zoom.isZoomInAllowed() && fullyContains(tb, left, top, right, bottom)) {
+ 			zoom.partialChangeZoom(zoomStep);
+ 			tb.setZoomAndAnimation(zoom.getBaseZoom(), 0, zoom.getZoomFloatPart());
+ 		}
+-		zoom.partialChangeZoom(-zoomStep);
+-		tb.setZoomAndAnimation(zoom.getBaseZoom(), 0, zoom.getZoomFloatPart());
++		if (zoom.isZoomOutAllowed()) {
++			zoom.partialChangeZoom(-zoomStep);
++			tb.setZoomAndAnimation(zoom.getBaseZoom(), 0, zoom.getZoomFloatPart());
++		}
+ 		if (dy != 0 || dx != 0) {
+ 			float x = tb.getPixWidth() / 2f + dx;
+ 			float y = tb.getPixHeight() / 2f + dy;

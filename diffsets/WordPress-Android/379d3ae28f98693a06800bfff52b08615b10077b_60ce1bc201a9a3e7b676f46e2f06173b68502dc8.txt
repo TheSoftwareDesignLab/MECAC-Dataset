@@ -1,0 +1,179 @@
+diff --git a/WordPress/src/main/java/org/wordpress/android/WordPress.java b/WordPress/src/main/java/org/wordpress/android/WordPress.java
+index f2c2a3e27030..aa752905fc34 100644
+--- a/WordPress/src/main/java/org/wordpress/android/WordPress.java
++++ b/WordPress/src/main/java/org/wordpress/android/WordPress.java
+@@ -41,11 +41,14 @@
+ import com.google.android.gms.common.api.GoogleApiClient;
+ import com.google.firebase.iid.FirebaseInstanceId;
+ import com.wordpress.rest.RestClient;
++import com.wordpress.stories.compose.NotificationTrackerProvider;
++import com.wordpress.stories.compose.frame.StoryNotificationType;
+ import com.yarolegovich.wellsql.WellSql;
+ 
+ import org.greenrobot.eventbus.EventBus;
+ import org.greenrobot.eventbus.Subscribe;
+ import org.greenrobot.eventbus.ThreadMode;
++import org.jetbrains.annotations.NotNull;
+ import org.wordpress.android.analytics.AnalyticsTracker;
+ import org.wordpress.android.analytics.AnalyticsTracker.Stat;
+ import org.wordpress.android.analytics.Tracker;
+@@ -76,6 +79,7 @@
+ import org.wordpress.android.networking.OAuthAuthenticator;
+ import org.wordpress.android.networking.RestClientUtils;
+ import org.wordpress.android.push.GCMRegistrationIntentService;
++import org.wordpress.android.push.NotificationType;
+ import org.wordpress.android.support.ZendeskHelper;
+ import org.wordpress.android.ui.ActivityId;
+ import org.wordpress.android.ui.notifications.SystemNotificationsTracker;
+@@ -147,6 +151,7 @@ public class WordPress extends MultiDexApplication implements HasServiceInjector
+     private static Context mContext;
+     private static BitmapLruCache mBitmapCache;
+     private static ApplicationLifecycleMonitor mApplicationLifecycleMonitor;
++    private static StoryNotificationTrackerProvider mStoryNotificationTrackerProvider;
+ 
+     private static GoogleApiClient mCredentialsClient;
+ 
+@@ -337,6 +342,7 @@ public void onConnectionSuspended(int i) {
+         ImageEditorInitializer.Companion.init(mImageManager, mImageEditorTracker);
+ 
+         initEmojiCompat();
++        mStoryNotificationTrackerProvider = new StoryNotificationTrackerProvider();
+         ProcessLifecycleOwner.get().getLifecycle().addObserver(mStoryMediaSaveUploadBridge);
+     }
+ 
+@@ -815,6 +821,10 @@ private void initEmojiCompat() {
+         EmojiCompat.init(config);
+     }
+ 
++    public StoryNotificationTrackerProvider getStoryNotificationTrackerProvider() {
++        return mStoryNotificationTrackerProvider;
++    }
++
+     @Override
+     public AndroidInjector<Service> serviceInjector() {
+         return mServiceDispatchingAndroidInjector;
+@@ -995,4 +1005,32 @@ public void onTrimMemory(final int level) {
+             }
+         }
+     }
++
++    private class StoryNotificationTrackerProvider implements NotificationTrackerProvider {
++        private NotificationType translateNotificationTypes(StoryNotificationType storyNotificationType) {
++            switch (storyNotificationType) {
++                case STORY_SAVE_SUCCESS:
++                    return NotificationType.STORY_SAVE_SUCCESS;
++                case STORY_SAVE_ERROR:
++                    return NotificationType.STORY_SAVE_ERROR;
++                case STORY_FRAME_SAVE_SUCCESS:
++                    return NotificationType.STORY_FRAME_SAVE_SUCCESS;
++                case STORY_FRAME_SAVE_ERROR:
++                    return NotificationType.STORY_FRAME_SAVE_ERROR;
++            }
++            return NotificationType.STORY_FRAME_SAVE_ERROR; // shouldn't reach this
++        }
++
++        @Override public void trackShownNotification(@NotNull StoryNotificationType storyNotificationType) {
++            mSystemNotificationsTracker.trackShownNotification(translateNotificationTypes(storyNotificationType));
++        }
++
++        @Override public void trackTappedNotification(@NotNull StoryNotificationType storyNotificationType) {
++            mSystemNotificationsTracker.trackShownNotification(translateNotificationTypes(storyNotificationType));
++        }
++
++        @Override public void trackDismissedNotification(@NotNull StoryNotificationType storyNotificationType) {
++            mSystemNotificationsTracker.trackShownNotification(translateNotificationTypes(storyNotificationType));
++        }
++    }
+ }
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/stories/StoryComposerActivity.kt b/WordPress/src/main/java/org/wordpress/android/ui/stories/StoryComposerActivity.kt
+index 89e04950c976..5ce1b9db1358 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/stories/StoryComposerActivity.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/stories/StoryComposerActivity.kt
+@@ -13,8 +13,10 @@ import com.wordpress.stories.compose.ComposeLoopFrameActivity
+ import com.wordpress.stories.compose.MediaPickerProvider
+ import com.wordpress.stories.compose.MetadataProvider
+ import com.wordpress.stories.compose.NotificationIntentLoader
++import com.wordpress.stories.compose.NotificationTrackerProvider
+ import com.wordpress.stories.compose.SnackbarProvider
+ import com.wordpress.stories.compose.StoryDiscardListener
++import com.wordpress.stories.compose.frame.StoryNotificationType
+ import com.wordpress.stories.compose.frame.StorySaveEvents.StorySaveResult
+ import com.wordpress.stories.compose.story.StoryIndex
+ import com.wordpress.stories.util.KEY_STORY_INDEX
+@@ -31,10 +33,12 @@ import org.wordpress.android.fluxc.model.post.PostStatus.PUBLISHED
+ import org.wordpress.android.fluxc.store.PostStore
+ import org.wordpress.android.push.NotificationType
+ import org.wordpress.android.push.NotificationsProcessingService
++import org.wordpress.android.push.NotificationsProcessingService.ARG_NOTIFICATION_TYPE
+ import org.wordpress.android.ui.ActivityLauncher
+ import org.wordpress.android.ui.RequestCodes
+ import org.wordpress.android.ui.media.MediaBrowserActivity
+ import org.wordpress.android.ui.media.MediaBrowserType
++import org.wordpress.android.ui.notifications.SystemNotificationsTracker
+ import org.wordpress.android.ui.pages.SnackbarMessageHolder
+ import org.wordpress.android.ui.photopicker.PhotoPickerActivity
+ import org.wordpress.android.ui.posts.EditPostActivity.OnPostUpdatedFromUIListener
+@@ -76,6 +80,7 @@ class StoryComposerActivity : ComposeLoopFrameActivity(),
+     @Inject lateinit var editPostRepository: EditPostRepository
+     @Inject lateinit var savePostToDbUseCase: SavePostToDbUseCase
+     @Inject lateinit var dispatcher: Dispatcher
++    @Inject lateinit var systemNotificationsTracker: SystemNotificationsTracker
+ 
+     private var addingMediaToEditorProgressDialog: ProgressDialog? = null
+ 
+@@ -97,6 +102,7 @@ class StoryComposerActivity : ComposeLoopFrameActivity(),
+         setNotificationExtrasLoader(this)
+         setMetadataProvider(this)
+         setStoryDiscardListener(this)
++        setNotificationTrackerProvider((application as WordPress).getStoryNotificationTrackerProvider())
+ 
+         if (savedInstanceState == null) {
+             site = intent.getSerializableExtra(WordPress.SITE) as SiteModel
+@@ -107,6 +113,11 @@ class StoryComposerActivity : ComposeLoopFrameActivity(),
+             } else {
+                 editPostRepository.loadPostByLocalPostId(localPostId)
+             }
++
++            if (intent.hasExtra(ARG_NOTIFICATION_TYPE)) {
++                val notificationType = intent.getSerializableExtra(ARG_NOTIFICATION_TYPE) as NotificationType
++                systemNotificationsTracker.trackTappedNotification(notificationType)
++            }
+         } else {
+             site = savedInstanceState.getSerializable(WordPress.SITE) as SiteModel
+             if (savedInstanceState.containsKey(STATE_KEY_POST_LOCAL_ID)) {
+@@ -296,16 +307,15 @@ class StoryComposerActivity : ComposeLoopFrameActivity(),
+         return authenticationUtils.getAuthHeaders(url)
+     }
+ 
+-    // NotificationIntentLoader
++    // region NotificationIntentLoader
+     override fun loadIntentForErrorNotification(): Intent {
+         val notificationIntent = Intent(applicationContext, StoryComposerActivity::class.java)
+         notificationIntent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+         notificationIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+         notificationIntent.putExtra(WordPress.SITE, site)
+-        // TODO WPSTORIES add TRACKS
+-        // add NotificationType.MEDIA_SAVE_ERROR param later when integrating with WPAndroid
+-//        val notificationType = NotificationType.MEDIA_SAVE_ERROR
+-//        notificationIntent.putExtra(ARG_NOTIFICATION_TYPE, notificationType)
++        // setup tracks NotificationType for Notification tracking. Note this doesn't use our interface.
++        val notificationType = NotificationType.STORY_FRAME_SAVE_ERROR
++        notificationIntent.putExtra(ARG_NOTIFICATION_TYPE, notificationType)
+         return notificationIntent
+     }
+ 
+@@ -321,6 +331,7 @@ class StoryComposerActivity : ComposeLoopFrameActivity(),
+     override fun setupErrorNotificationBaseId(): Int {
+         return BASE_FRAME_MEDIA_ERROR_NOTIFICATION_ID
+     }
++    // endregion
+ 
+     override fun loadMetadataForStory(index: StoryIndex): Bundle? {
+         val bundle = Bundle()
+diff --git a/libs/portkey-android b/libs/portkey-android
+index 982f52463c66..533e670dc679 160000
+--- a/libs/portkey-android
++++ b/libs/portkey-android
+@@ -1 +1 @@
+-Subproject commit 982f52463c663dc506aa28e23fc77cc3eb4de84c
++Subproject commit 533e670dc67953dcdf004ee0410d5a7ef4f62924

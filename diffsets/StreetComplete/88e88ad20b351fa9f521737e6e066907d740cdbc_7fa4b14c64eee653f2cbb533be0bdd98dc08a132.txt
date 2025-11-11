@@ -1,0 +1,561 @@
+diff --git a/app/src/main/java/de/westnordost/streetcomplete/measure/MeasureActivity.kt b/app/src/main/java/de/westnordost/streetcomplete/measure/MeasureActivity.kt
+index 79640945816..2df586f0a00 100644
+--- a/app/src/main/java/de/westnordost/streetcomplete/measure/MeasureActivity.kt
++++ b/app/src/main/java/de/westnordost/streetcomplete/measure/MeasureActivity.kt
+@@ -193,6 +193,7 @@ class MeasureActivity : AppCompatActivity(), Scene.OnUpdateListener {
+ 
+     private fun addArSceneView(session: Session) {
+         val arSceneView = ArSceneView(this)
++        arSceneView.planeRenderer.isEnabled = false
+         binding.arSceneViewContainer.addView(arSceneView, MATCH_PARENT, MATCH_PARENT)
+         arSceneView.setupSession(session)
+         arSceneView.scene.addOnUpdateListener(this)
+@@ -277,7 +278,16 @@ class MeasureActivity : AppCompatActivity(), Scene.OnUpdateListener {
+ 
+     private fun returnMeasuringResult() {
+         val resultIntent = Intent(RESULT_ACTION)
+-        resultIntent.putExtra(RESULT_MEASURE_IN_METERS, distance)
++        when(val displayUnit = displayUnit) {
++            is MeasureDisplayUnitFeetInch -> {
++                val (feet, inches) = displayUnit.getRounded(distance)
++                resultIntent.putExtra(RESULT_MEASURE_FEET, feet)
++                resultIntent.putExtra(RESULT_MEASURE_INCHES, inches)
++            }
++            is MeasureDisplayUnitMeter -> {
++                resultIntent.putExtra(RESULT_MEASURE_METERS, displayUnit.getRounded(distance))
++            }
++        }
+         setResult(RESULT_OK, resultIntent)
+         finish()
+     }
+@@ -376,9 +386,15 @@ class MeasureActivity : AppCompatActivity(), Scene.OnUpdateListener {
+ 
+         /** The action to identify a result */
+         const val RESULT_ACTION = "de.westnordost.streetcomplete.measure.RESULT_ACTION"
+-        /** The exact floating point measure result. It is up to the caller to round and/or convert
+-         *  it according to his preference */
+-        const val RESULT_MEASURE_IN_METERS = "measure_result"
++
++        /** The result as displayed to the user, set if display unit was meters. Float. */
++        const val RESULT_MEASURE_METERS = "measure_result_meters"
++
++        /** The result as displayed to the user, set if display unit was feet+inches. Int. */
++        const val RESULT_MEASURE_FEET = "measure_result_feet"
++
++        /** The result as displayed to the user, set if display unit was feet+inches. Int. */
++        const val RESULT_MEASURE_INCHES = "measure_result_inches"
+ 
+         /** Create the intent for starting this activity, with optional parameters:
+          * @param mode specifies whether to measure distances on the ground, on walls or both
+diff --git a/app/src/main/java/de/westnordost/streetcomplete/measure/MeasureDisplayUnit.kt b/app/src/main/java/de/westnordost/streetcomplete/measure/MeasureDisplayUnit.kt
+index 258da667d32..41351f332ed 100644
+--- a/app/src/main/java/de/westnordost/streetcomplete/measure/MeasureDisplayUnit.kt
++++ b/app/src/main/java/de/westnordost/streetcomplete/measure/MeasureDisplayUnit.kt
+@@ -2,7 +2,6 @@ package de.westnordost.streetcomplete.measure
+ 
+ import kotlinx.serialization.Serializable
+ import kotlin.math.floor
+-import kotlin.math.pow
+ import kotlin.math.round
+ 
+ /** In which unit the measurement is displayed */
+@@ -10,28 +9,34 @@ import kotlin.math.round
+ sealed class MeasureDisplayUnit {
+     abstract fun format(distanceMeters: Float): String
+ }
+-/** Measurement displayed in meters rounded to the given number of [decimals] */
++
++/** Measurement displayed in meters rounded to the nearest [cmStep] */
+ @Serializable
+-data class MeasureDisplayUnitMeter(val decimals: Int) : MeasureDisplayUnit() {
++data class MeasureDisplayUnitMeter(val cmStep: Int) : MeasureDisplayUnit() {
+     init {
+-        require(decimals >= 0)
++        require(cmStep > 0)
+     }
+ 
+     override fun format(distanceMeters: Float): String {
++        val decimals = when {
++            cmStep % 100 == 0 -> 0
++            cmStep % 10 == 0 -> 1
++            else -> 2
++        }
+         return "%.${decimals}f m".format(getRounded(distanceMeters))
+     }
+ 
+     /** Returns the given distance in meters rounded to the given precision */
+-    fun getRounded(distanceMeters: Float): Double {
+-        val num = 10.0.pow(decimals)
+-        return round(distanceMeters * num) / num
++    fun getRounded(distanceMeters: Float): Float {
++        return round(distanceMeters * 100 / cmStep) * cmStep / 100
+     }
+ }
+-/** Measurement displayed in feet+inch, inches rounded to nearest [inchStep]. Must be 1,2,3,4,6 or 12 */
++
++/** Measurement displayed in feet+inch, inches rounded to nearest [inchStep]. Must be between 1-12 */
+ @Serializable
+ data class MeasureDisplayUnitFeetInch(val inchStep: Int) : MeasureDisplayUnit() {
+     init {
+-        require(inchStep in arrayOf(1,2,3,4,6,12))
++        require(inchStep in 1..12)
+     }
+ 
+     override fun format(distanceMeters: Float): String {
+diff --git a/app/src/main/java/de/westnordost/streetcomplete/measure/TakeMeasurementLauncher.kt b/app/src/main/java/de/westnordost/streetcomplete/measure/TakeMeasurementLauncher.kt
+index f2d81b17aea..fed96180f36 100644
+--- a/app/src/main/java/de/westnordost/streetcomplete/measure/TakeMeasurementLauncher.kt
++++ b/app/src/main/java/de/westnordost/streetcomplete/measure/TakeMeasurementLauncher.kt
+@@ -4,7 +4,13 @@ import android.app.Activity
+ import android.content.Context
+ import androidx.activity.result.ActivityResultCaller
+ import androidx.activity.result.contract.ActivityResultContracts
+-import de.westnordost.streetcomplete.measure.MeasureActivity.Companion.RESULT_MEASURE_IN_METERS
++import de.westnordost.streetcomplete.measure.MeasureActivity.Companion.RESULT_MEASURE_METERS
++import de.westnordost.streetcomplete.measure.MeasureActivity.Companion.RESULT_MEASURE_FEET
++import de.westnordost.streetcomplete.measure.MeasureActivity.Companion.RESULT_MEASURE_INCHES
++import de.westnordost.streetcomplete.osm.Length
++import de.westnordost.streetcomplete.osm.LengthInFeetAndInches
++import de.westnordost.streetcomplete.osm.LengthInMeters
++import de.westnordost.streetcomplete.osm.LengthUnit
+ import de.westnordost.streetcomplete.util.ActivityForResultLauncher
+ 
+ /** Launches the MeasureActivity and returns its result */
+@@ -12,14 +18,29 @@ class TakeMeasurementLauncher(caller: ActivityResultCaller) {
+ 
+     private val activityForResultLauncher = ActivityForResultLauncher(caller, ActivityResultContracts.StartActivityForResult())
+ 
+-    /** Returns null or the exact measurement in meters */
++    /** Returns the measured Length or null, displayed at and rounded to a precision of 10cm / 4in */
+     suspend operator fun invoke(
+         context: Context,
+-        mode: MeasureActivity.MeasureMode? = null,
+-        unit: MeasureDisplayUnit? = null
+-    ): Float? {
++        lengthUnit: LengthUnit,
++        mode: MeasureActivity.MeasureMode? = null
++    ): Length? {
++        val unit = when (lengthUnit) {
++            LengthUnit.METER -> MeasureDisplayUnitMeter(10)
++            LengthUnit.FOOT_AND_INCH -> MeasureDisplayUnitFeetInch(4)
++        }
+         val result = activityForResultLauncher(MeasureActivity.createIntent(context, mode, unit, true))
+         if (result.resultCode != Activity.RESULT_OK) return null
+-        return result.data?.getFloatExtra(RESULT_MEASURE_IN_METERS, -1f)?.takeIf { it != -1f }
++
++        val meters = result.data?.getFloatExtra(RESULT_MEASURE_METERS, -1f)?.takeIf { it != -1f }
++        if (meters != null) {
++            return LengthInMeters(meters.toDouble())
++        }
++
++        val feet = result.data?.getIntExtra(RESULT_MEASURE_FEET, -1)?.takeIf { it != -1 }
++        val inches = result.data?.getIntExtra(RESULT_MEASURE_INCHES, -1)?.takeIf { it != -1 }
++        if (feet != null && inches != null) {
++            return LengthInFeetAndInches(feet, inches)
++        }
++        return null
+     }
+ }
+diff --git a/app/src/main/java/de/westnordost/streetcomplete/osm/Length.kt b/app/src/main/java/de/westnordost/streetcomplete/osm/Length.kt
+index 1835ba6f26c..3edef27ea52 100644
+--- a/app/src/main/java/de/westnordost/streetcomplete/osm/Length.kt
++++ b/app/src/main/java/de/westnordost/streetcomplete/osm/Length.kt
+@@ -13,10 +13,12 @@ sealed interface Length {
+     fun toMeters(): Double
+     fun toOsmValue(): String
+ }
+-data class LengthInMeters(val meters: Double) : Length{
++
++data class LengthInMeters(val meters: Double) : Length {
+     override fun toMeters() = meters
+     override fun toOsmValue() = meters.toShortString()
+ }
++
+ data class LengthInFeetAndInches(val feet: Int, val inches: Int) : Length {
+     override fun toMeters() = (feet * 12 + inches) * 0.0254
+     override fun toOsmValue() = "$feet'$inches\""
+diff --git a/app/src/main/java/de/westnordost/streetcomplete/quests/cycleway_width/AddCyclewayWidth.kt b/app/src/main/java/de/westnordost/streetcomplete/quests/cycleway_width/AddCyclewayWidth.kt
+index 57a5c8e96fe..62930cded36 100644
+--- a/app/src/main/java/de/westnordost/streetcomplete/quests/cycleway_width/AddCyclewayWidth.kt
++++ b/app/src/main/java/de/westnordost/streetcomplete/quests/cycleway_width/AddCyclewayWidth.kt
+@@ -32,7 +32,7 @@ class AddCyclewayWidth(
+ 
+     override fun getTitle(tags: Map<String, String>) : Int = R.string.quest_cycleway_width_title
+ 
+-    override fun createForm() = AddLengthForm()
++    override fun createForm() = AddWidthForm()
+ 
+     override fun applyAnswerTo(answer: Length, tags: Tags, timestampEdited: Long) {
+         val isExclusive = tags["highway"] == "cycleway" && tags["foot"] != "yes" && tags["foot"] != "designated"
+diff --git a/app/src/main/java/de/westnordost/streetcomplete/quests/cycleway_width/AddLengthForm.kt b/app/src/main/java/de/westnordost/streetcomplete/quests/cycleway_width/AddLengthForm.kt
+deleted file mode 100644
+index a446cc01536..00000000000
+--- a/app/src/main/java/de/westnordost/streetcomplete/quests/cycleway_width/AddLengthForm.kt
++++ /dev/null
+@@ -1,85 +0,0 @@
+-package de.westnordost.streetcomplete.quests.cycleway_width
+-
+-import android.content.Context
+-import android.os.Bundle
+-import android.view.View
+-import androidx.core.view.isGone
+-import androidx.lifecycle.lifecycleScope
+-import de.westnordost.streetcomplete.R
+-import de.westnordost.streetcomplete.databinding.QuestLengthBinding
+-import de.westnordost.streetcomplete.ktx.viewLifecycleScope
+-import de.westnordost.streetcomplete.measure.MeasureActivity
+-import de.westnordost.streetcomplete.measure.MeasureDisplayUnitFeetInch
+-import de.westnordost.streetcomplete.measure.MeasureDisplayUnitMeter
+-import de.westnordost.streetcomplete.measure.TakeMeasurementLauncher
+-import de.westnordost.streetcomplete.measure.isArSupported
+-import de.westnordost.streetcomplete.osm.Length
+-import de.westnordost.streetcomplete.osm.LengthInFeetAndInches
+-import de.westnordost.streetcomplete.osm.LengthInMeters
+-import de.westnordost.streetcomplete.osm.LengthUnit
+-import de.westnordost.streetcomplete.osm.toLengthUnit
+-import de.westnordost.streetcomplete.quests.AbstractQuestFormAnswerFragment
+-import kotlinx.coroutines.launch
+-
+-class AddLengthForm : AbstractQuestFormAnswerFragment<Length>() {
+-
+-    override val contentLayoutResId = R.layout.quest_length
+-    private val binding by contentViewBinding(QuestLengthBinding::bind)
+-    private val takeMeasurement = TakeMeasurementLauncher(this)
+-
+-    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+-        super.onViewCreated(view, savedInstanceState)
+-
+-        binding.lengthInput.selectableUnits = countryInfo.lengthUnits.map { it.toLengthUnit() }
+-        binding.measureButton.setOnClickListener { lifecycleScope.launch { takeMeasurement() } }
+-
+-        viewLifecycleScope.launch {
+-            binding.measureButton.isGone = !isArSupported(requireContext())
+-        }
+-    }
+-
+-    private suspend fun takeMeasurement() {
+-        val lengthUnit = binding.lengthInput.unit ?: return
+-        val length = takeMeasurement(requireContext(), lengthUnit, MeasureActivity.MeasureMode.HORIZONTAL) ?: return
+-
+-        when (length) {
+-            is LengthInFeetAndInches -> {
+-                binding.lengthInput.feet = length.feet
+-                binding.lengthInput.inches = length.inches
+-            }
+-            is LengthInMeters -> {
+-                binding.lengthInput.meters = length.meters
+-            }
+-        }
+-    }
+-
+-    override fun onClickOk() {
+-        applyAnswer(binding.lengthInput.length!!)
+-    }
+-
+-    override fun isFormComplete(): Boolean =
+-        binding.lengthInput.length != null
+-}
+-
+-suspend operator fun TakeMeasurementLauncher.invoke(
+-    context: Context,
+-    lengthUnit: LengthUnit,
+-    mode: MeasureActivity.MeasureMode? = null,
+-): Length? {
+-    val displayUnit = when (lengthUnit) {
+-        LengthUnit.METER -> MeasureDisplayUnitMeter(1)
+-        LengthUnit.FOOT_AND_INCH -> MeasureDisplayUnitFeetInch(4)
+-    }
+-
+-    val meters = invoke(context, mode, displayUnit) ?: return null
+-
+-    return when (displayUnit) {
+-        is MeasureDisplayUnitFeetInch -> {
+-            val (feet, inches) = displayUnit.getRounded(meters)
+-            LengthInFeetAndInches(feet, inches)
+-        }
+-        is MeasureDisplayUnitMeter -> {
+-            LengthInMeters(displayUnit.getRounded(meters))
+-        }
+-    }
+-}
+diff --git a/app/src/main/java/de/westnordost/streetcomplete/quests/cycleway_width/AddWidthForm.kt b/app/src/main/java/de/westnordost/streetcomplete/quests/cycleway_width/AddWidthForm.kt
+new file mode 100644
+index 00000000000..2cd2a0e1b55
+--- /dev/null
++++ b/app/src/main/java/de/westnordost/streetcomplete/quests/cycleway_width/AddWidthForm.kt
+@@ -0,0 +1,46 @@
++package de.westnordost.streetcomplete.quests.cycleway_width
++
++import android.os.Bundle
++import android.view.View
++import androidx.core.view.isGone
++import androidx.lifecycle.lifecycleScope
++import de.westnordost.streetcomplete.R
++import de.westnordost.streetcomplete.databinding.QuestWidthBinding
++import de.westnordost.streetcomplete.measure.ArSupportChecker
++import de.westnordost.streetcomplete.measure.MeasureActivity
++import de.westnordost.streetcomplete.measure.TakeMeasurementLauncher
++import de.westnordost.streetcomplete.osm.Length
++import de.westnordost.streetcomplete.osm.toLengthUnit
++import de.westnordost.streetcomplete.quests.AbstractQuestFormAnswerFragment
++import kotlinx.coroutines.launch
++import org.koin.android.ext.android.inject
++
++class AddWidthForm : AbstractQuestFormAnswerFragment<Length>() {
++
++    override val contentLayoutResId = R.layout.quest_width
++    private val binding by contentViewBinding(QuestWidthBinding::bind)
++    private val takeMeasurement = TakeMeasurementLauncher(this)
++    private val checkArSupport: ArSupportChecker by inject()
++
++    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
++        super.onViewCreated(view, savedInstanceState)
++
++        binding.lengthInput.selectableUnits = countryInfo.lengthUnits.map { it.toLengthUnit() }
++        binding.lengthInput.onInputChanged = { checkIsFormComplete() }
++        binding.measureButton.isGone = !checkArSupport()
++        binding.measureButton.setOnClickListener { lifecycleScope.launch { takeMeasurement() } }
++    }
++
++    private suspend fun takeMeasurement() {
++        val lengthUnit = binding.lengthInput.unit ?: return
++        val length = takeMeasurement(requireContext(), lengthUnit, MeasureActivity.MeasureMode.HORIZONTAL) ?: return
++        binding.lengthInput.length = length
++    }
++
++    override fun onClickOk() {
++        applyAnswer(binding.lengthInput.length!!)
++    }
++
++    override fun isFormComplete(): Boolean =
++        binding.lengthInput.length != null
++}
+diff --git a/app/src/main/java/de/westnordost/streetcomplete/quests/max_speed/AddMaxSpeedForm.kt b/app/src/main/java/de/westnordost/streetcomplete/quests/max_speed/AddMaxSpeedForm.kt
+index 6c3bbfbd389..393ba01d55f 100644
+--- a/app/src/main/java/de/westnordost/streetcomplete/quests/max_speed/AddMaxSpeedForm.kt
++++ b/app/src/main/java/de/westnordost/streetcomplete/quests/max_speed/AddMaxSpeedForm.kt
+@@ -17,8 +17,8 @@ import de.westnordost.streetcomplete.R
+ import de.westnordost.streetcomplete.databinding.QuestMaxspeedBinding
+ import de.westnordost.streetcomplete.databinding.QuestMaxspeedNoSignNoSlowZoneConfirmationBinding
+ import de.westnordost.streetcomplete.ktx.advisorySpeedLimitSignLayoutResId
++import de.westnordost.streetcomplete.ktx.intOrNull
+ import de.westnordost.streetcomplete.ktx.livingStreetSignDrawableResId
+-import de.westnordost.streetcomplete.ktx.numberOrNull
+ import de.westnordost.streetcomplete.ktx.showKeyboard
+ import de.westnordost.streetcomplete.quests.AbstractQuestFormAnswerFragment
+ import de.westnordost.streetcomplete.quests.AnswerItem
+@@ -203,7 +203,7 @@ class AddMaxSpeedForm : AbstractQuestFormAnswerFragment<MaxSpeedAnswer>() {
+     }
+ 
+     private fun getSpeedFromInput(): Speed? {
+-        val value = speedInput?.numberOrNull?.toInt() ?: return null
++        val value = speedInput?.intOrNull ?: return null
+         val unit = speedUnitSelect?.selectedItem as SpeedMeasurementUnit? ?: speedUnits.first()
+         return when (unit) {
+             KILOMETERS_PER_HOUR -> Kmh(value)
+diff --git a/app/src/main/java/de/westnordost/streetcomplete/view/LengthInput.kt b/app/src/main/java/de/westnordost/streetcomplete/view/LengthInput.kt
+index 4c8865fc3a0..a20377d5021 100644
+--- a/app/src/main/java/de/westnordost/streetcomplete/view/LengthInput.kt
++++ b/app/src/main/java/de/westnordost/streetcomplete/view/LengthInput.kt
+@@ -29,18 +29,6 @@ class LengthInput @JvmOverloads constructor(
+ 
+     var onInputChanged: (() -> Unit)? = null
+ 
+-    var feet: Int?
+-        get() = binding.feetInput.intOrNull
+-        set(value) { binding.feetInput.setText(value?.toString()) }
+-
+-    var inches: Int?
+-        get() = binding.inchesInput.intOrNull
+-        set(value) { binding.inchesInput.setText(value?.toString()) }
+-
+-    var meters: Double?
+-        get() = binding.metersInput.numberOrNull
+-        set(value) { binding.metersInput.setText(value?.toString()) }
+-
+     init {
+         binding.unitSelect.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+@@ -83,18 +71,31 @@ class LengthInput @JvmOverloads constructor(
+             }
+         }
+ 
+-    /** return the input length of the selected unit or null if input is not complete or invalid */
+-    val length: Length? get() = when (unit) {
+-        LengthUnit.METER -> {
+-            meters?.let { LengthInMeters(it) }
++    /** get/set the input length of the selected unit or null if input is not complete or invalid */
++    var length: Length?
++        get() = when (unit) {
++            LengthUnit.METER -> {
++                binding.metersInput.numberOrNull?.let { LengthInMeters(it) }
++            }
++            LengthUnit.FOOT_AND_INCH -> {
++                val feet = binding.feetInput.intOrNull
++                val inches = binding.inchesInput.intOrNull
++                if (feet != null && inches != null) LengthInFeetAndInches(feet, inches) else null
++            }
++            null -> null
+         }
+-        LengthUnit.FOOT_AND_INCH -> {
+-            val feet = feet
+-            val inches = inches
+-            if (feet != null && inches != null) LengthInFeetAndInches(feet, inches) else null
++        set(value) {
++            when(value) {
++                is LengthInFeetAndInches -> {
++                    binding.feetInput.setText(value.feet.toString())
++                    binding.inchesInput.setText(value.inches.toString())
++                }
++                is LengthInMeters -> {
++                    binding.metersInput.setText(value.meters.toString())
++                }
++                null -> {}
++            }
+         }
+-        null -> null
+-    }
+ 
+     private fun updateInputFieldsVisibility() {
+         binding.feetInchesContainer.isInvisible = unit != LengthUnit.FOOT_AND_INCH
+diff --git a/app/src/main/res/layout/quest_length.xml b/app/src/main/res/layout/quest_width.xml
+similarity index 56%
+rename from app/src/main/res/layout/quest_length.xml
+rename to app/src/main/res/layout/quest_width.xml
+index e3d12777626..67b4bd9075b 100644
+--- a/app/src/main/res/layout/quest_length.xml
++++ b/app/src/main/res/layout/quest_width.xml
+@@ -1,26 +1,33 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<LinearLayout
++<RelativeLayout
+     xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:app="http://schemas.android.com/apk/res-auto"
+     android:layout_width="match_parent"
+     android:layout_height="wrap_content"
+-    xmlns:tools="http://schemas.android.com/tools"
+-    android:orientation="vertical"
+-    android:gravity="center">
++    xmlns:tools="http://schemas.android.com/tools">
+ 
+     <de.westnordost.streetcomplete.view.LengthInput
+         android:id="@+id/lengthInput"
+         android:layout_width="wrap_content"
+-        android:layout_height="wrap_content"/>
++        android:layout_height="wrap_content"
++        android:layout_centerInParent="true"/>
+ 
+     <Button
+         android:id="@+id/measureButton"
+-        android:layout_width="wrap_content"
+-        android:layout_height="wrap_content"
++        android:layout_width="52dp"
++        android:layout_height="52dp"
+         android:visibility="gone"
+         tools:visibility="visible"
++        android:insetTop="0dp"
++        android:insetBottom="0dp"
++        android:insetLeft="0dp"
++        android:insetRight="0dp"
++        app:iconPadding="0dp"
++        app:iconGravity="textStart"
+         app:icon="@drawable/ic_camera_measure_24dp"
+         style="@style/Widget.MaterialComponents.Button.UnelevatedButton"
+-        android:text="@string/ar_measure"/>
++        android:contentDescription="@string/ar_measure"
++        android:layout_alignParentRight="true"
++        />
+ 
+-</LinearLayout>
++</RelativeLayout>
+diff --git a/app/src/main/res/layout/view_length_input.xml b/app/src/main/res/layout/view_length_input.xml
+index 188e5dc07f2..bc6781e2873 100644
+--- a/app/src/main/res/layout/view_length_input.xml
++++ b/app/src/main/res/layout/view_length_input.xml
+@@ -17,7 +17,7 @@
+ 
+             <LinearLayout
+                 android:id="@+id/feetInchesContainer"
+-                android:visibility="invisible"
++                android:visibility="visible"
+                 android:layout_width="wrap_content"
+                 android:layout_height="wrap_content"
+                 android:orientation="horizontal"
+@@ -29,9 +29,10 @@
+                     android:id="@+id/feetInput"
+                     android:layout_width="wrap_content"
+                     android:layout_height="wrap_content"
+-                    android:ems="2"
++                    android:minEms="1"
+                     android:textAlignment="textEnd"
+                     android:inputType="number"
++                    android:imeOptions="actionNext"
+                     tools:ignore="HardcodedText" />
+ 
+                 <TextView
+@@ -46,8 +47,9 @@
+                     android:layout_width="wrap_content"
+                     android:layout_height="wrap_content"
+                     android:textAlignment="textEnd"
+-                    android:ems="2"
++                    android:minEms="1"
+                     android:inputType="number"
++                    android:imeOptions="actionDone"
+                     tools:ignore="HardcodedText" />
+ 
+                 <TextView
+@@ -61,7 +63,8 @@
+ 
+             <LinearLayout
+                 android:id="@+id/metersContainer"
+-                android:visibility="visible"
++                tools:visibility="invisible"
++                android:visibility="invisible"
+                 android:layout_width="wrap_content"
+                 android:layout_height="wrap_content"
+                 android:orientation="horizontal"
+@@ -72,10 +75,11 @@
+                     android:id="@+id/metersInput"
+                     android:layout_width="wrap_content"
+                     android:layout_height="wrap_content"
+-                    android:ems="3"
++                    android:minEms="2"
+                     android:textAlignment="textEnd"
+                     android:inputType="numberDecimal"
+-                    tools:text="0.86"
++                    android:imeOptions="actionDone"
++                    tools:text="0.8"
+                     tools:ignore="HardcodedText" />
+ 
+             </LinearLayout>
+@@ -85,7 +89,8 @@
+         <Spinner
+             android:id="@+id/unitSelect"
+             android:layout_width="wrap_content"
+-            android:layout_height="wrap_content" />
++            android:layout_height="wrap_content"
++            android:background="?android:attr/selectableItemBackground"/>
+ 
+     </LinearLayout>
+ 
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index aa36611d6c6..c044c914876 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1204,7 +1204,7 @@ Alternatively, you can leave a note (with a photo)."</string>
+     <string name="quest_airConditioning_name_type_title">"Does %1$s (%2$s) have air conditioning?"</string>
+ 
+     <string name="no_camera_permission_warning_title">Camera permission</string>
+-    <string name="no_camera_permission_warning">The permission is necessary to be able to measure distances with augmented reality.</string>
++    <string name="no_camera_permission_warning">The permission is necessary to be able to measure distances with the camera.</string>
+     <string name="ar_measure">Measure</string>
+     <string name="ar_core_error_sdk_too_old">This app is too old, try updating.</string>
+     <string name="ar_core_tracking_error_bad_state">Something went wrong. Try restarting the measuring.</string>
+@@ -1212,6 +1212,7 @@ Alternatively, you can leave a note (with a photo)."</string>
+     <string name="ar_core_tracking_error_excessive_motion">Too much movement</string>
+     <string name="ar_core_tracking_error_insufficient_features">Insufficient visual features here</string>
+     <string name="ar_core_tracking_error_camera_unavailable">Camera is used by another app</string>
++    <string name="default_disabled_msg_no_ar">You need a measure tape to solve this quest because measuring with the camera is not supported on this device.</string>
+ 
+     <string name="quest_cycleway_width_title">"What’s the width of this cycleway here?"</string>
+ 

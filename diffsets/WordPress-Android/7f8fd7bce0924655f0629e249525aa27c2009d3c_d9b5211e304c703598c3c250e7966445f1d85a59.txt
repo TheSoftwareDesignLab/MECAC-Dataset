@@ -1,0 +1,655 @@
+diff --git a/WordPress/src/main/java/org/wordpress/android/modules/AppComponent.java b/WordPress/src/main/java/org/wordpress/android/modules/AppComponent.java
+index b142c290e764..a1c5e2cd542f 100644
+--- a/WordPress/src/main/java/org/wordpress/android/modules/AppComponent.java
++++ b/WordPress/src/main/java/org/wordpress/android/modules/AppComponent.java
+@@ -94,6 +94,7 @@
+ import org.wordpress.android.ui.posts.PostSettingsTagsActivity;
+ import org.wordpress.android.ui.posts.PostsListActivity;
+ import org.wordpress.android.ui.posts.SelectCategoriesActivity;
++import org.wordpress.android.ui.posts.adapters.AuthorSelectionAdapter;
+ import org.wordpress.android.ui.prefs.AccountSettingsFragment;
+ import org.wordpress.android.ui.prefs.AppSettingsFragment;
+ import org.wordpress.android.ui.prefs.BlogPreferencesActivity;
+@@ -358,6 +359,8 @@ public interface AppComponent extends AndroidInjector<WordPress> {
+ 
+     void inject(PostsListActivity object);
+ 
++    void inject(AuthorSelectionAdapter object);
++
+     void inject(PostListFragment object);
+ 
+     void inject(HistoryListFragment object);
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/posts/PostListFragment.kt b/WordPress/src/main/java/org/wordpress/android/ui/posts/PostListFragment.kt
+index 2a6389a50a41..528246366c45 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/posts/PostListFragment.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/posts/PostListFragment.kt
+@@ -45,6 +45,7 @@ import org.wordpress.android.viewmodel.posts.PostListViewModel.PostListEmptyUiSt
+ import org.wordpress.android.widgets.RecyclerItemDecoration
+ import javax.inject.Inject
+ 
++private const val EXTRA_POST_LIST_ONLY_USER = "post_list_only_user"
+ private const val EXTRA_POST_LIST_TYPE = "post_list_type"
+ 
+ class PostListFragment : Fragment() {
+@@ -109,10 +110,11 @@ class PostListFragment : Fragment() {
+     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+         super.onViewCreated(view, savedInstanceState)
+ 
++        val onlyUser = requireNotNull(arguments).getBoolean(EXTRA_POST_LIST_ONLY_USER)
+         val postListType = requireNotNull(arguments).getSerializable(EXTRA_POST_LIST_TYPE) as PostListType
+         viewModel = ViewModelProviders.of(this, viewModelFactory)
+                 .get<PostListViewModel>(PostListViewModel::class.java)
+-        viewModel.start(site, postListType)
++        viewModel.start(site, onlyUser, postListType)
+         viewModel.pagedListData.observe(this, Observer {
+             it?.let { pagedListData -> updatePagedListData(pagedListData) }
+         })
+@@ -249,8 +251,10 @@ class PostListFragment : Fragment() {
+     fun handleEditPostResult(resultCode: Int, data: Intent?) {
+         if (resultCode == Activity.RESULT_OK) {
+             if (data != null && EditPostActivity.checkToRestart(data)) {
+-                ActivityLauncher.editPostOrPageForResult(data, nonNullActivity, site,
+-                        data.getIntExtra(EditPostActivity.EXTRA_POST_LOCAL_ID, 0))
++                ActivityLauncher.editPostOrPageForResult(
++                        data, nonNullActivity, site,
++                        data.getIntExtra(EditPostActivity.EXTRA_POST_LOCAL_ID, 0)
++                )
+ 
+                 // a restart will happen so, no need to continue here
+                 return
+@@ -320,10 +324,11 @@ class PostListFragment : Fragment() {
+         const val TAG = "post_list_fragment_tag"
+ 
+         @JvmStatic
+-        fun newInstance(site: SiteModel, postListType: PostListType): PostListFragment {
++        fun newInstance(site: SiteModel, onlyUser: Boolean, postListType: PostListType): PostListFragment {
+             val fragment = PostListFragment()
+             val bundle = Bundle()
+             bundle.putSerializable(WordPress.SITE, site)
++            bundle.putSerializable(EXTRA_POST_LIST_ONLY_USER, onlyUser)
+             bundle.putSerializable(EXTRA_POST_LIST_TYPE, postListType)
+             fragment.arguments = bundle
+             return fragment
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/posts/PostListMainViewModel.kt b/WordPress/src/main/java/org/wordpress/android/ui/posts/PostListMainViewModel.kt
+index 02c367cc7d97..4ee5ceb91e8b 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/posts/PostListMainViewModel.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/posts/PostListMainViewModel.kt
+@@ -12,6 +12,7 @@ import kotlinx.coroutines.withContext
+ import org.wordpress.android.R.string
+ import org.wordpress.android.fluxc.model.SiteModel
+ import org.wordpress.android.fluxc.model.post.PostStatus
++import org.wordpress.android.fluxc.store.AccountStore
+ import org.wordpress.android.fluxc.store.PostStore
+ import org.wordpress.android.modules.BG_THREAD
+ import org.wordpress.android.modules.UI_THREAD
+@@ -31,6 +32,7 @@ val POST_LIST_PAGES = listOf(PUBLISHED, DRAFTS, SCHEDULED, TRASHED)
+ 
+ class PostListMainViewModel @Inject constructor(
+     private val postStore: PostStore,
++    private val accountStore: AccountStore,
+     @Named(UI_THREAD) private val mainDispatcher: CoroutineDispatcher,
+     @Named(BG_THREAD) private val bgDispatcher: CoroutineDispatcher
+ ) : ViewModel(), CoroutineScope {
+@@ -46,6 +48,12 @@ class PostListMainViewModel @Inject constructor(
+     private val _isFabVisible = MutableLiveData<Boolean>()
+     val isFabVisible: LiveData<Boolean> = _isFabVisible
+ 
++    private val _avatarUrl = MutableLiveData<String>()
++    val avatarUrl: LiveData<String> = _avatarUrl
++
++    private val _filterOnlyUser = MutableLiveData<Boolean>()
++    val filterOnlyUser: LiveData<Boolean> = _filterOnlyUser
++
+     private val _selectTab = SingleLiveEvent<Int>()
+     val selectTab = _selectTab as LiveData<Int>
+ 
+@@ -57,6 +65,7 @@ class PostListMainViewModel @Inject constructor(
+ 
+     fun start(site: SiteModel) {
+         this.site = site
++        _avatarUrl.value = accountStore?.account?.avatarUrl ?: ""
+     }
+ 
+     override fun onCleared() {
+@@ -68,6 +77,10 @@ class PostListMainViewModel @Inject constructor(
+         _postListAction.postValue(PostListAction.NewPost(site))
+     }
+ 
++    fun onAuthorSelectionChanged(onlyUser: Boolean) {
++        _filterOnlyUser.value = onlyUser
++    }
++
+     fun onTabChanged(position: Int) {
+         val currentPage = POST_LIST_PAGES[position]
+         _isFabVisible.value = FAB_VISIBLE_POST_LIST_PAGES.contains(currentPage)
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/posts/PostsListActivity.kt b/WordPress/src/main/java/org/wordpress/android/ui/posts/PostsListActivity.kt
+index e543ff27c36d..eb0e5545233a 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/posts/PostsListActivity.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/posts/PostsListActivity.kt
+@@ -12,8 +12,11 @@ import android.support.design.widget.TabLayout
+ import android.support.v4.view.ViewPager
+ import android.support.v4.view.ViewPager.OnPageChangeListener
+ import android.support.v7.app.AppCompatActivity
++import android.support.v7.widget.AppCompatSpinner
+ import android.support.v7.widget.Toolbar
+ import android.view.MenuItem
++import android.view.View
++import android.widget.AdapterView
+ import kotlinx.android.synthetic.main.pages_fragment.*
+ import org.wordpress.android.R
+ import org.wordpress.android.WordPress
+@@ -24,6 +27,7 @@ import org.wordpress.android.ui.RequestCodes
+ import org.wordpress.android.ui.posts.BasicFragmentDialog.BasicDialogNegativeClickInterface
+ import org.wordpress.android.ui.posts.BasicFragmentDialog.BasicDialogOnDismissByOutsideTouchInterface
+ import org.wordpress.android.ui.posts.BasicFragmentDialog.BasicDialogPositiveClickInterface
++import org.wordpress.android.ui.posts.adapters.AuthorSelectionAdapter
+ import org.wordpress.android.ui.utils.UiHelpers
+ import org.wordpress.android.util.AppLog
+ import org.wordpress.android.util.CrashlyticsUtils
+@@ -43,6 +47,9 @@ class PostsListActivity : AppCompatActivity(),
+     private lateinit var site: SiteModel
+     private lateinit var viewModel: PostListMainViewModel
+ 
++    private lateinit var authorSelectionAdapter: AuthorSelectionAdapter
++    private lateinit var authorSelection: AppCompatSpinner
++
+     private lateinit var postsPagerAdapter: PostsPagerAdapter
+     private lateinit var pager: ViewPager
+     private lateinit var fab: FloatingActionButton
+@@ -101,6 +108,22 @@ class PostsListActivity : AppCompatActivity(),
+     }
+ 
+     private fun setupContent() {
++        authorSelection = findViewById(R.id.post_list_author_selection)
++        authorSelectionAdapter = AuthorSelectionAdapter(this)
++        authorSelection.adapter = authorSelectionAdapter
++        authorSelection.setSelection(1) // Defaulting to Everyone
++
++        authorSelection.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
++            override fun onNothingSelected(parent: AdapterView<*>) {
++                authorSelectionAdapter.selectedPosition = -1
++            }
++
++            override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
++                authorSelectionAdapter.selectedPosition = position
++                viewModel.onAuthorSelectionChanged(position == 0)
++            }
++        }
++
+         pager = findViewById(R.id.postPager)
+         postsPagerAdapter = PostsPagerAdapter(
+                 POST_LIST_PAGES, site,
+@@ -144,6 +167,23 @@ class PostsListActivity : AppCompatActivity(),
+                 }
+             }
+         })
++
++        viewModel.avatarUrl.observe(this, Observer { avatarUrl ->
++            authorSelectionAdapter.avatarUrl = avatarUrl
++        })
++
++        viewModel.filterOnlyUser.observe(this, Observer { onlyUser ->
++            onlyUser?.let {
++                val position = when (onlyUser) {
++                    true -> 0
++                    false -> 1
++                }
++
++                authorSelection.setSelection(position)
++                postsPagerAdapter.onlyUser = onlyUser
++            }
++        })
++
+         viewModel.selectTab.observe(this, Observer { tabIndex ->
+             tabIndex?.let {
+                 tabLayout.getTabAt(tabIndex)?.select()
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/posts/PostsPagerAdapter.kt b/WordPress/src/main/java/org/wordpress/android/ui/posts/PostsPagerAdapter.kt
+index 44271a920c06..18356aa8442a 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/posts/PostsPagerAdapter.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/posts/PostsPagerAdapter.kt
+@@ -1,7 +1,8 @@
+ package org.wordpress.android.ui.posts
+ 
++import android.support.v4.app.Fragment
+ import android.support.v4.app.FragmentManager
+-import android.support.v4.app.FragmentPagerAdapter
++import android.support.v4.app.FragmentStatePagerAdapter
+ import android.view.ViewGroup
+ import org.wordpress.android.WordPress
+ import org.wordpress.android.fluxc.model.SiteModel
+@@ -11,13 +12,37 @@ class PostsPagerAdapter(
+     private val pages: List<PostListType>,
+     private val site: SiteModel,
+     val fm: FragmentManager
+-) : FragmentPagerAdapter(fm) {
++) : FragmentStatePagerAdapter(fm) {
+     private val listFragments = mutableMapOf<Int, WeakReference<PostListFragment>>()
+ 
++    var onlyUser: Boolean = false
++        set(value) {
++            val didChange = field != value
++            field = value
++
++            if (didChange) {
++                notifyDataSetChanged()
++            }
++        }
++
+     override fun getCount(): Int = pages.size
+ 
++    override fun getItemPosition(item: Any): Int {
++        if (item is Fragment) {
++            listFragments.forEach { set ->
++                if (set.value.get() == item) {
++                    return set.key
++                }
++            }
++
++            return POSITION_NONE
++        } else {
++            return POSITION_UNCHANGED
++        }
++    }
++
+     override fun getItem(position: Int): PostListFragment =
+-            PostListFragment.newInstance(site, pages[position])
++            PostListFragment.newInstance(site, onlyUser, pages[position])
+ 
+     override fun instantiateItem(container: ViewGroup, position: Int): Any {
+         val fragment = super.instantiateItem(container, position) as PostListFragment
+@@ -31,4 +56,10 @@ class PostsPagerAdapter(
+     fun getItemAtPosition(position: Int): PostListFragment? {
+         return listFragments[position]?.get()
+     }
++
++    override fun notifyDataSetChanged() {
++        listFragments.clear()
++
++        super.notifyDataSetChanged()
++    }
+ }
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/posts/adapters/AuthorSelectionAdapter.kt b/WordPress/src/main/java/org/wordpress/android/ui/posts/adapters/AuthorSelectionAdapter.kt
+new file mode 100644
+index 000000000000..b991a795167e
+--- /dev/null
++++ b/WordPress/src/main/java/org/wordpress/android/ui/posts/adapters/AuthorSelectionAdapter.kt
+@@ -0,0 +1,209 @@
++package org.wordpress.android.ui.posts.adapters
++
++import android.content.Context
++import android.database.DataSetObserver
++import android.support.annotation.ColorRes
++import android.support.annotation.DrawableRes
++import android.support.v4.content.ContextCompat
++import android.support.v7.widget.AppCompatImageView
++import android.support.v7.widget.AppCompatTextView
++import android.view.LayoutInflater
++import android.view.View
++import android.view.ViewGroup
++import android.widget.SpinnerAdapter
++import androidx.annotation.StringRes
++import org.wordpress.android.R
++import org.wordpress.android.WordPress
++import org.wordpress.android.util.DisplayUtils
++import org.wordpress.android.util.GravatarUtils
++import org.wordpress.android.util.image.ImageManager
++import org.wordpress.android.util.image.ImageType.AVATAR_WITH_BACKGROUND
++import java.lang.ref.WeakReference
++import javax.inject.Inject
++
++class AuthorSelectionAdapter(context: Context) : SpinnerAdapter {
++    @Inject lateinit var imageManager: ImageManager
++
++    private var observers: MutableList<WeakReference<DataSetObserver>> = mutableListOf()
++
++    var avatarUrl: String? = null
++        set(value) {
++            field = value
++            notifyDataSetChanged()
++        }
++
++    var selectedPosition: Int = 0
++
++    init {
++        (context.applicationContext as WordPress).component().inject(this)
++    }
++
++    override fun getCount(): Int = 2
++
++    override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
++        var view: View? = convertView
++        val holder: DropdownViewHolder
++
++        if (view == null) {
++            val inflater = LayoutInflater.from(parent.context)
++            view = inflater.inflate(R.layout.post_list_author_selection_dropdown, parent, false)
++            holder = DropdownViewHolder(view)
++            view.tag = holder
++        } else {
++            holder = view.tag as DropdownViewHolder
++        }
++
++        @StringRes val textRes: Int = getItem(position)
++        val isSelected = position == selectedPosition
++
++        when (position) {
++            0 -> {
++                val avatarUrl = avatarUrl
++
++                if (avatarUrl != null) {
++                    holder.bind(avatarUrl, textRes, isSelected, imageManager)
++                } else {
++                    holder.bind(R.drawable.ic_user_grey_darken_20_24dp, textRes, isSelected, imageManager)
++                }
++            }
++
++            else -> holder.bind(R.drawable.ic_multiple_users_grey_darken_20_24dp, textRes, isSelected, imageManager)
++        }
++
++        return view!!
++    }
++
++    @StringRes override fun getItem(position: Int): Int = when (position) {
++        0 -> ME
++        else -> EVERYONE
++    }
++
++    override fun getItemId(position: Int): Long {
++        return when (position) {
++            0 -> ME
++            else -> EVERYONE
++        }.toLong()
++    }
++
++    override fun getItemViewType(position: Int): Int = 0
++
++    override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
++        var view: View? = convertView
++        val holder: NormalViewHolder
++
++        if (view == null) {
++            val inflater = LayoutInflater.from(parent.context)
++            view = inflater.inflate(R.layout.post_list_author_selection, parent, false)
++            holder = NormalViewHolder(view)
++            view.tag = holder
++        } else {
++            holder = view.tag as NormalViewHolder
++        }
++
++        when (position) {
++            0 -> {
++                val avatarUrl = avatarUrl
++
++                if (avatarUrl != null) {
++                    holder.bind(avatarUrl, imageManager)
++                } else {
++                    holder.bind(R.drawable.ic_user_grey_darken_20_24dp, imageManager)
++                }
++            }
++
++            else -> holder.bind(R.drawable.ic_multiple_users_grey_darken_20_24dp, imageManager)
++        }
++
++        return view!!
++    }
++
++    override fun getViewTypeCount(): Int = 1
++    override fun hasStableIds(): Boolean = true
++    override fun isEmpty(): Boolean = false
++
++    fun notifyDataSetChanged() {
++        for (observer in observers) {
++            observer.get()?.onChanged()
++        }
++    }
++
++    override fun registerDataSetObserver(observer: DataSetObserver) {
++        for (alreadyAdded in observers) {
++            if (observer == alreadyAdded.get()) {
++                // No need to add since it is already added
++                return
++            }
++        }
++
++        observers.add(WeakReference(observer))
++    }
++
++    override fun unregisterDataSetObserver(observer: DataSetObserver) {
++        for ((index, currentRef) in observers.withIndex()) {
++            if (observer == currentRef.get()) {
++                observers.removeAt(index)
++                return
++            }
++        }
++    }
++
++    companion object {
++        private const val ME = R.string.post_list_author_me
++        private const val EVERYONE = R.string.post_list_author_everyone
++    }
++
++    class DropdownViewHolder(private val itemView: View) {
++        private val image: AppCompatImageView = itemView.findViewById(R.id.post_list_author_selection_image)
++        private val text: AppCompatTextView = itemView.findViewById(R.id.post_list_author_selection_text)
++
++        private fun bind(@StringRes textRes: Int, isSelected: Boolean) {
++            text.setText(textRes)
++
++            @ColorRes val backgroundColorRes: Int = when (isSelected) {
++                true -> R.color.grey_lighten_30_translucent_50
++                false -> R.color.transparent
++            }
++            itemView.setBackgroundColor(ContextCompat.getColor(itemView.context, backgroundColorRes))
++        }
++
++        fun bind(avatarUrl: String, @StringRes textRes: Int, isSelected: Boolean, imageManager: ImageManager) {
++            bind(textRes, isSelected)
++
++            val avatarSize = image.resources.getDimensionPixelSize(R.dimen.avatar_sz_small)
++            val url = GravatarUtils.fixGravatarUrl(avatarUrl, avatarSize)
++            imageManager.loadIntoCircle(image, AVATAR_WITH_BACKGROUND, url)
++
++            val padding = DisplayUtils.dpToPx(image.context, 8)
++            image.setPaddingRelative(padding, padding, padding, padding)
++        }
++
++        fun bind(@DrawableRes imageRes: Int, @StringRes textRes: Int, isSelected: Boolean, imageManager: ImageManager) {
++            bind(textRes, isSelected)
++
++            imageManager.load(image, imageRes)
++
++            val padding = DisplayUtils.dpToPx(image.context, 12)
++            image.setPaddingRelative(padding, padding, padding, padding)
++        }
++    }
++
++    class NormalViewHolder(itemView: View) {
++        private val image: AppCompatImageView = itemView.findViewById(R.id.post_list_author_selection_image)
++
++        fun bind(avatarUrl: String, imageManager: ImageManager) {
++            val avatarSize = image.resources.getDimensionPixelSize(R.dimen.avatar_sz_small)
++            val url = GravatarUtils.fixGravatarUrl(avatarUrl, avatarSize)
++            imageManager.loadIntoCircle(image, AVATAR_WITH_BACKGROUND, url)
++
++            val padding = DisplayUtils.dpToPx(image.context, 8)
++            image.setPaddingRelative(padding, padding, padding, padding)
++        }
++
++        fun bind(@DrawableRes imageRes: Int, imageManager: ImageManager) {
++            imageManager.load(image, imageRes)
++
++            val padding = DisplayUtils.dpToPx(image.context, 12)
++            image.setPaddingRelative(padding, padding, padding, padding)
++        }
++    }
++}
+diff --git a/WordPress/src/main/java/org/wordpress/android/viewmodel/posts/PostListViewModel.kt b/WordPress/src/main/java/org/wordpress/android/viewmodel/posts/PostListViewModel.kt
+index 6315c6462c91..17136ca41745 100644
+--- a/WordPress/src/main/java/org/wordpress/android/viewmodel/posts/PostListViewModel.kt
++++ b/WordPress/src/main/java/org/wordpress/android/viewmodel/posts/PostListViewModel.kt
+@@ -283,7 +283,7 @@ class PostListViewModel @Inject constructor(
+         lifecycleRegistry.markState(Lifecycle.State.CREATED)
+     }
+ 
+-    fun start(site: SiteModel, postListType: PostListType) {
++    fun start(site: SiteModel, onlyUser: Boolean, postListType: PostListType) {
+         if (isStarted) {
+             return
+         }
+diff --git a/WordPress/src/main/res/drawable/ic_multiple_users_grey_darken_20_24dp.xml b/WordPress/src/main/res/drawable/ic_multiple_users_grey_darken_20_24dp.xml
+new file mode 100644
+index 000000000000..8f6885ce7676
+--- /dev/null
++++ b/WordPress/src/main/res/drawable/ic_multiple_users_grey_darken_20_24dp.xml
+@@ -0,0 +1,3 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportHeight="24.0" android:viewportWidth="24.0">
++    <path android:fillColor="@color/grey_darken_20" android:pathData="M24 14.6c0 0.6-1.2 1-2.6 1.2-0.9-1.7-2.7-3-4.8-3.9 0.2-0.3 0.4-0.5 0.6-0.8H18c3.1-0.1 6 1.8 6 3.5zM6.8 11H6c-3.1 0-6 1.9-6 3.6 0 0.6 1.2 1 2.6 1.2 0.9-1.7 2.7-3 4.8-3.9L6.8 11zm5.2 1c2.2 0 4-1.8 4-4s-1.8-4-4-4-4 1.8-4 4 1.8 4 4 4zm0 1c-4.1 0-8 2.6-8 5 0 2 8 2 8 2s8 0 8-2c0-2.4-3.9-5-8-5zm5.7-3H18c1.7 0 3-1.3 3-3s-1.3-3-3-3c-0.5 0-0.9 0.1-1.3 0.3 0.8 1 1.3 2.3 1.3 3.7 0 0.7-0.1 1.4-0.3 2zM6 10h0.3C6.1 9.4 6 8.7 6 8c0-1.4 0.5-2.7 1.3-3.7C6.9 4.1 6.5 4 6 4 4.3 4 3 5.3 3 7s1.3 3 3 3z"/>
++</vector>
+diff --git a/WordPress/src/main/res/drawable/ic_user_grey_darken_20_24dp.xml b/WordPress/src/main/res/drawable/ic_user_grey_darken_20_24dp.xml
+new file mode 100644
+index 000000000000..5207e16a3ac9
+--- /dev/null
++++ b/WordPress/src/main/res/drawable/ic_user_grey_darken_20_24dp.xml
+@@ -0,0 +1,3 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportHeight="24.0" android:viewportWidth="24.0">
++    <path android:fillColor="@color/grey_darken_20" android:pathData="M12 4c2.2 0 4 1.8 4 4s-1.8 4-4 4-4-1.8-4-4 1.8-4 4-4zm0 16s8 0 8-2c0-2.4-3.9-5-8-5s-8 2.6-8 5c0 2 8 2 8 2z"/>
++</vector>
+diff --git a/WordPress/src/main/res/drawable/post_list_author_background.xml b/WordPress/src/main/res/drawable/post_list_author_background.xml
+new file mode 100644
+index 000000000000..19cbd019e7ff
+--- /dev/null
++++ b/WordPress/src/main/res/drawable/post_list_author_background.xml
+@@ -0,0 +1,12 @@
++<?xml version="1.0" encoding="utf-8"?>
++<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
++    <item
++        android:bottom="8dp"
++        android:left="8dp"
++        android:right="8dp"
++        android:top="8dp">
++        <shape android:shape="oval">
++            <solid android:color="@color/white"/>
++        </shape>
++    </item>
++</layer-list>
+diff --git a/WordPress/src/main/res/layout/post_list_activity.xml b/WordPress/src/main/res/layout/post_list_activity.xml
+index b657f5da0934..612f14e0667f 100644
+--- a/WordPress/src/main/res/layout/post_list_activity.xml
++++ b/WordPress/src/main/res/layout/post_list_activity.xml
+@@ -23,19 +23,33 @@
+             app:theme="@style/ThemeOverlay.AppCompat.Dark.ActionBar">
+         </android.support.v7.widget.Toolbar>
+ 
+-        <android.support.design.widget.TabLayout
+-            android:id="@+id/tabLayout"
++        <LinearLayout
+             android:layout_width="match_parent"
+-            android:layout_height="@dimen/tab_height"
+-            android:layout_gravity="start"
+-            android:background="@color/color_primary"
+-            app:tabContentStart="@dimen/toolbar_content_offset"
+-            app:tabGravity="fill"
+-            app:tabIndicatorColor="@color/white"
+-            app:tabMode="scrollable"
+-            app:tabSelectedTextColor="@color/white"
+-            app:tabTextColor="@color/white"
+-            app:theme="@style/Base.Widget.Design.TabLayout"/>
++            android:layout_height="wrap_content"
++            android:orientation="horizontal">
++
++            <android.support.v7.widget.AppCompatSpinner
++                android:id="@+id/post_list_author_selection"
++                style="@style/Widget.AppCompat.Button.Borderless"
++                android:layout_width="48dp"
++                android:layout_height="match_parent"
++                android:layout_marginEnd="8dp"
++                android:layout_marginStart="8dp"
++                android:padding="0dp"/>
++
++            <android.support.design.widget.TabLayout
++                android:id="@+id/tabLayout"
++                android:layout_width="match_parent"
++                android:layout_height="@dimen/tab_height"
++                android:layout_gravity="start"
++                android:background="@color/color_primary"
++                app:tabGravity="fill"
++                app:tabIndicatorColor="@color/white"
++                app:tabMode="scrollable"
++                app:tabSelectedTextColor="@color/white"
++                app:tabTextColor="@color/white"
++                app:theme="@style/Base.Widget.Design.TabLayout"/>
++        </LinearLayout>
+ 
+     </android.support.design.widget.AppBarLayout>
+ 
+diff --git a/WordPress/src/main/res/layout/post_list_author_selection.xml b/WordPress/src/main/res/layout/post_list_author_selection.xml
+new file mode 100644
+index 000000000000..a3aa2342ef63
+--- /dev/null
++++ b/WordPress/src/main/res/layout/post_list_author_selection.xml
+@@ -0,0 +1,16 @@
++<?xml version="1.0" encoding="utf-8"?>
++<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
++             xmlns:tools="http://schemas.android.com/tools"
++             android:layout_width="match_parent"
++             android:layout_height="match_parent">
++    <!-- FrameLayout required since we want to store a view holder it it's tag but Glide uses the tag on the ImageView -->
++
++    <android.support.v7.widget.AppCompatImageView
++        android:id="@+id/post_list_author_selection_image"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent"
++        android:background="@drawable/post_list_author_background"
++        android:padding="12dp"
++        tools:src="@drawable/ic_multiple_users_white_24dp"/>
++</FrameLayout>
++
+diff --git a/WordPress/src/main/res/layout/post_list_author_selection_dropdown.xml b/WordPress/src/main/res/layout/post_list_author_selection_dropdown.xml
+new file mode 100644
+index 000000000000..a2e20386666f
+--- /dev/null
++++ b/WordPress/src/main/res/layout/post_list_author_selection_dropdown.xml
+@@ -0,0 +1,30 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++              xmlns:tools="http://schemas.android.com/tools"
++              android:layout_width="match_parent"
++              android:layout_height="wrap_content"
++              android:foreground="?attr/selectableItemBackground"
++              android:gravity="center"
++              android:orientation="horizontal"
++              android:padding="4dp"
++              tools:ignore="UnusedAttribute">
++    <!-- UnusedAttribute is ignored since foreground was added in API 23, however the impact of the missing foreground
++         on lower APIs will be minimal -->
++
++    <android.support.v7.widget.AppCompatImageView
++        android:id="@+id/post_list_author_selection_image"
++        android:layout_width="48dp"
++        android:layout_height="48dp"
++        android:importantForAccessibility="no"
++        android:padding="12dp"
++        tools:src="@drawable/ic_multiple_users_grey_darken_20_24dp"/>
++
++    <android.support.v7.widget.AppCompatTextView
++        android:id="@+id/post_list_author_selection_text"
++        android:layout_width="0dp"
++        android:layout_height="wrap_content"
++        android:layout_weight="1"
++        android:textAppearance="@style/TextAppearance.AppCompat.Body1"
++        android:textColor="@color/text"
++        tools:text="@string/post_list_author_everyone"/>
++</LinearLayout>
+diff --git a/WordPress/src/main/res/values/strings.xml b/WordPress/src/main/res/values/strings.xml
+index b4d93286e8aa..b6a71397edcd 100644
+--- a/WordPress/src/main/res/values/strings.xml
++++ b/WordPress/src/main/res/values/strings.xml
+@@ -2470,6 +2470,8 @@
+ 
+ 
+     <!-- Posts -->
++    <string name="post_list_author_me">Me</string>
++    <string name="post_list_author_everyone">Everyone</string>
+     <string name="post_list_published">Published</string>
+     <string name="post_list_drafts">Drafts</string>
+     <string name="post_list_scheduled">Scheduled</string>

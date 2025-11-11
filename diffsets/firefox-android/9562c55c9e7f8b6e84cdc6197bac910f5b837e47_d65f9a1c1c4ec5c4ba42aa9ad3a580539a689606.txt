@@ -1,0 +1,215 @@
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/SentryWrapper.kt b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/SentryWrapper.kt
+index 4ccf550a7cbf..214570cc910a 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/SentryWrapper.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/SentryWrapper.kt
+@@ -18,7 +18,6 @@ import org.mozilla.focus.BuildConfig
+  * value with true (upload is disabled by default in dev builds).
+  */
+ object SentryWrapper {
+-
+     private const val TAG_BUILD_FLAVOR: String = "build_flavor"
+     private const val TAG_BUILD_TYPE: String = "build_type"
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
+index 05f1a7ca6b3f..4f977c6e96c9 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
+@@ -23,6 +23,7 @@ import org.mozilla.focus.R
+ import org.mozilla.focus.ext.components
+ import org.mozilla.focus.search.CustomSearchEngineStore
+ import org.mozilla.focus.utils.AppConstants
++import org.mozilla.focus.utils.MobileMetricsPingStorage
+ import org.mozilla.focus.utils.Settings
+ import org.mozilla.focus.utils.UrlUtils
+ import org.mozilla.focus.utils.activeExperimentNames
+@@ -265,6 +266,21 @@ object TelemetryWrapper {
+             TelemetryHolder.set(Telemetry(configuration, storage, client, scheduler)
+                     .addPingBuilder(TelemetryCorePingBuilder(configuration))
+                     .addPingBuilder(TelemetryEventPingBuilder(configuration))
++                    .also {
++                        if (!dayPassedSinceLastUpload(context)) return@also
++
++                        runBlocking {
++                            val mobileMetrics = MobileMetricsPingStorage(context).load() ?: JSONObject()
++                            it.addPingBuilder(TelemetryMobileMetricsPingBuilder(mobileMetrics,
++                                    configuration))
++                        }
++
++                        // Record new edited date
++                        PreferenceManager.getDefaultSharedPreferences(context)
++                                .edit()
++                                .putLong(LAST_MOBILE_METRICS_PINGS, (dateFormat.format(Date()).toLong()))
++                                .apply()
++                    }
+                     .setDefaultSearchProvider(createDefaultSearchProvider(context)))
+ 
+             TelemetryWrapper.recordActiveExperiments(context)
+@@ -327,19 +343,6 @@ object TelemetryWrapper {
+         histogram[histogramLoadIndex]++
+     }
+ 
+-    @JvmStatic
+-    fun addMobileMetricsPing(mobileMetrics: JSONObject) {
+-        val telemetry = TelemetryHolder.get()
+-        telemetry.addPingBuilder(TelemetryMobileMetricsPingBuilder(mobileMetrics,
+-                telemetry.configuration))
+-        telemetry.queuePing(TelemetryMobileMetricsPingBuilder.TYPE)
+-        // Record new edited date
+-        PreferenceManager.getDefaultSharedPreferences(telemetry.configuration.context)
+-                .edit()
+-                .putLong(LAST_MOBILE_METRICS_PINGS, (dateFormat.format(Date()).toLong()))
+-                .apply()
+-    }
+-
+     @JvmStatic
+     fun stopSession() {
+         TelemetryHolder.get().recordSessionEnd()
+@@ -373,6 +376,7 @@ object TelemetryWrapper {
+         TelemetryHolder.get()
+                 .queuePing(TelemetryCorePingBuilder.TYPE)
+                 .queuePing(TelemetryEventPingBuilder.TYPE)
++                .queuePing(TelemetryMobileMetricsPingBuilder.TYPE)
+                 .scheduleUpload()
+     }
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/utils/FileUtils.kt b/focus-android/app/src/main/java/org/mozilla/focus/utils/FileUtils.kt
+index 3c8972478e54..c5a850cf8726 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/utils/FileUtils.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/utils/FileUtils.kt
+@@ -24,7 +24,8 @@ class FileUtils {
+         fun truncateCacheDirectory(context: Context) = deleteContent(context.cacheDir, doNotEraseWhitelist = setOf(
+                 // If the folder or its contents are deleted, WebView will stop using the disk cache entirely.
+                 WEBVIEW_CACHE_DIR,
+-                SENTRY_CACHE_DIR
++                SENTRY_CACHE_DIR,
++                MobileMetricsPingStorage.STORAGE_FOLDER
+         ))
+ 
+         @JvmStatic
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/utils/MobileMetricsPingStorage.kt b/focus-android/app/src/main/java/org/mozilla/focus/utils/MobileMetricsPingStorage.kt
+index 37393714378c..c739437b461e 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/utils/MobileMetricsPingStorage.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/utils/MobileMetricsPingStorage.kt
+@@ -1,2 +1,52 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
+ package org.mozilla.focus.utils
+ 
++import android.content.Context
++import android.util.AtomicFile
++import org.json.JSONException
++import org.json.JSONObject
++import java.io.File
++import java.io.FileNotFoundException
++import java.io.IOException
++
++class MobileMetricsPingStorage(
++        private val context: Context,
++        file: File = File("${context.cacheDir}/$STORAGE_FOLDER/$FILE_NAME")
++) {
++    private val atomicFile = AtomicFile(file)
++
++    suspend fun save(json: JSONObject) {
++        val stream = atomicFile.startWrite()
++        try {
++            stream.writer().use {
++                it.append(json.toString())
++            }
++
++            atomicFile.finishWrite(stream)
++        } catch (e: IOException) {
++            atomicFile.failWrite(stream)
++        }
++    }
++
++    suspend fun load(): JSONObject? {
++        return try {
++            JSONObject(String(atomicFile.readFully()))
++        } catch (e: FileNotFoundException) {
++            null
++        } catch (e: JSONException) {
++            null
++        }
++    }
++
++    fun remove() {
++        atomicFile.delete()
++    }
++
++    companion object {
++        val STORAGE_FOLDER = "mobile-metrics"
++        val FILE_NAME = "metrics.json"
++    }
++}
+\ No newline at end of file
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/web/GeckoWebViewProvider.kt b/focus-android/app/src/main/java/org/mozilla/focus/web/GeckoWebViewProvider.kt
+index 979e1e4323f5..64f05ba8f885 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/web/GeckoWebViewProvider.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/web/GeckoWebViewProvider.kt
+@@ -18,8 +18,10 @@ import android.util.AttributeSet
+ import android.util.Log
+ import android.view.View
+ import android.webkit.WebSettings
++import kotlinx.coroutines.experimental.launch
+ import mozilla.components.browser.session.Session
+ import org.json.JSONException
++import org.mozilla.focus.IO
+ import org.mozilla.focus.R
+ import org.mozilla.focus.browser.LocalizedContent
+ import org.mozilla.focus.ext.savedWebViewState
+@@ -29,6 +31,7 @@ import org.mozilla.focus.telemetry.SentryWrapper
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.utils.AppConstants
+ import org.mozilla.focus.utils.IntentUtils
++import org.mozilla.focus.utils.MobileMetricsPingStorage
+ import org.mozilla.focus.utils.Settings
+ import org.mozilla.focus.utils.UrlUtils
+ import org.mozilla.focus.webview.SystemWebView
+@@ -176,9 +179,7 @@ class GeckoWebViewProvider : IWebViewProvider {
+         }
+ 
+         override fun onResume() {
+-            if (TelemetryWrapper.dayPassedSinceLastUpload(context)) {
+-                sendTelemetrySnapshots()
+-            }
++            storeTelemetrySnapshots()
+         }
+ 
+         override fun stopLoading() {
+@@ -635,16 +636,18 @@ class GeckoWebViewProvider : IWebViewProvider {
+             currentUrl = historyURL
+         }
+ 
+-        private fun sendTelemetrySnapshots() {
++        private fun storeTelemetrySnapshots() {
+             geckoRuntime!!.telemetry.getSnapshots(true).then({ value ->
+-                if (value != null) {
++                launch(IO) {
+                     try {
+-                        val jsonData = value.toJSONObject()
+-                        TelemetryWrapper.addMobileMetricsPing(jsonData)
++                        value?.toJSONObject()?.also {
++                            MobileMetricsPingStorage(context).save(it)
++                        }
+                     } catch (e: JSONException) {
+                         Log.e("getSnapshots failed", e.message)
+                     }
+                 }
++
+                 GeckoResult<Void>()
+             }, { _ ->
+                 GeckoResult<Void>()
+diff --git a/focus-android/app/src/test/java/org/mozilla/focus/utils/MobileMetricsPingStorageTest.kt b/focus-android/app/src/test/java/org/mozilla/focus/utils/MobileMetricsPingStorageTest.kt
+index 1e27e65113d3..e94aac132e12 100644
+--- a/focus-android/app/src/test/java/org/mozilla/focus/utils/MobileMetricsPingStorageTest.kt
++++ b/focus-android/app/src/test/java/org/mozilla/focus/utils/MobileMetricsPingStorageTest.kt
+@@ -1,3 +1,7 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
+ package org.mozilla.focus.utils
+ 
+ class MobileMetricsPingStorageTest {

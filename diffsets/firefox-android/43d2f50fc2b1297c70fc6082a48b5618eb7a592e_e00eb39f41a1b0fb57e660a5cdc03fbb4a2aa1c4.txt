@@ -1,0 +1,923 @@
+diff --git a/android-components/components/browser/toolbar/build.gradle b/android-components/components/browser/toolbar/build.gradle
+index 970bce6f8c67..e6dd1e5658bf 100644
+--- a/android-components/components/browser/toolbar/build.gradle
++++ b/android-components/components/browser/toolbar/build.gradle
+@@ -28,6 +28,13 @@ android {
+ 
+ dependencies {
+     implementation project(':concept-toolbar')
++    implementation project(':support-ktx')
++
++    implementation project(':ui-autocomplete')
++    implementation project(':ui-icons')
++    implementation project(':ui-progress')
++
++    implementation "com.android.support:appcompat-v7:${rootProject.ext.dependencies['supportLibraries']}"
+ 
+     implementation "org.jetbrains.kotlin:kotlin-stdlib:${rootProject.ext.dependencies['kotlin']}"
+ 
+diff --git a/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/BrowserToolbar.kt b/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/BrowserToolbar.kt
+index 1daf148b2a0f..8b26aec1616e 100644
+--- a/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/BrowserToolbar.kt
++++ b/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/BrowserToolbar.kt
+@@ -5,38 +5,145 @@
+ package mozilla.components.browser.toolbar
+ 
+ import android.content.Context
++import android.support.annotation.VisibleForTesting
+ import android.util.AttributeSet
+-import android.view.inputmethod.EditorInfo
+-import android.widget.EditText
+-import android.widget.FrameLayout
++import android.view.View
++import android.view.ViewGroup
++import mozilla.components.browser.toolbar.display.DisplayToolbar
++import mozilla.components.browser.toolbar.edit.EditToolbar
+ import mozilla.components.concept.toolbar.Toolbar
++import mozilla.components.support.ktx.android.view.dp
++import mozilla.components.support.ktx.android.view.forEach
+ 
+ /**
+  * A customizable toolbar for browsers.
++ *
++ * The toolbar can switch between two modes: display and edit. The display mode displays the current
++ * URL and controls for navigation. In edit mode the current URL can be edited. Those two modes are
++ * implemented by the DisplayToolbar and EditToolbar classes.
++ *
++ *           +----------------+
++ *           | BrowserToolbar |
++ *           +--------+-------+
++ *                    +
++ *            +-------+-------+
++ *            |               |
++ *  +---------v------+ +-------v--------+
++ *  | DisplayToolbar | |   EditToolbar  |
++ *  +----------------+ +----------------+
++ *
+  */
+ class BrowserToolbar @JvmOverloads constructor(
+     context: Context,
+     attrs: AttributeSet? = null,
+     defStyleAttr: Int = 0
+-) : FrameLayout(context, attrs, defStyleAttr), Toolbar {
++) : ViewGroup(context, attrs, defStyleAttr), Toolbar {
++
++    // displayToolbar and editToolbar are only visible internally and mutable so that we can mock
++    // them in tests.
++    @VisibleForTesting internal var displayToolbar = DisplayToolbar(context, this)
++    @VisibleForTesting internal var editToolbar = EditToolbar(context, this)
++
++    private var state: State = State.DISPLAY
++    private var url: String = ""
++    private var listener: ((String) -> Unit)? = null
++
++    init {
++        addView(displayToolbar)
++        addView(editToolbar)
++
++        updateState(State.DISPLAY)
++    }
++
++    // We layout the toolbar ourselves to avoid the overhead from using complex ViewGroup implementations
++    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
++        forEach { child ->
++            child.layout(left, top, right, bottom)
++        }
++    }
++
++    // We measure the views manually to avoid overhead by using complex ViewGroup implementations
++    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
++        // Our toolbar will always use the full width and a fixed height
++        val width = MeasureSpec.getSize(widthMeasureSpec)
++        val height = dp(TOOLBAR_HEIGHT_DP)
++
++        setMeasuredDimension(width, height)
++
++        // Let the children measure themselves using our fixed size
++        val childWidthSpec = MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY)
++        val childHeightSpec = MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY)
++
++        forEach { child -> child.measure(childWidthSpec, childHeightSpec) }
++    }
++
++    override fun onBackPressed(): Boolean {
++        if (state == State.EDIT) {
++            displayMode()
++            return true
++        }
++        return false
++    }
+ 
+     override fun displayUrl(url: String) {
+-        val urlView = getUrlViewComponent()
+-        urlView.setText(url)
+-        urlView.setSelection(0, url.length)
++        // We update the display toolbar immediately. We do not do that for the edit toolbar to not
++        // mess with what the user is entering. Instead we will remember the value and update the
++        // edit toolbar whenever we switch to it.
++        displayToolbar.updateUrl(url)
++
++        this.url = url
++    }
++
++    override fun displayProgress(progress: Int) {
++        displayToolbar.updateProgress(progress)
+     }
+ 
+     override fun setOnUrlChangeListener(listener: (String) -> Unit) {
+-        val urlView = getUrlViewComponent()
+-        urlView.setOnEditorActionListener { _, actionId, _ ->
+-            if (actionId == EditorInfo.IME_ACTION_GO) {
+-                listener.invoke(urlView.text.toString())
+-            }
+-            true
++        this.listener = listener
++    }
++
++    /**
++     * Switches to URL editing mode.
++     */
++    fun editMode() {
++        editToolbar.updateUrl(url)
++
++        updateState(State.EDIT)
++
++        editToolbar.focus()
++    }
++
++    /**
++     * Switches to URL displaying mode.
++     */
++    fun displayMode() {
++        updateState(State.DISPLAY)
++    }
++
++    internal fun onUrlEntered(url: String) {
++        displayMode()
++
++        listener?.invoke(url)
++    }
++
++    private fun updateState(state: State) {
++        this.state = state
++
++        val (show, hide) = when (state) {
++            State.DISPLAY -> Pair(displayToolbar, editToolbar)
++            State.EDIT -> Pair(editToolbar, displayToolbar)
+         }
++
++        show.visibility = View.VISIBLE
++        hide.visibility = View.GONE
++    }
++
++    private enum class State {
++        DISPLAY,
++        EDIT
+     }
+ 
+-    internal fun getUrlViewComponent(): EditText {
+-        return this.findViewById(R.id.urlView)
++    companion object {
++        private const val TOOLBAR_HEIGHT_DP = 56
+     }
+ }
+diff --git a/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/display/DisplayToolbar.kt b/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/display/DisplayToolbar.kt
+new file mode 100644
+index 000000000000..63fd6071437f
+--- /dev/null
++++ b/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/display/DisplayToolbar.kt
+@@ -0,0 +1,117 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package mozilla.components.browser.toolbar.display
++
++import android.annotation.SuppressLint
++import android.content.Context
++import android.view.Gravity
++import android.view.View
++import android.view.ViewGroup
++import android.widget.ImageView
++import android.widget.TextView
++import mozilla.components.browser.toolbar.BrowserToolbar
++import mozilla.components.support.ktx.android.view.dp
++import mozilla.components.ui.progress.AnimatedProgressBar
++
++/**
++ * Sub-component of the browser toolbar responsible for displaying the URL and related controls.
++ *
++ * Structure:
++ * +------+-----+--------------------+---------+------+
++ * | icon | nav |         url        | actions | menu |
++ * +------+-----+--------------------+---------+------+
++ *
++ * - icon: Security indicator, usually a lock or globe icon.
++ * - nav: Optional navigation buttons (back/forward) to be displayed on large devices like tablets
++ * - url: The URL of the currently displayed website (read-only). Clicking this element will switch
++ *        to editing mode.
++ * - actions: Optional (page) action icons injected by other components (e.g. reader mode).
++ * - menu: three dot menu button that opens the browser menu.
++ */
++@SuppressLint("ViewConstructor") // This view is only instantiated in code
++internal class DisplayToolbar(
++    context: Context,
++    val toolbar: BrowserToolbar
++) : ViewGroup(context) {
++    private val iconView = ImageView(context).apply {
++        val padding = dp(ICON_PADDING_DP)
++        setPadding(padding, padding, padding, padding)
++
++        setImageResource(mozilla.components.ui.icons.R.drawable.mozac_ic_globe)
++    }
++
++    private val urlView = TextView(context).apply {
++        gravity = Gravity.CENTER_VERTICAL
++        textSize = URL_TEXT_SIZE
++        setFadingEdgeLength(URL_FADING_EDGE_SIZE_DP)
++        isHorizontalFadingEdgeEnabled = true
++
++        setSingleLine(true)
++
++        setOnClickListener {
++            toolbar.editMode()
++        }
++    }
++
++    private val progressView = AnimatedProgressBar(context)
++
++    init {
++        addView(iconView)
++        addView(urlView)
++        addView(progressView)
++    }
++
++    /**
++     * Updates the URL to be displayed.
++     */
++    fun updateUrl(url: String) {
++        urlView.text = url
++    }
++
++    /**
++     * Updates the progress to be displayed.
++     */
++    fun updateProgress(progress: Int) {
++        progressView.progress = progress
++
++        progressView.visibility = if (progress < progressView.max) View.VISIBLE else View.GONE
++    }
++
++    // We measure the views manually to avoid overhead by using complex ViewGroup implementations
++    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
++        // This toolbar is using the full size provided by the parent
++        val width = MeasureSpec.getSize(widthMeasureSpec)
++        val height = MeasureSpec.getSize(heightMeasureSpec)
++
++        setMeasuredDimension(width, height)
++
++        // The icon fills the whole height and has a square shape
++        val iconSquareSpec = MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY)
++        iconView.measure(iconSquareSpec, iconSquareSpec)
++
++        // The url uses whatever space is left
++        val urlWidthSpec = MeasureSpec.makeMeasureSpec(width - height, MeasureSpec.EXACTLY)
++        urlView.measure(urlWidthSpec, heightMeasureSpec)
++
++        val progressHeightSpec = MeasureSpec.makeMeasureSpec(dp(PROGRESS_BAR_HEIGHT_DP), MeasureSpec.EXACTLY)
++        progressView.measure(widthMeasureSpec, progressHeightSpec)
++    }
++
++    // We layout the toolbar ourselves to avoid the overhead from using complex ViewGroup implementations
++    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
++        iconView.layout(left, top, left + iconView.measuredWidth, bottom)
++
++        urlView.layout(left + iconView.measuredWidth, top, right, bottom)
++
++        progressView.layout(left, bottom - progressView.measuredHeight, right, bottom)
++    }
++
++    companion object {
++        private const val ICON_PADDING_DP = 16
++        private const val URL_TEXT_SIZE = 15f
++        private const val URL_FADING_EDGE_SIZE_DP = 24
++        private const val PROGRESS_BAR_HEIGHT_DP = 3
++    }
++}
+diff --git a/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/edit/EditToolbar.kt b/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/edit/EditToolbar.kt
+new file mode 100644
+index 000000000000..3ad38e5242a1
+--- /dev/null
++++ b/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/edit/EditToolbar.kt
+@@ -0,0 +1,109 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package mozilla.components.browser.toolbar.edit
++
++import android.annotation.SuppressLint
++import android.content.Context
++import android.text.InputType
++import android.view.Gravity
++import android.view.ViewGroup
++import android.view.inputmethod.EditorInfo
++import android.widget.ImageView
++import mozilla.components.browser.toolbar.BrowserToolbar
++import mozilla.components.support.ktx.android.view.dp
++import mozilla.components.support.ktx.android.view.showKeyboard
++import mozilla.components.ui.autocomplete.InlineAutocompleteEditText
++
++/**
++ * Sub-component of the browser toolbar responsible for allowing the user to edit the URL.
++ *
++ * Structure:
++ * +---------------------------------+---------+------+
++ * |                 url             | actions | exit |
++ * +---------------------------------+---------+------+
++ *
++ * - url: Editable URL of the currently displayed website
++ * - actions: Optional action icons injected by other components (e.g. barcode scanner)
++ * - exit: Button that switches back to display mode.
++ */
++@SuppressLint("ViewConstructor") // This view is only instantiated in code
++class EditToolbar(
++    context: Context,
++    private val toolbar: BrowserToolbar
++) : ViewGroup(context) {
++    private val urlView = InlineAutocompleteEditText(context).apply {
++        imeOptions = EditorInfo.IME_ACTION_GO or EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
++        gravity = Gravity.CENTER_VERTICAL
++        background = null
++        setLines(1)
++        textSize = URL_TEXT_SIZE
++        inputType = InputType.TYPE_TEXT_VARIATION_URI
++
++        val padding = dp(URL_PADDING_DP)
++        setPadding(padding, padding, padding, padding)
++        setSelectAllOnFocus(true)
++
++        setOnCommitListener { toolbar.onUrlEntered(text.toString()) }
++    }
++
++    private val cancelView = ImageView(context).apply {
++        val padding = dp(CANCEL_PADDING_DP)
++        setPadding(padding, padding, padding, padding)
++        setImageResource(mozilla.components.ui.icons.R.drawable.mozac_ic_close)
++
++        setOnClickListener {
++            toolbar.displayMode()
++        }
++    }
++
++    init {
++        addView(urlView)
++        addView(cancelView)
++    }
++
++    /**
++     * Updates the URL. This should only be called if the toolbar is not in editing mode. Otherwise
++     * this might override the URL the user is currently typing.
++     */
++    fun updateUrl(url: String) {
++        urlView.setText(url)
++    }
++
++    /**
++     * Focus the URL editing component and show the virtual keyboard if needed.
++     */
++    fun focus() {
++        urlView.showKeyboard()
++    }
++
++    // We measure the views manually to avoid overhead by using complex ViewGroup implementations
++    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
++        // This toolbar is using the full size provided by the parent
++        val width = MeasureSpec.getSize(widthMeasureSpec)
++        val height = MeasureSpec.getSize(heightMeasureSpec)
++
++        setMeasuredDimension(width, height)
++
++        // The icon fills the whole height and has a square shape
++        val iconSquareSpec = MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY)
++        cancelView.measure(iconSquareSpec, iconSquareSpec)
++
++        val urlWidthSpec = MeasureSpec.makeMeasureSpec(width - height, MeasureSpec.EXACTLY)
++        urlView.measure(urlWidthSpec, heightMeasureSpec)
++    }
++
++    // We layout the toolbar ourselves to avoid the overhead from using complex ViewGroup implementations
++    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
++        cancelView.layout(right - cancelView.measuredWidth, top, right, bottom)
++
++        urlView.layout(left, top, right - cancelView.measuredWidth, bottom)
++    }
++
++    companion object {
++        private const val URL_TEXT_SIZE = 15f
++        private const val URL_PADDING_DP = 8
++        private const val CANCEL_PADDING_DP = 16
++    }
++}
+diff --git a/android-components/components/browser/toolbar/src/main/res/values/ids.xml b/android-components/components/browser/toolbar/src/main/res/values/ids.xml
+deleted file mode 100644
+index 32baccf27c35..000000000000
+--- a/android-components/components/browser/toolbar/src/main/res/values/ids.xml
++++ /dev/null
+@@ -1,7 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!-- This Source Code Form is subject to the terms of the Mozilla Public
+-   - License, v. 2.0. If a copy of the MPL was not distributed with this
+-   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+-<resources>
+-    <item name="urlView" type="id" />
+-</resources>
+diff --git a/android-components/components/browser/toolbar/src/test/java/mozilla/components/browser/toolbar/BrowserToolbarTest.kt b/android-components/components/browser/toolbar/src/test/java/mozilla/components/browser/toolbar/BrowserToolbarTest.kt
+index 133ae5de4a2c..5f27ead5bbb0 100644
+--- a/android-components/components/browser/toolbar/src/test/java/mozilla/components/browser/toolbar/BrowserToolbarTest.kt
++++ b/android-components/components/browser/toolbar/src/test/java/mozilla/components/browser/toolbar/BrowserToolbarTest.kt
+@@ -4,44 +4,215 @@
+ 
+ package mozilla.components.browser.toolbar
+ 
+-import android.view.inputmethod.EditorInfo
+-import android.widget.EditText
++import android.view.View
++import mozilla.components.browser.toolbar.display.DisplayToolbar
++import mozilla.components.browser.toolbar.edit.EditToolbar
+ import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
+ import org.junit.Test
+ import org.junit.runner.RunWith
+-import org.mockito.Mockito.doReturn
+-import org.mockito.Mockito.spy
++import org.mockito.ArgumentMatchers
++import org.mockito.Mockito.mock
++import org.mockito.Mockito.never
+ import org.mockito.Mockito.verify
++import org.mockito.Mockito.verifyNoMoreInteractions
+ import org.robolectric.RobolectricTestRunner
+ import org.robolectric.RuntimeEnvironment
+ 
+ @RunWith(RobolectricTestRunner::class)
+ class BrowserToolbarTest {
++    @Test
++    fun `display toolbar is visible by default`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++        assertTrue(toolbar.displayToolbar.visibility == View.VISIBLE)
++        assertTrue(toolbar.editToolbar.visibility == View.GONE)
++    }
++
++    @Test
++    fun `calling editMode() makes edit toolbar visible`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++        assertTrue(toolbar.displayToolbar.visibility == View.VISIBLE)
++        assertTrue(toolbar.editToolbar.visibility == View.GONE)
++
++        toolbar.editMode()
++
++        assertTrue(toolbar.displayToolbar.visibility == View.GONE)
++        assertTrue(toolbar.editToolbar.visibility == View.VISIBLE)
++    }
++
++    @Test
++    fun `calling displayMode() makes display toolbar visible`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++        toolbar.editMode()
++
++        assertTrue(toolbar.displayToolbar.visibility == View.GONE)
++        assertTrue(toolbar.editToolbar.visibility == View.VISIBLE)
++
++        toolbar.displayMode()
++
++        assertTrue(toolbar.displayToolbar.visibility == View.VISIBLE)
++        assertTrue(toolbar.editToolbar.visibility == View.GONE)
++    }
++
++    @Test
++    fun `back presses will not be handled in display mode`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++        toolbar.displayMode()
++
++        assertFalse(toolbar.onBackPressed())
++
++        assertTrue(toolbar.displayToolbar.visibility == View.VISIBLE)
++        assertTrue(toolbar.editToolbar.visibility == View.GONE)
++    }
++
++    @Test
++    fun `back presses will switch from edit mode to display mode`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++        toolbar.editMode()
++
++        assertTrue(toolbar.displayToolbar.visibility == View.GONE)
++        assertTrue(toolbar.editToolbar.visibility == View.VISIBLE)
++
++        assertTrue(toolbar.onBackPressed())
++
++        assertTrue(toolbar.displayToolbar.visibility == View.VISIBLE)
++        assertTrue(toolbar.editToolbar.visibility == View.GONE)
++    }
++
++    @Test
++    fun `displayUrl will be forwarded to display toolbar immediately`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++        val displayToolbar = mock(DisplayToolbar::class.java)
++        val ediToolbar = mock(EditToolbar::class.java)
++
++        toolbar.displayToolbar = displayToolbar
++        toolbar.editToolbar = ediToolbar
++
++        toolbar.displayUrl("https://www.mozilla.org")
++
++        verify(displayToolbar).updateUrl("https://www.mozilla.org")
++        verify(ediToolbar, never()).updateUrl(ArgumentMatchers.anyString())
++    }
++
++    @Test
++    fun `last URL will be forwarded to edit toolbar when switching mode`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++
++        val ediToolbar = mock(EditToolbar::class.java)
++        toolbar.editToolbar = ediToolbar
++
++        toolbar.displayUrl("https://www.mozilla.org")
++        verify(ediToolbar, never()).updateUrl("https://www.mozilla.org")
++
++        toolbar.editMode()
++
++        verify(ediToolbar).updateUrl("https://www.mozilla.org")
++    }
+ 
+     @Test
+-    fun testDisplayUrl() {
+-        val url = "http://mozilla.org"
+-        val editText = spy(EditText(RuntimeEnvironment.application))
+-        val toolbar = spy(BrowserToolbar(RuntimeEnvironment.application))
+-        doReturn(editText).`when`(toolbar).getUrlViewComponent()
++    fun `displayProgress will be forwarded to display toolbar`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++        val displayToolbar = mock(DisplayToolbar::class.java)
++
++        toolbar.displayToolbar = displayToolbar
+ 
+-        toolbar.displayUrl(url)
++        toolbar.displayProgress(10)
++        toolbar.displayProgress(50)
++        toolbar.displayProgress(75)
++        toolbar.displayProgress(100)
+ 
+-        verify(editText).setText(url)
+-        verify(editText).setSelection(0, url.length)
++        verify(displayToolbar).updateProgress(10)
++        verify(displayToolbar).updateProgress(50)
++        verify(displayToolbar).updateProgress(75)
++        verify(displayToolbar).updateProgress(100)
++
++        verifyNoMoreInteractions(displayToolbar)
+     }
+ 
+     @Test
+-    fun testUrlChangeListener() {
+-        var actualUrl: String? = null
+-        val editText = EditText(RuntimeEnvironment.application)
+-        val toolbar = spy(BrowserToolbar(RuntimeEnvironment.application))
+-        doReturn(editText).`when`(toolbar).getUrlViewComponent()
++    fun `internal onUrlEntered callback will be forwarded to urlChangeListener`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++
++        val mockedListener = object {
++            var called = false
++            var url: String? = null
++
++            fun invoke(url: String) {
++                this.called = true
++                this.url = url
++            }
++        }
++
++        toolbar.setOnUrlChangeListener(mockedListener::invoke)
++        toolbar.onUrlEntered("https://www.mozilla.org")
++
++        assertTrue(mockedListener.called)
++        assertEquals("https://www.mozilla.org", mockedListener.url)
++    }
++
++    @Test
++    fun `toolbar measure will use full width and fixed 56dp height`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++
++        val widthSpec = View.MeasureSpec.makeMeasureSpec(1024, View.MeasureSpec.AT_MOST)
++        val heightSpec = View.MeasureSpec.makeMeasureSpec(800, View.MeasureSpec.AT_MOST)
++
++        toolbar.measure(widthSpec, heightSpec)
++
++        assertEquals(1024, toolbar.measuredWidth)
++        assertEquals(56, toolbar.measuredHeight)
++    }
++
++    @Test
++    fun `display and edit toolbar will use full size of browser toolbar`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++
++        assertEquals(0, toolbar.displayToolbar.measuredWidth)
++        assertEquals(0, toolbar.displayToolbar.measuredHeight)
++        assertEquals(0, toolbar.editToolbar.measuredWidth)
++        assertEquals(0, toolbar.editToolbar.measuredHeight)
++
++        val widthSpec = View.MeasureSpec.makeMeasureSpec(1024, View.MeasureSpec.AT_MOST)
++        val heightSpec = View.MeasureSpec.makeMeasureSpec(800, View.MeasureSpec.AT_MOST)
++
++        toolbar.measure(widthSpec, heightSpec)
++
++        assertEquals(1024, toolbar.displayToolbar.measuredWidth)
++        assertEquals(56, toolbar.displayToolbar.measuredHeight)
++        assertEquals(1024, toolbar.editToolbar.measuredWidth)
++        assertEquals(56, toolbar.editToolbar.measuredHeight)
++    }
++
++    fun `toolbar will switch back to display mode after an URL has been entered`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++        toolbar.editMode()
++
++        assertTrue(toolbar.displayToolbar.visibility == View.GONE)
++        assertTrue(toolbar.editToolbar.visibility == View.VISIBLE)
++
++        toolbar.onUrlEntered("https://www.mozilla.org")
++
++        assertTrue(toolbar.displayToolbar.visibility == View.VISIBLE)
++        assertTrue(toolbar.editToolbar.visibility == View.GONE)
++    }
++
++    @Test
++    fun `display and edit toolbar will be laid out at the exact same position`() {
++        val toolbar = BrowserToolbar(RuntimeEnvironment.application)
++        val displayToolbar = mock(DisplayToolbar::class.java)
++        val ediToolbar = mock(EditToolbar::class.java)
++
++        toolbar.displayToolbar = displayToolbar
++        toolbar.editToolbar = ediToolbar
++
++        toolbar.removeAllViews()
++        toolbar.addView(toolbar.displayToolbar)
++        toolbar.addView(toolbar.editToolbar)
+ 
+-        toolbar.setOnUrlChangeListener { actualUrl = it }
+-        toolbar.getUrlViewComponent().setText("http://mozilla.org")
+-        toolbar.getUrlViewComponent().onEditorAction(EditorInfo.IME_ACTION_GO)
++        toolbar.layout(100, 100, 1100, 300)
+ 
+-        assertEquals("http://mozilla.org", actualUrl)
++        verify(displayToolbar).layout(100, 100, 1100, 300)
++        verify(ediToolbar).layout(100, 100, 1100, 300)
+     }
+ }
+diff --git a/android-components/components/browser/toolbar/src/test/java/mozilla/components/browser/toolbar/display/DisplayToolbarTest.kt b/android-components/components/browser/toolbar/src/test/java/mozilla/components/browser/toolbar/display/DisplayToolbarTest.kt
+new file mode 100644
+index 000000000000..7197402108cc
+--- /dev/null
++++ b/android-components/components/browser/toolbar/src/test/java/mozilla/components/browser/toolbar/display/DisplayToolbarTest.kt
+@@ -0,0 +1,127 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package mozilla.components.browser.toolbar.display
++
++import android.view.View
++import android.widget.ImageView
++import android.widget.TextView
++import mozilla.components.browser.toolbar.BrowserToolbar
++import mozilla.components.support.ktx.android.view.forEach
++import mozilla.components.ui.progress.AnimatedProgressBar
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.mockito.Mockito.mock
++import org.mockito.Mockito.verify
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++
++@RunWith(RobolectricTestRunner::class)
++class DisplayToolbarTest {
++    @Test
++    fun `clicking on the URL switches the toolbar to editing mode`() {
++        val toolbar = mock(BrowserToolbar::class.java)
++        val displayToolbar = DisplayToolbar(RuntimeEnvironment.application, toolbar)
++
++        val urlView = extractUrlView(displayToolbar)
++        assertTrue(urlView.performClick())
++
++        verify(toolbar).editMode()
++    }
++
++    @Test
++    fun `progress is forwarded to progress bar`() {
++        val toolbar = mock(BrowserToolbar::class.java)
++        val displayToolbar = DisplayToolbar(RuntimeEnvironment.application, toolbar)
++
++        val progressView = extractProgressView(displayToolbar)
++
++        displayToolbar.updateProgress(10)
++        assertEquals(10, progressView.progress)
++
++        displayToolbar.updateProgress(50)
++        assertEquals(50, progressView.progress)
++
++        displayToolbar.updateProgress(75)
++        assertEquals(75, progressView.progress)
++
++        displayToolbar.updateProgress(100)
++        assertEquals(100, progressView.progress)
++    }
++
++    @Test
++    fun `icon view will use square size`() {
++        val toolbar = mock(BrowserToolbar::class.java)
++        val displayToolbar = DisplayToolbar(RuntimeEnvironment.application, toolbar)
++
++        val widthSpec = View.MeasureSpec.makeMeasureSpec(1024, View.MeasureSpec.EXACTLY)
++        val heightSpec = View.MeasureSpec.makeMeasureSpec(56, View.MeasureSpec.EXACTLY)
++
++        displayToolbar.measure(widthSpec, heightSpec)
++
++        val iconView = extractIconView(displayToolbar)
++
++        assertEquals(56, iconView.measuredWidth)
++        assertEquals(56, iconView.measuredHeight)
++    }
++
++    @Test
++    fun `progress view will use full width and 3dp height`() {
++        val toolbar = mock(BrowserToolbar::class.java)
++        val displayToolbar = DisplayToolbar(RuntimeEnvironment.application, toolbar)
++
++        val widthSpec = View.MeasureSpec.makeMeasureSpec(1024, View.MeasureSpec.EXACTLY)
++        val heightSpec = View.MeasureSpec.makeMeasureSpec(56, View.MeasureSpec.EXACTLY)
++
++        displayToolbar.measure(widthSpec, heightSpec)
++
++        val progressView = extractProgressView(displayToolbar)
++
++        assertEquals(1024, progressView.measuredWidth)
++        assertEquals(3, progressView.measuredHeight)
++    }
++
++    companion object {
++        private fun extractUrlView(displayToolbar: DisplayToolbar): TextView {
++            var textView: TextView? = null
++
++            displayToolbar.forEach {
++                if (it is TextView) {
++                    textView = it
++                    return@forEach
++                }
++            }
++
++            return textView ?: throw AssertionError("Could not find URL view")
++        }
++
++        private fun extractProgressView(displayToolbar: DisplayToolbar): AnimatedProgressBar {
++            var progressView: AnimatedProgressBar? = null
++
++            displayToolbar.forEach {
++                if (it is AnimatedProgressBar) {
++                    progressView = it
++                    return@forEach
++                }
++            }
++
++            return progressView ?: throw AssertionError("Could not find URL view")
++        }
++
++        private fun extractIconView(displayToolbar: DisplayToolbar): ImageView {
++            var iconView: ImageView? = null
++
++            displayToolbar.forEach {
++                if (it is ImageView) {
++                    iconView = it
++                    return@forEach
++                }
++            }
++
++            return iconView ?: throw AssertionError("Could not find URL view")
++        }
++    }
++}
+diff --git a/android-components/components/concept/toolbar/src/main/java/mozilla/components/concept/toolbar/Toolbar.kt b/android-components/components/concept/toolbar/src/main/java/mozilla/components/concept/toolbar/Toolbar.kt
+index 234b55f9b5cd..36988b2d079b 100644
+--- a/android-components/components/concept/toolbar/src/main/java/mozilla/components/concept/toolbar/Toolbar.kt
++++ b/android-components/components/concept/toolbar/src/main/java/mozilla/components/concept/toolbar/Toolbar.kt
+@@ -16,6 +16,18 @@ interface Toolbar {
+      */
+     fun displayUrl(url: String)
+ 
++    /**
++     * Displays the given loading progress. Expects values in the range [0, 100].
++     */
++    fun displayProgress(progress: Int)
++
++    /**
++     * Should be called by an activity when the user pressed the back key of the device.
++     *
++     * @return Returns true if the back press event was handled and should not be propagated further.
++     */
++    fun onBackPressed(): Boolean
++
+     /**
+      * Registers the given function to be invoked when the url changes as result
+      * of user input.
+diff --git a/android-components/components/feature/toolbar/src/main/java/mozilla/components/feature/toolbar/ToolbarFeature.kt b/android-components/components/feature/toolbar/src/main/java/mozilla/components/feature/toolbar/ToolbarFeature.kt
+index e04a8a91bd92..88d67f3dcd75 100644
+--- a/android-components/components/feature/toolbar/src/main/java/mozilla/components/feature/toolbar/ToolbarFeature.kt
++++ b/android-components/components/feature/toolbar/src/main/java/mozilla/components/feature/toolbar/ToolbarFeature.kt
+@@ -33,7 +33,7 @@ class ToolbarFeature(
+      * @return true if the event was handled, otherwise false.
+      */
+     fun handleBackPressed(): Boolean {
+-        return false
++        return toolbar.onBackPressed()
+     }
+ 
+     /**
+diff --git a/android-components/components/feature/toolbar/src/main/java/mozilla/components/feature/toolbar/ToolbarPresenter.kt b/android-components/components/feature/toolbar/src/main/java/mozilla/components/feature/toolbar/ToolbarPresenter.kt
+index 24a632d27762..7760c436ce91 100644
+--- a/android-components/components/feature/toolbar/src/main/java/mozilla/components/feature/toolbar/ToolbarPresenter.kt
++++ b/android-components/components/feature/toolbar/src/main/java/mozilla/components/feature/toolbar/ToolbarPresenter.kt
+@@ -59,9 +59,11 @@ class ToolbarPresenter(
+         toolbar.displayUrl(session.url)
+     }
+ 
+-    override fun onProgress() { /* TODO display progress */ }
++    override fun onProgress() {
++        toolbar.displayProgress(session.progress)
++    }
+ 
+-    override fun onLoadingStateChanged() { /* TODO */ }
++    override fun onLoadingStateChanged() { }
+ 
+     override fun onNavigationStateChanged() { /* TODO */ }
+ }
+diff --git a/android-components/components/ui/autocomplete/src/main/java/mozilla/components/ui/autocomplete/InlineAutocompleteEditText.kt b/android-components/components/ui/autocomplete/src/main/java/mozilla/components/ui/autocomplete/InlineAutocompleteEditText.kt
+index cb9eb44b764c..80eb9d261df3 100644
+--- a/android-components/components/ui/autocomplete/src/main/java/mozilla/components/ui/autocomplete/InlineAutocompleteEditText.kt
++++ b/android-components/components/ui/autocomplete/src/main/java/mozilla/components/ui/autocomplete/InlineAutocompleteEditText.kt
+@@ -5,6 +5,7 @@
+ package mozilla.components.ui.autocomplete
+ 
+ import android.content.Context
++import android.graphics.Color.parseColor
+ import android.graphics.Rect
+ import android.os.Build
+ import android.support.v7.widget.AppCompatEditText
+@@ -27,8 +28,6 @@ import android.view.inputmethod.InputConnectionWrapper
+ import android.view.inputmethod.InputMethodManager
+ import android.widget.TextView
+ 
+-import android.graphics.Color.parseColor
+-
+ typealias OnCommitListener = () -> Unit
+ typealias OnFilterListener = (String, InlineAutocompleteEditText?) -> Unit
+ typealias OnSearchStateChangeListener = (Boolean) -> Unit
+diff --git a/android-components/samples/browser/src/main/res/layout/activity_main.xml b/android-components/samples/browser/src/main/res/layout/activity_main.xml
+index 6b073065477a..74191d0c4c7c 100644
+--- a/android-components/samples/browser/src/main/res/layout/activity_main.xml
++++ b/android-components/samples/browser/src/main/res/layout/activity_main.xml
+@@ -12,33 +12,8 @@
+     <mozilla.components.browser.toolbar.BrowserToolbar
+         android:id="@+id/toolbar"
+         android:layout_width="match_parent"
+-        android:layout_height="55dp"
+-        android:background="#aaaaaa">
+-
+-        <mozilla.components.ui.autocomplete.InlineAutocompleteEditText
+-            android:id="@+id/urlView"
+-            android:layout_width="match_parent"
+-            android:layout_height="40dp"
+-            android:layout_weight="1"
+-            android:layout_gravity="center_vertical"
+-            android:imeOptions="actionGo|flagNoExtractUi|flagNoFullscreen"
+-            android:background="@android:color/transparent"
+-            android:inputType="textUri"
+-            android:lines="1"
+-            android:paddingTop="8dp"
+-            android:paddingBottom="8dp"
+-            android:paddingStart="8dp"
+-            android:paddingEnd="8dp"
+-            android:requiresFadingEdge="horizontal"
+-            android:selectAllOnFocus="true"
+-            android:textColor="#ffffff"
+-            android:textColorHighlight="#ff9400"
+-            android:textColorHint="#000000"
+-            android:textSize="15sp"
+-            android:importantForAutofill="no"
+-            tools:targetApi="o" />
+-
+-    </mozilla.components.browser.toolbar.BrowserToolbar>
++        android:layout_height="56dp"
++        android:background="#aaaaaa" />
+ 
+     <mozilla.components.concept.engine.EngineView
+         android:id="@+id/engineView"

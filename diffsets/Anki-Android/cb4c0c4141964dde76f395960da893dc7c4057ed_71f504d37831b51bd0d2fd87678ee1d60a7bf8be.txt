@@ -1,0 +1,194 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt b/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt
+index e77ff627a1e5..40b72c59f433 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt
+@@ -241,7 +241,8 @@ open class DeckPicker :
+      * has changed between deck list refreshes, we need to recenter the deck list to the new current
+      * deck.
+      */
+-    private var mFocusedDeck: Long = 0
++    @VisibleForTesting
++    internal var mFocusedDeck: DeckId = 0
+ 
+     var importColpkgListener: ImportColpkgListener? = null
+ 
+@@ -347,9 +348,13 @@ open class DeckPicker :
+     }
+ 
+     private val mDeckLongClickListener = OnLongClickListener { v ->
+-        val deckId = v.tag as Long
++        val deckId = v.tag as DeckId
+         Timber.i("DeckPicker:: Long tapped on deck with id %d", deckId)
+-        showDialogFragment(mContextMenuFactory.newDeckPickerContextMenu(deckId))
++        launchCatchingTask {
++            withCol { decks.select(deckId) }
++            updateDeckList() // focus has changed
++            showDialogFragment(mContextMenuFactory.newDeckPickerContextMenu(deckId))
++        }
+         true
+     }
+ 
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/DeckPickerTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/DeckPickerTest.kt
+index a46fed53ba69..7e831d68628a 100644
+--- a/AnkiDroid/src/test/java/com/ichi2/anki/DeckPickerTest.kt
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/DeckPickerTest.kt
+@@ -5,16 +5,19 @@ import android.content.Intent
+ import android.content.SharedPreferences
+ import android.content.pm.PackageManager
+ import android.view.Menu
++import android.widget.TextView
+ import androidx.core.content.edit
++import androidx.core.view.children
+ import androidx.test.core.app.ActivityScenario
++import com.ichi2.anki.AbstractFlashcardViewer.Companion.EASE_4
+ import com.ichi2.anki.dialogs.DatabaseErrorDialog.DatabaseErrorDialogType
+ import com.ichi2.anki.exception.UnknownDatabaseVersionException
+ import com.ichi2.anki.preferences.sharedPrefs
+ import com.ichi2.annotations.NeedsTest
+ import com.ichi2.libanki.Storage
+ import com.ichi2.testutils.*
++import com.ichi2.testutils.libanki.buryNewSiblings
+ import com.ichi2.utils.ResourceLoader
+-import kotlinx.coroutines.ExperimentalCoroutinesApi
+ import org.apache.commons.exec.OS
+ import org.hamcrest.MatcherAssert.assertThat
+ import org.hamcrest.Matchers.*
+@@ -32,7 +35,6 @@ import java.io.File
+ import kotlin.test.assertFailsWith
+ import kotlin.test.assertNotNull
+ 
+-@OptIn(ExperimentalCoroutinesApi::class)
+ @RunWith(ParameterizedRobolectricTestRunner::class)
+ class DeckPickerTest : RobolectricTest() {
+     @ParameterizedRobolectricTestRunner.Parameter
+@@ -490,6 +492,55 @@ class DeckPickerTest : RobolectricTest() {
+         )
+     }
+ 
++    @Test
++    fun `unbury is usable - Issue 15050`() {
++        // We had an issue where 'Unbury' was not visible
++        // This was because the deck selection was not changed when a long press occurred
++
++        // one empty deck to be initially selected, one with cards to check 'unbury' status
++        val emptyDeck = addDeck("No Cards")
++        val deckWithCards = addDeck("With Cards")
++        updateDeckConfig(deckWithCards) { buryNewSiblings = true }
++
++        // Add a note with 2 cards in deck "With Cards", one of these cards is to be buried
++        col.notetypes.byName("Basic (and reversed card)")!!.also { noteType ->
++            col.notetypes.save(noteType.apply { put("did", deckWithCards) })
++        }
++        addNoteUsingBasicAndReversedModel()
++
++        // Answer 'Easy' for one of the cards, burying the other
++        col.decks.select(deckWithCards)
++        col.sched.deckDueTree() // ? if not called, decks.select(toSelect) un-buries a card
++        col.sched.answerCard(col.sched.card!!, EASE_4)
++        assertThat("the other card is buried", col.sched.card, nullValue())
++
++        // select a deck with no cards
++        col.decks.select(emptyDeck)
++        assertThat("unbury is not visible: deck has no cards", !col.sched.haveBuriedInCurrentDeck())
++
++        deckPicker {
++            assertThat("deck focus is set", mFocusedDeck, equalTo(emptyDeck))
++
++            // ACT: open up the Deck Context Menu
++            val deckToClick = recyclerView.children.single {
++                it.findViewById<TextView>(R.id.deckpicker_name).text == "With Cards"
++            }
++            deckToClick.performLongClick()
++
++            // ASSERT
++            assertThat("unbury is visible: one card is buried", col.sched.haveBuriedInCurrentDeck())
++            assertThat("deck focus has changed", mFocusedDeck, equalTo(deckWithCards))
++        }
++    }
++
++    private fun deckPicker(function: suspend DeckPicker.() -> Unit) = runTest {
++        val deckPicker = startActivityNormallyOpenCollectionWithIntent(
++            DeckPicker::class.java,
++            Intent()
++        )
++        function(deckPicker)
++    }
++
+     private fun useCollection(collectionType: CollectionType) {
+         // load asset into temp
+         val path = ResourceLoader.getTempCollection(targetContext, collectionType.assetFile)
+diff --git a/AnkiDroid/src/test/java/com/ichi2/testutils/TestClass.kt b/AnkiDroid/src/test/java/com/ichi2/testutils/TestClass.kt
+index 293abb21bbab..2d23a4b2ec87 100644
+--- a/AnkiDroid/src/test/java/com/ichi2/testutils/TestClass.kt
++++ b/AnkiDroid/src/test/java/com/ichi2/testutils/TestClass.kt
+@@ -19,6 +19,8 @@ package com.ichi2.testutils
+ import com.ichi2.anki.CollectionManager
+ import com.ichi2.libanki.Collection
+ import com.ichi2.libanki.Consts
++import com.ichi2.libanki.DeckConfig
++import com.ichi2.libanki.DeckId
+ import com.ichi2.libanki.Note
+ import com.ichi2.libanki.NotetypeJson
+ import com.ichi2.libanki.Notetypes
+@@ -108,7 +110,7 @@ interface TestClass {
+         col
+     }
+ 
+-    fun addDeck(deckName: String?): Long {
++    fun addDeck(deckName: String?): DeckId {
+         return try {
+             col.decks.id(deckName!!)
+         } catch (filteredAncestor: DeckRenameException) {
+@@ -116,7 +118,7 @@ interface TestClass {
+         }
+     }
+ 
+-    fun addDynamicDeck(name: String?): Long {
++    fun addDynamicDeck(name: String?): DeckId {
+         return try {
+             col.decks.newDyn(name!!)
+         } catch (filteredAncestor: DeckRenameException) {
+@@ -127,6 +129,13 @@ interface TestClass {
+     /** Adds [count] notes in the same deck with the same front & back */
+     fun addNotes(count: Int): List<Note> = (0..count).map { addNoteUsingBasicModel() }
+ 
++    /** helper method to update deck config */
++    fun updateDeckConfig(deckId: DeckId, function: DeckConfig.() -> Unit) {
++        val deckConfig = col.decks.confForDid(deckId)
++        function(deckConfig)
++        col.decks.save(deckConfig)
++    }
++
+     /** * A wrapper around the standard [kotlinx.coroutines.test.runTest] that
+      * takes care of updating the dispatcher used by CollectionManager as well.
+      * * An argument could be made for using [StandardTestDispatcher] and
+diff --git a/AnkiDroid/src/test/java/com/ichi2/testutils/libanki/DeckConfig.kt b/AnkiDroid/src/test/java/com/ichi2/testutils/libanki/DeckConfig.kt
+new file mode 100644
+index 000000000000..371c953ff917
+--- /dev/null
++++ b/AnkiDroid/src/test/java/com/ichi2/testutils/libanki/DeckConfig.kt
+@@ -0,0 +1,24 @@
++/*
++ *  Copyright (c) 2023 David Allison <davidallisongithub@gmail.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify it under
++ *  the terms of the GNU General Public License as published by the Free Software
++ *  Foundation; either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++ *  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with
++ *  this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package com.ichi2.testutils.libanki
++
++import com.ichi2.libanki.DeckConfig
++
++/** Burying - Bury New siblings */
++var DeckConfig.buryNewSiblings: Boolean
++    get() = getJSONObject("new").getBoolean("bury")
++    set(value) { getJSONObject("new").put("bury", value) }

@@ -1,0 +1,322 @@
+diff --git a/Mastodon/In Progress New Layout and Datamodel/GroupedNotificationFeedLoader.swift b/Mastodon/In Progress New Layout and Datamodel/GroupedNotificationFeedLoader.swift
+index 2f527cb773..8c22a31ab8 100644
+--- a/Mastodon/In Progress New Layout and Datamodel/GroupedNotificationFeedLoader.swift	
++++ b/Mastodon/In Progress New Layout and Datamodel/GroupedNotificationFeedLoader.swift	
+@@ -14,12 +14,15 @@ import os.log
+ 
+ @MainActor
+ final public class GroupedNotificationFeedLoader {
++    
++    struct FeedLoadResult {
++        let allRecords: [_NotificationViewModel]
++        let canLoadOlder: Bool
++    }
+ 
+     struct FeedLoadRequest: Equatable {
+-        let olderThan: MastodonFeedItemIdentifier?
+-        let newerThan: MastodonFeedItemIdentifier?
+-
+-        var maxID: String? { olderThan?.id }
++        let olderThan: String?
++        let newerThan: String?
+ 
+         var resultsInsertionPoint: InsertLocation {
+             if olderThan != nil {
+@@ -42,7 +45,7 @@ final public class GroupedNotificationFeedLoader {
+     private static let entryNotFoundMessage =
+         "Failed to find suitable record. Depending on the context this might result in errors (data not being updated) or can be discarded (e.g. when there are mixed data sources where an entry might or might not exist)."
+ 
+-    @Published private(set) var records: [_NotificationViewModel] = []
++    @Published private(set) var records: FeedLoadResult = FeedLoadResult(allRecords: [], canLoadOlder: true)
+ 
+     private let kind: MastodonFeedKind
+     private let presentError: (Error) -> Void
+@@ -60,17 +63,17 @@ final public class GroupedNotificationFeedLoader {
+                 if filterBox != nil {
+                     Task { [weak self] in
+                         guard let self else { return }
+-                        await self.setRecordsAfterFiltering(self.records)
++                        let curAllRecords = self.records.allRecords
++                        let curCanLoadOlder = self.records.canLoadOlder
++                        await self.setRecordsAfterFiltering(curAllRecords, canLoadOlder: curCanLoadOlder)
+                     }
+                 }
+             }
+     }
+ 
+-    private var mostRecentLoad: FeedLoadRequest?
+-
+     public func loadMore(
+-        olderThan: MastodonFeedItemIdentifier?,
+-        newerThan: MastodonFeedItemIdentifier?
++        olderThan: String?,
++        newerThan: String?
+     ) {
+         let request = FeedLoadRequest(
+             olderThan: olderThan, newerThan: newerThan)
+@@ -81,22 +84,36 @@ final public class GroupedNotificationFeedLoader {
+             )
+         }
+     }
++    
++    public func asyncLoadMore(
++        olderThan: String?,
++        newerThan: String?
++    ) async {
++        let request = FeedLoadRequest(
++            olderThan: olderThan, newerThan: newerThan)
++        do {
++            let unfiltered = try await load(request)
++            await insertRecordsAfterFiltering(
++                at: request.resultsInsertionPoint, additionalRecords: unfiltered
++            )
++        } catch {
++            presentError(error)
++        }
++    }
+ 
+     private func load(_ request: FeedLoadRequest) async throws
+         -> [_NotificationViewModel]
+     {
+-        guard request != mostRecentLoad else { throw AppError.badRequest }
+-        mostRecentLoad = request
+         switch kind {
+         case .notificationsAll:
+             return try await loadNotifications(
+-                withScope: .everything, olderThan: request.maxID)
++                withScope: .everything, olderThan: request.olderThan)
+         case .notificationsMentionsOnly:
+             return try await loadNotifications(
+-                withScope: .mentions, olderThan: request.maxID)
++                withScope: .mentions, olderThan: request.olderThan)
+         case .notificationsWithAccount(let accountID):
+             return try await loadNotifications(
+-                withAccountID: accountID, olderThan: request.maxID)
++                withAccountID: accountID, olderThan: request.olderThan)
+         }
+     }
+ }
+@@ -104,37 +121,43 @@ final public class GroupedNotificationFeedLoader {
+ // MARK: - Filtering
+ extension GroupedNotificationFeedLoader {
+     private func setRecordsAfterFiltering(
+-        _ newRecords: [_NotificationViewModel]
++        _ newRecords: [_NotificationViewModel],
++        canLoadOlder: Bool
+     ) async {
+         guard let filterBox = StatusFilterService.shared.activeFilterBox else {
+-            self.records = newRecords
++            self.records = FeedLoadResult(allRecords: newRecords.removingDuplicates(), canLoadOlder: canLoadOlder)
+             return
+         }
+         let filtered = await self.filter(
+             newRecords, forFeed: kind, with: filterBox)
+-        self.records = filtered.removingDuplicates()
++        self.records = FeedLoadResult(allRecords: filtered.removingDuplicates(), canLoadOlder: canLoadOlder)
+     }
+ 
+     private func insertRecordsAfterFiltering(
+         at insertionPoint: FeedLoadRequest.InsertLocation,
+         additionalRecords: [_NotificationViewModel]
+     ) async {
+-        guard let filterBox = StatusFilterService.shared.activeFilterBox else {
+-            self.records += additionalRecords
+-            return
++        let newRecords: [_NotificationViewModel]
++        if let filterBox = StatusFilterService.shared.activeFilterBox {
++            newRecords = await self.filter(
++                additionalRecords, forFeed: kind, with: filterBox)
++        } else {
++            newRecords = additionalRecords
+         }
+-        let newRecords = await self.filter(
+-            additionalRecords, forFeed: kind, with: filterBox)
+-        var combinedRecords = self.records
++        var canLoadOlder = self.records.canLoadOlder
++        var combinedRecords = self.records.allRecords
+         switch insertionPoint {
+         case .start:
+-            combinedRecords = newRecords + combinedRecords
++            combinedRecords = (newRecords + combinedRecords).removingDuplicates()
+         case .end:
+-            combinedRecords.append(contentsOf: newRecords)
++            let prevLast = combinedRecords.last
++            combinedRecords = (combinedRecords + newRecords).removingDuplicates()
++            let curLast = combinedRecords.last
++            canLoadOlder = !(prevLast == curLast)
+         case .replace:
+-            combinedRecords = newRecords
++            combinedRecords = newRecords.removingDuplicates()
+         }
+-        self.records = combinedRecords.removingDuplicates()
++        self.records = FeedLoadResult(allRecords: combinedRecords, canLoadOlder: canLoadOlder)
+     }
+ 
+     private func filter(
+diff --git a/Mastodon/In Progress New Layout and Datamodel/NotificationListViewController.swift b/Mastodon/In Progress New Layout and Datamodel/NotificationListViewController.swift
+index 69d02c2e2b..e97e0363b3 100644
+--- a/Mastodon/In Progress New Layout and Datamodel/NotificationListViewController.swift	
++++ b/Mastodon/In Progress New Layout and Datamodel/NotificationListViewController.swift	
+@@ -88,6 +88,8 @@ struct NotificationListView: View {
+                             switch item {
+                             case .groupedNotification(let viewModel):
+                                 viewModel.prepareForDisplay()
++                            case .bottomLoader:
++                                loadMore()
+                             default:
+                                 break
+                             }
+@@ -98,6 +100,9 @@ struct NotificationListView: View {
+                 }
+             }
+             .listStyle(.plain)
++            .refreshable {
++                await viewModel.refreshFeedFromTop()
++            }
+         }
+         
+     }
+@@ -105,7 +110,11 @@ struct NotificationListView: View {
+     @ViewBuilder func rowView(_ notificationListItem: NotificationListItem) -> some View {
+         switch notificationListItem {
+         case .bottomLoader:
+-            Text("loader not yet implemented")
++            HStack {
++                Spacer()
++                ProgressView().progressViewStyle(.circular)
++                Spacer()
++            }
+         case .filteredNotificationsInfo:
+             Text("filtered notifications not yet implemented")
+         case .notification(let feedItemIdentifier):
+@@ -116,6 +125,10 @@ struct NotificationListView: View {
+         }
+     }
+     
++    func loadMore() {
++        viewModel.loadOlder()
++    }
++    
+     func didTap(item: NotificationListItem) {
+         switch item {
+         case .filteredNotificationsInfo:
+@@ -165,15 +178,27 @@ fileprivate class NotificationListViewModel: ObservableObject {
+         feedSubscription = feedLoader.$records
+             .receive(on: DispatchQueue.main)
+             .sink { [weak self] records in
+-                // TODO: add middle loader and bottom loader?
+-                let updatedItems = records.map {
++                var updatedItems = records.allRecords.map {
+                     NotificationListItem.groupedNotification($0)
+                 }
++                if records.canLoadOlder {
++                    updatedItems.append(.bottomLoader)
++                }
+                 // TODO: add the filtered notifications announcement if needed
+                 self?.notificationItems = updatedItems
+             }
+         feedLoader.loadMore(olderThan: nil, newerThan: nil)
+     }
++    
++    public func refreshFeedFromTop() async {
++        let newestKnown = feedLoader.records.allRecords.first?.newestID
++        await feedLoader.asyncLoadMore(olderThan: nil, newerThan: newestKnown)
++    }
++    
++    public func loadOlder() {
++        let oldestKnown = feedLoader.records.allRecords.last?.oldestID
++        feedLoader.loadMore(olderThan: oldestKnown, newerThan: nil)
++    }
+ }
+ 
+ extension NotificationListItem {
+diff --git a/Mastodon/In Progress New Layout and Datamodel/NotificationRowView.swift b/Mastodon/In Progress New Layout and Datamodel/NotificationRowView.swift
+index 2ec3614549..db7c03397c 100644
+--- a/Mastodon/In Progress New Layout and Datamodel/NotificationRowView.swift	
++++ b/Mastodon/In Progress New Layout and Datamodel/NotificationRowView.swift	
+@@ -341,6 +341,8 @@ enum RelationshipElement: Equatable {
+ 
+ protocol NotificationInfo {
+     var id: String { get }
++    var newestNotificationID: String { get }
++    var oldestNotificationID: String { get }
+     var type: Mastodon.Entity.NotificationType { get }
+     var isGrouped: Bool { get }
+     var notificationsCount: Int { get }
+@@ -385,6 +387,8 @@ struct GroupedNotificationInfo: NotificationInfo {
+     }
+     
+     let id: String
++    let oldestNotificationID: String
++    let newestNotificationID: String
+     
+     let type: MastodonSDK.Mastodon.Entity.NotificationType
+     
+@@ -418,6 +422,13 @@ struct GroupedNotificationInfo: NotificationInfo {
+ 
+ extension Mastodon.Entity.Notification: NotificationInfo {
+     
++    var oldestNotificationID: String {
++        return id
++    }
++    var newestNotificationID: String {
++        return id
++    }
++    
+     var authorsCount: Int { 1 }
+     var notificationsCount: Int { 1 }
+     var primaryAuthorAccount: Mastodon.Entity.Account? { account }
+@@ -468,6 +479,13 @@ extension Mastodon.Entity.Notification: NotificationInfo {
+ 
+ extension Mastodon.Entity.NotificationGroup: NotificationInfo {
+     
++    var newestNotificationID: String {
++        return pageNewestID ?? "\(mostRecentNotificationID)"
++    }
++    var oldestNotificationID: String {
++        return pageOldestID ?? "\(mostRecentNotificationID)"
++    }
++    
+     @MainActor
+     var primaryAuthorAccount: Mastodon.Entity.Account? {
+         guard let firstAccountID = sampleAccountIDs.first else { return nil }
+@@ -752,6 +770,8 @@ enum NotificationViewComponent: Identifiable {
+ 
+ class _NotificationViewModel: ObservableObject {
+     let identifier: MastodonFeedItemIdentifier
++    let oldestID: String?
++    let newestID: String?
+     let type: Mastodon.Entity.NotificationType
+     let presentError: (Error) -> ()
+     public let iconInfo: NotificationIconInfo?
+@@ -776,6 +796,8 @@ class _NotificationViewModel: ObservableObject {
+     init(_ notificationInfo: NotificationInfo, presentError: @escaping (Error)->()) {
+         
+         self.identifier = .notificationGroup(id: notificationInfo.id)
++        self.oldestID = notificationInfo.oldestNotificationID
++        self.newestID = notificationInfo.newestNotificationID
+         self.type = notificationInfo.type
+         self.iconInfo = NotificationIconInfo(notificationType: notificationInfo.type, isGrouped: notificationInfo.isGrouped)
+         self.presentError = presentError
+@@ -1024,7 +1046,20 @@ extension _NotificationViewModel {
+             
+             let status = group.statusID == nil ? nil : statuses[group.statusID!]
+             
+-            let info = GroupedNotificationInfo(id: group.id, type: group.type, authorsCount: group.authorsCount, notificationsCount: group.notificationsCount, primaryAuthorAccount: primaryAccount, authorName: authorName, authorAvatarUrls: avatarUrls, statusViewModel: status?.viewModel(), ruleViolationReport: group.ruleViolationReport, relationshipSeveranceEvent: group.relationshipSeveranceEvent)
++            let info = GroupedNotificationInfo(
++                id: group.id,
++                oldestNotificationID: group.oldestNotificationID,
++                newestNotificationID: group.newestNotificationID,
++                type: group.type,
++                authorsCount: group.authorsCount,
++                notificationsCount: group.notificationsCount,
++                primaryAuthorAccount: primaryAccount,
++                authorName: authorName,
++                authorAvatarUrls: avatarUrls,
++                statusViewModel: status?.viewModel(),
++                ruleViolationReport: group.ruleViolationReport,
++                relationshipSeveranceEvent: group.relationshipSeveranceEvent
++            )
+             
+             return _NotificationViewModel(info, presentError: presentError)
+         }

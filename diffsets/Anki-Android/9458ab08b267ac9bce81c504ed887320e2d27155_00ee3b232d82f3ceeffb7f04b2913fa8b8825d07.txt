@@ -1,0 +1,475 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.kt b/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.kt
+index 8572342b17c2..a1331f2619a4 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.kt
+@@ -1295,6 +1295,12 @@ abstract class AbstractFlashcardViewer :
+         }
+     }
+ 
++    private suspend fun automaticAnswerShouldWaitForAudio(): Boolean {
++        return withCol {
++            decks.confForDid(currentCard!!.did).optBoolean("waitForAudio", true)
++        }
++    }
++
+     internal inner class ReadTextListener : ReadText.ReadTextListener {
+         override fun onDone(playedSide: SoundSide?) {
+             Timber.d("done reading text")
+@@ -1318,6 +1324,11 @@ abstract class AbstractFlashcardViewer :
+         }
+         val content = htmlGenerator!!.generateHtml(getColUnsafe, currentCard!!, Side.FRONT)
+         automaticAnswer.onDisplayQuestion()
++        launchCatchingTask {
++            if (!automaticAnswerShouldWaitForAudio()) {
++                automaticAnswer.scheduleAutomaticDisplayAnswer()
++            }
++        }
+         updateCard(content)
+         hideEaseButtons()
+         // If Card-based TTS is enabled, we "automatic display" after the TTS has finished as we don't know the duration
+@@ -1359,6 +1370,11 @@ abstract class AbstractFlashcardViewer :
+         isSelecting = false
+         val answerContent = htmlGenerator!!.generateHtml(getColUnsafe, currentCard!!, Side.BACK)
+         automaticAnswer.onDisplayAnswer()
++        launchCatchingTask {
++            if (!automaticAnswerShouldWaitForAudio()) {
++                automaticAnswer.scheduleAutomaticDisplayQuestion()
++            }
++        }
+         updateCard(answerContent)
+         displayAnswerBottomBar()
+     }
+@@ -1473,10 +1489,14 @@ abstract class AbstractFlashcardViewer :
+      */
+     open fun onSoundGroupCompleted() {
+         Timber.v("onSoundGroupCompleted")
+-        if (isDisplayingAnswer) {
+-            automaticAnswer.scheduleAutomaticDisplayQuestion()
+-        } else {
+-            automaticAnswer.scheduleAutomaticDisplayAnswer()
++        launchCatchingTask {
++            if (automaticAnswerShouldWaitForAudio()) {
++                if (isDisplayingAnswer) {
++                    automaticAnswer.scheduleAutomaticDisplayQuestion()
++                } else {
++                    automaticAnswer.scheduleAutomaticDisplayAnswer()
++                }
++            }
+         }
+     }
+ 
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/analytics/UsageAnalytics.kt b/AnkiDroid/src/main/java/com/ichi2/anki/analytics/UsageAnalytics.kt
+index 3788d335f8de..d2cd71743c4e 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/analytics/UsageAnalytics.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/analytics/UsageAnalytics.kt
+@@ -458,9 +458,6 @@ object UsageAnalytics {
+         "learnCutoff", // Learn ahead limit
+         "timeLimit", // Timebox time limit
+         "timeoutAnswer", // Automatic display answer
+-        "automaticAnswerAction", // Timeout answer
+-        "timeoutAnswerSeconds", // Time to show answer
+-        "timeoutQuestionSeconds", // Time to show next question
+         "keepScreenOn", // Disable screen timeout
+         "newTimezoneHandling", // New timezone handling
+         "doubleTapTimeInterval", // Double tap time interval (milliseconds)
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/preferences/ReviewingSettingsFragment.kt b/AnkiDroid/src/main/java/com/ichi2/anki/preferences/ReviewingSettingsFragment.kt
+index 9a8894cd139e..3e5e3343cb84 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/preferences/ReviewingSettingsFragment.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/preferences/ReviewingSettingsFragment.kt
+@@ -15,14 +15,12 @@
+  */
+ package com.ichi2.anki.preferences
+ 
+-import androidx.preference.ListPreference
+ import androidx.preference.SwitchPreferenceCompat
+ import com.ichi2.anki.CollectionManager.withCol
+ import com.ichi2.anki.R
+ import com.ichi2.anki.launchCatchingTask
+ import com.ichi2.anki.preferences.Preferences.Companion.getDayOffset
+ import com.ichi2.anki.preferences.Preferences.Companion.setDayOffset
+-import com.ichi2.anki.reviewer.AutomaticAnswerAction
+ import com.ichi2.preferences.NumberRangePreferenceCompat
+ import com.ichi2.preferences.SliderPreference
+ 
+@@ -63,20 +61,6 @@ class ReviewingSettingsFragment : SettingsFragment() {
+             }
+         }
+ 
+-        /**
+-         * Timeout answer
+-         * An integer representing the action when "Automatic Answer" flips a card from answer to question
+-         * 0 represents "bury", 1-4 represents the named buttons
+-         * @see com.ichi2.anki.reviewer.AutomaticAnswerAction
+-         * We use the same key in the collection config
+-         * @see com.ichi2.anki.reviewer.AutomaticAnswerAction.CONFIG_KEY
+-         * */
+-        requirePreference<ListPreference>(R.string.automatic_answer_action_preference).apply {
+-            launchCatchingTask { setValueIndex(withCol { config.get(AutomaticAnswerAction.CONFIG_KEY) ?: 0 }) }
+-            setOnPreferenceChangeListener { newValue ->
+-                launchCatchingTask { withCol { config.set(AutomaticAnswerAction.CONFIG_KEY, (newValue as String).toInt()) } }
+-            }
+-        }
+         // New timezone handling
+         requirePreference<SwitchPreferenceCompat>(R.string.new_timezone_handling_preference).apply {
+             launchCatchingTask {
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/reviewer/AutomaticAnswer.kt b/AnkiDroid/src/main/java/com/ichi2/anki/reviewer/AutomaticAnswer.kt
+index f626cf7874b6..4dc39dad9569 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/reviewer/AutomaticAnswer.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/reviewer/AutomaticAnswer.kt
+@@ -19,11 +19,13 @@ package com.ichi2.anki.reviewer
+ import android.content.SharedPreferences
+ import androidx.annotation.CheckResult
+ import androidx.annotation.VisibleForTesting
+-import com.ichi2.anki.R
++import com.ichi2.anki.CollectionManager.TR
+ import com.ichi2.anki.Reviewer
+ import com.ichi2.anki.cardviewer.ViewerCommand
+ import com.ichi2.anki.reviewer.AnswerButtons.*
++import com.ichi2.anki.snackbar.showSnackbar
+ import com.ichi2.libanki.Collection
++import com.ichi2.libanki.DeckConfig
+ import com.ichi2.libanki.DeckId
+ import com.ichi2.utils.HandlerUtils
+ import timber.log.Timber
+@@ -260,52 +262,30 @@ class AutomaticAnswerSettings(
+ 
+     companion object {
+         /**
+-         * Obtains the options for [AutomaticAnswer] in the deck config ("review" section)
+-         * @return null if the deck is dynamic (use global settings),
+-         * or if "useGeneralTimeoutSettings" is set
++         * Obtains the options for [AutomaticAnswer] in the deck config
+          */
+-        fun queryDeckSpecificOptions(
+-            action: AutomaticAnswerAction,
++        fun queryOptions(
++            preferences: SharedPreferences,
+             col: Collection,
+             selectedDid: DeckId
+-        ): AutomaticAnswerSettings? {
+-            // Dynamic don't have review options; attempt to get deck-specific auto-advance options
+-            // but be prepared to go with all default if it's a dynamic deck
+-            if (col.decks.isDyn(selectedDid)) {
+-                return null
+-            }
+-
+-            val revOptions = col.decks.confForDid(selectedDid).getJSONObject("rev")
++        ): AutomaticAnswerSettings {
++            val conf = col.decks.confForDid(selectedDid)
++            val action = getAction(conf)
++            val useTimer = preferences.getBoolean("timeoutAnswer", false)
++            val waitQuestionSecond = conf.optInt("secondsToShowQuestion", 0)
++            val waitAnswerSecond = conf.optInt("secondsToShowAnswer", 0)
+ 
+-            if (revOptions.optBoolean("useGeneralTimeoutSettings", true)) {
+-                // we want to use the general settings, no need for per-deck settings
+-                return null
+-            }
+-
+-            val useTimer = revOptions.optBoolean("timeoutAnswer", false)
+-            val waitQuestionSecond = revOptions.optInt("timeoutQuestionSeconds", 60)
+-            val waitAnswerSecond = revOptions.optInt("timeoutAnswerSeconds", 20)
+             return AutomaticAnswerSettings(action, useTimer, waitQuestionSecond, waitAnswerSecond)
+         }
+ 
+-        fun queryFromPreferences(preferences: SharedPreferences, action: AutomaticAnswerAction): AutomaticAnswerSettings {
+-            val prefUseTimer: Boolean = preferences.getBoolean("timeoutAnswer", false)
+-            val prefWaitQuestionSecond: Int = preferences.getInt("timeoutQuestionSeconds", 60)
+-            val prefWaitAnswerSecond: Int = preferences.getInt("timeoutAnswerSeconds", 20)
+-            return AutomaticAnswerSettings(action, prefUseTimer, prefWaitQuestionSecond, prefWaitAnswerSecond)
+-        }
+-
+         fun createInstance(preferences: SharedPreferences, col: Collection): AutomaticAnswerSettings {
+-            // deck specific options take precedence over general (preference-based) options.
+-            // the action can only be set via preferences (but is stored in the collection).
+-            val action = getAction(col)
+-            return queryDeckSpecificOptions(action, col, col.decks.selected()) ?: queryFromPreferences(preferences, action)
++            return queryOptions(preferences, col, col.decks.selected())
+         }
+ 
+-        private fun getAction(col: Collection): AutomaticAnswerAction {
++        private fun getAction(conf: DeckConfig): AutomaticAnswerAction {
+             return try {
+-                val value: Int = col.config.get(AutomaticAnswerAction.CONFIG_KEY) ?: return AutomaticAnswerAction.BURY_CARD
+-                AutomaticAnswerAction.fromPreferenceValue(value)
++                val value: Int = conf.optInt(AutomaticAnswerAction.CONFIG_KEY)
++                AutomaticAnswerAction.fromConfigValue(value)
+             } catch (e: Exception) {
+                 AutomaticAnswerAction.BURY_CARD
+             }
+@@ -314,43 +294,46 @@ class AutomaticAnswerSettings(
+ }
+ 
+ /**
+- * Represents a value from [R.array.automatic_answer_values]/[R.array.automatic_answer_options]
++ * Represents a value from [anki.deck_config.DeckConfig.Config.AnswerAction]
+  * Executed when answering a card (showing the question).
+  */
+-enum class AutomaticAnswerAction(private val preferenceValue: Int) {
++enum class AutomaticAnswerAction(private val configValue: Int) {
+     /** Default: least invasive action */
+     BURY_CARD(0),
+     ANSWER_AGAIN(1),
+-    ANSWER_HARD(2),
+-    ANSWER_GOOD(3),
+-    ANSWER_EASY(4);
++    ANSWER_GOOD(2),
++    ANSWER_HARD(3),
++    SHOW_REMINDER(4);
+ 
+     fun execute(reviewer: Reviewer) {
+         val numberOfButtons = 4
+         val actualAction = handleInvalidButtons(numberOfButtons)
+         val action = actualAction.toCommand(numberOfButtons)
+-        Timber.i("Executing %s", action)
+-        reviewer.executeCommand(action)
++        if (action != null) {
++            Timber.i("Executing %s", action)
++            reviewer.executeCommand(action)
++        } else {
++            reviewer.showSnackbar(TR.studyingAnswerTimeElapsed())
++        }
+     }
+ 
+     /** Handle **Hard/Easy** uf they don't appear */
+     private fun handleInvalidButtons(numberOfButtons: Int): AutomaticAnswerAction {
+         return when (this) {
+             ANSWER_HARD -> if (AnswerButtons.canAnswerHard(numberOfButtons)) ANSWER_HARD else ANSWER_GOOD
+-            ANSWER_EASY -> if (AnswerButtons.canAnswerEasy(numberOfButtons)) ANSWER_EASY else ANSWER_GOOD
+             // Again and Good always appear. So does Bury
+             else -> this
+         }
+     }
+ 
+     /** Convert to a [ViewerCommand] */
+-    private fun toCommand(numberOfButtons: Int): ViewerCommand {
++    private fun toCommand(numberOfButtons: Int): ViewerCommand? {
+         return when (this) {
+             BURY_CARD -> ViewerCommand.BURY_CARD
+             ANSWER_AGAIN -> AGAIN.toViewerCommand(numberOfButtons)
+             ANSWER_HARD -> HARD.toViewerCommand(numberOfButtons)
+             ANSWER_GOOD -> GOOD.toViewerCommand(numberOfButtons)
+-            ANSWER_EASY -> EASY.toViewerCommand(numberOfButtons)
++            else -> null
+         }
+     }
+ 
+@@ -358,17 +341,13 @@ enum class AutomaticAnswerAction(private val preferenceValue: Int) {
+         /**
+          * An integer representing the action when Automatic Answer flips a card from answer to question
+          *
+-         * 0 represents "bury", 1-4 represents the named buttons
+-         *
+-         * Although AnkiMobile and AnkiDroid have the feature, this config key is currently AnkiDroid only
+-         *
+          * @see AutomaticAnswerAction
+          */
+-        const val CONFIG_KEY = "automaticAnswerAction"
++        const val CONFIG_KEY = "answerAction"
+ 
+-        /** convert from [R.array.automatic_answer_values] ([R.array.automatic_answer_options]) to the enum */
+-        fun fromPreferenceValue(i: Int): AutomaticAnswerAction {
+-            return values().firstOrNull { it.preferenceValue == i } ?: BURY_CARD
++        /** convert from [anki.deck_config.DeckConfig.Config.AnswerAction] to the enum */
++        fun fromConfigValue(i: Int): AutomaticAnswerAction {
++            return values().firstOrNull { it.configValue == i } ?: BURY_CARD
+         }
+     }
+ }
+diff --git a/AnkiDroid/src/main/res/values/10-preferences.xml b/AnkiDroid/src/main/res/values/10-preferences.xml
+index d4ede6c26eb6..9eb02444c27e 100644
+--- a/AnkiDroid/src/main/res/values/10-preferences.xml
++++ b/AnkiDroid/src/main/res/values/10-preferences.xml
+@@ -21,7 +21,6 @@
+ <resources xmlns:tools="http://schemas.android.com/tools">
+     <!-- generic strings -->
+     <string name="disabled">Disabled</string>
+-    <string name="pref_summary_seconds">%s s</string>
+     <plurals name="pref_summ_minutes">
+         <item quantity="one">%d min</item>
+         <item quantity="other">%d mins</item>
+@@ -131,10 +130,7 @@
+     <string name="notification_minimum_cards_due_vibrate" maxLength="41">Vibrate</string>
+     <string name="notification_minimum_cards_due_blink" maxLength="41">Blink light</string>
+     <string name="timeout_answer_text" maxLength="41">Automatic display answer</string>
+-    <string name="timeout_answer" maxLength="41">Timeout answer</string>
+-    <string name="timeout_answer_summ">Show answer automatically without user input. Delay includes time for automatically played audio files.</string>
+-    <string name="timeout_answer_seconds" maxLength="41">Time to show answer</string>
+-    <string name="timeout_question_seconds" maxLength="41">Time to show next question</string>
++    <string name="timeout_answer_summ2">Show answer automatically without user input. Configure from deck options.</string>
+     <string name="select_locale_title">Select language</string>
+     <string name="software_render" maxLength="41">Disable card hardware render</string>
+     <string name="software_render_summ">Hardware render is faster but may have problems, specifically on Android 8/8.1. If you cannot see parts of the card review user interface, try this setting.</string>
+diff --git a/AnkiDroid/src/main/res/values/11-arrays.xml b/AnkiDroid/src/main/res/values/11-arrays.xml
+index a99c56b6e899..407b6e075b59 100644
+--- a/AnkiDroid/src/main/res/values/11-arrays.xml
++++ b/AnkiDroid/src/main/res/values/11-arrays.xml
+@@ -87,8 +87,6 @@
+     <string name="gesture_show_all_hints">Show All Hints</string>
+     <string name="record_voice">Record Voice</string>
+     <string name="replay_voice">Replay Voice</string>
+-    <string name="automatic_answer_option_2">Hard (Good if unavailable)</string>
+-    <string name="automatic_answer_option_4">Easy (Good if unavailable)</string>
+     <string name="save_voice">Save Recording</string>
+ 
+ </resources>
+diff --git a/AnkiDroid/src/main/res/values/constants.xml b/AnkiDroid/src/main/res/values/constants.xml
+index 6c6bfa389771..6958b6aaa441 100644
+--- a/AnkiDroid/src/main/res/values/constants.xml
++++ b/AnkiDroid/src/main/res/values/constants.xml
+@@ -167,20 +167,6 @@
+         <item>0</item>
+         <item>1</item>
+     </string-array>
+-    <string-array name="automatic_answer_options">
+-        <item>@string/menu_bury_card</item>
+-        <item>@string/ease_button_again</item>
+-        <item>@string/automatic_answer_option_2</item>
+-        <item>@string/ease_button_good</item>
+-        <item>@string/automatic_answer_option_4</item>
+-    </string-array>
+-    <string-array name="automatic_answer_values">
+-        <item>0</item>
+-        <item>1</item>
+-        <item>2</item>
+-        <item>3</item>
+-        <item>4</item>
+-    </string-array>
+     <string-array name="full_screen_mode_values">
+         <item>0</item>
+         <item>1</item>
+diff --git a/AnkiDroid/src/main/res/values/preferences.xml b/AnkiDroid/src/main/res/values/preferences.xml
+index 507be428ea29..444badf1766f 100644
+--- a/AnkiDroid/src/main/res/values/preferences.xml
++++ b/AnkiDroid/src/main/res/values/preferences.xml
+@@ -14,9 +14,6 @@
+     <string name="learn_cutoff_preference">learnCutoff</string>
+     <string name="time_limit_preference">timeLimit</string>
+     <string name="timeout_answer_preference">timeoutAnswer</string>
+-    <string name="automatic_answer_action_preference">automaticAnswerAction</string>
+-    <string name="timeout_answer_seconds_preference">timeoutAnswerSeconds</string>
+-    <string name="timeout_question_seconds_preference">timeoutQuestionSeconds</string>
+     <string name="keep_screen_on_preference">keepScreenOn</string>
+     <string name="new_timezone_handling_preference">newTimezoneHandling</string>
+     <string name="double_tap_time_interval_preference">doubleTapTimeInterval</string>
+diff --git a/AnkiDroid/src/main/res/xml/preferences_reviewing.xml b/AnkiDroid/src/main/res/xml/preferences_reviewing.xml
+index 68feb1ce5f63..41176037ae3a 100644
+--- a/AnkiDroid/src/main/res/xml/preferences_reviewing.xml
++++ b/AnkiDroid/src/main/res/xml/preferences_reviewing.xml
+@@ -54,32 +54,8 @@
+             android:defaultValue="false"
+             android:disableDependentsState="false"
+             android:key="@string/timeout_answer_preference"
+-            android:summary="@string/timeout_answer_summ"
++            android:summary="@string/timeout_answer_summ2"
+             android:title="@string/timeout_answer_text" />
+-        <ListPreference
+-            android:entries="@array/automatic_answer_options"
+-            android:dependency="@string/timeout_answer_preference"
+-            android:entryValues="@array/automatic_answer_values"
+-            android:defaultValue="0"
+-            android:key="@string/automatic_answer_action_preference"
+-            android:title="@string/timeout_answer"
+-            app1:useSimpleSummaryProvider="true"/>
+-        <com.ichi2.preferences.SliderPreference
+-            android:key="@string/timeout_answer_seconds_preference"
+-            android:dependency="@string/timeout_answer_preference"
+-            android:title="@string/timeout_answer_seconds"
+-            android:defaultValue="20"
+-            android:valueFrom="0"
+-            android:valueTo="30"
+-            app1:displayFormat="@string/pref_summary_seconds"/>
+-        <com.ichi2.preferences.SliderPreference
+-            android:key="@string/timeout_question_seconds_preference"
+-            android:dependency="@string/timeout_answer_preference"
+-            android:defaultValue="60"
+-            android:valueFrom="0"
+-            android:valueTo="60"
+-            android:title="@string/timeout_question_seconds"
+-            app1:displayFormat="@string/pref_summary_seconds"/>
+     </PreferenceCategory>
+     <PreferenceCategory android:title="@string/pref_cat_advanced">
+         <SwitchPreferenceCompat
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/reviewer/AutomaticAnswerActionTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/reviewer/AutomaticAnswerActionTest.kt
+index 092a2c6034bf..0df3b17a76d5 100644
+--- a/AnkiDroid/src/test/java/com/ichi2/anki/reviewer/AutomaticAnswerActionTest.kt
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/reviewer/AutomaticAnswerActionTest.kt
+@@ -19,7 +19,7 @@ package com.ichi2.anki.reviewer
+ import com.ichi2.anki.Reviewer
+ import com.ichi2.anki.cardviewer.ViewerCommand
+ import com.ichi2.anki.reviewer.AutomaticAnswerAction.*
+-import com.ichi2.anki.reviewer.AutomaticAnswerAction.Companion.fromPreferenceValue
++import com.ichi2.anki.reviewer.AutomaticAnswerAction.Companion.fromConfigValue
+ import org.hamcrest.CoreMatchers.equalTo
+ import org.hamcrest.MatcherAssert.assertThat
+ import org.junit.Test
+@@ -31,11 +31,11 @@ class AutomaticAnswerActionTest {
+ 
+     @Test
+     fun fromPreferenceValue() {
+-        assertThat(fromPreferenceValue(0), equalTo(BURY_CARD))
+-        assertThat(fromPreferenceValue(1), equalTo(ANSWER_AGAIN))
+-        assertThat(fromPreferenceValue(2), equalTo(ANSWER_HARD))
+-        assertThat(fromPreferenceValue(3), equalTo(ANSWER_GOOD))
+-        assertThat(fromPreferenceValue(4), equalTo(ANSWER_EASY))
++        assertThat(fromConfigValue(0), equalTo(BURY_CARD))
++        assertThat(fromConfigValue(1), equalTo(ANSWER_AGAIN))
++        assertThat(fromConfigValue(2), equalTo(ANSWER_GOOD))
++        assertThat(fromConfigValue(3), equalTo(ANSWER_HARD))
++        assertThat(fromConfigValue(4), equalTo(SHOW_REMINDER))
+     }
+ 
+     @Test
+@@ -45,7 +45,6 @@ class AutomaticAnswerActionTest {
+         assertExecuteReturns(ANSWER_AGAIN, ViewerCommand.FLIP_OR_ANSWER_EASE1)
+         assertExecuteReturns(ANSWER_HARD, ViewerCommand.FLIP_OR_ANSWER_EASE2)
+         assertExecuteReturns(ANSWER_GOOD, ViewerCommand.FLIP_OR_ANSWER_EASE3)
+-        assertExecuteReturns(ANSWER_EASY, ViewerCommand.FLIP_OR_ANSWER_EASE4)
+     }
+ 
+     private fun assertExecuteReturns(action: AutomaticAnswerAction, expectedCommand: ViewerCommand) {
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/reviewer/AutomaticAnswerAndroidTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/reviewer/AutomaticAnswerAndroidTest.kt
+index d8612d9d4a3f..eaa127907e33 100644
+--- a/AnkiDroid/src/test/java/com/ichi2/anki/reviewer/AutomaticAnswerAndroidTest.kt
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/reviewer/AutomaticAnswerAndroidTest.kt
+@@ -31,31 +31,28 @@ class AutomaticAnswerAndroidTest : RobolectricTest() {
+     @Test
+     fun default_is_bury() {
+         assertThat("no value", createInstance().settings.answerAction, equalTo(AutomaticAnswerAction.BURY_CARD))
+-        setPreference(-1) // invalid
+-        assertThat("bad pref", createInstance().settings.answerAction, equalTo(AutomaticAnswerAction.BURY_CARD))
+         assertThat("default", AutomaticAnswer.defaultInstance(mock()).settings.answerAction, equalTo(AutomaticAnswerAction.BURY_CARD))
+-
+-        // ensure "bad pref" isn't picked up as a good value
+-        setPreference(1)
+-        assertThat("good pref", createInstance().settings.answerAction, not(equalTo(AutomaticAnswerAction.BURY_CARD)))
+-
+-        // reset the value
+-        resetPrefs()
+-        assertThat("xml pref", createInstance().settings.answerAction, equalTo(AutomaticAnswerAction.BURY_CARD))
+     }
+ 
+     @Test
+     fun preference_sets_action() {
+         setPreference(1)
+         assertThat(createInstance().settings.answerAction, equalTo(AutomaticAnswerAction.ANSWER_AGAIN))
++        // reset the value
++        resetPrefs()
++        assertThat("default", createInstance().settings.answerAction, equalTo(AutomaticAnswerAction.BURY_CARD))
+     }
+ 
+     private fun resetPrefs() {
+-        col.config.remove("automaticAnswerAction")
++        val conf = col.decks.confForDid(col.decks.selected())
++        conf.remove(AutomaticAnswerAction.CONFIG_KEY)
++        col.decks.save(conf)
+     }
+ 
+     private fun setPreference(value: Int) {
+-        col.config.set("automaticAnswerAction", value)
++        val conf = col.decks.confForDid(col.decks.selected())
++        conf.put(AutomaticAnswerAction.CONFIG_KEY, value)
++        col.decks.save(conf)
+     }
+ 
+     private fun createInstance() =

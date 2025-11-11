@@ -1,0 +1,141 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/FenixApplication.kt b/fenix/app/src/main/java/org/mozilla/fenix/FenixApplication.kt
+index 48956ca458d9..3fa3a10e9237 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/FenixApplication.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/FenixApplication.kt
+@@ -142,6 +142,7 @@ open class FenixApplication : LocaleAwareApplication() {
+             }
+         }
+ 
++        prefetchForHomeFragment()
+         setupLeakCanary()
+         if (settings().isTelemetryEnabled) {
+             components.analytics.metrics.start(MetricServiceType.Data)
+@@ -228,6 +229,13 @@ open class FenixApplication : LocaleAwareApplication() {
+         // no-op, LeakCanary is disabled by default
+     }
+ 
++    // This is for issue https://github.com/mozilla-mobile/fenix/issues/11660. We prefetch our info for startup
++    // so that we're sure that we have all the data available as our fragment is launched.
++    private fun prefetchForHomeFragment() {
++        StrictMode.allowThreadDiskReads().resetPoliciesAfter {
++            components.core.topSiteStorage.prefetch()
++        }
++    }
+     private fun setupPush() {
+         // Sets the PushFeature as the singleton instance for push messages to go to.
+         // We need the push feature setup here to deliver messages in the case where the service
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/TopSiteStorage.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/TopSiteStorage.kt
+index 0922a0606b5c..a9ddaacee23c 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/TopSiteStorage.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/TopSiteStorage.kt
+@@ -14,6 +14,7 @@ import mozilla.components.feature.top.sites.TopSite
+ import mozilla.components.feature.top.sites.TopSiteStorage
+ import mozilla.components.support.locale.LocaleManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ext.observeOnce
+ import org.mozilla.fenix.ext.settings
+ import org.mozilla.fenix.settings.SupportUtils
+ import org.mozilla.fenix.settings.advanced.getSelectedLocale
+@@ -86,4 +87,10 @@ class TopSiteStorage(private val context: Context) {
+             context.settings().defaultTopSitesAdded = true
+         }
+     }
++
++    fun prefetch() {
++        getTopSites().observeOnce {
++            cachedTopSites = it
++        }
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/ext/LiveData.kt b/fenix/app/src/main/java/org/mozilla/fenix/ext/LiveData.kt
+new file mode 100644
+index 000000000000..718385219bd1
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/ext/LiveData.kt
+@@ -0,0 +1,20 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.ext
++
++import androidx.lifecycle.LiveData
++import androidx.lifecycle.Observer
++
++/**
++ * Observe a LiveData once and unregister from it as soon as the live data returns a value
++ */
++fun <T> LiveData<T>.observeOnce(observer: (T) -> Unit) {
++    observeForever(object : Observer<T> {
++        override fun onChanged(value: T) {
++            removeObserver(this)
++            observer(value)
++        }
++    })
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
+index 1ac5e78a2144..7fb414bdda08 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
+@@ -215,11 +215,10 @@ class HomeFragment : Fragment() {
+             sessionControlInteractor,
+             homeViewModel
+         )
+-        activity.themeManager.applyStatusBarTheme(activity)
+ 
+-        view.consumeFrom(homeFragmentStore, viewLifecycleOwner) {
+-            sessionControlView?.update(it)
+-        }
++        updateSessionControlView(view)
++
++        activity.themeManager.applyStatusBarTheme(activity)
+ 
+         view.consumeFrom(requireComponents.core.store, viewLifecycleOwner) {
+             val tabCount = if (currentMode.getCurrentMode() == Mode.Normal) {
+@@ -234,6 +233,20 @@ class HomeFragment : Fragment() {
+         return view
+     }
+ 
++    /**
++     * The [SessionControlView] is forced to update with our current state when we call
++     * [HomeFragment.onCreateView] in order to be able to draw everything at once with the current
++     * data in our store. The [View.consumeFrom] coroutine dispatch
++     * doesn't get run right away which means that we won't draw on the first layout pass.
++     */
++    fun updateSessionControlView(view: View) {
++        sessionControlView?.update(homeFragmentStore.state)
++
++        view.consumeFrom(homeFragmentStore, viewLifecycleOwner) {
++            sessionControlView?.update(it)
++        }
++    }
++
+     private fun updateLayout(view: View) {
+         val shouldUseBottomToolbar = view.context.settings().shouldUseBottomToolbar
+ 
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlView.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlView.kt
+index 809b1ec7e62c..f35b8503fda5 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlView.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlView.kt
+@@ -4,7 +4,6 @@
+ 
+ package org.mozilla.fenix.home.sessioncontrol
+ 
+-import android.os.Build
+ import android.view.View
+ import androidx.recyclerview.widget.ItemTouchHelper
+ import androidx.recyclerview.widget.LinearLayoutManager
+@@ -142,13 +141,8 @@ class SessionControlView(
+     }
+ 
+     fun update(state: HomeFragmentState) {
+-        // Workaround for list not updating until scroll on Android 5 + 6
+-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+-            sessionControlAdapter.submitList(null)
+-        }
+ 
+         val stateAdapterList = state.toAdapterList()
+-
+         if (homeScreenViewModel.shouldScrollToTopSites) {
+             sessionControlAdapter.submitList(stateAdapterList) {
+ 

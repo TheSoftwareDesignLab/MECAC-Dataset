@@ -1,0 +1,167 @@
+diff --git a/src/controllers/groups.js b/src/controllers/groups.js
+index 96521d37290..e219dd8b15c 100644
+--- a/src/controllers/groups.js
++++ b/src/controllers/groups.js
+@@ -417,16 +417,13 @@ questStart = function(req, res) {
+   // TODO will this handle appropriately when people leave/join party between quest invite?
+   _.each(group.members, function(m){
+     var updates = {$set:{},$inc:{'_v':1}};
+-    if (m == user._id)
++    if (m == group.quest.leader)
+       updates['$inc']['items.quests.'+key] = -1;
+     if (group.quest.members[m] == true) {
+-      updates['$set']['party.quest.key'] = key;
+-      updates['$set']['party.quest.progress'] = {up:0,down:0,collect:collected};
+-      updates['$unset'] = {'party.quest.completed':1};
++      updates['$set']['party.quest'] = Group.cleanQuestProgress({key:key,progress:{collect:collected}});
+       questMembers[m] = true;
+     } else {
+-      updates['$unset'] = {'party.quest.key':1};
+-      updates['$set']['party.quest.progress'] = {};
++      updates['$set']['party.quest'] = Group.cleanQuestProgress();
+     }
+     parallel.push(function(cb2){
+       User.update({_id:m},updates,cb2);
+@@ -464,9 +461,10 @@ api.questAccept = function(req, res) {
+     // Invite everyone. true means "accepted", false="rejected", undefined="pending". Once we click "start quest"
+     // or everyone has either accepted/rejected, then we store quest key in user object.
+     _.each(group.members, function(m){
+-      if (m == user._id)
++      if (m == user._id) {
+         group.quest.members[m] = true;
+-      else
++        group.quest.leader = user._id;
++      } else
+         group.quest.members[m] = undefined;
+     });
+ 
+@@ -493,14 +491,23 @@ api.questAbort = function(req, res, next){
+   var group = res.locals.group;
+   async.parallel([
+     function(cb){
+-      User.update({_id:{$in: _.keys(group.quest.members)}},{
+-        $unset: {'party.quest.key':1},
+-        $set:   {'party.quest.progress.collect':{}},
+-        $inc:   {_v:1}
+-      },cb);
++      User.update(
++        {_id:{$in: _.keys(group.quest.members)}},
++        {
++          $set: {'party.quest':Group.cleanQuestProgress()},
++          $inc: {_v:1}
++        },
++        {multi:true},
++        cb);
++    },
++    // Refund party leader quest scroll
++    function(cb){
++      var update = {$inc:{}};
++      update['$inc']['items.quests.' + group.quest.key] = 1;
++      User.update({_id:group.quest.leader}, update, cb);
+     },
+     function(cb) {
+-      group.quest = {};
++      group.quest = {key:null,progress:{},leader:null};
+       group.markModified('quest');
+       group.save(cb);
+     }
+diff --git a/src/models/group.js b/src/models/group.js
+index 8d94232d56b..7ce332e39dc 100644
+--- a/src/models/group.js
++++ b/src/models/group.js
+@@ -36,6 +36,7 @@ var GroupSchema = new Schema({
+   quest: {
+     key: String,
+     active: {type:Boolean, 'default':false},
++    leader: {type:String, ref:'User'},
+     progress:{
+       hp: Number,
+       collect: {type:Schema.Types.Mixed, 'default':{}} // {feather: 5, ingot: 3}
+@@ -107,6 +108,23 @@ GroupSchema.methods.sendChat = function(message, user){
+   group.chat.splice(200);
+ }
+ 
++var cleanQuestProgress = function(merge){
++  var clean = {
++    key: null,
++    progress: {
++      up: 0,
++      down: 0,
++      collect: {}
++    },
++    completed: null
++  };
++  merge = merge || {progress:{}};
++  _.merge(clean, _.omit(merge,'progress'));
++  _.merge(clean.progress, merge.progress);
++  return clean;
++}
++GroupSchema.statics.cleanQuestProgress = cleanQuestProgress;
++
+ // Participants: Grant rewards & achievements, finish quest
+ GroupSchema.methods.finishQuest = function(quest, cb) {
+   var group = this;
+@@ -119,9 +137,7 @@ GroupSchema.methods.finishQuest = function(quest, cb) {
+   updates['$inc']['stats.gp'] = +quest.drop.gp;
+   updates['$inc']['stats.exp'] = +quest.drop.exp;
+   updates['$inc']['_v'] = 1;
+-  updates['$unset'] = {'party.quest.key':undefined};
+-  updates['$set']['party.quest.collect'] = {};
+-  updates['$set']['party.quest.completed'] = questK;
++  updates['$set']['party.quest'] = cleanQuestProgress({completed:questK});
+ 
+   switch (quest.drop.type) {
+     case 'gear':
+@@ -140,10 +156,10 @@ GroupSchema.methods.finishQuest = function(quest, cb) {
+       updates['$set']['items.mounts.'+dropK] = true;
+       break;
+   }
+-  // FIXME this is TERRIBLE practice. Looks like there are circular dependencies in the models, such that `var User` at
+-  // this point is undefined. So we get around that by loading from mongoose only once we get to this point
+   var members = _.keys(group.quest.members);
+   group.quest = {};group.markModified('quest');
++  // FIXME this is TERRIBLE practice. Looks like there are circular dependencies in the models, such that `var User` at
++  // this point is undefined. So we get around that by loading from mongoose only once we get to this point
+   mongoose.models.User.update({_id:{$in:members}}, updates, {multi:true}, cb);
+ }
+ 
+diff --git a/src/utils.js b/src/utils.js
+index 33c291dcdb3..0fb599fde95 100644
+--- a/src/utils.js
++++ b/src/utils.js
+@@ -12,11 +12,8 @@ module.exports.sendEmail = function(mailData) {
+     }
+   });
+   smtpTransport.sendMail(mailData, function(error, response){
+-    if(error){
+-      console.log(error);
+-    }else{
+-      console.log("Message sent: " + response.message);
+-    }
++    if(error) console.log(error);
++    else console.log("Message sent: " + response.message);
+     smtpTransport.close(); // shut down the connection pool, no more messages
+   });
+ }
+diff --git a/views/options/social/group.jade b/views/options/social/group.jade
+index 2de352fbe54..de224d432fb 100644
+--- a/views/options/social/group.jade
++++ b/views/options/social/group.jade
+@@ -21,7 +21,7 @@ a.pull-right.gem-wallet(popover-trigger='mouseenter', popover-title='Guild Bank'
+           hr
+           .npc_ian.pull-left
+           p Once all members have either accepted or rejected, the quest begins. Only those that clicked "accept" will be able to participate in the quest and recieve the drops. If members are pending too long (inactive?), you can start without them by clicking "Begin".
+-          button.btn.btn-small.btn-warning(ng-click='party.$questAccept({"force":true})') Begin
++          button.btn.btn-small.btn-warning(ng-if='group.quest.leader==user._id || group.leader==user._id', ng-click='party.$questAccept({"force":true})') Begin
+           //-TODO Cancel button
+           //-TODO Both force-start & cancel should only be available to quest-initiator
+ 
+@@ -71,7 +71,7 @@ a.pull-right.gem-wallet(popover-trigger='mouseenter', popover-title='Guild Bank'
+             p Only participants can collect items and share in the quest loot. If you die during a quest, you get booted from the quest. If everyone dies once, the quest fails.
+ 
+ 
+-          button.btn.btn-mini.btn-danger(ng-click='questAbort()') Abort
++          button.btn.btn-mini.btn-danger(ng-if='group.quest.leader==user._id || group.leader==user._id', ng-click='questAbort()') Abort
+ 
+     // ------ Information -------
+     .modal.inline-modal

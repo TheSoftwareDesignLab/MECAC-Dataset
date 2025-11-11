@@ -1,0 +1,3834 @@
+diff --git a/.github/workflows/pr_test_build.yml b/.github/workflows/pr_test_build.yml
+index 53008ed52e..0ea93f4f3f 100644
+--- a/.github/workflows/pr_test_build.yml
++++ b/.github/workflows/pr_test_build.yml
+@@ -113,6 +113,7 @@ jobs:
+           echo "const twitterBearerToken = '${{ secrets.TWITTER_BEARER_TOKEN }}';" >> lib/.secrets.g.dart
+           echo "const trocadorApiKey = '${{ secrets.TROCADOR_API_KEY }}';" >> lib/.secrets.g.dart
+           echo "const trocadorExchangeMarkup = '${{ secrets.TROCADOR_EXCHANGE_MARKUP }}';" >> lib/.secrets.g.dart
++          echo "const anonPayReferralCode = '${{ secrets.ANON_PAY_REFERRAL_CODE }}';" >> lib/.secrets.g.dart
+ 
+       - name: Rename app
+         run: echo -e "id=com.cakewallet.test\nname=$GITHUB_HEAD_REF" > /opt/android/cake_wallet/android/app.properties
+diff --git a/cw_core/lib/crypto_currency.dart b/cw_core/lib/crypto_currency.dart
+index 925f39de03..3d076f6e90 100644
+--- a/cw_core/lib/crypto_currency.dart
++++ b/cw_core/lib/crypto_currency.dart
+@@ -1,6 +1,7 @@
++import 'package:cw_core/currency.dart';
+ import 'package:cw_core/enumerable_item.dart';
+ 
+-class CryptoCurrency extends EnumerableItem<int> with Serializable<int> {
++class CryptoCurrency extends EnumerableItem<int> with Serializable<int> implements Currency {
+   const CryptoCurrency({
+     String title = '',
+     int raw = -1,
+@@ -162,6 +163,14 @@ class CryptoCurrency extends EnumerableItem<int> with Serializable<int> {
+       return acc;
+     });
+ 
++  static final Map<String, CryptoCurrency> _fullNameCurrencyMap =
++    [...all, ...havenCurrencies].fold<Map<String, CryptoCurrency>>(<String, CryptoCurrency>{}, (acc, item) {
++      if(item.fullName != null){
++        acc.addAll({item.fullName!.toLowerCase(): item});
++      }
++      return acc;
++    });
++
+   static CryptoCurrency deserialize({required int raw}) {
+ 
+     if (CryptoCurrency._rawCurrencyMap[raw] == null) {
+@@ -180,6 +189,16 @@ class CryptoCurrency extends EnumerableItem<int> with Serializable<int> {
+     return CryptoCurrency._nameCurrencyMap[name.toLowerCase()]!;
+   }
+ 
++  static CryptoCurrency fromFullName(String name) {
++
++    if (CryptoCurrency._fullNameCurrencyMap[name.toLowerCase()] == null) {
++      final s = 'Unexpected token: $name for CryptoCurrency fromFullName';
++      throw  ArgumentError.value(name, 'Fullname', s);
++    }
++    return CryptoCurrency._fullNameCurrencyMap[name.toLowerCase()]!;
++  }
++  
++
+   @override
+   String toString() => title;
+ }
+diff --git a/cw_core/lib/currency.dart b/cw_core/lib/currency.dart
+new file mode 100644
+index 0000000000..4f67c4e282
+--- /dev/null
++++ b/cw_core/lib/currency.dart
+@@ -0,0 +1,6 @@
++abstract class Currency {
++  String get name;
++  String? get tag;
++  String? get fullName;
++  String? get iconPath;
++}
+\ No newline at end of file
+diff --git a/lib/anonpay/anonpay_api.dart b/lib/anonpay/anonpay_api.dart
+new file mode 100644
+index 0000000000..bc6abc6e20
+--- /dev/null
++++ b/lib/anonpay/anonpay_api.dart
+@@ -0,0 +1,211 @@
++import 'dart:convert';
++import 'package:cake_wallet/anonpay/anonpay_donation_link_info.dart';
++import 'package:cake_wallet/anonpay/anonpay_invoice_info.dart';
++import 'package:cake_wallet/anonpay/anonpay_request.dart';
++import 'package:cake_wallet/anonpay/anonpay_status_response.dart';
++import 'package:cake_wallet/core/fiat_conversion_service.dart';
++import 'package:cake_wallet/entities/fiat_currency.dart';
++import 'package:cake_wallet/exchange/limits.dart';
++import 'package:cw_core/wallet_base.dart';
++import 'package:http/http.dart';
++import 'package:cw_core/crypto_currency.dart';
++import 'package:cake_wallet/.secrets.g.dart' as secrets;
++
++class AnonPayApi {
++  const AnonPayApi({
++    this.useTorOnly = false,
++    required this.wallet,
++  });
++  final bool useTorOnly;
++  final WalletBase wallet;
++
++  static const anonpayRef = secrets.anonPayReferralCode;
++  static const onionApiAuthority = 'trocadorfyhlu27aefre5u7zri66gudtzdyelymftvr4yjwcxhfaqsid.onion';
++  static const clearNetAuthority = 'trocador.app';
++  static const markup = secrets.trocadorExchangeMarkup;
++  static const anonPayPath = '/anonpay';
++  static const anonPayStatus = '/anonpay/status';
++  static const coinPath = 'api/coin';
++  static const apiKey = secrets.trocadorApiKey;
++
++  Future<AnonpayStatusResponse> paymentStatus(String id) async {
++    final authority = await _getAuthority();
++    final response = await get(Uri.https(authority, "$anonPayStatus/$id"));
++    final responseJSON = json.decode(response.body) as Map<String, dynamic>;
++    final status = responseJSON['Status'] as String;
++    final fiatAmount = responseJSON['Fiat_Amount'] as double?;
++    final fiatEquiv = responseJSON['Fiat_Equiv'] as String?;
++    final amountTo = responseJSON['AmountTo'] as double?;
++    final coinTo = responseJSON['CoinTo'] as String;
++    final address = responseJSON['Address'] as String;
++
++    return AnonpayStatusResponse(
++      status: status,
++      fiatAmount: fiatAmount,
++      amountTo: amountTo,
++      coinTo: coinTo,
++      address: address,
++      fiatEquiv: fiatEquiv,
++    );
++  }
++
++  Future<AnonpayInvoiceInfo> createInvoice(AnonPayRequest request) async {
++    final description = Uri.encodeComponent(request.description);
++    final body = <String, dynamic>{
++      'ticker_to': request.cryptoCurrency.title.toLowerCase(),
++      'network_to': _networkFor(request.cryptoCurrency),
++      'address': request.address,
++      'name': request.name,
++      'description': description,
++      'email': request.email,
++      'ref': anonpayRef,
++      'markup': markup,
++      'direct': 'False',
++    };
++
++    if (request.amount != null) {
++      body['amount'] = request.amount;
++    }
++    if (request.fiatEquivalent != null) {
++      body['fiat_equiv'] = request.fiatEquivalent;
++    }
++    final authority = await _getAuthority();
++
++    final response = await get(Uri.https(authority, anonPayPath, body));
++
++    final responseJSON = json.decode(response.body) as Map<String, dynamic>;
++    final id = responseJSON['ID'] as String;
++    final url = responseJSON['url'] as String;
++    final urlOnion = responseJSON['url_onion'] as String;
++    final statusUrl = responseJSON['status_url'] as String;
++    final statusUrlOnion = responseJSON['status_url_onion'] as String;
++
++    final statusInfo = await paymentStatus(id);
++
++    return AnonpayInvoiceInfo(
++      invoiceId: id,
++      clearnetUrl: url,
++      onionUrl: urlOnion,
++      status: statusInfo.status,
++      fiatAmount: statusInfo.fiatAmount,
++      fiatEquiv: statusInfo.fiatEquiv,
++      amountTo: statusInfo.amountTo,
++      coinTo: statusInfo.coinTo,
++      address: statusInfo.address,
++      clearnetStatusUrl: statusUrl,
++      onionStatusUrl: statusUrlOnion,
++      walletId: wallet.id,
++      createdAt: DateTime.now(),
++      provider: 'Trocador AnonPay invoice',
++    );
++  }
++
++  Future<AnonpayDonationLinkInfo> generateDonationLink(AnonPayRequest request) async {
++    final body = <String, dynamic>{
++      'ticker_to': request.cryptoCurrency.title.toLowerCase(),
++      'network_to': _networkFor(request.cryptoCurrency),
++      'address': request.address,
++      'ref': anonpayRef,
++      'direct': 'True',
++    };
++    if (request.name.isNotEmpty) {
++      body['name'] = request.name;
++    }
++    if (request.description.isNotEmpty) {
++      body['description'] = request.description;
++    }
++    if (request.email.isNotEmpty) {
++      body['email'] = request.email;
++    }
++
++    final clearnetUrl = Uri.https(clearNetAuthority, anonPayPath, body);
++    final onionUrl = Uri.https(onionApiAuthority, anonPayPath, body);
++    return AnonpayDonationLinkInfo(
++      clearnetUrl: clearnetUrl.toString(),
++      onionUrl: onionUrl.toString(),
++      address: request.address,
++    );
++  }
++
++  Future<Limits> fetchLimits({
++    FiatCurrency? fiatCurrency,
++    required CryptoCurrency cryptoCurrency,
++  }) async {
++    double fiatRate = 0.0;
++    if (fiatCurrency != null) {
++      fiatRate = await FiatConversionService.fetchPrice(
++        crypto: cryptoCurrency,
++        fiat: fiatCurrency,
++        torOnly: useTorOnly,
++      );
++    }
++
++    final params = <String, String>{
++      'api_key': apiKey,
++      'ticker': cryptoCurrency.title.toLowerCase(),
++      'name': cryptoCurrency.name,
++    };
++
++    final String apiAuthority = await _getAuthority();
++    final uri = Uri.https(apiAuthority, coinPath, params);
++
++    final response = await get(uri);
++
++    if (response.statusCode != 200) {
++      throw Exception('Unexpected http status: ${response.statusCode}');
++    }
++
++    final responseJSON = json.decode(response.body) as List<dynamic>;
++
++    if (responseJSON.isEmpty) {
++      throw Exception('No data');
++    }
++
++    final coinJson = responseJSON.first as Map<String, dynamic>;
++    final minimum = coinJson['minimum'] as double;
++    final maximum = coinJson['maximum'] as double;
++
++    if (fiatCurrency != null) {
++      return Limits(
++        min: double.tryParse((minimum * fiatRate).toStringAsFixed(2)),
++        max: double.tryParse((maximum * fiatRate).toStringAsFixed(2)),
++      );
++    }
++
++    return Limits(
++      min: minimum,
++      max: maximum,
++    );
++  }
++
++  String _networkFor(CryptoCurrency currency) {
++    switch (currency) {
++      case CryptoCurrency.usdt:
++        return CryptoCurrency.btc.title.toLowerCase();
++      default:
++        return currency.tag != null ? _normalizeTag(currency.tag!) : 'Mainnet';
++    }
++  }
++
++  String _normalizeTag(String tag) {
++    switch (tag) {
++      case 'ETH':
++        return 'ERC20';
++      default:
++        return tag.toLowerCase();
++    }
++  }
++
++  Future<String> _getAuthority() async {
++    try {
++      if (useTorOnly) {
++        return onionApiAuthority;
++      }
++      final uri = Uri.https(onionApiAuthority, '/anonpay');
++      await get(uri);
++      return onionApiAuthority;
++    } catch (e) {
++      return clearNetAuthority;
++    }
++  }
++}
+diff --git a/lib/anonpay/anonpay_donation_link_info.dart b/lib/anonpay/anonpay_donation_link_info.dart
+new file mode 100644
+index 0000000000..9c4d3dda7f
+--- /dev/null
++++ b/lib/anonpay/anonpay_donation_link_info.dart
+@@ -0,0 +1,13 @@
++import 'package:cake_wallet/anonpay/anonpay_info_base.dart';
++
++class AnonpayDonationLinkInfo implements AnonpayInfoBase{
++  final String clearnetUrl;
++  final String onionUrl;
++  final String address;
++  
++  AnonpayDonationLinkInfo({
++    required this.clearnetUrl,
++    required this.onionUrl,
++    required this.address,
++  });
++}
+\ No newline at end of file
+diff --git a/lib/anonpay/anonpay_info_base.dart b/lib/anonpay/anonpay_info_base.dart
+new file mode 100644
+index 0000000000..d53dd0d7f0
+--- /dev/null
++++ b/lib/anonpay/anonpay_info_base.dart
+@@ -0,0 +1,5 @@
++abstract class AnonpayInfoBase {
++  String get clearnetUrl;
++  String get onionUrl;
++  String get address;
++}
+\ No newline at end of file
+diff --git a/lib/anonpay/anonpay_invoice_info.dart b/lib/anonpay/anonpay_invoice_info.dart
+new file mode 100644
+index 0000000000..89613224ea
+--- /dev/null
++++ b/lib/anonpay/anonpay_invoice_info.dart
+@@ -0,0 +1,57 @@
++import 'package:cake_wallet/anonpay/anonpay_info_base.dart';
++import 'package:cw_core/keyable.dart';
++import 'package:hive/hive.dart';
++
++part 'anonpay_invoice_info.g.dart';
++
++@HiveType(typeId: AnonpayInvoiceInfo.typeId)
++class AnonpayInvoiceInfo extends HiveObject with Keyable implements AnonpayInfoBase {
++  @HiveField(0)
++  final String invoiceId;
++  @HiveField(1)
++  String status;
++  @HiveField(2)
++  final double? fiatAmount;
++  @HiveField(3)
++  final String? fiatEquiv;
++  @HiveField(4)
++  final double? amountTo;
++  @HiveField(5)
++  final String coinTo;
++  @HiveField(6)
++  final String address;
++  @HiveField(7)
++  final String clearnetUrl;
++  @HiveField(8)
++  final String onionUrl;
++  @HiveField(9)
++  final String clearnetStatusUrl;
++  @HiveField(10)
++  final String onionStatusUrl;
++  @HiveField(11)
++  final DateTime createdAt;
++  @HiveField(12)
++  final String walletId;
++  @HiveField(13)
++  final String provider;
++
++  static const typeId = 10;
++  static const boxName = 'AnonpayInvoiceInfo';
++
++  AnonpayInvoiceInfo({
++    required this.invoiceId,
++    required this.clearnetUrl,
++    required this.onionUrl,
++    required this.clearnetStatusUrl,
++    required this.onionStatusUrl,
++    required this.status,
++    this.fiatAmount,
++    this.fiatEquiv,
++    this.amountTo,
++    required this.coinTo,
++    required this.address,
++    required this.createdAt,
++    required this.walletId,
++    required this.provider,
++  });
++}
+diff --git a/lib/anonpay/anonpay_request.dart b/lib/anonpay/anonpay_request.dart
+new file mode 100644
+index 0000000000..f548ea16ec
+--- /dev/null
++++ b/lib/anonpay/anonpay_request.dart
+@@ -0,0 +1,21 @@
++import 'package:cw_core/crypto_currency.dart';
++
++class AnonPayRequest {
++  CryptoCurrency cryptoCurrency;
++  String address;
++  String name;
++  String? amount;
++  String email;
++  String description;
++  String? fiatEquivalent;
++
++  AnonPayRequest({
++    required this.cryptoCurrency,
++    required this.address,
++    required this.name,
++    required this.email,
++    this.amount,
++    required this.description,
++    this.fiatEquivalent,
++  });
++}
+diff --git a/lib/anonpay/anonpay_status_response.dart b/lib/anonpay/anonpay_status_response.dart
+new file mode 100644
+index 0000000000..53e28e9b86
+--- /dev/null
++++ b/lib/anonpay/anonpay_status_response.dart
+@@ -0,0 +1,17 @@
++class AnonpayStatusResponse {
++  final String status;
++  final double? fiatAmount;
++  final String? fiatEquiv;
++  final double? amountTo;
++  final String coinTo;
++  final String address;
++
++  const AnonpayStatusResponse({
++    required this.status,
++    this.fiatAmount,
++    this.fiatEquiv,
++    this.amountTo,
++    required this.coinTo,
++    required this.address,
++  });
++}
+diff --git a/lib/di.dart b/lib/di.dart
+index 2f20d2ce26..0b8407cf59 100644
+--- a/lib/di.dart
++++ b/lib/di.dart
+@@ -1,10 +1,18 @@
++import 'package:cake_wallet/anonpay/anonpay_api.dart';
++import 'package:cake_wallet/anonpay/anonpay_info_base.dart';
++import 'package:cake_wallet/anonpay/anonpay_invoice_info.dart';
+ import 'package:cake_wallet/core/yat_service.dart';
++import 'package:cake_wallet/entities/exchange_api_mode.dart';
+ import 'package:cake_wallet/entities/parse_address_from_domain.dart';
++import 'package:cake_wallet/entities/receive_page_option.dart';
+ import 'package:cake_wallet/entities/wake_lock.dart';
+ import 'package:cake_wallet/ionia/ionia_anypay.dart';
+ import 'package:cake_wallet/ionia/ionia_gift_card.dart';
+ import 'package:cake_wallet/ionia/ionia_tip.dart';
++import 'package:cake_wallet/src/screens/anonpay_details/anonpay_details_page.dart';
+ import 'package:cake_wallet/src/screens/buy/onramper_page.dart';
++import 'package:cake_wallet/src/screens/receive/anonpay_invoice_page.dart';
++import 'package:cake_wallet/src/screens/receive/anonpay_receive_page.dart';
+ import 'package:cake_wallet/src/screens/settings/display_settings_page.dart';
+ import 'package:cake_wallet/src/screens/settings/other_settings_page.dart';
+ import 'package:cake_wallet/src/screens/settings/privacy_page.dart';
+@@ -13,7 +21,11 @@ import 'package:cake_wallet/src/screens/ionia/cards/ionia_custom_redeem_page.dar
+ import 'package:cake_wallet/src/screens/ionia/cards/ionia_gift_card_detail_page.dart';
+ import 'package:cake_wallet/src/screens/ionia/cards/ionia_more_options_page.dart';
+ import 'package:cake_wallet/src/screens/settings/connection_sync_page.dart';
++import 'package:cake_wallet/store/anonpay/anonpay_transactions_store.dart';
+ import 'package:cake_wallet/utils/payment_request.dart';
++import 'package:cake_wallet/view_model/anon_invoice_page_view_model.dart';
++import 'package:cake_wallet/view_model/anonpay_details_view_model.dart';
++import 'package:cake_wallet/view_model/dashboard/receive_option_view_model.dart';
+ import 'package:cake_wallet/view_model/ionia/ionia_auth_view_model.dart';
+ import 'package:cake_wallet/view_model/ionia/ionia_buy_card_view_model.dart';
+ import 'package:cake_wallet/view_model/ionia/ionia_custom_tip_view_model.dart';
+@@ -176,6 +188,7 @@ late Box<ExchangeTemplate> _exchangeTemplates;
+ late Box<TransactionDescription> _transactionDescriptionBox;
+ late Box<Order> _ordersSource;
+ late Box<UnspentCoinsInfo>? _unspentCoinsInfoSource;
++late Box<AnonpayInvoiceInfo> _anonpayInvoiceInfoSource;
+ 
+ Future setup(
+     {required Box<WalletInfo> walletInfoSource,
+@@ -186,7 +199,9 @@ Future setup(
+     required Box<ExchangeTemplate> exchangeTemplates,
+     required Box<TransactionDescription> transactionDescriptionBox,
+     required Box<Order> ordersSource,
+-    Box<UnspentCoinsInfo>? unspentCoinsInfoSource}) async {
++    Box<UnspentCoinsInfo>? unspentCoinsInfoSource,
++    required Box<AnonpayInvoiceInfo> anonpayInvoiceInfoSource
++    }) async {
+   _walletInfoSource = walletInfoSource;
+   _nodeSource = nodeSource;
+   _contactSource = contactSource;
+@@ -196,6 +211,7 @@ Future setup(
+   _transactionDescriptionBox = transactionDescriptionBox;
+   _ordersSource = ordersSource;
+   _unspentCoinsInfoSource = unspentCoinsInfoSource;
++  _anonpayInvoiceInfoSource = anonpayInvoiceInfoSource;
+ 
+   if (!_isSetupFinished) {
+     getIt.registerSingletonAsync<SharedPreferences>(
+@@ -240,6 +256,8 @@ Future setup(
+       appStore: getIt.get<AppStore>(),
+       secureStorage: getIt.get<FlutterSecureStorage>())
+     ..init());
++  getIt.registerSingleton<AnonpayTransactionsStore>(AnonpayTransactionsStore(
++      anonpayInvoiceInfoSource: _anonpayInvoiceInfoSource));
+ 
+   final secretStore =
+       await SecretStoreBase.load(getIt.get<FlutterSecureStorage>());
+@@ -306,7 +324,9 @@ Future setup(
+       transactionFilterStore: getIt.get<TransactionFilterStore>(),
+       settingsStore: settingsStore,
+       yatStore: getIt.get<YatStore>(),
+-      ordersStore: getIt.get<OrdersStore>()));
++      ordersStore: getIt.get<OrdersStore>(),
++      anonpayTransactionsStore: getIt.get<AnonpayTransactionsStore>())
++    );
+ 
+   getIt.registerFactory<AuthService>(() => AuthService(
+       secureStorage: getIt.get<FlutterSecureStorage>(),
+@@ -360,11 +380,37 @@ Future setup(
+    BalancePage(dashboardViewModel: getIt.get<DashboardViewModel>(), settingsStore: getIt.get<SettingsStore>()));
+ 
+   getIt.registerFactory<DashboardPage>(() => DashboardPage( balancePage: getIt.get<BalancePage>(), walletViewModel: getIt.get<DashboardViewModel>(), addressListViewModel: getIt.get<WalletAddressListViewModel>()));
++  
++  getIt.registerFactoryParam<ReceiveOptionViewModel, ReceivePageOption?, void>((pageOption, _) => ReceiveOptionViewModel(
++      getIt.get<AppStore>().wallet!, pageOption));
++
++  getIt.registerFactoryParam<AnonInvoicePageViewModel, List<dynamic>, void>((args, _) { 
++    final address = args.first as String;
++    final pageOption = args.last as ReceivePageOption;
++    return AnonInvoicePageViewModel(
++      getIt.get<AnonPayApi>(), 
++      address, 
++      getIt.get<SettingsStore>(), 
++      getIt.get<AppStore>().wallet!, 
++      _anonpayInvoiceInfoSource, 
++      getIt.get<SharedPreferences>(),
++      pageOption,
++    ); 
++    });
++
++  getIt.registerFactoryParam<AnonPayInvoicePage, List<dynamic>, void>((List<dynamic> args, _) { 
++    final pageOption = args.last as ReceivePageOption;
++    return AnonPayInvoicePage(
++       getIt.get<AnonInvoicePageViewModel>(param1: args), 
++       getIt.get<ReceiveOptionViewModel>(param1: pageOption));
++    });  
++  
+   getIt.registerFactory<ReceivePage>(() => ReceivePage(
+       addressListViewModel: getIt.get<WalletAddressListViewModel>()));
+   getIt.registerFactory<AddressPage>(() => AddressPage(
+       addressListViewModel: getIt.get<WalletAddressListViewModel>(),
+-      walletViewModel: getIt.get<DashboardViewModel>()));
++      walletViewModel: getIt.get<DashboardViewModel>(),
++      receiveOptionViewModel: getIt.get<ReceiveOptionViewModel>()));
+ 
+   getIt.registerFactoryParam<WalletAddressEditOrCreateViewModel, WalletAddressListItem?, void>(
+       (WalletAddressListItem? item, _) => WalletAddressEditOrCreateViewModel(
+@@ -716,8 +762,8 @@ Future setup(
+   getIt.registerFactory(() => AddressResolver(yatService: getIt.get<YatService>(),
+     walletType: getIt.get<AppStore>().wallet!.type));
+ 
+-  getIt.registerFactoryParam<FullscreenQRPage, String, bool>(
+-          (String qrData, bool isLight) => FullscreenQRPage(qrData: qrData, isLight: isLight,));
++  getIt.registerFactoryParam<FullscreenQRPage, String, int?>(
++          (String qrData, int? version) => FullscreenQRPage(qrData: qrData, version: version,));
+ 
+   getIt.registerFactory(() => IoniaApi());
+ 
+@@ -823,6 +869,25 @@ Future setup(
+   getIt.registerFactory(() => IoniaAccountPage(getIt.get<IoniaAccountViewModel>()));
+ 
+   getIt.registerFactory(() => IoniaAccountCardsPage(getIt.get<IoniaAccountViewModel>()));
++  
++  getIt.registerFactory(() => AnonPayApi(useTorOnly: getIt.get<SettingsStore>().exchangeStatus == ExchangeApiMode.torOnly,
++    wallet: getIt.get<AppStore>().wallet!) 
++  );
++
++  getIt.registerFactoryParam<AnonpayDetailsViewModel, AnonpayInvoiceInfo, void>(
++  (AnonpayInvoiceInfo anonpayInvoiceInfo, _)
++    => AnonpayDetailsViewModel(
++      anonPayApi: getIt.get<AnonPayApi>(),
++      anonpayInvoiceInfo: anonpayInvoiceInfo,
++      settingsStore: getIt.get<SettingsStore>(),
++     ));
++
++  getIt.registerFactoryParam<AnonPayReceivePage, AnonpayInfoBase, void>(
++    (AnonpayInfoBase anonpayInvoiceInfo, _) => AnonPayReceivePage(invoiceInfo: anonpayInvoiceInfo));
++
++  getIt.registerFactoryParam<AnonpayDetailsPage, AnonpayInvoiceInfo, void>(
++    (AnonpayInvoiceInfo anonpayInvoiceInfo, _) 
++    => AnonpayDetailsPage(anonpayDetailsViewModel: getIt.get<AnonpayDetailsViewModel>(param1: anonpayInvoiceInfo)));
+ 
+   getIt.registerFactoryParam<IoniaPaymentStatusViewModel, IoniaAnyPayPaymentInfo, AnyPayPaymentCommittedInfo>(
+     (IoniaAnyPayPaymentInfo paymentInfo, AnyPayPaymentCommittedInfo committedInfo)
+diff --git a/lib/entities/fiat_currency.dart b/lib/entities/fiat_currency.dart
+index 12ceff92a5..8310eb18fb 100644
+--- a/lib/entities/fiat_currency.dart
++++ b/lib/entities/fiat_currency.dart
+@@ -1,6 +1,7 @@
++import 'package:cw_core/currency.dart';
+ import 'package:cw_core/enumerable_item.dart';
+ 
+-class FiatCurrency extends EnumerableItem<String> with Serializable<String> {
++class FiatCurrency extends EnumerableItem<String> with Serializable<String> implements Currency {
+   const FiatCurrency({required String symbol, required this.countryCode, required this.fullName}) : super(title: symbol, raw: symbol);
+ 
+   final String countryCode;
+@@ -118,4 +119,13 @@ class FiatCurrency extends EnumerableItem<String> with Serializable<String> {
+ 
+   @override
+   int get hashCode => raw.hashCode ^ title.hashCode;
++  
++  @override
++  String get name => raw;
++  
++  @override
++  String? get tag => null;
++
++  @override
++  String get iconPath => "assets/images/flags/$countryCode.png"; 
+ }
+diff --git a/lib/entities/preferences_key.dart b/lib/entities/preferences_key.dart
+index e237b06913..8ea30a6f2a 100644
+--- a/lib/entities/preferences_key.dart
++++ b/lib/entities/preferences_key.dart
+@@ -37,4 +37,6 @@ class PreferencesKey {
+     => '${PreferencesKey.moneroWalletPasswordUpdateV1Base}_${name}';
+ 
+   static const exchangeProvidersSelection = 'exchange-providers-selection';
++  static const clearnetDonationLink = 'clearnet_donation_link'; 
++  static const onionDonationLink = 'onion_donation_link'; 
+ }
+diff --git a/lib/entities/receive_page_option.dart b/lib/entities/receive_page_option.dart
+new file mode 100644
+index 0000000000..3ee9abe96e
+--- /dev/null
++++ b/lib/entities/receive_page_option.dart
+@@ -0,0 +1,23 @@
++
++enum ReceivePageOption {
++  mainnet,
++  anonPayInvoice,
++  anonPayDonationLink;
++
++  @override
++  String toString() {
++    String label = '';
++    switch (this) {
++      case ReceivePageOption.mainnet:
++        label = 'Mainnet';
++        break;
++      case ReceivePageOption.anonPayInvoice:
++        label = 'Trocador AnonPay Invoice';
++        break;
++      case ReceivePageOption.anonPayDonationLink:
++        label = 'Trocador AnonPay Donation Link';
++        break;
++    }
++    return label;
++  }
++}
+diff --git a/lib/main.dart b/lib/main.dart
+index 7ba1f204a9..8cc2629c91 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -1,4 +1,5 @@
+ import 'dart:async';
++import 'package:cake_wallet/anonpay/anonpay_invoice_info.dart';
+ import 'package:cake_wallet/core/auth_service.dart';
+ import 'package:cake_wallet/entities/language_service.dart';
+ import 'package:cake_wallet/buy/order.dart';
+@@ -100,6 +101,10 @@ Future<void> main() async {
+       Hive.registerAdapter(UnspentCoinsInfoAdapter());
+     }
+ 
++    if (!Hive.isAdapterRegistered(AnonpayInvoiceInfo.typeId)) {
++      Hive.registerAdapter(AnonpayInvoiceInfoAdapter());
++    }
++
+     final secureStorage = FlutterSecureStorage();
+     final transactionDescriptionsBoxKey = await getEncryptionKey(
+         secureStorage: secureStorage, forKey: TransactionDescription.boxKey);
+@@ -120,6 +125,7 @@ Future<void> main() async {
+     final templates = await Hive.openBox<Template>(Template.boxName);
+     final exchangeTemplates =
+         await Hive.openBox<ExchangeTemplate>(ExchangeTemplate.boxName);
++    final anonpayInvoiceInfo = await Hive.openBox<AnonpayInvoiceInfo>(AnonpayInvoiceInfo.boxName);
+     Box<UnspentCoinsInfo>? unspentCoinsInfoSource;
+     
+     if (!isMoneroOnly) {
+@@ -139,6 +145,7 @@ Future<void> main() async {
+         exchangeTemplates: exchangeTemplates,
+         transactionDescriptions: transactionDescriptions,
+         secureStorage: secureStorage,
++        anonpayInvoiceInfo: anonpayInvoiceInfo,
+         initialMigrationVersion: 19);
+     runApp(App());
+   }, (error, stackTrace) async {
+@@ -158,6 +165,7 @@ Future<void> initialSetup(
+     required Box<ExchangeTemplate> exchangeTemplates,
+     required Box<TransactionDescription> transactionDescriptions,
+     required FlutterSecureStorage secureStorage,
++    required Box<AnonpayInvoiceInfo> anonpayInvoiceInfo,
+     Box<UnspentCoinsInfo>? unspentCoinsInfoSource,
+     int initialMigrationVersion = 15}) async {
+   LanguageService.loadLocaleList();
+@@ -178,6 +186,7 @@ Future<void> initialSetup(
+       exchangeTemplates: exchangeTemplates,
+       transactionDescriptionBox: transactionDescriptions,
+       ordersSource: ordersSource,
++      anonpayInvoiceInfoSource: anonpayInvoiceInfo,
+       unspentCoinsInfoSource: unspentCoinsInfoSource,
+       );
+   await bootstrap(navigatorKey);
+diff --git a/lib/router.dart b/lib/router.dart
+index dbeb540eb2..ac3c67b260 100644
+--- a/lib/router.dart
++++ b/lib/router.dart
+@@ -1,10 +1,15 @@
++import 'package:cake_wallet/anonpay/anonpay_info_base.dart';
++import 'package:cake_wallet/anonpay/anonpay_invoice_info.dart';
+ import 'package:cake_wallet/entities/contact_record.dart';
+ import 'package:cake_wallet/buy/order.dart';
++import 'package:cake_wallet/src/screens/anonpay_details/anonpay_details_page.dart';
+ import 'package:cake_wallet/src/screens/backup/backup_page.dart';
+ import 'package:cake_wallet/src/screens/backup/edit_backup_password_page.dart';
+ import 'package:cake_wallet/src/screens/buy/buy_webview_page.dart';
+ import 'package:cake_wallet/src/screens/buy/onramper_page.dart';
+ import 'package:cake_wallet/src/screens/buy/pre_order_page.dart';
++import 'package:cake_wallet/src/screens/receive/anonpay_invoice_page.dart';
++import 'package:cake_wallet/src/screens/receive/anonpay_receive_page.dart';
+ import 'package:cake_wallet/src/screens/settings/display_settings_page.dart';
+ import 'package:cake_wallet/src/screens/settings/other_settings_page.dart';
+ import 'package:cake_wallet/src/screens/settings/privacy_page.dart';
+@@ -440,7 +445,8 @@ Route<dynamic> createRoute(RouteSettings settings) {
+           builder: (_) =>
+               getIt.get<FullscreenQRPage>(
+                 param1: args['qrData'] as String,
+-                param2: args['isLight'] as bool,
++                param2: args['version'] as int?,
++                
+               ));
+ 
+     case Routes.ioniaWelcomePage:
+@@ -514,7 +520,19 @@ Route<dynamic> createRoute(RouteSettings settings) {
+             getIt.get<AdvancedPrivacySettingsViewModel>(param1: type),
+             getIt.get<NodeCreateOrEditViewModel>(param1: type),
+           ));
+-
++    
++    case Routes.anonPayInvoicePage:
++      final args = settings.arguments as List;
++      return CupertinoPageRoute<void>(builder: (_) => getIt.get<AnonPayInvoicePage>(param1: args));
++    
++    case Routes.anonPayReceivePage:
++        final anonInvoiceViewData = settings.arguments as AnonpayInfoBase;
++      return CupertinoPageRoute<void>(builder: (_) => getIt.get<AnonPayReceivePage>(param1: anonInvoiceViewData));
++    
++    case Routes.anonPayDetailsPage:
++      final anonInvoiceViewData = settings.arguments as AnonpayInvoiceInfo;
++      return CupertinoPageRoute<void>(builder: (_) => getIt.get<AnonpayDetailsPage>(param1: anonInvoiceViewData));
++      
+     default:
+       return MaterialPageRoute<void>(
+           builder: (_) => Scaffold(
+diff --git a/lib/routes.dart b/lib/routes.dart
+index 5ea2503102..8c07873d7d 100644
+--- a/lib/routes.dart
++++ b/lib/routes.dart
+@@ -82,4 +82,7 @@ class Routes {
+   static const displaySettingsPage = '/display_settings_page';
+   static const otherSettingsPage = '/other_settings_page';
+   static const advancedPrivacySettings = '/advanced_privacy_settings';
++  static const anonPayInvoicePage = '/anon_pay_invoice_page';
++  static const anonPayReceivePage = '/anon_pay_receive_page';
++  static const anonPayDetailsPage = '/anon_pay_details_page';
+ }
+diff --git a/lib/src/screens/anonpay_details/anonpay_details_page.dart b/lib/src/screens/anonpay_details/anonpay_details_page.dart
+new file mode 100644
+index 0000000000..14ebadc0e9
+--- /dev/null
++++ b/lib/src/screens/anonpay_details/anonpay_details_page.dart
+@@ -0,0 +1,56 @@
++import 'package:cake_wallet/generated/i18n.dart';
++import 'package:cake_wallet/src/screens/base_page.dart';
++import 'package:cake_wallet/src/screens/trade_details/trade_details_list_card.dart';
++import 'package:cake_wallet/src/screens/trade_details/trade_details_status_item.dart';
++import 'package:cake_wallet/src/widgets/list_row.dart';
++import 'package:cake_wallet/src/widgets/standard_list.dart';
++import 'package:cake_wallet/src/widgets/standard_list_card.dart';
++import 'package:cake_wallet/src/widgets/standard_list_status_row.dart';
++import 'package:cake_wallet/utils/show_bar.dart';
++import 'package:cake_wallet/view_model/anonpay_details_view_model.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter/services.dart';
++
++class AnonpayDetailsPage extends BasePage {
++  AnonpayDetailsPage({required this.anonpayDetailsViewModel});
++
++  @override
++  String get title => S.current.invoice_details;
++
++  final AnonpayDetailsViewModel anonpayDetailsViewModel;
++
++  @override
++  Widget body(BuildContext context) {
++    return SectionStandardList(
++        context: context,
++        sectionCount: 1,
++        itemCounter: (int _) => anonpayDetailsViewModel.items.length,
++        itemBuilder: (_, __, index) {
++          final item = anonpayDetailsViewModel.items[index];
++
++          if (item is DetailsListStatusItem) {
++            return StandardListStatusRow(title: item.title, value: item.value);
++          }
++
++          if (item is TradeDetailsListCardItem) {
++            return TradeDetailsStandardListCard(
++              id: item.id,
++              create: item.createdAt,
++              pair: item.pair,
++              currentTheme: anonpayDetailsViewModel.settingsStore.currentTheme.type,
++              onTap: item.onTap,
++            );
++          }
++
++            return GestureDetector(
++              onTap: () {
++                Clipboard.setData(ClipboardData(text: item.value));
++                showBar<void>(context, S.of(context).transaction_details_copied(item.title));
++              },
++              child: ListRow(title: '${item.title}:', value: item.value),
++            );
++          
++
++        });
++  }
++}
+diff --git a/lib/src/screens/contact/contact_page.dart b/lib/src/screens/contact/contact_page.dart
+index 86a51d71f3..abc39bda80 100644
+--- a/lib/src/screens/contact/contact_page.dart
++++ b/lib/src/screens/contact/contact_page.dart
+@@ -1,6 +1,7 @@
+ import 'package:cake_wallet/core/validator.dart';
+ import 'package:cake_wallet/palette.dart';
+ import 'package:cake_wallet/utils/show_pop_up.dart';
++import 'package:cw_core/currency.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter/cupertino.dart';
+ import 'package:flutter_mobx/flutter_mobx.dart';
+@@ -153,8 +154,8 @@ class ContactPage extends BasePage {
+             items: contactViewModel.currencies,
+             title: S.of(context).please_select,
+             hintText: S.of(context).search_currency,
+-            onItemSelected: (CryptoCurrency item) =>
+-                contactViewModel.currency = item),
++            onItemSelected: (Currency item) =>
++                contactViewModel.currency = item as CryptoCurrency),
+         context: context);
+   }
+ 
+diff --git a/lib/src/screens/dashboard/widgets/address_page.dart b/lib/src/screens/dashboard/widgets/address_page.dart
+index a09eb2ba8d..5de8124c41 100644
+--- a/lib/src/screens/dashboard/widgets/address_page.dart
++++ b/lib/src/screens/dashboard/widgets/address_page.dart
+@@ -1,9 +1,14 @@
++import 'package:cake_wallet/anonpay/anonpay_donation_link_info.dart';
++import 'package:cake_wallet/entities/preferences_key.dart';
++import 'package:cake_wallet/entities/receive_page_option.dart';
+ import 'package:cake_wallet/src/screens/base_page.dart';
++import 'package:cake_wallet/src/screens/dashboard/widgets/present_receive_option_picker.dart';
+ import 'package:cake_wallet/src/widgets/alert_with_two_actions.dart';
+ import 'package:cake_wallet/src/widgets/keyboard_done_button.dart';
+ import 'package:cake_wallet/themes/theme_base.dart';
+ import 'package:cake_wallet/utils/share_util.dart';
+ import 'package:cake_wallet/utils/show_pop_up.dart';
++import 'package:cake_wallet/view_model/dashboard/receive_option_view_model.dart';
+ import 'package:cake_wallet/view_model/dashboard/dashboard_view_model.dart';
+ import 'package:flutter/material.dart';
+ import 'package:cake_wallet/view_model/wallet_address_list/wallet_address_list_view_model.dart';
+@@ -13,24 +18,25 @@ import 'package:cake_wallet/generated/i18n.dart';
+ import 'package:flutter_mobx/flutter_mobx.dart';
+ import 'package:keyboard_actions/keyboard_actions.dart';
+ import 'package:mobx/mobx.dart';
++import 'package:shared_preferences/shared_preferences.dart';
++import 'package:cake_wallet/di.dart';
+ 
+ class AddressPage extends BasePage {
+   AddressPage({
+     required this.addressListViewModel,
+-    required this.walletViewModel})
+-    : _cryptoAmountFocus = FocusNode();
++    required this.walletViewModel,
++    required this.receiveOptionViewModel,
++  }) : _cryptoAmountFocus = FocusNode();
+ 
+   final WalletAddressListViewModel addressListViewModel;
+   final DashboardViewModel walletViewModel;
++  final ReceiveOptionViewModel receiveOptionViewModel;
+ 
+   final FocusNode _cryptoAmountFocus;
+ 
+   @override
+-  String get title => S.current.receive;
+-
+-  @override
+-  Color get backgroundLightColor => currentTheme.type == ThemeType.bright
+-      ? Colors.transparent : Colors.white;
++  Color get backgroundLightColor =>
++      currentTheme.type == ThemeType.bright ? Colors.transparent : Colors.white;
+ 
+   @override
+   Color get backgroundDarkColor => Colors.transparent;
+@@ -38,11 +44,15 @@ class AddressPage extends BasePage {
+   @override
+   bool get resizeToAvoidBottomInset => false;
+ 
++  bool effectsInstalled = false;
++
+   @override
+   Widget leading(BuildContext context) {
+-    final _backButton = Icon(Icons.arrow_back_ios,
+-      color: Theme.of(context).accentTextTheme!.headline2!.backgroundColor!,
+-      size: 16,);
++    final _backButton = Icon(
++      Icons.arrow_back_ios,
++      color: Theme.of(context).accentTextTheme.headline2!.backgroundColor!,
++      size: 16,
++    );
+ 
+     return SizedBox(
+       height: 37,
+@@ -61,16 +71,8 @@ class AddressPage extends BasePage {
+   }
+ 
+   @override
+-  Widget middle(BuildContext context) {
+-    return Text(
+-      title,
+-      style: TextStyle(
+-          fontSize: 18.0,
+-          fontWeight: FontWeight.bold,
+-          fontFamily: 'Lato',
+-          color: Theme.of(context).accentTextTheme!.headline2!.backgroundColor!),
+-    );
+-  }
++  Widget middle(BuildContext context) =>
++      PresentReceiveOptionPicker(receiveOptionViewModel: receiveOptionViewModel);
+ 
+   @override
+   Widget Function(BuildContext, Widget) get rootWrapper =>
+@@ -85,53 +87,56 @@ class AddressPage extends BasePage {
+ 
+   @override
+   Widget? trailing(BuildContext context) {
+-    final shareImage =
+-    Image.asset('assets/images/share.png',
++    final shareImage = Image.asset('assets/images/share.png',
+         color: Theme.of(context).accentTextTheme!.headline2!.backgroundColor!);
+ 
+-    return !addressListViewModel.hasAddressList ? Material(
+-      color: Colors.transparent,
+-      child: IconButton(
+-        padding: EdgeInsets.zero,
+-        constraints: BoxConstraints(),
+-        highlightColor: Colors.transparent,
+-        splashColor: Colors.transparent,
+-        iconSize: 25,
+-        onPressed: () {
+-          ShareUtil.share(
+-            text: addressListViewModel.address.address,
+-            context: context,
+-          );
+-        },
+-        icon: shareImage,
+-      ),
+-    ) : null;
++    return !addressListViewModel.hasAddressList
++        ? Material(
++            color: Colors.transparent,
++            child: IconButton(
++              padding: EdgeInsets.zero,
++              constraints: BoxConstraints(),
++              highlightColor: Colors.transparent,
++              splashColor: Colors.transparent,
++              iconSize: 25,
++              onPressed: () {
++                ShareUtil.share(
++                  text: addressListViewModel.address.address,
++                  context: context,
++                );
++              },
++              icon: shareImage,
++            ),
++          )
++        : null;
+   }
+ 
+   @override
+   Widget body(BuildContext context) {
++    _setEffects(context);
++
+     autorun((_) async {
+-      if (!walletViewModel.isOutdatedElectrumWallet
+-        || !walletViewModel.settingsStore.shouldShowReceiveWarning) {
++      if (!walletViewModel.isOutdatedElectrumWallet ||
++          !walletViewModel.settingsStore.shouldShowReceiveWarning) {
+         return;
+       }
+ 
+       await Future<void>.delayed(Duration(seconds: 1));
+       if (context.mounted) {
+         await showPopUp<void>(
+-          context: context,
+-          builder: (BuildContext context) {
+-            return AlertWithTwoActions(
+-                alertTitle: S.of(context).pre_seed_title,
+-                alertContent: S.of(context).outdated_electrum_wallet_receive_warning,
+-                leftButtonText: S.of(context).understand,
+-                actionLeftButton: () => Navigator.of(context).pop(),
+-                rightButtonText: S.of(context).do_not_show_me,
+-                actionRightButton: () {
+-                  walletViewModel.settingsStore.setShouldShowReceiveWarning(false);
+-                  Navigator.of(context).pop();
+-                });
+-          });
++            context: context,
++            builder: (BuildContext context) {
++              return AlertWithTwoActions(
++                  alertTitle: S.of(context).pre_seed_title,
++                  alertContent: S.of(context).outdated_electrum_wallet_receive_warning,
++                  leftButtonText: S.of(context).understand,
++                  actionLeftButton: () => Navigator.of(context).pop(),
++                  rightButtonText: S.of(context).do_not_show_me,
++                  actionRightButton: () {
++                    walletViewModel.settingsStore.setShouldShowReceiveWarning(false);
++                    Navigator.of(context).pop();
++                  });
++            });
+       }
+     });
+ 
+@@ -141,8 +146,7 @@ class AddressPage extends BasePage {
+         tapOutsideToDismiss: true,
+         config: KeyboardActionsConfig(
+             keyboardActionsPlatform: KeyboardActionsPlatform.IOS,
+-            keyboardBarColor:
+-                Theme.of(context).accentTextTheme!.bodyText1!.backgroundColor!,
++            keyboardBarColor: Theme.of(context).accentTextTheme.bodyText1!.backgroundColor!,
+             nextFocus: false,
+             actions: [
+               KeyboardActionsItem(
+@@ -154,29 +158,25 @@ class AddressPage extends BasePage {
+           padding: EdgeInsets.fromLTRB(24, 24, 24, 32),
+           child: Column(
+             children: <Widget>[
+-              Expanded(
+-                  child: Observer(builder: (_) => QRWidget(
+-                      addressListViewModel: addressListViewModel,
+-                      amountTextFieldFocusNode: _cryptoAmountFocus,
+-                      isAmountFieldShow: !addressListViewModel.hasAccounts,
+-                      isLight: walletViewModel.settingsStore.currentTheme.type == ThemeType.light))
++            Expanded(
++              child: Observer(builder: (_) => QRWidget(
++                addressListViewModel: addressListViewModel,
++                amountTextFieldFocusNode: _cryptoAmountFocus,
++                isAmountFieldShow: !addressListViewModel.hasAccounts,
++                isLight: walletViewModel.settingsStore.currentTheme.type == ThemeType.light))
+               ),
+               Observer(builder: (_) {
+                 return addressListViewModel.hasAddressList
+                     ? GestureDetector(
+-                        onTap: () =>
+-                            Navigator.of(context).pushNamed(Routes.receive),
++                        onTap: () => Navigator.of(context).pushNamed(Routes.receive),
+                         child: Container(
+                           height: 50,
+                           padding: EdgeInsets.only(left: 24, right: 12),
+                           alignment: Alignment.center,
+                           decoration: BoxDecoration(
+-                              borderRadius:
+-                                  BorderRadius.all(Radius.circular(25)),
++                              borderRadius: BorderRadius.all(Radius.circular(25)),
+                               border: Border.all(
+-                                  color:
+-                                      Theme.of(context).textTheme!.subtitle1!.color!,
+-                                  width: 1),
++                                  color: Theme.of(context).textTheme.subtitle1!.color!, width: 1),
+                               color: Theme.of(context).buttonColor),
+                           child: Row(
+                             mainAxisSize: MainAxisSize.max,
+@@ -185,42 +185,79 @@ class AddressPage extends BasePage {
+                               Observer(
+                                   builder: (_) => Text(
+                                         addressListViewModel.hasAccounts
+-                                            ? S
+-                                                .of(context)
+-                                                .accounts_subaddresses
++                                            ? S.of(context).accounts_subaddresses
+                                             : S.of(context).addresses,
+                                         style: TextStyle(
+                                             fontSize: 14,
+                                             fontWeight: FontWeight.w500,
+                                             color: Theme.of(context)
+-                                                .accentTextTheme!
++                                                .accentTextTheme
+                                                 .headline2!
+                                                 .backgroundColor!),
+                                       )),
+                               Icon(
+                                 Icons.arrow_forward_ios,
+                                 size: 14,
+-                                color: Theme.of(context)
+-                                    .accentTextTheme!
+-                                    .headline2!
+-                                    .backgroundColor!,
++                                color:
++                                    Theme.of(context).accentTextTheme.headline2!.backgroundColor!,
+                               )
+                             ],
+                           ),
+                         ),
+                       )
+-                    : Text(
+-                        S.of(context).electrum_address_disclaimer,
++                    : Text(S.of(context).electrum_address_disclaimer,
+                         textAlign: TextAlign.center,
+                         style: TextStyle(
+                             fontSize: 15,
+-                            color: Theme.of(context)
+-                              .accentTextTheme!
+-                              .headline3!
+-                              .backgroundColor!));
++                            color: Theme.of(context).accentTextTheme.headline3!.backgroundColor!));
+               })
+             ],
+           ),
+         ));
+   }
++
++  void _setEffects(BuildContext context) {
++    if (effectsInstalled) {
++      return;
++    }
++
++    reaction((_) => receiveOptionViewModel.selectedReceiveOption, (ReceivePageOption option) {
++      Navigator.pop(context);
++      switch (option) {
++        case ReceivePageOption.anonPayInvoice:
++          Navigator.pushReplacementNamed(
++            context,
++            Routes.anonPayInvoicePage,
++            arguments: [addressListViewModel.address.address, option],
++          );
++          break;
++        case ReceivePageOption.anonPayDonationLink:
++          final sharedPreferences = getIt.get<SharedPreferences>();
++          final clearnetUrl = sharedPreferences.getString(PreferencesKey.clearnetDonationLink);
++          final onionUrl = sharedPreferences.getString(PreferencesKey.onionDonationLink);
++
++          if (clearnetUrl != null && onionUrl != null) {
++            Navigator.pushReplacementNamed(
++              context,
++              Routes.anonPayReceivePage,
++              arguments: AnonpayDonationLinkInfo(
++                clearnetUrl: clearnetUrl,
++                onionUrl: onionUrl,
++                address: addressListViewModel.address.address,
++              ),
++            );
++          } else {
++            Navigator.pushReplacementNamed(
++              context,
++              Routes.anonPayInvoicePage,
++              arguments: [addressListViewModel.address.address, option],
++            );
++          }
++          break;
++        default:
++      }
++    });
++
++    effectsInstalled = true;
++  }
+ }
+diff --git a/lib/src/screens/dashboard/widgets/anonpay_transaction_row.dart b/lib/src/screens/dashboard/widgets/anonpay_transaction_row.dart
+new file mode 100644
+index 0000000000..38f0ffd88f
+--- /dev/null
++++ b/lib/src/screens/dashboard/widgets/anonpay_transaction_row.dart
+@@ -0,0 +1,64 @@
++import 'package:flutter/material.dart';
++
++class AnonpayTransactionRow extends StatelessWidget {
++  AnonpayTransactionRow({
++    required this.provider,
++    required this.createdAt,
++    required this.currency,
++    required this.onTap,
++    required this.amount,
++  });
++
++  final VoidCallback? onTap;
++  final String provider;
++  final String createdAt;
++  final String amount;
++  final String currency;
++
++  @override
++  Widget build(BuildContext context) {
++    return InkWell(
++        onTap: onTap,
++        child: Container(
++          padding: EdgeInsets.fromLTRB(24, 8, 24, 8),
++          color: Colors.transparent,
++          child: Row(
++            mainAxisSize: MainAxisSize.max,
++            crossAxisAlignment: CrossAxisAlignment.center,
++            children: [
++              _getImage(),
++              SizedBox(width: 12),
++              Expanded(
++                  child: Column(
++                mainAxisSize: MainAxisSize.min,
++                children: [
++                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: <Widget>[
++                    Text(provider,
++                        style: TextStyle(
++                            fontSize: 16,
++                            fontWeight: FontWeight.w500,
++                            color: Theme.of(context).accentTextTheme.headline2!.backgroundColor!)),
++                    Text(amount + ' ' + currency,
++                        style: TextStyle(
++                            fontSize: 16,
++                            fontWeight: FontWeight.w500,
++                            color: Theme.of(context).accentTextTheme.headline2!.backgroundColor!))
++                  ]),
++                  SizedBox(height: 5),
++                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: <Widget>[
++                    Text(createdAt,
++                        style: TextStyle(
++                            fontSize: 14,
++                            color: Theme.of(context).textTheme.overline!.backgroundColor!))
++                  ])
++                ],
++              ))
++            ],
++          ),
++        ));
++  }
++
++  Widget _getImage() => ClipRRect(
++      borderRadius: BorderRadius.circular(50),
++      child: Image.asset('assets/images/trocador.png', width: 36, height: 36));
++}
+diff --git a/lib/src/screens/dashboard/widgets/present_receive_option_picker.dart b/lib/src/screens/dashboard/widgets/present_receive_option_picker.dart
+new file mode 100644
+index 0000000000..2ca63dd826
+--- /dev/null
++++ b/lib/src/screens/dashboard/widgets/present_receive_option_picker.dart
+@@ -0,0 +1,140 @@
++import 'package:cake_wallet/palette.dart';
++import 'package:cake_wallet/src/screens/ionia/widgets/rounded_checkbox.dart';
++import 'package:cake_wallet/src/widgets/alert_background.dart';
++import 'package:cake_wallet/typography.dart';
++import 'package:cake_wallet/utils/show_pop_up.dart';
++import 'package:cake_wallet/view_model/dashboard/receive_option_view_model.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_mobx/flutter_mobx.dart';
++import 'package:cake_wallet/generated/i18n.dart';
++
++class PresentReceiveOptionPicker extends StatelessWidget {
++  PresentReceiveOptionPicker({required this.receiveOptionViewModel});
++
++  final ReceiveOptionViewModel receiveOptionViewModel;
++
++  @override
++  Widget build(BuildContext context) {
++    final arrowBottom =
++        Image.asset('assets/images/arrow_bottom_purple_icon.png', color: Colors.white, height: 6);
++
++    return TextButton(
++      onPressed: () => _showPicker(context),
++      style: ButtonStyle(
++        padding: MaterialStateProperty.all(EdgeInsets.zero),
++        splashFactory: NoSplash.splashFactory,
++        foregroundColor: MaterialStateProperty.all(Colors.transparent),
++        overlayColor: MaterialStateProperty.all(Colors.transparent),
++      ),
++      child: Row(
++        mainAxisSize: MainAxisSize.min,
++        crossAxisAlignment: CrossAxisAlignment.start,
++        children: <Widget>[
++          Column(
++            crossAxisAlignment: CrossAxisAlignment.center,
++            mainAxisSize: MainAxisSize.min,
++            children: <Widget>[
++              Text(
++                S.current.receive,
++                style: TextStyle(
++                    fontSize: 18.0,
++                    fontWeight: FontWeight.bold,
++                    fontFamily: 'Lato',
++                    color: Theme.of(context).accentTextTheme.headline2!.backgroundColor!),
++              ),
++              Observer(
++                  builder: (_) => Text(receiveOptionViewModel.selectedReceiveOption.toString(),
++                      style: TextStyle(
++                          fontSize: 10.0,
++                          fontWeight: FontWeight.w500,
++                          color: Theme.of(context).textTheme.headline5!.color!)))
++            ],
++          ),
++          SizedBox(width: 5),
++          Padding(
++            padding: EdgeInsets.only(top: 12),
++            child: arrowBottom,
++          )
++        ],
++      ),
++    );
++  }
++
++  void _showPicker(BuildContext context) async {
++    await showPopUp<void>(
++      builder: (BuildContext popUpContext) => Scaffold(
++        resizeToAvoidBottomInset: false,
++        backgroundColor: Colors.transparent,
++        body: AlertBackground(
++          child: Column(
++            mainAxisSize: MainAxisSize.min,
++            mainAxisAlignment: MainAxisAlignment.center,
++            children: [
++              Spacer(),
++              Container(
++                margin: EdgeInsets.symmetric(horizontal: 24),
++                decoration: BoxDecoration(
++                  borderRadius: BorderRadius.circular(30),
++                  color: Theme.of(context).backgroundColor,
++                ),
++                child: Padding(
++                  padding: const EdgeInsets.only(top: 24, bottom: 24),
++                  child: (ListView.separated(
++                    padding: EdgeInsets.zero,
++                    shrinkWrap: true,
++                    itemCount: receiveOptionViewModel.options.length,
++                    itemBuilder: (_, index) {
++                      final option = receiveOptionViewModel.options[index];
++                      return InkWell(
++                        onTap: () => receiveOptionViewModel.selectReceiveOption(option),
++                        child: Padding(
++                          padding: const EdgeInsets.only(left: 24, right: 24),
++                          child: Observer(builder: (_) {
++                            final value = receiveOptionViewModel.selectedReceiveOption;
++
++                            return Row(
++                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
++                              children: [
++                                Text(option.toString(),
++                                    textAlign: TextAlign.left,
++                                    style: textSmall(
++                                      color: Theme.of(context).primaryTextTheme.headline6!.color!,
++                                    ).copyWith(
++                                      fontWeight:
++                                          value == option ? FontWeight.w800 : FontWeight.w500,
++                                    )),
++                                RoundedCheckbox(
++                                  value: value == option,
++                                )
++                              ],
++                            );
++                          }),
++                        ),
++                      );
++                    },
++                    separatorBuilder: (_, index) => SizedBox(height: 30),
++                  )),
++                ),
++              ),
++              Spacer(),
++              Container(
++                margin: EdgeInsets.only(bottom: 40),
++                child: InkWell(
++                  onTap: () => Navigator.pop(context),
++                  child: CircleAvatar(
++                    child: Icon(
++                      Icons.close,
++                      color: Palette.darkBlueCraiola,
++                    ),
++                    backgroundColor: Colors.white,
++                  ),
++                ),
++              )
++            ],
++          ),
++        ),
++      ),
++      context: context,
++    );
++  }
++}
+diff --git a/lib/src/screens/dashboard/widgets/transactions_page.dart b/lib/src/screens/dashboard/widgets/transactions_page.dart
+index cda23b8c92..f773fa8fcc 100644
+--- a/lib/src/screens/dashboard/widgets/transactions_page.dart
++++ b/lib/src/screens/dashboard/widgets/transactions_page.dart
+@@ -1,5 +1,8 @@
++import 'package:cake_wallet/src/screens/dashboard/widgets/anonpay_transaction_row.dart';
+ import 'package:cake_wallet/src/screens/dashboard/widgets/order_row.dart';
++import 'package:cake_wallet/view_model/dashboard/anonpay_transaction_list_item.dart';
+ import 'package:cake_wallet/view_model/dashboard/order_list_item.dart';
++import 'package:cw_core/crypto_currency.dart';
+ import 'package:flutter/material.dart';
+ import 'package:cake_wallet/view_model/dashboard/dashboard_view_model.dart';
+ import 'package:flutter_mobx/flutter_mobx.dart';
+@@ -22,102 +25,104 @@ class TransactionsPage extends StatelessWidget {
+   @override
+   Widget build(BuildContext context) {
+     return Container(
+-      padding: EdgeInsets.only(
+-        top: 24,
+-        bottom: 24
+-      ),
++      padding: EdgeInsets.only(top: 24, bottom: 24),
+       child: Column(
+         children: <Widget>[
+           HeaderRow(dashboardViewModel: dashboardViewModel),
+-          Expanded(
+-            child: Observer(
+-                builder: (_) {
+-                  final items = dashboardViewModel.items;
++          Expanded(child: Observer(builder: (_) {
++            final items = dashboardViewModel.items;
+ 
+-                  return items?.isNotEmpty ?? false
+-                    ? ListView.builder(
+-                      itemCount: items.length,
+-                      itemBuilder: (context, index) {
++            return items.isNotEmpty
++                ? ListView.builder(
++                    itemCount: items.length,
++                    itemBuilder: (context, index) {
++                      final item = items[index];
+ 
+-                        final item = items[index];
++                      if (item is DateSectionItem) {
++                        return DateSectionRaw(date: item.date);
++                      }
+ 
+-                        if (item is DateSectionItem) {
+-                          return DateSectionRaw(date: item.date);
+-                        }
++                      if (item is TransactionListItem) {
++                        final transaction = item.transaction;
+ 
+-                        if (item is TransactionListItem) {
+-                          final transaction = item.transaction;
++                        return Observer(
++                            builder: (_) => TransactionRow(
++                                onTap: () => Navigator.of(context)
++                                    .pushNamed(Routes.transactionDetails, arguments: transaction),
++                                direction: transaction.direction,
++                                formattedDate: DateFormat('HH:mm').format(transaction.date),
++                                formattedAmount: item.formattedCryptoAmount,
++                                formattedFiatAmount:
++                                    dashboardViewModel.balanceViewModel.isFiatDisabled
++                                        ? ''
++                                        : item.formattedFiatAmount,
++                                isPending: transaction.isPending,
++                                title: item.formattedTitle + item.formattedStatus));
++                      }
+ 
+-                          return Observer(
+-                              builder: (_) => TransactionRow(
+-                              onTap: () => Navigator.of(context).pushNamed(
+-                                  Routes.transactionDetails,
+-                                  arguments: transaction),
+-                              direction: transaction.direction,
+-                              formattedDate: DateFormat('HH:mm')
+-                                  .format(transaction.date),
+-                              formattedAmount: item.formattedCryptoAmount,
+-                              formattedFiatAmount:
+-                              dashboardViewModel.balanceViewModel.isFiatDisabled
+-                                  ? '' : item.formattedFiatAmount,
+-                              isPending: transaction.isPending,
+-                              title: item.formattedTitle + item.formattedStatus));
+-                        }
++                      if (item is AnonpayTransactionListItem) {
++                        final transactionInfo = item.transaction;
+ 
+-                        if (item is TradeListItem) {
+-                          final trade = item.trade;
++                        return AnonpayTransactionRow(
++                          onTap: () => Navigator.of(context)
++                              .pushNamed(Routes.anonPayDetailsPage, arguments: transactionInfo),
++                          currency: transactionInfo.fiatAmount != null
++                              ? transactionInfo.fiatEquiv ?? ''
++                              : CryptoCurrency.fromFullName(transactionInfo.coinTo)
++                                  .name
++                                  .toUpperCase(),
++                          provider: transactionInfo.provider,
++                          amount: transactionInfo.fiatAmount?.toString() ??
++                              (transactionInfo.amountTo?.toString() ?? ''),
++                          createdAt: DateFormat('HH:mm').format(transactionInfo.createdAt),
++                        );
++                      }
+ 
+-                          return Observer(builder: (_) => TradeRow(
+-                              onTap: () => Navigator.of(context).pushNamed(
+-                                  Routes.tradeDetails,
+-                                  arguments: trade),
+-                              provider: trade.provider,
+-                              from: trade.from,
+-                              to: trade.to,
+-                              createdAtFormattedDate:
+-                              trade.createdAt != null
+-                                ? DateFormat('HH:mm').format(trade.createdAt!)
+-                                : null,
+-                              formattedAmount: item.tradeFormattedAmount
+-                          ));
+-                        }
++                      if (item is TradeListItem) {
++                        final trade = item.trade;
+ 
+-                        if (item is OrderListItem) {
+-                          final order = item.order;
++                        return Observer(
++                            builder: (_) => TradeRow(
++                                onTap: () => Navigator.of(context)
++                                    .pushNamed(Routes.tradeDetails, arguments: trade),
++                                provider: trade.provider,
++                                from: trade.from,
++                                to: trade.to,
++                                createdAtFormattedDate: trade.createdAt != null
++                                    ? DateFormat('HH:mm').format(trade.createdAt!)
++                                    : null,
++                                formattedAmount: item.tradeFormattedAmount));
++                      }
+ 
+-                          return Observer(builder: (_) => OrderRow(
+-                            onTap: () => Navigator.of(context).pushNamed(
+-                                Routes.orderDetails,
+-                                arguments: order),
+-                            provider: order.provider,
+-                            from: order.from!,
+-                            to: order.to!,
+-                            createdAtFormattedDate:
+-                            DateFormat('HH:mm').format(order.createdAt),
+-                            formattedAmount: item.orderFormattedAmount,
+-                          ));
+-                        }
++                      if (item is OrderListItem) {
++                        final order = item.order;
+ 
+-                        return Container(
+-                            color: Colors.transparent,
+-                            height: 1);
++                        return Observer(
++                            builder: (_) => OrderRow(
++                                  onTap: () => Navigator.of(context)
++                                      .pushNamed(Routes.orderDetails, arguments: order),
++                                  provider: order.provider,
++                                  from: order.from!,
++                                  to: order.to!,
++                                  createdAtFormattedDate:
++                                      DateFormat('HH:mm').format(order.createdAt),
++                                  formattedAmount: item.orderFormattedAmount,
++                                ));
+                       }
+-                  )
+-                  : Center(
++
++                      return Container(color: Colors.transparent, height: 1);
++                    })
++                : Center(
+                     child: Text(
+                       S.of(context).placeholder_transactions,
+                       style: TextStyle(
+-                        fontSize: 14,
+-                        color: Theme.of(context).primaryTextTheme!
+-                            .overline!.decorationColor!
+-                      ),
++                          fontSize: 14,
++                          color: Theme.of(context).primaryTextTheme.overline!.decorationColor!),
+                     ),
+                   );
+-                }
+-            )
+-          )
++          }))
+         ],
+       ),
+     );
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/lib/src/screens/exchange/widgets/currency_picker.dart b/lib/src/screens/exchange/widgets/currency_picker.dart
+index b785378c59..442ee1b240 100644
+--- a/lib/src/screens/exchange/widgets/currency_picker.dart
++++ b/lib/src/screens/exchange/widgets/currency_picker.dart
+@@ -2,6 +2,7 @@ import 'dart:ui';
+ import 'package:cake_wallet/src/screens/exchange/widgets/currency_picker_item_widget.dart';
+ import 'package:cake_wallet/src/screens/exchange/widgets/picker_item.dart';
+ import 'package:cake_wallet/src/widgets/alert_close_button.dart';
++import 'package:cw_core/currency.dart';
+ import 'package:flutter/cupertino.dart';
+ import 'package:flutter/material.dart';
+ import 'package:cw_core/crypto_currency.dart';
+@@ -20,9 +21,9 @@ class CurrencyPicker extends StatefulWidget {
+       this.isConvertFrom = false});
+ 
+   int selectedAtIndex;
+-  final List<CryptoCurrency> items;
++  final List<Currency> items;
+   final String? title;
+-  final Function(CryptoCurrency) onItemSelected;
++  final Function(Currency) onItemSelected;
+   final bool isMoneroWallet;
+   final bool isConvertFrom;
+   final String? hintText;
+@@ -38,13 +39,13 @@ class CurrencyPickerState extends State<CurrencyPicker> {
+         subPickerItemsList = items,
+         appBarTextStyle =
+           TextStyle(fontSize: 20, fontFamily: 'Lato', backgroundColor: Colors.transparent, color: Colors.white),
+-        pickerItemsList = <PickerItem<CryptoCurrency>>[];
++        pickerItemsList = <PickerItem<Currency>>[];
+ 
+-  List<PickerItem<CryptoCurrency>> pickerItemsList;
+-  List<CryptoCurrency> items;
++  List<PickerItem<Currency>> pickerItemsList;
++  List<Currency> items;
+   bool isSearchBarActive;
+   String textFieldValue;
+-  List<CryptoCurrency> subPickerItemsList;
++  List<Currency> subPickerItemsList;
+   TextStyle appBarTextStyle;
+ 
+   void cleanSubPickerItemsList() => subPickerItemsList = items;
+@@ -54,7 +55,7 @@ class CurrencyPickerState extends State<CurrencyPicker> {
+       if (subString.isNotEmpty) {
+         subPickerItemsList = items
+             .where((element) =>
+-        (element.title != null ? element.title.toLowerCase().contains(subString.toLowerCase()) : false) ||
++        element.name.toLowerCase().contains(subString.toLowerCase()) ||
+             (element.tag != null ? element.tag!.toLowerCase().contains(subString.toLowerCase()) : false) ||
+             (element.fullName != null ? element.fullName!.toLowerCase().contains(subString.toLowerCase()) : false))
+             .toList();
+@@ -139,7 +140,7 @@ class CurrencyPickerState extends State<CurrencyPicker> {
+                             AspectRatio(
+                               aspectRatio: 6,
+                               child: PickerItemWidget(
+-                                title: items[widget.selectedAtIndex].title,
++                                title: items[widget.selectedAtIndex].name,
+                                 iconPath: items[widget.selectedAtIndex].iconPath,
+                                 isSelected: true,
+                                 tag: items[widget.selectedAtIndex].tag,
+diff --git a/lib/src/screens/exchange/widgets/currency_picker_item_widget.dart b/lib/src/screens/exchange/widgets/currency_picker_item_widget.dart
+index d7bd586334..88aaaedd3d 100644
+--- a/lib/src/screens/exchange/widgets/currency_picker_item_widget.dart
++++ b/lib/src/screens/exchange/widgets/currency_picker_item_widget.dart
+@@ -32,12 +32,12 @@ class PickerItemWidget extends StatelessWidget {
+                   width: 20.0,
+                 ),
+               ),
+-              const SizedBox(width: 6),
++              const SizedBox(width: 12),
+               Expanded(
+                 child: Row(
+                   children: [
+                     Text(
+-                      title,
++                      title.toUpperCase(),
+                       style: TextStyle(
+                         color: isSelected ? Palette.blueCraiola : Theme.of(context).primaryTextTheme!.headline6!.color!,
+                         fontSize: isSelected ? 16 : 14.0,
+diff --git a/lib/src/screens/exchange/widgets/currency_picker_widget.dart b/lib/src/screens/exchange/widgets/currency_picker_widget.dart
+index bfb1677af0..ae7fa052e9 100644
+--- a/lib/src/screens/exchange/widgets/currency_picker_widget.dart
++++ b/lib/src/screens/exchange/widgets/currency_picker_widget.dart
+@@ -1,6 +1,5 @@
++import 'package:cw_core/currency.dart';
+ import 'package:flutter/material.dart';
+-import 'package:cw_core/crypto_currency.dart';
+-import 'picker_item.dart';
+ import 'currency_picker_item_widget.dart';
+ 
+ class CurrencyPickerWidget extends StatelessWidget {
+@@ -14,7 +13,7 @@ class CurrencyPickerWidget extends StatelessWidget {
+   final int crossAxisCount;
+   final int selectedAtIndex;
+   final Function pickListItem;
+-  final List<CryptoCurrency> pickerItemsList;
++  final List<Currency> pickerItemsList;
+ 
+   final ScrollController _scrollController = ScrollController();
+ 
+@@ -39,8 +38,8 @@ class CurrencyPickerWidget extends StatelessWidget {
+                 onTap: () {
+                   pickListItem(index);
+                 },
+-                title: pickerItemsList[index].title,
+-                iconPath: pickerItemsList[index].iconPath,
++                title: pickerItemsList[index].name,
++                iconPath: pickerItemsList[index].iconPath, 
+                 tag: pickerItemsList[index].tag,
+               );
+             }),
+diff --git a/lib/src/screens/exchange/widgets/exchange_card.dart b/lib/src/screens/exchange/widgets/exchange_card.dart
+index 40aa679a42..2bacbac3c7 100644
+--- a/lib/src/screens/exchange/widgets/exchange_card.dart
++++ b/lib/src/screens/exchange/widgets/exchange_card.dart
+@@ -4,6 +4,7 @@ import 'package:cake_wallet/src/widgets/alert_with_two_actions.dart';
+ import 'package:cake_wallet/utils/show_bar.dart';
+ import 'package:cake_wallet/utils/show_pop_up.dart';
+ import 'package:cake_wallet/utils/payment_request.dart';
++import 'package:cw_core/currency.dart';
+ import 'package:flutter/services.dart';
+ import 'package:flutter/material.dart';
+ import 'package:cake_wallet/generated/i18n.dart';
+@@ -501,9 +502,9 @@ class ExchangeCardState extends State<ExchangeCard> {
+             hintText: S.of(context).search_currency,
+             isMoneroWallet: _isMoneroWallet,
+             isConvertFrom: widget.hasRefundAddress,
+-            onItemSelected: (CryptoCurrency item) =>
++            onItemSelected: (Currency item) =>
+                 widget.onCurrencySelected != null
+-                    ? widget.onCurrencySelected(item)
++                    ? widget.onCurrencySelected(item as CryptoCurrency)
+                     : null),
+         context: context);
+   }
+diff --git a/lib/src/screens/receive/anonpay_invoice_page.dart b/lib/src/screens/receive/anonpay_invoice_page.dart
+new file mode 100644
+index 0000000000..effd5155ef
+--- /dev/null
++++ b/lib/src/screens/receive/anonpay_invoice_page.dart
+@@ -0,0 +1,222 @@
++import 'package:cake_wallet/anonpay/anonpay_donation_link_info.dart';
++import 'package:cake_wallet/core/execution_state.dart';
++import 'package:cake_wallet/di.dart';
++import 'package:cake_wallet/entities/preferences_key.dart';
++import 'package:cake_wallet/entities/receive_page_option.dart';
++import 'package:cake_wallet/routes.dart';
++import 'package:cake_wallet/src/screens/dashboard/widgets/present_receive_option_picker.dart';
++import 'package:cake_wallet/src/screens/receive/widgets/anonpay_input_form.dart';
++import 'package:cake_wallet/src/widgets/alert_with_one_action.dart';
++import 'package:cake_wallet/src/widgets/keyboard_done_button.dart';
++import 'package:cake_wallet/view_model/anon_invoice_page_view_model.dart';
++import 'package:cake_wallet/view_model/dashboard/receive_option_view_model.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_mobx/flutter_mobx.dart';
++import 'package:keyboard_actions/keyboard_actions.dart';
++import 'package:cake_wallet/src/screens/base_page.dart';
++import 'package:cake_wallet/src/widgets/trail_button.dart';
++import 'package:cake_wallet/utils/show_pop_up.dart';
++import 'package:cake_wallet/generated/i18n.dart';
++import 'package:cake_wallet/src/widgets/primary_button.dart';
++import 'package:cake_wallet/src/widgets/scollable_with_bottom_section.dart';
++import 'package:mobx/mobx.dart';
++import 'package:shared_preferences/shared_preferences.dart';
++
++class AnonPayInvoicePage extends BasePage {
++  AnonPayInvoicePage(
++    this.anonInvoicePageViewModel,
++    this.receiveOptionViewModel,
++  ) : _amountFocusNode = FocusNode() {
++    _nameController.text = anonInvoicePageViewModel.receipientName;
++    _descriptionController.text = anonInvoicePageViewModel.description;
++    _emailController.text = anonInvoicePageViewModel.receipientEmail;
++  }
++
++  final _nameController = TextEditingController();
++  final _emailController = TextEditingController();
++  final _descriptionController = TextEditingController();
++  final _amountController = TextEditingController();
++  final FocusNode _amountFocusNode;
++
++  final AnonInvoicePageViewModel anonInvoicePageViewModel;
++  final ReceiveOptionViewModel receiveOptionViewModel;
++  final _formKey = GlobalKey<FormState>();
++
++  bool effectsInstalled = false;
++  @override
++  Color get titleColor => Colors.white;
++
++  @override
++  bool get resizeToAvoidBottomInset => false;
++
++  @override
++  bool get extendBodyBehindAppBar => true;
++
++  @override
++  AppBarStyle get appBarStyle => AppBarStyle.transparent;
++
++  @override
++  Widget middle(BuildContext context) =>
++      PresentReceiveOptionPicker(receiveOptionViewModel: receiveOptionViewModel);
++
++  @override
++  Widget trailing(BuildContext context) => TrailButton(
++      caption: S.of(context).clear,
++      onPressed: () {
++        _formKey.currentState?.reset();
++        anonInvoicePageViewModel.reset();
++      });
++
++  @override
++  Widget body(BuildContext context) {
++    WidgetsBinding.instance.addPostFrameCallback((_) => _setReactions(context));
++
++    return KeyboardActions(
++      disableScroll: true,
++      config: KeyboardActionsConfig(
++          keyboardActionsPlatform: KeyboardActionsPlatform.IOS,
++          keyboardBarColor: Theme.of(context).accentTextTheme.bodyText1!.backgroundColor!,
++          nextFocus: false,
++          actions: [
++            KeyboardActionsItem(
++              focusNode: _amountFocusNode,
++              toolbarButtons: [(_) => KeyboardDoneButton()],
++            ),
++          ]),
++      child: Container(
++        color: Theme.of(context).backgroundColor,
++        child: ScrollableWithBottomSection(
++          contentPadding: EdgeInsets.only(bottom: 24),
++          content: Container(
++            decoration: BoxDecoration(
++              borderRadius: BorderRadius.only(
++                  bottomLeft: Radius.circular(24), bottomRight: Radius.circular(24)),
++              gradient: LinearGradient(
++                colors: [
++                  Theme.of(context).primaryTextTheme.subtitle2!.color!,
++                  Theme.of(context).primaryTextTheme.subtitle2!.decorationColor!,
++                ],
++                begin: Alignment.topLeft,
++                end: Alignment.bottomRight,
++              ),
++            ),
++            child: Observer(builder: (_) {
++              return Padding(
++                padding: EdgeInsets.fromLTRB(24, 100, 24, 0),
++                child: AnonInvoiceForm(
++                  nameController: _nameController,
++                  descriptionController: _descriptionController,
++                  amountController: _amountController,
++                  emailController: _emailController,
++                  depositAmountFocus: _amountFocusNode,
++                  formKey: _formKey,
++                  isInvoice: receiveOptionViewModel.selectedReceiveOption ==
++                      ReceivePageOption.anonPayInvoice,
++                  anonInvoicePageViewModel: anonInvoicePageViewModel,
++                ),
++              );
++            }),
++          ),
++          bottomSectionPadding: EdgeInsets.only(left: 24, right: 24, bottom: 24),
++          bottomSection: Observer(builder: (_) {
++            final isInvoice =
++                receiveOptionViewModel.selectedReceiveOption == ReceivePageOption.anonPayInvoice;
++            return Column(
++              children: <Widget>[
++                Padding(
++                  padding: EdgeInsets.only(bottom: 15),
++                  child: Center(
++                    child: Text(
++                      isInvoice
++                          ? S.of(context).anonpay_description("an invoice", "pay")
++                          : S.of(context).anonpay_description("a donation link", "donate"),
++                      textAlign: TextAlign.center,
++                      style: TextStyle(
++                          color: Theme.of(context).primaryTextTheme.headline1!.decorationColor!,
++                          fontWeight: FontWeight.w500,
++                          fontSize: 12),
++                    ),
++                  ),
++                ),
++                LoadingPrimaryButton(
++                  text:
++                      isInvoice ? S.of(context).create_invoice : S.of(context).create_donation_link,
++                  onPressed: () {
++                    anonInvoicePageViewModel.setRequestParams(
++                      inputAmount: _amountController.text,
++                      inputName: _nameController.text,
++                      inputEmail: _emailController.text,
++                      inputDescription: _descriptionController.text,
++                    );
++                    if (anonInvoicePageViewModel.receipientEmail.isNotEmpty &&
++                        _formKey.currentState != null &&
++                        !_formKey.currentState!.validate()) {
++                      return;
++                    }
++                    if (isInvoice) {
++                      anonInvoicePageViewModel.createInvoice();
++                    } else {
++                      anonInvoicePageViewModel.generateDonationLink();
++                    }
++                  },
++                  color: Theme.of(context).accentTextTheme.bodyText1!.color!,
++                  textColor: Colors.white,
++                  isLoading: anonInvoicePageViewModel.state is IsExecutingState,
++                ),
++              ],
++            );
++          }),
++        ),
++      ),
++    );
++  }
++
++  void _setReactions(BuildContext context) {
++    if (effectsInstalled) {
++      return;
++    }
++
++    reaction((_) => receiveOptionViewModel.selectedReceiveOption, (ReceivePageOption option) {
++      Navigator.pop(context);
++      switch (option) {
++        case ReceivePageOption.mainnet:
++          Navigator.popAndPushNamed(context, Routes.addressPage);
++          break;
++        case ReceivePageOption.anonPayDonationLink:
++          final sharedPreferences = getIt.get<SharedPreferences>();
++          final clearnetUrl = sharedPreferences.getString(PreferencesKey.clearnetDonationLink);
++          final onionUrl = sharedPreferences.getString(PreferencesKey.onionDonationLink);
++
++          if (clearnetUrl != null && onionUrl != null) {
++            Navigator.pushReplacementNamed(context, Routes.anonPayReceivePage,
++                arguments: AnonpayDonationLinkInfo(
++                  clearnetUrl: clearnetUrl,
++                  onionUrl: onionUrl,
++                  address: anonInvoicePageViewModel.address,
++                ));
++          }
++          break;
++        default:
++      }
++    });
++
++    reaction((_) => anonInvoicePageViewModel.state, (ExecutionState state) {
++      if (state is ExecutedSuccessfullyState) {
++        Navigator.pushNamed(context, Routes.anonPayReceivePage, arguments: state.payload);
++      }
++      if (state is FailureState) {
++        showPopUp<void>(
++            context: context,
++            builder: (BuildContext context) {
++              return AlertWithOneAction(
++                  alertTitle: S.of(context).error,
++                  alertContent: state.error.toString(),
++                  buttonText: S.of(context).ok,
++                  buttonAction: () => Navigator.of(context).pop());
++            });
++      }
++    });
++
++    effectsInstalled = true;
++  }
++}
+diff --git a/lib/src/screens/receive/anonpay_receive_page.dart b/lib/src/screens/receive/anonpay_receive_page.dart
+new file mode 100644
+index 0000000000..27b5d41a32
+--- /dev/null
++++ b/lib/src/screens/receive/anonpay_receive_page.dart
+@@ -0,0 +1,181 @@
++import 'package:cake_wallet/anonpay/anonpay_info_base.dart';
++import 'package:cake_wallet/anonpay/anonpay_invoice_info.dart';
++import 'package:cake_wallet/entities/receive_page_option.dart';
++import 'package:cake_wallet/generated/i18n.dart';
++import 'package:cake_wallet/routes.dart';
++import 'package:cake_wallet/src/screens/base_page.dart';
++import 'package:cake_wallet/src/screens/receive/widgets/anonpay_status_section.dart';
++import 'package:cake_wallet/src/screens/receive/widgets/qr_image.dart';
++import 'package:cake_wallet/src/screens/receive/widgets/copy_link_item.dart';
++import 'package:cake_wallet/themes/theme_base.dart';
++import 'package:device_display_brightness/device_display_brightness.dart';
++import 'package:flutter/material.dart';
++import 'package:qr_flutter/qr_flutter.dart' as qr;
++
++class AnonPayReceivePage extends BasePage {
++  final AnonpayInfoBase invoiceInfo;
++
++  AnonPayReceivePage({required this.invoiceInfo});
++
++  @override
++  String get title => S.current.receive;
++
++  @override
++  Color get backgroundLightColor =>
++      currentTheme.type == ThemeType.bright ? Colors.transparent : Colors.white;
++
++  @override
++  Color get backgroundDarkColor => Colors.transparent;
++
++  @override
++  bool get resizeToAvoidBottomInset => false;
++
++  @override
++  Widget leading(BuildContext context) {
++    final _backButton = Icon(
++      Icons.arrow_back_ios,
++      color: Theme.of(context).accentTextTheme.headline2!.backgroundColor!,
++      size: 16,
++    );
++
++    return SizedBox(
++      height: 37,
++      width: 37,
++      child: ButtonTheme(
++        minWidth: double.minPositive,
++        child: TextButton(
++            onPressed: () =>
++                Navigator.pushNamedAndRemoveUntil(context, Routes.dashboard, (route) => false),
++            child: _backButton),
++      ),
++    );
++  }
++
++  @override
++  Widget middle(BuildContext context) {
++    return Column(
++      children: [
++        Text(
++          title,
++          style: TextStyle(
++              fontSize: 18.0,
++              fontWeight: FontWeight.bold,
++              fontFamily: 'Lato',
++              color: Theme.of(context).accentTextTheme.headline2!.backgroundColor!),
++        ),
++        Text(
++          invoiceInfo is AnonpayInvoiceInfo
++              ? ReceivePageOption.anonPayInvoice.toString()
++              : ReceivePageOption.anonPayDonationLink.toString(),
++          style: TextStyle(
++              fontSize: 10.0,
++              fontWeight: FontWeight.w500,
++              color: Theme.of(context).textTheme.headline5!.color!),
++        )
++      ],
++    );
++  }
++
++  @override
++  Widget? trailing(BuildContext context) {
++    if (invoiceInfo is AnonpayInvoiceInfo) {
++      return null;
++    }
++
++    return Material(
++      color: Colors.transparent,
++      child: IconButton(
++        onPressed: () => Navigator.popAndPushNamed(
++          context,
++          Routes.anonPayInvoicePage,
++          arguments: [invoiceInfo.address, ReceivePageOption.anonPayDonationLink],
++        ),
++        icon: Icon(
++          Icons.edit,
++          color: Theme.of(context).accentTextTheme.caption!.color!,
++          size: 22.0,
++        ),
++      ),
++    );
++  }
++
++  @override
++  Widget Function(BuildContext, Widget) get rootWrapper =>
++      (BuildContext context, Widget scaffold) => Container(
++          decoration: BoxDecoration(
++              gradient: LinearGradient(colors: [
++            Theme.of(context).accentColor,
++            Theme.of(context).scaffoldBackgroundColor,
++            Theme.of(context).primaryColor,
++          ], begin: Alignment.topRight, end: Alignment.bottomLeft)),
++          child: scaffold);
++
++  @override
++  Widget body(BuildContext context) {
++    return SingleChildScrollView(
++      child: Column(
++        children: <Widget>[
++          SizedBox(height: 24),
++          if (invoiceInfo is AnonpayInvoiceInfo)
++            AnonInvoiceStatusSection(invoiceInfo: invoiceInfo as AnonpayInvoiceInfo),
++          Padding(
++            padding: EdgeInsets.fromLTRB(24, 50, 24, 24),
++            child: ConstrainedBox(
++              constraints: BoxConstraints(
++                maxWidth: MediaQuery.of(context).size.width * 0.5,
++              ),
++              child: GestureDetector(
++                onTap: () async {
++                  final double brightness = await DeviceDisplayBrightness.getBrightness();
++
++                  // ignore: unawaited_futures
++                  DeviceDisplayBrightness.setBrightness(1.0);
++                  await Navigator.pushNamed(
++                    context,
++                    Routes.fullscreenQR,
++                    arguments: {
++                      'qrData': invoiceInfo.clearnetUrl,
++                      'version': qr.QrVersions.auto,
++                    },
++                  );
++                  // ignore: unawaited_futures
++                  DeviceDisplayBrightness.setBrightness(brightness);
++                },
++                child: Hero(
++                  tag: Key(invoiceInfo.clearnetUrl),
++                  child: Center(
++                    child: AspectRatio(
++                      aspectRatio: 1.0,
++                      child: Container(
++                        padding: EdgeInsets.all(5),
++                        decoration: BoxDecoration(
++                          border: Border.all(
++                            width: 3,
++                            color: Theme.of(context).accentTextTheme!.headline2!.backgroundColor!,
++                          ),
++                        ),
++                        child: QrImage(
++                          data: invoiceInfo.clearnetUrl,
++                          version: qr.QrVersions.auto,
++                        ),
++                      ),
++                    ),
++                  ),
++                ),
++              ),
++            ),
++          ),
++          SizedBox(height: 24),
++          Column(
++            children: [
++              CopyLinkItem(url: invoiceInfo.clearnetUrl, title: S.of(context).clearnet_link),
++              SizedBox(height: 16),
++              CopyLinkItem(url: invoiceInfo.onionUrl, title: S.of(context).onion_link),
++            ],
++          ),
++          SizedBox(height: 100),
++        ],
++      ),
++    );
++  }
++}
+diff --git a/lib/src/screens/receive/fullscreen_qr_page.dart b/lib/src/screens/receive/fullscreen_qr_page.dart
+index 0966c8ac86..885c548f0e 100644
+--- a/lib/src/screens/receive/fullscreen_qr_page.dart
++++ b/lib/src/screens/receive/fullscreen_qr_page.dart
+@@ -4,10 +4,10 @@ import 'package:flutter/material.dart';
+ import 'package:cake_wallet/src/screens/base_page.dart';
+ 
+ class FullscreenQRPage extends BasePage {
+-  FullscreenQRPage({required this.qrData, required this.isLight});
++  FullscreenQRPage({required this.qrData, int? this.version});
+ 
+-  final bool isLight;
+   final String qrData;
++  final int? version;
+ 
+   @override
+   Color get backgroundLightColor => currentTheme.type == ThemeType.bright ? Colors.transparent : Colors.white;
+@@ -71,7 +71,7 @@ class FullscreenQRPage extends BasePage {
+               padding: EdgeInsets.all(10),
+               decoration: BoxDecoration(
+                   border: Border.all(width: 3, color: Theme.of(context).accentTextTheme!.headline2!.backgroundColor!)),
+-              child: QrImage(data: qrData),
++              child: QrImage(data: qrData, version: version),
+             ),
+           ),
+         ),
+diff --git a/lib/src/screens/receive/widgets/anonpay_currency_input_field.dart b/lib/src/screens/receive/widgets/anonpay_currency_input_field.dart
+new file mode 100644
+index 0000000000..6f2d5179cd
+--- /dev/null
++++ b/lib/src/screens/receive/widgets/anonpay_currency_input_field.dart
+@@ -0,0 +1,153 @@
++import 'package:cake_wallet/generated/i18n.dart';
++import 'package:cake_wallet/src/widgets/base_text_form_field.dart';
++import 'package:cw_core/currency.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter/services.dart';
++
++class AnonpayCurrencyInputField extends StatelessWidget {
++  const AnonpayCurrencyInputField(
++      {super.key,
++      required this.onTapPicker,
++      required this.selectedCurrency,
++      required this.focusNode,
++      required this.controller,
++      required this.minAmount,
++      required this.maxAmount});
++  final Function() onTapPicker;
++  final Currency selectedCurrency;
++  final FocusNode focusNode;
++  final TextEditingController controller;
++  final String minAmount;
++  final String maxAmount;
++  @override
++  Widget build(BuildContext context) {
++    final arrowBottomPurple = Image.asset(
++      'assets/images/arrow_bottom_purple_icon.png',
++      color: Colors.white,
++      height: 8,
++    );
++    return Column(
++      children: [
++        Container(
++            decoration: BoxDecoration(
++              border: Border(
++                  bottom: BorderSide(
++                      color: Theme.of(context).accentTextTheme.headline6!.backgroundColor!,
++                      width: 1)),
++            ),
++            child: Padding(
++              padding: EdgeInsets.only(top: 20),
++              child: Row(
++                children: [
++                  Container(
++                    padding: EdgeInsets.only(right: 8),
++                    height: 32,
++                    child: InkWell(
++                      onTap: onTapPicker,
++                      child: Row(
++                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
++                          mainAxisSize: MainAxisSize.min,
++                          children: <Widget>[
++                            Padding(
++                              padding: EdgeInsets.only(right: 5),
++                              child: arrowBottomPurple,
++                            ),
++                            Text(selectedCurrency.name.toUpperCase(),
++                                style: TextStyle(
++                                    fontWeight: FontWeight.w600, fontSize: 16, color: Colors.white))
++                          ]),
++                    ),
++                  ),
++                  selectedCurrency.tag != null
++                      ? Padding(
++                          padding: const EdgeInsets.only(right: 3.0),
++                          child: Container(
++                            height: 32,
++                            decoration: BoxDecoration(
++                                color: Theme.of(context).primaryTextTheme.headline4!.color!,
++                                borderRadius: BorderRadius.all(Radius.circular(6))),
++                            child: Center(
++                              child: Padding(
++                                padding: const EdgeInsets.all(6.0),
++                                child: Text(
++                                  selectedCurrency.tag!,
++                                  style: TextStyle(
++                                    fontSize: 12,
++                                    fontWeight: FontWeight.bold,
++                                    color: Theme.of(context)
++                                        .primaryTextTheme
++                                        .headline4!
++                                        .decorationColor!,
++                                  ),
++                                ),
++                              ),
++                            ),
++                          ),
++                        )
++                      : Container(),
++                  Padding(
++                    padding: const EdgeInsets.only(right: 4.0),
++                    child: Text(':',
++                        style: TextStyle(
++                            fontWeight: FontWeight.w600, fontSize: 16, color: Colors.white)),
++                  ),
++                  Expanded(
++                    child: Row(
++                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
++                      children: [
++                        Flexible(
++                          child: BaseTextFormField(
++                            focusNode: focusNode,
++                            controller: controller,
++                            textInputAction: TextInputAction.next,
++                            enabled: true,
++                            textAlign: TextAlign.left,
++                            keyboardType:
++                                TextInputType.numberWithOptions(signed: false, decimal: true),
++                            inputFormatters: [
++                              FilteringTextInputFormatter.deny(RegExp('[\\-|\\ ]'))
++                            ],
++                            hintText: '0.0000',
++                            borderColor: Colors.transparent,
++                            //widget.borderColor,
++                            textStyle: TextStyle(
++                                fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white),
++                            placeholderTextStyle: TextStyle(
++                              fontSize: 16,
++                              fontWeight: FontWeight.w600,
++                              color: Theme.of(context).accentTextTheme.headline1!.decorationColor!,
++                            ),
++                            validator: null,
++                          ),
++                        ),
++                      ],
++                    ),
++                  ),
++                ],
++              ),
++            )),
++        Container(
++          height: 15,
++          child: Row(
++            mainAxisAlignment: MainAxisAlignment.start,
++            children: <Widget>[
++              Text(
++                S.of(context).min_value(minAmount, selectedCurrency.toString()),
++                style: TextStyle(
++                    fontSize: 10,
++                    height: 1.2,
++                    color: Theme.of(context).accentTextTheme.headline1!.decorationColor!),
++              ),
++              SizedBox(width: 10),
++              Text(S.of(context).max_value(maxAmount, selectedCurrency.toString()),
++                  style: TextStyle(
++                      fontSize: 10,
++                      height: 1.2,
++                      color: Theme.of(context).accentTextTheme.headline1!.decorationColor!)),
++            ],
++          ),
++        )
++      ],
++    );
++  }
++}
+diff --git a/lib/src/screens/receive/widgets/anonpay_input_form.dart b/lib/src/screens/receive/widgets/anonpay_input_form.dart
+new file mode 100644
+index 0000000000..52d456d0b3
+--- /dev/null
++++ b/lib/src/screens/receive/widgets/anonpay_input_form.dart
+@@ -0,0 +1,132 @@
++import 'package:cake_wallet/core/email_validator.dart';
++import 'package:cake_wallet/generated/i18n.dart';
++import 'package:cake_wallet/src/screens/exchange/widgets/currency_picker.dart';
++import 'package:cake_wallet/src/screens/receive/widgets/anonpay_currency_input_field.dart';
++import 'package:cake_wallet/src/widgets/base_text_form_field.dart';
++import 'package:cake_wallet/typography.dart';
++import 'package:cake_wallet/utils/show_pop_up.dart';
++import 'package:cake_wallet/view_model/anon_invoice_page_view_model.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_mobx/flutter_mobx.dart';
++
++class AnonInvoiceForm extends StatelessWidget {
++  AnonInvoiceForm({
++    super.key,
++    required this.formKey,
++    required this.anonInvoicePageViewModel,
++    required this.isInvoice,
++    required this.amountController,
++    required this.nameController,
++    required this.emailController,
++    required this.descriptionController,
++    required this.depositAmountFocus,
++  })  : _nameFocusNode = FocusNode(),
++        _emailFocusNode = FocusNode(),
++        _descriptionFocusNode = FocusNode();
++
++  final TextEditingController amountController;
++  final TextEditingController nameController;
++  final TextEditingController emailController;
++  final TextEditingController descriptionController;
++  final AnonInvoicePageViewModel anonInvoicePageViewModel;
++  final FocusNode depositAmountFocus;
++  final FocusNode _nameFocusNode;
++  final FocusNode _emailFocusNode;
++  final FocusNode _descriptionFocusNode;
++  final GlobalKey<FormState> formKey;
++  final bool isInvoice;
++
++  @override
++  Widget build(BuildContext context) {
++    return Form(
++        key: formKey,
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: <Widget>[
++            Text(
++              isInvoice ? S.of(context).invoice_details : S.of(context).donation_link_details,
++              style: textMediumSemiBold(),
++            ),
++            if (isInvoice)
++              Observer(builder: (_) {
++                return AnonpayCurrencyInputField(
++                  onTapPicker: () => _presentPicker(context),
++                  controller: amountController,
++                  focusNode: depositAmountFocus,
++                  maxAmount: anonInvoicePageViewModel.maximum?.toString() ?? '...',
++                  minAmount: anonInvoicePageViewModel.minimum?.toString() ?? '...',
++                  selectedCurrency: anonInvoicePageViewModel.selectedCurrency,
++                );
++              }),
++            SizedBox(
++              height: 24,
++            ),
++            BaseTextFormField(
++              controller: nameController,
++              focusNode: _nameFocusNode,
++              borderColor: Theme.of(context).accentTextTheme.headline6!.backgroundColor,
++              suffixIcon: SizedBox(width: 36),
++              hintText: S.of(context).optional_name,
++              textInputAction: TextInputAction.next,
++              placeholderTextStyle: TextStyle(
++                fontSize: 16,
++                fontWeight: FontWeight.w600,
++                color: Theme.of(context).accentTextTheme.headline1!.decorationColor!,
++              ),
++              textStyle: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white),
++              validator: null,
++            ),
++            SizedBox(
++              height: 24,
++            ),
++            BaseTextFormField(
++              controller: descriptionController,
++              focusNode: _descriptionFocusNode,
++              textInputAction: TextInputAction.next,
++              borderColor: Theme.of(context).accentTextTheme.headline6!.backgroundColor,
++              suffixIcon: SizedBox(width: 36),
++              hintText: S.of(context).optional_description,
++              placeholderTextStyle: TextStyle(
++                fontSize: 16,
++                fontWeight: FontWeight.w600,
++                color: Theme.of(context).accentTextTheme.headline1!.decorationColor!,
++              ),
++              textStyle: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white),
++              validator: null,
++            ),
++            SizedBox(height: 24),
++            BaseTextFormField(
++              controller: emailController,
++              textInputAction: TextInputAction.next,
++              focusNode: _emailFocusNode,
++              borderColor: Theme.of(context).accentTextTheme.headline6!.backgroundColor,
++              suffixIcon: SizedBox(width: 36),
++              keyboardType: TextInputType.emailAddress,
++              hintText: S.of(context).optional_email_hint,
++              placeholderTextStyle: TextStyle(
++                fontSize: 16,
++                fontWeight: FontWeight.w600,
++                color: Theme.of(context).accentTextTheme.headline1!.decorationColor!,
++              ),
++              textStyle: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white),
++              validator: EmailValidator(),
++            ),
++            SizedBox(
++              height: 52,
++            ),
++          ],
++        ));
++  }
++
++  void _presentPicker(BuildContext context) {
++    showPopUp<void>(
++      builder: (_) => CurrencyPicker(
++        selectedAtIndex: anonInvoicePageViewModel.selectedCurrencyIndex,
++        items: anonInvoicePageViewModel.currencies,
++        hintText: S.of(context).search_currency,
++        onItemSelected: anonInvoicePageViewModel.selectCurrency,
++      ),
++      context: context,
++    );
++  }
++}
+diff --git a/lib/src/screens/receive/widgets/anonpay_status_section.dart b/lib/src/screens/receive/widgets/anonpay_status_section.dart
+new file mode 100644
+index 0000000000..d1c8f51376
+--- /dev/null
++++ b/lib/src/screens/receive/widgets/anonpay_status_section.dart
+@@ -0,0 +1,87 @@
++import 'package:cake_wallet/anonpay/anonpay_invoice_info.dart';
++import 'package:cake_wallet/generated/i18n.dart';
++import 'package:cake_wallet/src/screens/dashboard/widgets/sync_indicator_icon.dart';
++import 'package:cake_wallet/typography.dart';
++import 'package:flutter/material.dart';
++
++class AnonInvoiceStatusSection extends StatelessWidget {
++  const AnonInvoiceStatusSection({
++    super.key,
++    required this.invoiceInfo,
++  });
++
++  final AnonpayInvoiceInfo invoiceInfo;
++
++  @override
++  Widget build(BuildContext context) {
++    return Container(
++      width: 200,
++      padding: EdgeInsets.all(19),
++      decoration: BoxDecoration(
++        color: Theme.of(context).backgroundColor,
++        borderRadius: BorderRadius.circular(30),
++      ),
++      child: Column(
++        children: [
++          Row(
++            mainAxisAlignment: MainAxisAlignment.spaceBetween,
++            children: [
++              Text(
++                S.current.status,
++                style: TextStyle(
++                  fontSize: 14,
++                  fontWeight: FontWeight.w500,
++                  color: Theme.of(context).primaryTextTheme.headline1!.decorationColor!,
++                ),
++              ),
++              Container(
++                padding: EdgeInsets.symmetric(horizontal: 10, vertical: 5),
++                decoration: BoxDecoration(
++                  color: Theme.of(context).accentTextTheme.headline3!.color!,
++                  borderRadius: BorderRadius.circular(10),
++                ),
++                child: Row(
++                  mainAxisSize: MainAxisSize.min,
++                  children: [
++                    SyncIndicatorIcon(
++                      boolMode: false,
++                      value: invoiceInfo.status ?? '',
++                      size: 6,
++                    ),
++                    SizedBox(width: 5),
++                    Text(
++                      invoiceInfo.status ?? '',
++                      style: textSmallSemiBold(
++                        color: Theme.of(context).primaryTextTheme.headline6!.color,
++                      ),
++                    )
++                  ],
++                ),
++              )
++            ],
++          ),
++          SizedBox(height: 27),
++          Row(
++            mainAxisAlignment: MainAxisAlignment.spaceBetween,
++            children: [
++              Text(
++                'ID',
++                style: TextStyle(
++                  fontSize: 14,
++                  fontWeight: FontWeight.w500,
++                  color: Theme.of(context).primaryTextTheme.headline1!.decorationColor!,
++                ),
++              ),
++              Text(
++                invoiceInfo.invoiceId ?? '',
++                style: textSmallSemiBold(
++                  color: Theme.of(context).primaryTextTheme.headline6!.color,
++                ),
++              ),
++            ],
++          ),
++        ],
++      ),
++    );
++  }
++}
+diff --git a/lib/src/screens/receive/widgets/copy_link_item.dart b/lib/src/screens/receive/widgets/copy_link_item.dart
+new file mode 100644
+index 0000000000..5fe1220285
+--- /dev/null
++++ b/lib/src/screens/receive/widgets/copy_link_item.dart
+@@ -0,0 +1,56 @@
++
++import 'package:cake_wallet/generated/i18n.dart';
++import 'package:cake_wallet/typography.dart';
++import 'package:cake_wallet/utils/show_bar.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter/services.dart';
++import 'package:share_plus/share_plus.dart';
++
++class CopyLinkItem extends StatelessWidget {
++  const CopyLinkItem({super.key, required this.url, required this.title});
++  final String url;
++  final String title;
++
++  @override
++  Widget build(BuildContext context) {
++    final copyImage = Image.asset('assets/images/copy_address.png',
++        color: Theme.of(context).accentTextTheme.headline2!.backgroundColor!);
++
++    return Row(
++      mainAxisAlignment: MainAxisAlignment.center,
++      children: [
++        Text(
++          title,
++          style: textMedium(
++            color: Theme.of(context).accentTextTheme.headline2!.backgroundColor!,
++          ),
++        ),
++        SizedBox(width: 50),
++        Row(
++          children: [
++            InkWell(
++              onTap: () {
++                Clipboard.setData(ClipboardData(text: url));
++                showBar<void>(context, S.of(context).copied_to_clipboard);
++              },
++              child: copyImage,
++            ),
++            SizedBox(width: 20),
++            IconButton(
++              padding: EdgeInsets.zero,
++              constraints: BoxConstraints(),
++              highlightColor: Colors.transparent,
++              splashColor: Colors.transparent,
++              iconSize: 25,
++              onPressed: () => Share.share(url),
++              icon: Icon(
++                Icons.share,
++                color: Theme.of(context).accentTextTheme.headline2!.backgroundColor!,
++              ),
++            )
++          ],
++        )
++      ],
++    );
++  }
++}
+diff --git a/lib/src/screens/receive/widgets/qr_image.dart b/lib/src/screens/receive/widgets/qr_image.dart
+index 6e17dbcfca..c8cc622c4e 100644
+--- a/lib/src/screens/receive/widgets/qr_image.dart
++++ b/lib/src/screens/receive/widgets/qr_image.dart
+@@ -5,13 +5,13 @@ class QrImage extends StatelessWidget {
+   QrImage({
+     required this.data,
+     this.size = 100.0,
+-    this.version = 9, // Previous value: 7 something happened after flutter upgrade monero wallets addresses are longer than ver. 7 ???
++    this.version,
+     this.errorCorrectionLevel = qr.QrErrorCorrectLevel.L,
+   });
+ 
+   final double size;
+   final String data;
+-  final int version;
++  final int? version;
+   final int errorCorrectionLevel;
+ 
+   @override
+@@ -19,7 +19,7 @@ class QrImage extends StatelessWidget {
+     return qr.QrImage(
+       data: data,
+       errorCorrectionLevel: errorCorrectionLevel,
+-      version: version,
++      version: version ?? 9, // Previous value: 7 something happened after flutter upgrade monero wallets addresses are longer than ver. 7 ???
+       size: size,
+       foregroundColor: Colors.black,
+       backgroundColor: Colors.white,
+diff --git a/lib/src/screens/receive/widgets/qr_widget.dart b/lib/src/screens/receive/widgets/qr_widget.dart
+index 85d5f93e3c..96a19f850e 100644
+--- a/lib/src/screens/receive/widgets/qr_widget.dart
++++ b/lib/src/screens/receive/widgets/qr_widget.dart
+@@ -3,7 +3,6 @@ import 'package:cake_wallet/utils/show_bar.dart';
+ import 'package:cw_core/wallet_type.dart';
+ import 'package:device_display_brightness/device_display_brightness.dart';
+ import 'package:flutter/material.dart';
+-import 'package:flutter/cupertino.dart';
+ import 'package:flutter/services.dart';
+ import 'package:flutter_mobx/flutter_mobx.dart';
+ import 'package:cake_wallet/generated/i18n.dart';
+@@ -16,11 +15,12 @@ class QRWidget extends StatelessWidget {
+   QRWidget(
+       {required this.addressListViewModel,
+       required this.isLight,
++      this.qrVersion,
+       this.isAmountFieldShow = false,
+       this.amountTextFieldFocusNode})
+       : amountController = TextEditingController(),
+         _formKey = GlobalKey<FormState>() {
+-    amountController.addListener(() => addressListViewModel.amount =
++    amountController.addListener(() => addressListViewModel?.amount =
+         _formKey.currentState!.validate() ? amountController.text : '');
+   }
+ 
+@@ -30,6 +30,7 @@ class QRWidget extends StatelessWidget {
+   final FocusNode? amountTextFieldFocusNode;
+   final GlobalKey<FormState> _formKey;
+   final bool isLight;
++  final int? qrVersion;
+ 
+   @override
+   Widget build(BuildContext context) {
+@@ -57,46 +58,48 @@ class QRWidget extends StatelessWidget {
+               children: <Widget>[
+                 Spacer(flex: 3),
+                 Observer(
+-                  builder: (_) => Flexible(
+-                    flex: 5,
+-                    child: GestureDetector(
+-                      onTap: () async {
+-                        // Get the current brightness:
+-                        final double brightness = await DeviceDisplayBrightness.getBrightness();
++                  builder: (_) {
++                    return Flexible(
++                      flex: 5,
++                      child: GestureDetector(
++                        onTap: () async {
++                          // Get the current brightness:
++                          final double brightness = await DeviceDisplayBrightness.getBrightness();
+ 
+-                        // ignore: unawaited_futures
+-                        DeviceDisplayBrightness.setBrightness(1.0);
+-                        await Navigator.pushNamed(
+-                          context,
+-                          Routes.fullscreenQR,
+-                          arguments: {
+-                            'qrData': addressListViewModel.uri.toString(),
+-                            'isLight': isLight,
+-                          },
+-                        );
+-                        // ignore: unawaited_futures
+-                        DeviceDisplayBrightness.setBrightness(brightness);
+-                      },
+-                      child: Hero(
+-                        tag: Key(addressListViewModel.uri.toString()),
+-                        child: Center(
+-                          child: AspectRatio(
+-                            aspectRatio: 1.0,
+-                            child: Container(
+-                              padding: EdgeInsets.all(5),
+-                              decoration: BoxDecoration(
+-                                border: Border.all(
+-                                  width: 3,
+-                                  color: Theme.of(context).accentTextTheme!.headline2!.backgroundColor!,
++                          // ignore: unawaited_futures
++                          DeviceDisplayBrightness.setBrightness(1.0);
++                          await Navigator.pushNamed(
++                            context,
++                            Routes.fullscreenQR,
++                            arguments: {
++                              'qrData': addressListViewModel.uri.toString(),
++                            },
++                          );
++                          // ignore: unawaited_futures
++                          DeviceDisplayBrightness.setBrightness(brightness);
++                        },
++                        child: Hero(
++                          tag: Key(addressListViewModel.uri.toString()),
++                          child: Center(
++                            child: AspectRatio(
++                              aspectRatio: 1.0,
++                              child: Container(
++                                padding: EdgeInsets.all(5),
++                                decoration: BoxDecoration(
++                                  border: Border.all(
++                                    width: 3,
++                                    color:
++                                        Theme.of(context).accentTextTheme!.headline2!.backgroundColor!,
++                                  ),
+                                 ),
++                                child: QrImage(data: addressListViewModel.uri.toString(), version: qrVersion),
+                               ),
+-                              child: QrImage(data: addressListViewModel.uri.toString()),
+                             ),
+                           ),
+                         ),
+                       ),
+-                    ),
+-                  ),
++                    );
++                  }
+                 ),
+                 Spacer(flex: 3)
+               ],
+@@ -120,8 +123,9 @@ class QRWidget extends StatelessWidget {
+                       hintText: S.of(context).receive_amount,
+                       textColor: Theme.of(context).accentTextTheme!.headline2!.backgroundColor!,
+                       borderColor: Theme.of(context).textTheme!.headline5!.decorationColor!,
+-                      validator: AmountValidator(currency:
+-                      walletTypeToCryptoCurrency(addressListViewModel.type), isAutovalidate: true),
++                      validator: AmountValidator(
++                          currency: walletTypeToCryptoCurrency(addressListViewModel!.type),
++                          isAutovalidate: true),
+                       // FIX-ME: Check does it equal to autovalidate: true,
+                       autovalidateMode: AutovalidateMode.always,
+                       placeholderTextStyle: TextStyle(
+@@ -135,39 +139,40 @@ class QRWidget extends StatelessWidget {
+               ],
+             ),
+           ),
+-        Padding(
+-          padding: EdgeInsets.only(top: 8, bottom: 8),
+-          child: Builder(
+-            builder: (context) => Observer(
+-              builder: (context) => GestureDetector(
+-                onTap: () {
+-                  Clipboard.setData(ClipboardData(text: addressListViewModel.address.address));
+-                  showBar<void>(context, S.of(context).copied_to_clipboard);
+-                },
+-                child: Row(
+-                  mainAxisSize: MainAxisSize.max,
+-                  crossAxisAlignment: CrossAxisAlignment.start,
+-                  children: <Widget>[
+-                    Expanded(
+-                      child: Text(
+-                        addressListViewModel.address.address,
+-                        textAlign: TextAlign.center,
+-                        style: TextStyle(
+-                            fontSize: 15,
+-                            fontWeight: FontWeight.w500,
+-                            color: Theme.of(context).accentTextTheme!.headline2!.backgroundColor!),
++          Padding(
++            padding: EdgeInsets.only(top: 8, bottom: 8),
++            child: Builder(
++              builder: (context) => Observer(
++                builder: (context) => GestureDetector(
++                  onTap: () {
++                    Clipboard.setData(ClipboardData(text: addressListViewModel!.address.address));
++                    showBar<void>(context, S.of(context).copied_to_clipboard);
++                  },
++                  child: Row(
++                    mainAxisSize: MainAxisSize.max,
++                    crossAxisAlignment: CrossAxisAlignment.start,
++                    children: <Widget>[
++                      Expanded(
++                        child: Text(
++                          addressListViewModel!.address.address,
++                          textAlign: TextAlign.center,
++                          style: TextStyle(
++                              fontSize: 15,
++                              fontWeight: FontWeight.w500,
++                              color:
++                                  Theme.of(context).accentTextTheme!.headline2!.backgroundColor!),
++                        ),
+                       ),
+-                    ),
+-                    Padding(
+-                      padding: EdgeInsets.only(left: 12),
+-                      child: copyImage,
+-                    )
+-                  ],
++                      Padding(
++                        padding: EdgeInsets.only(left: 12),
++                        child: copyImage,
++                      )
++                    ],
++                  ),
+                 ),
+               ),
+             ),
+-          ),
+-        )
++          )
+       ],
+     );
+   }
+diff --git a/lib/src/screens/wallet_keys/wallet_keys_page.dart b/lib/src/screens/wallet_keys/wallet_keys_page.dart
+index e9f9ea2853..8c378d174d 100644
+--- a/lib/src/screens/wallet_keys/wallet_keys_page.dart
++++ b/lib/src/screens/wallet_keys/wallet_keys_page.dart
+@@ -33,7 +33,6 @@ class WalletKeysPage extends BasePage {
+           Routes.fullscreenQR,
+           arguments: {
+             'qrData': (await walletKeysViewModel.url).toString(),
+-            'isLight': true,
+           },
+         );
+         // ignore: unawaited_futures
+diff --git a/lib/store/anonpay/anonpay_transactions_store.dart b/lib/store/anonpay/anonpay_transactions_store.dart
+new file mode 100644
+index 0000000000..c6f05b9933
+--- /dev/null
++++ b/lib/store/anonpay/anonpay_transactions_store.dart
+@@ -0,0 +1,34 @@
++import 'dart:async';
++import 'package:cake_wallet/anonpay/anonpay_invoice_info.dart';
++import 'package:cake_wallet/view_model/dashboard/anonpay_transaction_list_item.dart';
++import 'package:hive/hive.dart';
++import 'package:mobx/mobx.dart';
++
++part 'anonpay_transactions_store.g.dart';
++
++class AnonpayTransactionsStore = AnonpayTransactionsStoreBase with _$AnonpayTransactionsStore;
++
++abstract class AnonpayTransactionsStoreBase with Store {
++  AnonpayTransactionsStoreBase({
++    required this.anonpayInvoiceInfoSource,
++  }) : transactions = <AnonpayTransactionListItem>[] {
++    anonpayInvoiceInfoSource.watch().listen(
++          (_) async => await updateTransactionList(),
++        );
++    updateTransactionList();
++  }
++
++  Box<AnonpayInvoiceInfo> anonpayInvoiceInfoSource;
++
++  @observable
++  List<AnonpayTransactionListItem> transactions;
++
++  @action
++  Future<void> updateTransactionList() async {
++    transactions = anonpayInvoiceInfoSource.values
++        .map(
++          (transaction) => AnonpayTransactionListItem(transaction: transaction),
++        )
++        .toList();
++  }
++}
+diff --git a/lib/store/dashboard/transaction_filter_store.dart b/lib/store/dashboard/transaction_filter_store.dart
+index 95264a23d1..af0dcce87f 100644
+--- a/lib/store/dashboard/transaction_filter_store.dart
++++ b/lib/store/dashboard/transaction_filter_store.dart
+@@ -1,8 +1,8 @@
++import 'package:cake_wallet/view_model/dashboard/action_list_item.dart';
++import 'package:cake_wallet/view_model/dashboard/anonpay_transaction_list_item.dart';
+ import 'package:mobx/mobx.dart';
+ import 'package:cw_core/transaction_direction.dart';
+ import 'package:cake_wallet/view_model/dashboard/transaction_list_item.dart';
+-import 'package:cake_wallet/view_model/dashboard/filter_item.dart';
+-import 'package:cake_wallet/generated/i18n.dart';
+ 
+ part 'transaction_filter_store.g.dart';
+ 
+@@ -57,8 +57,8 @@ abstract class TransactionFilterStoreBase with Store {
+   @action
+   void changeEndDate(DateTime date) => endDate = date;
+ 
+-  List<TransactionListItem> filtered({required List<TransactionListItem> transactions}) {
+-    var _transactions = <TransactionListItem>[];
++  List<ActionListItem> filtered({required List<ActionListItem> transactions}) {
++    var _transactions = <ActionListItem>[];
+     final needToFilter = !displayAll ||
+         (startDate != null && endDate != null);
+ 
+@@ -67,16 +67,26 @@ abstract class TransactionFilterStoreBase with Store {
+         var allowed = true;
+ 
+         if (allowed && startDate != null && endDate != null) {
++          if(item is TransactionListItem){
+           allowed = (startDate?.isBefore(item.transaction.date) ?? false)
+               && (endDate?.isAfter(item.transaction.date) ?? false);
++           }else if(item is AnonpayTransactionListItem){
++            allowed = (startDate?.isBefore(item.transaction.createdAt) ?? false)
++                && (endDate?.isAfter(item.transaction.createdAt) ?? false);
++            }
+         }
+ 
+         if (allowed && (!displayAll)) {
++          if(item is TransactionListItem){
+           allowed = (displayOutgoing &&
+               item.transaction.direction ==
+                   TransactionDirection.outgoing) ||
+               (displayIncoming &&
+                   item.transaction.direction == TransactionDirection.incoming);
++        } else if(item is AnonpayTransactionListItem){
++            allowed = displayIncoming;
++          }
++        
+         }
+ 
+         return allowed;
+diff --git a/lib/view_model/anon_invoice_page_view_model.dart b/lib/view_model/anon_invoice_page_view_model.dart
+new file mode 100644
+index 0000000000..b9617e6dd5
+--- /dev/null
++++ b/lib/view_model/anon_invoice_page_view_model.dart
+@@ -0,0 +1,186 @@
++import 'package:cake_wallet/anonpay/anonpay_api.dart';
++import 'package:cake_wallet/anonpay/anonpay_invoice_info.dart';
++import 'package:cake_wallet/anonpay/anonpay_request.dart';
++import 'package:cake_wallet/core/execution_state.dart';
++import 'package:cake_wallet/entities/fiat_currency.dart';
++import 'package:cake_wallet/entities/preferences_key.dart';
++import 'package:cake_wallet/entities/receive_page_option.dart';
++import 'package:cake_wallet/store/settings_store.dart';
++import 'package:cw_core/crypto_currency.dart';
++import 'package:cw_core/currency.dart';
++import 'package:cw_core/wallet_base.dart';
++import 'package:cw_core/wallet_type.dart';
++import 'package:hive/hive.dart';
++import 'package:mobx/mobx.dart';
++import 'package:shared_preferences/shared_preferences.dart';
++
++part 'anon_invoice_page_view_model.g.dart';
++
++class AnonInvoicePageViewModel = AnonInvoicePageViewModelBase with _$AnonInvoicePageViewModel;
++
++abstract class AnonInvoicePageViewModelBase with Store {
++  AnonInvoicePageViewModelBase(
++    this.anonPayApi,
++    this.address,
++    this.settingsStore,
++    this._wallet,
++    this._anonpayInvoiceInfoSource,
++    this.sharedPreferences,
++    this.pageOption,
++  )   : receipientEmail = '',
++        receipientName = '',
++        description = '',
++        amount = '',
++        state = InitialExecutionState(),
++        selectedCurrency = walletTypeToCryptoCurrency(_wallet.type),
++        cryptoCurrency = walletTypeToCryptoCurrency(_wallet.type) {
++    _getPreviousDonationLink();
++    _fetchLimits();
++  }
++
++  List<Currency> get currencies => [walletTypeToCryptoCurrency(_wallet.type), ...FiatCurrency.all];
++  final AnonPayApi anonPayApi;
++  final String address;
++  final SettingsStore settingsStore;
++  final WalletBase _wallet;
++  final Box<AnonpayInvoiceInfo> _anonpayInvoiceInfoSource;
++  final SharedPreferences sharedPreferences;
++  final ReceivePageOption pageOption;
++
++  @observable
++  Currency selectedCurrency;
++
++  CryptoCurrency cryptoCurrency;
++
++  @observable
++  String receipientEmail;
++
++  @observable
++  String receipientName;
++
++  @observable
++  String description;
++
++  @observable
++  String amount;
++
++  @observable
++  ExecutionState state;
++
++  @computed
++  int get selectedCurrencyIndex => currencies.indexOf(selectedCurrency);
++
++  @observable
++  double? minimum;
++
++  @observable
++  double? maximum;
++
++  @action
++  void selectCurrency(Currency currency) {
++    selectedCurrency = currency;
++    maximum = minimum = null;
++    if (currency is CryptoCurrency) {
++      cryptoCurrency = currency;
++    } else {
++      cryptoCurrency = walletTypeToCryptoCurrency(_wallet.type);
++    }
++
++    _fetchLimits();
++  }
++
++  @action
++  Future<void> createInvoice() async {
++    state = IsExecutingState();
++    if (amount.isNotEmpty) {
++      final amountInCrypto = double.parse(amount);
++      if (minimum != null && amountInCrypto < minimum!) {
++        state = FailureState('Amount is too small');
++        return;
++      }
++      if (maximum != null && amountInCrypto > maximum!) {
++        state = FailureState('Amount is too big');
++        return;
++      }
++    }
++    final result = await anonPayApi.createInvoice(AnonPayRequest(
++      cryptoCurrency: cryptoCurrency,
++      address: address,
++      amount: amount.isEmpty ? null : amount,
++      description: description,
++      email: receipientEmail,
++      name: receipientName,
++      fiatEquivalent:
++          selectedCurrency is FiatCurrency ? (selectedCurrency as FiatCurrency).raw : null,
++    ));
++
++    _anonpayInvoiceInfoSource.add(result);
++
++    state = ExecutedSuccessfullyState(payload: result);
++  }
++
++  @action
++  void setRequestParams({
++    required String inputAmount,
++    required String inputName,
++    required String inputEmail,
++    required String inputDescription,
++  }) {
++    receipientName = inputName;
++    receipientEmail = inputEmail;
++    description = inputDescription;
++    amount = inputAmount;
++  }
++
++  @action
++  Future<void> generateDonationLink() async {
++    state = IsExecutingState();
++
++    final result = await anonPayApi.generateDonationLink(AnonPayRequest(
++      cryptoCurrency: cryptoCurrency,
++      address: address,
++      description: description,
++      email: receipientEmail,
++      name: receipientName,
++    ));
++
++    await sharedPreferences.setString(PreferencesKey.clearnetDonationLink, result.clearnetUrl);
++    await sharedPreferences.setString(PreferencesKey.onionDonationLink, result.onionUrl);
++
++    state = ExecutedSuccessfullyState(payload: result);
++  }
++
++  Future<void> _fetchLimits() async {
++    final limit = await anonPayApi.fetchLimits(
++      cryptoCurrency: cryptoCurrency,
++      fiatCurrency: selectedCurrency is FiatCurrency ? selectedCurrency as FiatCurrency : null,
++    );
++    minimum = limit.min;
++    maximum = limit.max != null ? limit.max! / 4 : null;
++  }
++
++  @action
++  void reset() {
++    selectedCurrency = walletTypeToCryptoCurrency(_wallet.type);
++    cryptoCurrency =  walletTypeToCryptoCurrency(_wallet.type);
++    receipientEmail = '';
++    receipientName = '';
++    description = '';
++    amount = '';
++    _fetchLimits();
++  }
++
++  Future<void> _getPreviousDonationLink() async {
++    if (pageOption == ReceivePageOption.anonPayDonationLink) {
++      final donationLink = sharedPreferences.getString(PreferencesKey.clearnetDonationLink);
++      if (donationLink != null) {
++        final url = Uri.parse(donationLink);
++        url.queryParameters.forEach((key, value) {
++          if (key == 'name') receipientName = value;
++          if (key == 'email') receipientEmail = value;
++          if (key == 'description') description = Uri.decodeComponent(value);
++        });
++      }
++    }
++  }
++}
+diff --git a/lib/view_model/anonpay_details_view_model.dart b/lib/view_model/anonpay_details_view_model.dart
+new file mode 100644
+index 0000000000..6c528f4952
+--- /dev/null
++++ b/lib/view_model/anonpay_details_view_model.dart
+@@ -0,0 +1,78 @@
++import 'dart:async';
++
++import 'package:cake_wallet/anonpay/anonpay_api.dart';
++import 'package:cake_wallet/anonpay/anonpay_invoice_info.dart';
++import 'package:cake_wallet/generated/i18n.dart';
++import 'package:cake_wallet/src/screens/trade_details/track_trade_list_item.dart';
++import 'package:cake_wallet/src/screens/trade_details/trade_details_list_card.dart';
++import 'package:cake_wallet/src/screens/trade_details/trade_details_status_item.dart';
++import 'package:cake_wallet/src/screens/transaction_details/standart_list_item.dart';
++import 'package:cake_wallet/store/settings_store.dart';
++import 'package:cake_wallet/utils/date_formatter.dart';
++import 'package:cake_wallet/utils/show_bar.dart';
++import 'package:cw_core/crypto_currency.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter/services.dart';
++import 'package:mobx/mobx.dart';
++import 'package:url_launcher/url_launcher_string.dart';
++
++part 'anonpay_details_view_model.g.dart';
++
++class AnonpayDetailsViewModel = AnonpayDetailsViewModelBase with _$AnonpayDetailsViewModel;
++
++abstract class AnonpayDetailsViewModelBase with Store {
++  AnonpayDetailsViewModelBase(
++      {required this.anonPayApi,
++      required AnonpayInvoiceInfo anonpayInvoiceInfo,
++      required this.settingsStore})
++      : items = ObservableList<StandartListItem>(),
++        invoiceDetail = anonpayInvoiceInfo {
++    _updateItems();
++    _updateInvoiceDetail();
++    timer = Timer.periodic(Duration(seconds: 20), (_) async => _updateInvoiceDetail());
++  }
++
++  final AnonPayApi anonPayApi;
++  final SettingsStore settingsStore;
++  final AnonpayInvoiceInfo invoiceDetail;
++
++  final ObservableList<StandartListItem> items;
++
++  Timer? timer;
++
++  @action
++  Future<void> _updateInvoiceDetail() async {
++    try {
++      final data = await anonPayApi.paymentStatus(invoiceDetail.invoiceId);
++      invoiceDetail.status = data.status;
++      _updateItems();
++    } catch (e) {
++      print(e.toString());
++    }
++  }
++
++  void _updateItems() {
++    final dateFormat = DateFormatter.withCurrentLocal();
++    items.clear();
++    items.addAll([
++      DetailsListStatusItem(title: S.current.status, value: invoiceDetail.status),
++      TradeDetailsListCardItem(
++        id: invoiceDetail.invoiceId,
++        createdAt: dateFormat.format(invoiceDetail.createdAt).toString(),
++        pair: (invoiceDetail.fiatAmount != null)
++            ? "→ ${invoiceDetail.fiatAmount} ${invoiceDetail.fiatEquiv ?? ''}"
++            : '→ ${invoiceDetail.amountTo ?? ''} ${CryptoCurrency.fromFullName(invoiceDetail.coinTo).name.toUpperCase()}',
++        onTap: (BuildContext context) {
++          Clipboard.setData(ClipboardData(text: '${invoiceDetail.invoiceId}'));
++          showBar<void>(context, S.of(context).copied_to_clipboard);
++        },
++      ),
++      StandartListItem(title: S.current.trade_details_provider, value: invoiceDetail.provider)
++    ]);
++
++    items.add(TrackTradeListItem(
++        title: 'Track',
++        value: invoiceDetail.clearnetStatusUrl,
++        onTap: () => launchUrlString(invoiceDetail.clearnetStatusUrl)));
++  }
++}
+diff --git a/lib/view_model/dashboard/anonpay_transaction_list_item.dart b/lib/view_model/dashboard/anonpay_transaction_list_item.dart
+new file mode 100644
+index 0000000000..261e49070f
+--- /dev/null
++++ b/lib/view_model/dashboard/anonpay_transaction_list_item.dart
+@@ -0,0 +1,11 @@
++import 'package:cake_wallet/anonpay/anonpay_invoice_info.dart';
++import 'package:cake_wallet/view_model/dashboard/action_list_item.dart';
++
++class AnonpayTransactionListItem extends ActionListItem {
++  AnonpayTransactionListItem({required this.transaction});
++
++  final AnonpayInvoiceInfo transaction;
++
++  @override
++  DateTime get date => transaction.createdAt;
++}
+diff --git a/lib/view_model/dashboard/dashboard_view_model.dart b/lib/view_model/dashboard/dashboard_view_model.dart
+index d41e51411b..3b95a291b1 100644
+--- a/lib/view_model/dashboard/dashboard_view_model.dart
++++ b/lib/view_model/dashboard/dashboard_view_model.dart
+@@ -1,5 +1,7 @@
+ import 'package:cake_wallet/entities/exchange_api_mode.dart';
+ import 'package:cake_wallet/entities/fiat_api_mode.dart';
++import 'package:cake_wallet/store/anonpay/anonpay_transactions_store.dart';
++import 'package:cake_wallet/view_model/dashboard/anonpay_transaction_list_item.dart';
+ import 'package:cake_wallet/wallet_type_utils.dart';
+ import 'package:cw_core/transaction_history.dart';
+ import 'package:cw_core/balance.dart';
+@@ -48,7 +50,9 @@ abstract class DashboardViewModelBase with Store {
+       required this.transactionFilterStore,
+       required this.settingsStore,
+       required this.yatStore,
+-      required this.ordersStore})
++      required this.ordersStore,
++      required this.anonpayTransactionsStore,
++      })
+   : isOutdatedElectrumWallet = false,
+     hasSellAction = false,
+     isEnabledSellAction = false,
+@@ -227,6 +231,11 @@ abstract class DashboardViewModelBase with Store {
+   List<OrderListItem> get orders => ordersStore.orders
+       .where((item) => item.order.walletId == wallet.id)
+       .toList();
++  
++  @computed
++  List<AnonpayTransactionListItem> get anonpayTransactons => anonpayTransactionsStore.transactions
++      .where((item) => item.transaction.walletId == wallet.id)
++      .toList();
+ 
+   @computed
+   double get price => balanceViewModel.price;
+@@ -235,7 +244,7 @@ abstract class DashboardViewModelBase with Store {
+   List<ActionListItem> get items {
+     final _items = <ActionListItem>[];
+ 
+-    _items.addAll(transactionFilterStore.filtered(transactions: transactions));
++    _items.addAll(transactionFilterStore.filtered(transactions: [...transactions, ...anonpayTransactons]));
+     _items.addAll(tradeFilterStore.filtered(trades: trades, wallet: wallet));
+     _items.addAll(orders);
+ 
+@@ -262,6 +271,8 @@ abstract class DashboardViewModelBase with Store {
+ 
+   TradeFilterStore tradeFilterStore;
+ 
++  AnonpayTransactionsStore anonpayTransactionsStore;
++
+   TransactionFilterStore transactionFilterStore;
+ 
+   Map<String, List<FilterItem>> filterItems;
+diff --git a/lib/view_model/dashboard/receive_option_view_model.dart b/lib/view_model/dashboard/receive_option_view_model.dart
+new file mode 100644
+index 0000000000..0eaa2a5f0b
+--- /dev/null
++++ b/lib/view_model/dashboard/receive_option_view_model.dart
+@@ -0,0 +1,34 @@
++import 'package:cake_wallet/entities/receive_page_option.dart';
++import 'package:cw_core/wallet_base.dart';
++import 'package:cw_core/wallet_type.dart';
++import 'package:mobx/mobx.dart';
++
++part 'receive_option_view_model.g.dart';
++
++class ReceiveOptionViewModel = ReceiveOptionViewModelBase with _$ReceiveOptionViewModel;
++
++abstract class ReceiveOptionViewModelBase with Store {
++  ReceiveOptionViewModelBase(this._wallet, this.initialPageOption)
++      : selectedReceiveOption = initialPageOption ?? ReceivePageOption.mainnet,
++        _options = [] {
++    final walletType = _wallet.type;
++    _options =
++        walletType == WalletType.haven ? [ReceivePageOption.mainnet] : ReceivePageOption.values;
++  }
++
++  final WalletBase _wallet;
++
++  final ReceivePageOption? initialPageOption;
++
++  List<ReceivePageOption> _options;
++
++  @observable
++  ReceivePageOption selectedReceiveOption;
++
++  List<ReceivePageOption> get options => _options;
++
++  @action
++  void selectReceiveOption(ReceivePageOption option) {
++    selectedReceiveOption = option;
++  }
++}
+diff --git a/res/values/strings_ar.arb b/res/values/strings_ar.arb
+index d44113a5a7..142578dd27 100644
+--- a/res/values/strings_ar.arb
++++ b/res/values/strings_ar.arb
+@@ -684,5 +684,15 @@
+    "do_not_send": "لا ترسل",
+    "error_dialog_content": "عفوًا ، لقد حصلنا على بعض الخطأ.\n\nيرجى إرسال تقرير التعطل إلى فريق الدعم لدينا لتحسين التطبيق.",
+    "decimal_places_error": "عدد كبير جدًا من المنازل العشرية",
+-   "edit_node": "تحرير العقدة"
++   "edit_node": "تحرير العقدة",
++   "invoice_details": "تفاصيل الفاتورة",
++   "donation_link_details": "تفاصيل رابط التبرع",
++   "anonpay_description": "توليد ${type}. يمكن للمستلم ${method} بأي عملة مشفرة مدعومة ، وستتلقى أموالاً في هذه",
++   "create_invoice": "إنشاء فاتورة",
++   "create_donation_link": "إنشاء رابط التبرع",
++   "optional_email_hint": "البريد الإلكتروني إخطار المدفوع لأمره الاختياري",
++   "optional_description": "وصف اختياري",
++   "optional_name": "اسم المستلم الاختياري",
++   "clearnet_link": "رابط Clearnet",
++   "onion_link": "رابط البصل"
+ }
+diff --git a/res/values/strings_bg.arb b/res/values/strings_bg.arb
+index f135a853a1..0a7b6f02a9 100644
+--- a/res/values/strings_bg.arb
++++ b/res/values/strings_bg.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "Не изпращай",
+   "error_dialog_content": "Получихме грешка.\n\nМоля, изпратете доклада до нашия отдел поддръжка, за да подобрим приложението.",
+   "decimal_places_error": "Твърде много знаци след десетичната запетая",
+-  "edit_node": "Редактиране на възел"
++  "edit_node": "Редактиране на възел",
++  "invoice_details": "IДанни за фактура",
++  "donation_link_details": "Подробности за връзката за дарение",
++  "anonpay_description": "Генерирайте ${type}. Получателят може да ${method} с всяка поддържана криптовалута и вие ще получите средства в този портфейл.",
++  "create_invoice": "Създайте фактура",
++  "create_donation_link": "Създайте връзка за дарение",
++  "optional_email_hint": "Незадължителен имейл за уведомяване на получателя",
++  "optional_description": "Описание по избор",
++  "optional_name": "Незадължително име на получател",
++  "clearnet_link": "Clearnet връзка",
++  "onion_link": "Лукова връзка"
+ }
+diff --git a/res/values/strings_cs.arb b/res/values/strings_cs.arb
+index 17fd90b2ff..3e4dd01525 100644
+--- a/res/values/strings_cs.arb
++++ b/res/values/strings_cs.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "Neodesílat",
+   "error_dialog_content": "Nastala chyba.\n\nProsím odešlete zprávu o chybě naší podpoře, aby mohli zajistit opravu.",
+   "decimal_places_error": "Příliš mnoho desetinných míst",
+-  "edit_node": "Upravit uzel"
++  "edit_node": "Upravit uzel",
++  "invoice_details": "detaily faktury",
++  "donation_link_details": "Podrobnosti odkazu na darování",
++  "anonpay_description": "Vygenerujte ${type}. Příjemce může ${method} s jakoukoli podporovanou kryptoměnou a vy obdržíte prostředky v této peněžence.",
++  "create_invoice": "Vytvořit fakturu",
++  "create_donation_link": "Vytvořit odkaz na darování",
++  "optional_email_hint": "Volitelný e-mail s upozorněním na příjemce platby",
++  "optional_description": "Volitelný popis",
++  "optional_name": "Volitelné jméno příjemce",
++  "clearnet_link": "Odkaz na Clearnet",
++  "onion_link": "Cibulový odkaz"
+ }
+diff --git a/res/values/strings_de.arb b/res/values/strings_de.arb
+index 132d5b72aa..ed34c53a34 100644
+--- a/res/values/strings_de.arb
++++ b/res/values/strings_de.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "Nicht senden",
+   "error_dialog_content": "Hoppla, wir haben einen Fehler.\n\nBitte senden Sie den Absturzbericht an unser Support-Team, um die Anwendung zu verbessern.",
+   "decimal_places_error": "Zu viele Nachkommastellen",
+-  "edit_node": "Knoten bearbeiten"
++  "edit_node": "Knoten bearbeiten",
++  "invoice_details": "Rechnungs-Details",
++  "donation_link_details": "Details zum Spendenlink",
++  "anonpay_description": "Generieren Sie ${type}. Der Empfänger kann ${method} mit jeder unterstützten Kryptowährung verwenden, und Sie erhalten Geld in dieser Brieftasche.",
++  "create_invoice": "Rechnung erstellen",
++  "create_donation_link": "Spendenlink erstellen",
++  "optional_email_hint": "Optionale Benachrichtigungs-E-Mail für den Zahlungsempfänger",
++  "optional_description": "Optionale Beschreibung",
++  "optional_name": "Optionaler Empfängername",
++  "clearnet_link": "Clearnet-Link",
++  "onion_link": "Zwiebel-Link"
+ }
+diff --git a/res/values/strings_en.arb b/res/values/strings_en.arb
+index 77a35265f3..b0090aafc7 100644
+--- a/res/values/strings_en.arb
++++ b/res/values/strings_en.arb
+@@ -685,6 +685,16 @@
+   "arrive_in_this_address" : "${currency} ${tag}will arrive in this address",
+   "do_not_send": "Don't send",
+   "error_dialog_content": "Oops, we got some error.\n\nPlease send the crash report to our support team to make the application better.",
++  "invoice_details": "Invoice details",
++  "donation_link_details": "Donation link details",
++  "anonpay_description": "Generate ${type}. The recipient can ${method} with any supported cryptocurrency, and you will receive funds in this wallet.",
++  "create_invoice": "Create invoice",
++  "create_donation_link": "Create donation link",
++  "optional_email_hint": "Optional payee notification email",
++  "optional_description": "Optional description",
++  "optional_name": "Optional recipient name",
++  "clearnet_link": "Clearnet link",
++  "onion_link": "Onion link",
+   "decimal_places_error": "Too many decimal places",
+   "edit_node": "Edit Node"
+ }
+diff --git a/res/values/strings_es.arb b/res/values/strings_es.arb
+index 63d209f3c8..7380a51bc1 100644
+--- a/res/values/strings_es.arb
++++ b/res/values/strings_es.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "no enviar",
+   "error_dialog_content": "Vaya, tenemos un error.\n\nEnvíe el informe de bloqueo a nuestro equipo de soporte para mejorar la aplicación.",
+   "decimal_places_error": "Demasiados lugares decimales",
+-  "edit_node": "Edit Node"
++  "edit_node": "Edit Node",
++  "invoice_details": "Detalles de la factura",
++  "donation_link_details": "Detalles del enlace de donación",
++  "anonpay_description": "Genera ${type}. El destinatario puede ${method} con cualquier criptomoneda admitida, y recibirá fondos en esta billetera.",
++  "create_invoice": "Crear factura",
++  "create_donation_link": "Crear enlace de donación",
++  "optional_email_hint": "Correo electrónico de notificación del beneficiario opcional",
++  "optional_description": "Descripción opcional",
++  "optional_name": "Nombre del destinatario opcional",
++  "clearnet_link": "enlace Clearnet",
++  "onion_link": "Enlace de cebolla"
+ }
+diff --git a/res/values/strings_fr.arb b/res/values/strings_fr.arb
+index 1f90fb0214..6ac561f3c7 100644
+--- a/res/values/strings_fr.arb
++++ b/res/values/strings_fr.arb
+@@ -684,5 +684,15 @@
+   "do_not_send": "N'envoyez pas",
+   "error_dialog_content": "Oups, nous avons eu une erreur.\n\nVeuillez envoyer le rapport de plantage à notre équipe d'assistance pour améliorer l'application.",
+   "decimal_places_error": "Trop de décimales",
+-  "edit_node": "Modifier le nœud"
++  "edit_node": "Modifier le nœud",
++  "invoice_details": "Détails de la facture",
++  "donation_link_details": "Détails du lien de don",
++  "anonpay_description": "Générez ${type}. Le destinataire peut ${method} avec n'importe quelle crypto-monnaie prise en charge, et vous recevrez des fonds dans ce portefeuille.",
++  "create_invoice": "Créer une facture",
++  "create_donation_link": "Créer un lien de don",
++  "optional_email_hint": "E-mail de notification du bénéficiaire facultatif",
++  "optional_description": "Descriptif facultatif",
++  "optional_name": "Nom du destinataire facultatif",
++  "clearnet_link": "Lien Clearnet",
++  "onion_link": "Lien d'oignon"
+ }
+diff --git a/res/values/strings_hi.arb b/res/values/strings_hi.arb
+index 81cda43591..1dadd5d296 100644
+--- a/res/values/strings_hi.arb
++++ b/res/values/strings_hi.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "मत भेजो",
+   "error_dialog_content": "ओह, हमसे कुछ गड़बड़ी हुई है.\n\nएप्लिकेशन को बेहतर बनाने के लिए कृपया क्रैश रिपोर्ट हमारी सहायता टीम को भेजें।",
+   "decimal_places_error": "बहुत अधिक दशमलव स्थान",
+-  "edit_node": "नोड संपादित करें"
++  "edit_node": "नोड संपादित करें",
++  "invoice_details": "चालान विवरण",
++  "donation_link_details": "दान लिंक विवरण",
++  "anonpay_description": "${type} उत्पन्न करें। प्राप्तकर्ता किसी भी समर्थित क्रिप्टोकरेंसी के साथ ${method} कर सकता है, और आपको इस वॉलेट में धन प्राप्त होगा।",
++  "create_invoice": "इनवॉयस बनाएँ",
++  "create_donation_link": "दान लिंक बनाएं",
++  "optional_email_hint": "वैकल्पिक प्राप्तकर्ता सूचना ईमेल",
++  "optional_description": "वैकल्पिक विवरण",
++  "optional_name": "वैकल्पिक प्राप्तकर्ता नाम",
++  "clearnet_link": "क्लियरनेट लिंक",
++  "onion_link": "प्याज का लिंक"
+ }
+diff --git a/res/values/strings_hr.arb b/res/values/strings_hr.arb
+index a2d75717a1..b2a7800a87 100644
+--- a/res/values/strings_hr.arb
++++ b/res/values/strings_hr.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "Ne šalji",
+   "error_dialog_content": "Ups, imamo grešku.\n\nPošaljite izvješće o padu našem timu za podršku kako bismo poboljšali aplikaciju.",
+   "decimal_places_error": "Previše decimalnih mjesta",
+-  "edit_node": "Uredi čvor"
++  "edit_node": "Uredi čvor",
++  "invoice_details": "Podaci o fakturi",
++  "donation_link_details": "Detalji veza za donacije",
++  "anonpay_description": "Generiraj ${type}. Primatelj može ${method} s bilo kojom podržanom kriptovalutom, a vi ćete primiti sredstva u ovaj novčanik.",
++  "create_invoice": "Izradite fakturu",
++  "create_donation_link": "Izradi poveznicu za donaciju",
++  "optional_email_hint": "Neobavezna e-pošta za obavijest primatelja",
++  "optional_description": "Opcijski opis",
++  "optional_name": "Izborno ime primatelja",
++  "clearnet_link": "Clearnet veza",
++  "onion_link": "Poveznica luka"
+ }
+diff --git a/res/values/strings_id.arb b/res/values/strings_id.arb
+index 137cd5c5a5..c325913756 100644
+--- a/res/values/strings_id.arb
++++ b/res/values/strings_id.arb
+@@ -668,5 +668,15 @@
+   "contact_list_contacts": "Kontak",
+   "contact_list_wallets": "Dompet Saya",
+   "decimal_places_error": "Terlalu banyak tempat desimal",
+-  "edit_node": "Sunting Node"
++  "edit_node": "Sunting Node",
++  "invoice_details": "Detail faktur",
++  "donation_link_details": "Detail tautan donasi",
++  "anonpay_description": "Hasilkan ${type}. Penerima dapat ${method} dengan cryptocurrency apa pun yang didukung, dan Anda akan menerima dana di dompet ini.",
++  "create_invoice": "Buat faktur",
++  "create_donation_link": "Buat tautan donasi",
++  "optional_email_hint": "Email pemberitahuan penerima pembayaran opsional",
++  "optional_description": "Deskripsi opsional",
++  "optional_name": "Nama penerima opsional",
++  "clearnet_link": "Tautan clearnet",
++  "onion_link": "Tautan bawang"
+ }
+diff --git a/res/values/strings_it.arb b/res/values/strings_it.arb
+index 0125df372d..19f3463de1 100644
+--- a/res/values/strings_it.arb
++++ b/res/values/strings_it.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "Non inviare",
+   "error_dialog_content": "Spiacenti, abbiamo riscontrato un errore.\n\nSi prega di inviare il rapporto sull'arresto anomalo al nostro team di supporto per migliorare l'applicazione.",
+   "decimal_places_error": "Troppe cifre decimali",
+-  "edit_node": "Modifica nodo"
++  "edit_node": "Modifica nodo",
++  "invoice_details": "Dettagli della fattura",
++  "donation_link_details": "Dettagli del collegamento alla donazione",
++  "anonpay_description": "Genera ${type}. Il destinatario può ${method} con qualsiasi criptovaluta supportata e riceverai fondi in questo portafoglio.",
++  "create_invoice": "Crea fattura",
++  "create_donation_link": "Crea un link per la donazione",
++  "optional_email_hint": "Email di notifica del beneficiario facoltativa",
++  "optional_description": "Descrizione facoltativa",
++  "optional_name": "Nome del destinatario facoltativo",
++  "clearnet_link": "Collegamento Clearnet",
++  "onion_link": "Collegamento a cipolla"
+ }
+diff --git a/res/values/strings_ja.arb b/res/values/strings_ja.arb
+index e255662b40..fd7bce470b 100644
+--- a/res/values/strings_ja.arb
++++ b/res/values/strings_ja.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "送信しない",
+   "error_dialog_content": "エラーが発生しました。\n\nアプリケーションを改善するために、クラッシュ レポートをサポート チームに送信してください。",
+   "decimal_places_error": "小数点以下の桁数が多すぎる",
+-  "edit_node": "ノードを編集"
++  "edit_node": "ノードを編集",
++  "invoice_details": "請求の詳細",
++  "donation_link_details": "寄付リンクの詳細",
++  "anonpay_description": "${type} を生成します。受取人はサポートされている任意の暗号通貨で ${method} でき、あなたはこのウォレットで資金を受け取ります。",
++  "create_invoice": "請求書の作成",
++  "create_donation_link": "寄付リンクを作成",
++  "optional_email_hint": "オプションの受取人通知メール",
++  "optional_description": "オプションの説明",
++  "optional_name": "オプションの受信者名",
++  "clearnet_link": "クリアネット リンク",
++  "onion_link": "オニオンリンク"
+ }
+diff --git a/res/values/strings_ko.arb b/res/values/strings_ko.arb
+index d32bdd17db..796d9c63a8 100644
+--- a/res/values/strings_ko.arb
++++ b/res/values/strings_ko.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "보내지 마세요",
+   "error_dialog_content": "죄송합니다. 오류가 발생했습니다.\n\n응용 프로그램을 개선하려면 지원 팀에 충돌 보고서를 보내주십시오.",
+   "decimal_places_error": "소수점 이하 자릿수가 너무 많습니다.",
+-  "edit_node": "노드 편집"
++  "edit_node": "노드 편집",
++  "invoice_details": "인보이스 세부정보",
++  "donation_link_details": "기부 링크 세부정보",
++  "anonpay_description": "${type} 생성. 수신자는 지원되는 모든 암호화폐로 ${method}할 수 있으며 이 지갑에서 자금을 받게 됩니다.",
++  "create_invoice": "인보이스 생성",
++  "create_donation_link": "기부 링크 만들기",
++  "optional_email_hint": "선택적 수취인 알림 이메일",
++  "optional_description": "선택적 설명",
++  "optional_name": "선택적 수신자 이름",
++  "clearnet_link": "클리어넷 링크",
++  "onion_link": "양파 링크"
+ }
+diff --git a/res/values/strings_my.arb b/res/values/strings_my.arb
+index 20ad57b22c..1ffe7561a0 100644
+--- a/res/values/strings_my.arb
++++ b/res/values/strings_my.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "မပို့ပါနှင့်",
+   "error_dialog_content": "အိုး၊ ကျွန်ုပ်တို့တွင် အမှားအယွင်းအချို့ရှိသည်။\n\nအပလီကေးရှင်းကို ပိုမိုကောင်းမွန်စေရန်အတွက် ပျက်စီးမှုအစီရင်ခံစာကို ကျွန်ုပ်တို့၏ပံ့ပိုးကူညီရေးအဖွဲ့ထံ ပေးပို့ပါ။",
+   "decimal_places_error": "ဒဿမနေရာများ များလွန်းသည်။",
+-  "edit_node": "Node ကို တည်းဖြတ်ပါ။"
++  "edit_node": "Node ကို တည်းဖြတ်ပါ။",
++  "invoice_details": "ပြေစာအသေးစိတ်",
++  "donation_link_details": "လှူဒါန်းရန်လင့်ခ်အသေးစိတ်",
++  "anonpay_description": "${type} ကို ဖန်တီးပါ။ လက်ခံသူက ${method} ကို ပံ့ပိုးပေးထားသည့် cryptocurrency တစ်ခုခုဖြင့် လုပ်ဆောင်နိုင်ပြီး၊ သင်သည် ဤပိုက်ဆံအိတ်တွင် ရံပုံငွေများ ရရှိမည်ဖြစ်သည်။",
++  "create_invoice": "ပြေစာဖန်တီးပါ။",
++  "create_donation_link": "လှူဒါန်းမှုလင့်ခ်ကို ဖန်တီးပါ။",
++  "optional_email_hint": "ရွေးချယ်နိုင်သော ငွေလက်ခံသူ အကြောင်းကြားချက် အီးမေးလ်",
++  "optional_description": "ရွေးချယ်နိုင်သော ဖော်ပြချက်",
++  "optional_name": "ရွေးချယ်နိုင်သော လက်ခံသူအမည်",
++  "clearnet_link": "Clearnet လင့်ခ်",
++  "onion_link": "ကြက်သွန်လင့်"
+ }
+diff --git a/res/values/strings_nl.arb b/res/values/strings_nl.arb
+index 72ef5d29e4..ba3797e206 100644
+--- a/res/values/strings_nl.arb
++++ b/res/values/strings_nl.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "Niet sturen",
+   "error_dialog_content": "Oeps, er is een fout opgetreden.\n\nStuur het crashrapport naar ons ondersteuningsteam om de applicatie te verbeteren.",
+   "decimal_places_error": "Te veel decimalen",
+-  "edit_node": "Knooppunt bewerken"
++  "edit_node": "Knooppunt bewerken",
++  "invoice_details": "Factuurgegevens",
++  "donation_link_details": "Details van de donatielink",
++  "anonpay_description": "Genereer ${type}. De ontvanger kan ${method} gebruiken met elke ondersteunde cryptocurrency en u ontvangt geld in deze portemonnee",
++  "create_invoice": "Factuur maken",
++  "create_donation_link": "Maak een donatielink aan",
++  "optional_email_hint": "Optionele kennisgeving per e-mail aan de begunstigde",
++  "optional_description": "Optionele beschrijving",
++  "optional_name": "Optionele naam ontvanger",
++  "clearnet_link": "Clearnet-link",
++  "onion_link": "Ui koppeling"
+ }
+diff --git a/res/values/strings_pl.arb b/res/values/strings_pl.arb
+index f63414b5a9..acb83ce4a7 100644
+--- a/res/values/strings_pl.arb
++++ b/res/values/strings_pl.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "Nie wysyłaj",
+   "error_dialog_content": "Ups, wystąpił błąd.\n\nPrześlij raport o awarii do naszego zespołu wsparcia, aby ulepszyć aplikację.",
+   "decimal_places_error": "Za dużo miejsc dziesiętnych",
+-  "edit_node": "Edytuj węzeł"
++  "edit_node": "Edytuj węzeł",
++  "invoice_details": "Dane do faktury",
++  "donation_link_details": "Szczegóły linku darowizny",
++  "anonpay_description": "Wygeneruj ${type}. Odbiorca może ${method} z dowolną obsługiwaną kryptowalutą, a Ty otrzymasz środki w tym portfelu.",
++  "create_invoice": "Wystaw fakturę",
++  "create_donation_link": "Utwórz link do darowizny",
++  "optional_email_hint": "Opcjonalny e-mail z powiadomieniem odbiorcy płatności",
++  "optional_description": "Opcjonalny opis",
++  "optional_name": "Opcjonalna nazwa odbiorcy",
++  "clearnet_link": "łącze Clearnet",
++  "onion_link": "Łącznik cebulowy"
+ }
+diff --git a/res/values/strings_pt.arb b/res/values/strings_pt.arb
+index 0e9d9df677..2224d2807d 100644
+--- a/res/values/strings_pt.arb
++++ b/res/values/strings_pt.arb
+@@ -685,5 +685,15 @@
+   "do_not_send": "não envie",
+   "error_dialog_content": "Ops, houve algum erro.\n\nPor favor, envie o relatório de falha para nossa equipe de suporte para melhorar o aplicativo.",
+   "decimal_places_error": "Muitas casas decimais",
+-  "edit_node": "Editar nó"
++  "edit_node": "Editar nó",
++  "invoice_details": "Detalhes da fatura",
++  "donation_link_details": "Detalhes do link de doação",
++  "anonpay_description": "Gere ${type}. O destinatário pode ${method} com qualquer criptomoeda suportada e você receberá fundos nesta carteira.",
++  "create_invoice": "Criar recibo",
++  "create_donation_link": "Criar link de doação",
++  "optional_email_hint": "E-mail opcional de notificação do beneficiário",
++  "optional_description": "Descrição opcional",
++  "optional_name": "Nome do destinatário opcional",
++  "clearnet_link": "link clear net",
++  "onion_link": "ligação de cebola"
+ }
+diff --git a/res/values/strings_ru.arb b/res/values/strings_ru.arb
+index d266b6a0d9..0c65afbe79 100644
+--- a/res/values/strings_ru.arb
++++ b/res/values/strings_ru.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "Не отправлять",
+   "error_dialog_content": "Ой, у нас какая-то ошибка.\n\nПожалуйста, отправьте отчет о сбое в нашу службу поддержки, чтобы сделать приложение лучше.",
+   "decimal_places_error": "Слишком много десятичных знаков",
+-  "edit_node": "Редактировать узел"
++  "edit_node": "Редактировать узел",
++  "invoice_details": "Детали счета",
++  "donation_link_details": "Информация о ссылке для пожертвований",
++  "anonpay_description": "Создайте ${type}. Получатель может использовать ${method} с любой поддерживаемой криптовалютой, и вы получите средства на этот кошелек.",
++  "create_invoice": "Создать счет",
++  "create_donation_link": "Создать ссылку для пожертвований",
++  "optional_email_hint": "Необязательное электронное письмо с уведомлением получателя платежа",
++  "optional_description": "Дополнительное описание",
++  "optional_name": "Необязательное имя получателя",
++  "clearnet_link": "Клирнет ссылка",
++  "onion_link": "Луковая ссылка"
+ }
+diff --git a/res/values/strings_th.arb b/res/values/strings_th.arb
+index 7d473980f5..27e87f78c5 100644
+--- a/res/values/strings_th.arb
++++ b/res/values/strings_th.arb
+@@ -684,5 +684,15 @@
+   "do_not_send": "อย่าส่ง",
+   "error_dialog_content": "อ๊ะ เราพบข้อผิดพลาดบางอย่าง\n\nโปรดส่งรายงานข้อขัดข้องไปยังทีมสนับสนุนของเราเพื่อปรับปรุงแอปพลิเคชันให้ดียิ่งขึ้น",
+   "decimal_places_error": "ทศนิยมมากเกินไป",
+-  "edit_node": "แก้ไขโหนด"
++  "edit_node": "แก้ไขโหนด",
++  "invoice_details": "รายละเอียดใบแจ้งหนี้",
++  "donation_link_details": "รายละเอียดลิงค์บริจาค",
++  "anonpay_description": "สร้าง ${type} ผู้รับสามารถ ${method} ด้วยสกุลเงินดิจิทัลที่รองรับ และคุณจะได้รับเงินในกระเป๋าสตางค์นี้",
++  "create_invoice": "สร้างใบแจ้งหนี้",
++  "create_donation_link": "สร้างลิงค์บริจาค",
++  "optional_email_hint": "อีเมลแจ้งผู้รับเงินเพิ่มเติม",
++  "optional_description": "คำอธิบายเพิ่มเติม",
++  "optional_name": "ชื่อผู้รับเพิ่มเติม",
++  "clearnet_link": "ลิงค์เคลียร์เน็ต",
++  "onion_link": "ลิงค์หัวหอม"
+ }
+diff --git a/res/values/strings_tr.arb b/res/values/strings_tr.arb
+index 65ff7868ab..aa10785125 100644
+--- a/res/values/strings_tr.arb
++++ b/res/values/strings_tr.arb
+@@ -686,5 +686,15 @@
+   "do_not_send": "Gönderme",
+   "error_dialog_content": "Hay aksi, bir hatamız var.\n\nUygulamayı daha iyi hale getirmek için lütfen kilitlenme raporunu destek ekibimize gönderin.",
+   "decimal_places_error": "Çok fazla ondalık basamak",
+-  "edit_node": "Düğümü Düzenle"
++  "edit_node": "Düğümü Düzenle",
++  "invoice_details": "fatura detayları",
++  "donation_link_details": "Bağış bağlantısı ayrıntıları",
++  "anonpay_description": "${type} oluşturun. Alıcı, desteklenen herhangi bir kripto para birimi ile ${method} yapabilir ve bu cüzdanda para alırsınız.",
++  "create_invoice": "Fatura oluşturmak",
++  "create_donation_link": "Bağış bağlantısı oluştur",
++  "optional_email_hint": "İsteğe bağlı alacaklı bildirim e-postası",
++  "optional_description": "İsteğe bağlı açıklama",
++  "optional_name": "İsteğe bağlı alıcı adı",
++  "clearnet_link": "Net bağlantı",
++  "onion_link": "soğan bağlantısı"
+ }
+diff --git a/res/values/strings_uk.arb b/res/values/strings_uk.arb
+index b53ab72422..e89cbb8353 100644
+--- a/res/values/strings_uk.arb
++++ b/res/values/strings_uk.arb
+@@ -685,5 +685,15 @@
+   "do_not_send": "Не надсилайте",
+   "error_dialog_content": "На жаль, ми отримали помилку.\n\nБудь ласка, надішліть звіт про збій нашій команді підтримки, щоб покращити додаток.",
+   "decimal_places_error": "Забагато знаків після коми",
+-  "edit_node": "Редагувати вузол"
++  "edit_node": "Редагувати вузол",
++  "invoice_details": "Реквізити рахунку-фактури",
++  "donation_link_details": "Деталі посилання для пожертв",
++  "anonpay_description": "Згенерувати ${type}. Одержувач може ${method} будь-якою підтримуваною криптовалютою, і ви отримаєте кошти на цей гаманець.",
++  "create_invoice": "Створити рахунок-фактуру",
++  "create_donation_link": "Створити посилання для пожертв",
++  "optional_email_hint": "Додаткова електронна адреса для сповіщення одержувача",
++  "optional_description": "Додатковий опис",
++  "optional_name": "Додаткове ім'я одержувача",
++  "clearnet_link": "Посилання Clearnet",
++  "onion_link": "Посилання на цибулю"
+ }
+diff --git a/res/values/strings_ur.arb b/res/values/strings_ur.arb
+index f1f8036ec1..5892207a3d 100644
+--- a/res/values/strings_ur.arb
++++ b/res/values/strings_ur.arb
+@@ -687,5 +687,15 @@
+   "do_not_send" : "مت بھیجیں۔",
+   "error_dialog_content" : "افوہ، ہمیں کچھ خرابی ملی۔\n\nایپلی کیشن کو بہتر بنانے کے لیے براہ کرم کریش رپورٹ ہماری سپورٹ ٹیم کو بھیجیں۔",
+   "decimal_places_error": "بہت زیادہ اعشاریہ جگہیں۔",
+-  "edit_node": "نوڈ میں ترمیم کریں۔"
++  "edit_node": "نوڈ میں ترمیم کریں۔",
++  "invoice_details": "رسید کی تفصیلات",
++  "donation_link_details": "عطیہ کے لنک کی تفصیلات",
++  "anonpay_description": "${type} بنائیں۔ وصول کنندہ کسی بھی تعاون یافتہ کرپٹو کرنسی کے ساتھ ${method} کرسکتا ہے، اور آپ کو اس بٹوے میں فنڈز موصول ہوں گے۔",
++  "create_invoice": "انوائس بنائیں",
++  "create_donation_link": "عطیہ کا لنک بنائیں",
++  "optional_email_hint": "اختیاری وصول کنندہ کی اطلاع کا ای میل",
++  "optional_description": "اختیاری تفصیل",
++  "optional_name": "اختیاری وصول کنندہ کا نام",
++  "clearnet_link": "کلیرنیٹ لنک",
++  "onion_link": "پیاز کا لنک"
+ }
+diff --git a/res/values/strings_zh.arb b/res/values/strings_zh.arb
+index 2efab32707..df9637f67c 100644
+--- a/res/values/strings_zh.arb
++++ b/res/values/strings_zh.arb
+@@ -684,5 +684,15 @@
+   "do_not_send": "不要发送",
+   "error_dialog_content": "糟糕，我们遇到了一些错误。\n\n请将崩溃报告发送给我们的支持团队，以改进应用程序。",
+   "decimal_places_error": "小数位太多",
+-  "edit_node": "编辑节点"
++  "edit_node": "编辑节点",
++  "invoice_details": "发票明细",
++  "donation_link_details": "捐赠链接详情",
++  "anonpay_description": "生成 ${type}。收款人可以使用任何受支持的加密货币 ${method}，您将在此钱包中收到资金。",
++  "create_invoice": "创建发票",
++  "create_donation_link": "创建捐赠链接",
++  "optional_email_hint": "可选的收款人通知电子邮件",
++  "optional_description": "可选说明",
++  "optional_name": "可选收件人姓名",
++  "clearnet_link": "明网链接",
++  "onion_link": "洋葱链接"
+ }
+diff --git a/tool/utils/secret_key.dart b/tool/utils/secret_key.dart
+index c27bc5ff7d..3b5d822d9d 100644
+--- a/tool/utils/secret_key.dart
++++ b/tool/utils/secret_key.dart
+@@ -27,6 +27,7 @@ class SecretKey {
+     SecretKey('trocadorApiKey', () => ''),
+     SecretKey('trocadorExchangeMarkup', () => ''),
+     SecretKey('twitterBearerToken', () => ''),
++    SecretKey('anonPayReferralCode', () => '')
+   ];
+ 
+   final String name;

@@ -1,0 +1,188 @@
+diff --git a/vlc-android/jni/libvlcjni.c b/vlc-android/jni/libvlcjni.c
+index 6169dc5a7c..2c5c7b2d02 100644
+--- a/vlc-android/jni/libvlcjni.c
++++ b/vlc-android/jni/libvlcjni.c
+@@ -57,6 +57,7 @@ JavaVM *myVm;
+ 
+ static pthread_mutex_t vout_android_lock;
+ static void *vout_android_surf = NULL;
++static void *vout_android_gui = NULL;
+ 
+ void LockSurface() {
+     pthread_mutex_lock(&vout_android_lock);
+@@ -70,6 +71,23 @@ void *GetSurface() {
+     return vout_android_surf;
+ }
+ 
++void SetSurfaceSize(int width, int height)
++{
++    if (vout_android_gui == NULL)
++        return;
++
++    JNIEnv *p_env;
++
++    (*myVm)->AttachCurrentThread (myVm, &p_env, NULL);
++    jclass cls = (*p_env)->GetObjectClass (p_env, vout_android_gui);
++    jmethodID methodId = (*p_env)->GetMethodID (p_env, cls, "setSurfaceSize", "(II)V");
++
++    (*p_env)->CallVoidMethod (p_env, vout_android_gui, methodId, width, height);
++
++    (*p_env)->DeleteLocalRef(p_env, cls);
++    (*myVm)->DetachCurrentThread (myVm);
++}
++
+ jint JNI_OnLoad(JavaVM *vm, void *reserved)
+ {
+     // Keep a reference on the Java VM.
+@@ -85,7 +103,7 @@ void JNI_OnUnload(JavaVM* vm, void* reserved) {
+     pthread_mutex_destroy(&vout_android_lock);
+ }
+ 
+-void Java_org_videolan_vlc_android_LibVLC_attachSurface(JNIEnv *env, jobject thiz, jobject surf, jint width, jint height) {
++void Java_org_videolan_vlc_android_LibVLC_attachSurface(JNIEnv *env, jobject thiz, jobject surf, jobject gui, jint width, jint height) {
+     jclass clz;
+     jfieldID fid;
+     jthrowable exp;
+@@ -104,6 +122,8 @@ void Java_org_videolan_vlc_android_LibVLC_attachSurface(JNIEnv *env, jobject thi
+     }
+     vout_android_surf = (void*)(*env)->GetIntField(env, surf, fid);
+     (*env)->DeleteLocalRef(env, clz);
++
++    vout_android_gui = (*env)->NewGlobalRef(env, gui);
+     pthread_mutex_unlock(&vout_android_lock);
+ }
+ 
+@@ -111,6 +131,9 @@ void Java_org_videolan_vlc_android_LibVLC_detachSurface(JNIEnv *env, jobject thi
+     pthread_mutex_lock(&vout_android_lock);
+     //(*env)->DeleteGlobalRef(env, vout_android_ref);
+     vout_android_surf = NULL;
++    if (vout_android_gui != NULL)
++        (*env)->DeleteGlobalRef(env, vout_android_gui);
++    vout_android_gui = NULL;
+     pthread_mutex_unlock(&vout_android_lock);
+ }
+ 
+diff --git a/vlc-android/res/layout/main.xml b/vlc-android/res/layout/main.xml
+index 847b03ce87..aeda9dee6f 100644
+--- a/vlc-android/res/layout/main.xml
++++ b/vlc-android/res/layout/main.xml
+@@ -1,12 +1,13 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     android:orientation="vertical"
+     android:layout_width="fill_parent"
+     android:layout_height="fill_parent"
+     >
+ 	<SurfaceView
+-		android:layout_width="fill_parent"
+-		android:layout_height="fill_parent"
++		android:layout_width="wrap_content"
++		android:layout_height="wrap_content"
+ 		android:id="@+id/surface_view"
++		android:layout_gravity="center"
+ 		/>
+-</LinearLayout>
++</FrameLayout>
+diff --git a/vlc-android/src/org/videolan/vlc/android/LibVLC.java b/vlc-android/src/org/videolan/vlc/android/LibVLC.java
+index 846a8e30fd..5f54797d2f 100644
+--- a/vlc-android/src/org/videolan/vlc/android/LibVLC.java
++++ b/vlc-android/src/org/videolan/vlc/android/LibVLC.java
+@@ -14,7 +14,7 @@ public class LibVLC {
+ 
+     private Aout mAout;
+ 
+-    public native void attachSurface(Surface surface, int width, int height);
++    public native void attachSurface(Surface surface, VLC gui, int width, int height);
+     public native void detachSurface();
+ 
+     /* Load library before object instantiation */
+diff --git a/vlc-android/src/org/videolan/vlc/android/VLC.java b/vlc-android/src/org/videolan/vlc/android/VLC.java
+index 6a54156123..0f686f54d3 100644
+--- a/vlc-android/src/org/videolan/vlc/android/VLC.java
++++ b/vlc-android/src/org/videolan/vlc/android/VLC.java
+@@ -7,12 +7,10 @@
+ import android.content.SharedPreferences;
+ import android.content.pm.ActivityInfo;
+ import android.graphics.PixelFormat;
+-
+ import android.os.Bundle;
++import android.os.Handler;
++import android.os.Message;
+ import android.preference.PreferenceManager;
+-import android.widget.Button;
+-import android.widget.MediaController;
+-
+ import android.util.Log;
+ import android.view.Menu;
+ import android.view.MenuInflater;
+@@ -20,8 +18,8 @@
+ import android.view.SurfaceHolder;
+ import android.view.SurfaceView;
+ import android.view.View;
+-import android.view.Window;
+-import android.view.WindowManager;
++import android.view.ViewGroup.LayoutParams;
++import android.widget.MediaController;
+ 
+ public class VLC extends Activity {
+     private static final String TAG = "VLC_Activity";
+@@ -33,6 +31,41 @@ public class VLC extends Activity {
+     
+     private MediaController controller;
+ 
++	Handler sizeHandler = new Handler() {
++		@Override
++		public void handleMessage(Message msg) {
++			//video size
++			int vw = msg.arg1;
++			int vh = msg.arg2;
++			float ar = (float)vw / (float)vh;
++
++			//screen size
++			int dw = getWindowManager().getDefaultDisplay().getWidth();
++			int dh = getWindowManager().getDefaultDisplay().getHeight();
++
++			//fix ar
++			if (vw > vh)
++				dh = (int)(dw / ar);
++			else
++				dw = (int)(dh * ar);
++
++			Log.i(TAG, "video size changed to "+vw+"x"+vh+", displaying at "+dw+"x"+dh);
++			mSurfaceHolderVideo.setFixedSize(vw, vh);
++			LayoutParams lp = mSurfaceViewVideo.getLayoutParams();
++			lp.width = dw;
++			lp.height = dh;
++			mSurfaceViewVideo.setLayoutParams(lp);
++			mSurfaceViewVideo.invalidate();
++		}
++	};
++
++    public void setSurfaceSize(int width, int height) {
++		Message msg = Message.obtain();
++		msg.arg1 = width;
++		msg.arg2 = height;
++		sizeHandler.sendMessage(msg);
++    }
++
+     /** Called when the activity is first created. */
+     @Override
+     public void onCreate(Bundle savedInstanceState) {
+@@ -55,6 +88,7 @@ public void onCreate(Bundle savedInstanceState) {
+         mSurfaceViewVideo = (SurfaceView) findViewById(R.id.surface_view);
+         mSurfaceHolderVideo = mSurfaceViewVideo.getHolder();
+         mSurfaceHolderVideo.setFormat(PixelFormat.RGBX_8888);
++        mSurfaceHolderVideo.setKeepScreenOn(true);
+         mSurfaceViewVideo.setOnClickListener(new View.OnClickListener() {
+             public void onClick(View v) {
+                 controller.show(10000);
+@@ -75,7 +109,7 @@ public void surfaceCreated(SurfaceHolder holder) {
+ 
+         	@Override
+         	public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+-        		mLibVlc.attachSurface(holder.getSurface(), width, height);
++        		mLibVlc.attachSurface(holder.getSurface(), sInstance, width, height);
+         	}
+ 
+         	@Override

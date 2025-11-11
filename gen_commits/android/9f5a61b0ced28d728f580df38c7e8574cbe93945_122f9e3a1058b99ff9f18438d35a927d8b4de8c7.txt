@@ -1,0 +1,1704 @@
+diff --git a/app/build.gradle b/app/build.gradle
+index 7815ca2ef07..bf6a46ee857 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -1,5 +1,6 @@
+ apply plugin: 'com.android.application'
+ apply plugin: 'kotlin-android'
++apply plugin: 'kotlin-android-extensions'
+ apply plugin: 'kotlin-kapt'
+ apply plugin: 'com.google.firebase.appdistribution'
+ apply plugin: 'com.github.triplet.play'
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 8114b2c6db4..108a6f6ea08 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -32,6 +32,24 @@
+         android:networkSecurityConfig="@xml/network_security_config"
+         tools:ignore="GoogleAppIndexingWarning">
+ 
++        <receiver android:name=".widgets.ButtonWidget">
++            <intent-filter>
++                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
++                <action android:name="io.homeassistant.companion.android.widgets.ButtonWidget.CALL_SERVICE" />
++                <action android:name="io.homeassistant.companion.android.widgets.ButtonWidget.RECEIVE_DATA" />
++            </intent-filter>
++
++            <meta-data
++                android:name="android.appwidget.provider"
++                android:resource="@xml/button_widget_info" />
++        </receiver>
++
++        <activity android:name=".widgets.ButtonWidgetConfigureActivity">
++            <intent-filter>
++                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
++            </intent-filter>
++        </activity>
++
+         <receiver
+             android:name=".background.LocationBroadcastReceiver"
+             android:enabled="true"
+diff --git a/app/src/main/java/io/homeassistant/companion/android/widgets/ButtonWidget.kt b/app/src/main/java/io/homeassistant/companion/android/widgets/ButtonWidget.kt
+new file mode 100644
+index 00000000000..1530664e7c8
+--- /dev/null
++++ b/app/src/main/java/io/homeassistant/companion/android/widgets/ButtonWidget.kt
+@@ -0,0 +1,250 @@
++package io.homeassistant.companion.android.widgets
++
++import android.app.PendingIntent
++import android.appwidget.AppWidgetManager
++import android.appwidget.AppWidgetProvider
++import android.content.Context
++import android.content.Intent
++import android.os.Bundle
++import android.os.Handler
++import android.util.Log
++import android.view.View
++import android.widget.RemoteViews
++import io.homeassistant.companion.android.R
++import io.homeassistant.companion.android.common.dagger.GraphComponentAccessor
++import io.homeassistant.companion.android.domain.integration.IntegrationUseCase
++import io.homeassistant.companion.android.domain.widgets.WidgetUseCase
++import javax.inject.Inject
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.launch
++
++class ButtonWidget : AppWidgetProvider() {
++    companion object {
++        private const val TAG = "ButtonWidget"
++        private const val CALL_SERVICE =
++            "io.homeassistant.companion.android.widgets.ButtonWidget.CALL_SERVICE"
++        internal const val RECEIVE_DATA =
++            "io.homeassistant.companion.android.widgets.ButtonWidget.RECEIVE_DATA"
++
++        internal const val EXTRA_DOMAIN = "EXTRA_DOMAIN"
++        internal const val EXTRA_SERVICE = "EXTRA_SERVICE"
++        internal const val EXTRA_SERVICE_DATA = "EXTRA_SERVICE_DATA"
++        internal const val EXTRA_LABEL = "EXTRA_LABEL"
++        internal const val EXTRA_ICON = "EXTRA_ICON"
++    }
++
++    @Inject
++    lateinit var integrationUseCase: IntegrationUseCase
++    @Inject
++    lateinit var widgetStorage: WidgetUseCase
++
++    private val mainScope: CoroutineScope = CoroutineScope(Dispatchers.Main + Job())
++
++    override fun onUpdate(
++        context: Context,
++        appWidgetManager: AppWidgetManager,
++        appWidgetIds: IntArray
++    ) {
++        // There may be multiple widgets active, so update all of them
++        for (appWidgetId in appWidgetIds) {
++            mainScope.launch {
++                val views = getWidgetRemoteViews(context, appWidgetId)
++                appWidgetManager.updateAppWidget(appWidgetId, views)
++            }
++        }
++    }
++
++    override fun onDeleted(context: Context, appWidgetIds: IntArray) {
++        // When the user deletes the widget, delete the preference associated with it.
++        for (appWidgetId in appWidgetIds) {
++            mainScope.launch {
++                widgetStorage.deleteWidgetData(appWidgetId)
++            }
++        }
++    }
++
++    override fun onEnabled(context: Context) {
++        // Enter relevant functionality for when the first widget is created
++    }
++
++    override fun onDisabled(context: Context) {
++        // Enter relevant functionality for when the last widget is disabled
++    }
++
++    override fun onReceive(context: Context, intent: Intent) {
++        val action = intent.action
++        val appWidgetId = intent.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, -1)
++
++        Log.d(
++            TAG, "Broadcast received: " + System.lineSeparator() +
++                    "Broadcast action: " + action + System.lineSeparator() +
++                    "AppWidgetId: " + appWidgetId
++        )
++
++        ensureInjected(context)
++
++        super.onReceive(context, intent)
++        when (action) {
++            CALL_SERVICE -> callConfiguredService(context, appWidgetId)
++            RECEIVE_DATA -> saveServiceCallConfiguration(context, intent.extras, appWidgetId)
++        }
++    }
++
++    private suspend fun getWidgetRemoteViews(context: Context, appWidgetId: Int): RemoteViews {
++        // Every time AppWidgetManager.updateAppWidget(...) is called, the button listener
++        // and label need to be re-assigned, or the next time the layout updates
++        // (e.g home screen rotation) the widget will fall back on its default layout
++        // without any click listener being applied
++
++        val intent = Intent(context, ButtonWidget::class.java).apply {
++            action = CALL_SERVICE
++            putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, appWidgetId)
++        }
++
++        val views = RemoteViews(context.packageName, R.layout.widget_button).apply {
++            val iconName = widgetStorage.loadIcon(appWidgetId) ?: "ic_flash_on_black_24dp"
++            val icon = context.resources.getIdentifier(iconName, "drawable", `package`)
++
++            setImageViewResource(
++                R.id.widgetImageButton,
++                icon
++            )
++            setOnClickPendingIntent(
++                R.id.widgetImageButton,
++                PendingIntent.getBroadcast(
++                    context,
++                    appWidgetId,
++                    intent,
++                    PendingIntent.FLAG_UPDATE_CURRENT
++                )
++            )
++            setTextViewText(
++                R.id.widgetLabel,
++                widgetStorage.loadLabel(appWidgetId)
++            )
++        }
++
++        return views
++    }
++
++    private fun callConfiguredService(context: Context, appWidgetId: Int) {
++        Log.d(TAG, "Calling widget service")
++
++        // Set up progress bar as immediate feedback to show the click has been received
++        // Success or failure feedback will come from the mainScope coroutine
++        val loadingViews: RemoteViews = RemoteViews(context.packageName, R.layout.widget_button)
++        val appWidgetManager = AppWidgetManager.getInstance(context)
++
++        loadingViews.setInt(R.id.widgetProgressBar, "setVisibility", View.VISIBLE)
++        loadingViews.setInt(R.id.widgetImageButton, "setVisibility", View.INVISIBLE)
++        appWidgetManager.partiallyUpdateAppWidget(appWidgetId, loadingViews)
++
++        mainScope.launch {
++            // Change color of background image for feedback
++            var views = getWidgetRemoteViews(context, appWidgetId)
++
++            // Set default feedback as negative
++            var feedbackColor = R.drawable.ic_circle_red_24dp
++            var feedbackIcon = R.drawable.ic_clear_black_24dp
++
++            // Load the service call data from Shared Preferences
++            val domain = widgetStorage.loadDomain(appWidgetId)
++            val service = widgetStorage.loadService(appWidgetId)
++            val serviceData = widgetStorage.loadServiceData(appWidgetId)
++
++            Log.d(
++                TAG, "Service Call Data loaded:" + System.lineSeparator() +
++                        "domain: " + domain + System.lineSeparator() +
++                        "service: " + service + System.lineSeparator() +
++                        "service_data: " + serviceData
++            )
++
++            if (domain == null || service == null || serviceData == null) {
++                Log.w(TAG, "Service Call Data incomplete.  Aborting service call")
++            } else {
++                // If everything loaded correctly, package the service data and attempt the call
++                val serviceDataMap = HashMap<String, Any>()
++                serviceDataMap["entity_id"] = serviceData
++
++                try {
++                    integrationUseCase.callService(domain, service, serviceDataMap)
++
++                    // If service call does not throw an exception, send positive feedback
++                    feedbackColor = R.drawable.ic_circle_green_24dp
++                    feedbackIcon = R.drawable.ic_check_black_24dp
++                } catch (e: Exception) {
++                    Log.e(TAG, "Could not send service call.", e)
++                }
++            }
++
++            // Update widget with feedback and reset visibilities
++            views.setImageViewResource(R.id.widgetImageButtonBackground, feedbackColor)
++            views.setImageViewResource(R.id.widgetImageButton, feedbackIcon)
++            views.setInt(R.id.widgetProgressBar, "setVisibility", View.INVISIBLE)
++            views.setInt(R.id.widgetImageButton, "setVisibility", View.VISIBLE)
++            appWidgetManager.updateAppWidget(appWidgetId, views)
++
++            // Reload default views in the coroutine to pass to the post handler
++            views = getWidgetRemoteViews(context, appWidgetId)
++
++            // Set a timer to change it back after 1 second
++            Handler().postDelayed({
++                views.setImageViewResource(
++                    R.id.widgetImageButtonBackground,
++                    R.drawable.ic_circle_white_24dp
++                )
++                appWidgetManager.updateAppWidget(appWidgetId, views)
++            }, 1000)
++        }
++    }
++
++    private fun saveServiceCallConfiguration(context: Context, extras: Bundle?, appWidgetId: Int) {
++        if (extras == null) return
++
++        val domain: String? = extras.getString(EXTRA_DOMAIN)
++        val service: String? = extras.getString(EXTRA_SERVICE)
++        val serviceData: String? = extras.getString(EXTRA_SERVICE_DATA)
++        val label: String? = extras.getString(EXTRA_LABEL)
++        val icon: Int = extras.getInt(EXTRA_ICON)
++
++        if (domain == null || service == null || serviceData == null) {
++            Log.e(TAG, "Did not receive complete service call data")
++            return
++        }
++
++        mainScope.launch {
++            Log.d(
++                TAG, "Saving service call config data:" + System.lineSeparator() +
++                        "domain: " + domain + System.lineSeparator() +
++                        "service: " + service + System.lineSeparator() +
++                        "service_data: " + serviceData + System.lineSeparator() +
++                        "label: " + label
++            )
++
++            widgetStorage.saveServiceCallData(appWidgetId, domain, service, serviceData)
++            widgetStorage.saveLabel(appWidgetId, label)
++
++            val iconName = context.resources.getResourceEntryName(icon)
++            widgetStorage.saveIcon(appWidgetId, iconName)
++
++            // It is the responsibility of the configuration activity to update the app widget
++            // This method is only called during the initial setup of the widget,
++            // so rather than duplicating code in the ButtonWidgetConfigurationActivity,
++            // it is just calling onUpdate manually here.
++            onUpdate(context, AppWidgetManager.getInstance(context), intArrayOf(appWidgetId))
++        }
++    }
++
++    private fun ensureInjected(context: Context) {
++        if (context.applicationContext is GraphComponentAccessor) {
++            DaggerProviderComponent.builder()
++                .appComponent((context.applicationContext as GraphComponentAccessor).appComponent)
++                .build()
++                .inject(this)
++        } else {
++            throw Exception("Application Context passed is not of our application!")
++        }
++    }
++}
+diff --git a/app/src/main/java/io/homeassistant/companion/android/widgets/ButtonWidgetConfigSpinnerAdaptor.kt b/app/src/main/java/io/homeassistant/companion/android/widgets/ButtonWidgetConfigSpinnerAdaptor.kt
+new file mode 100644
+index 00000000000..e620336b38f
+--- /dev/null
++++ b/app/src/main/java/io/homeassistant/companion/android/widgets/ButtonWidgetConfigSpinnerAdaptor.kt
+@@ -0,0 +1,38 @@
++package io.homeassistant.companion.android.widgets
++
++import android.content.Context
++import android.view.LayoutInflater
++import android.view.View
++import android.view.ViewGroup
++import android.widget.BaseAdapter
++import io.homeassistant.companion.android.R
++import kotlinx.android.synthetic.main.widget_image_spinner.view.*
++
++class ButtonWidgetConfigSpinnerAdaptor(
++    var context: Context,
++    var icons: IntArray
++) : BaseAdapter() {
++    var inflator: LayoutInflater = LayoutInflater.from(context)
++
++    override fun getCount(): Int {
++        return icons.size
++    }
++
++    override fun getItem(p0: Int): Any {
++        return context.getDrawable(icons[p0])!!
++    }
++
++    override fun getItemId(p0: Int): Long {
++        return icons[p0].toLong()
++    }
++
++    override fun getView(p0: Int, p1: View?, p2: ViewGroup?): View {
++        // Inflate the view if it hasn't been inflated yet
++        val view: View = p1 ?: inflator.inflate(R.layout.widget_image_spinner, p2, false)
++
++        // Assign the correct icon
++        view.widget_config_spinner_icon.setImageResource(icons[p0])
++
++        return view
++    }
++}
+diff --git a/app/src/main/java/io/homeassistant/companion/android/widgets/ButtonWidgetConfigureActivity.kt b/app/src/main/java/io/homeassistant/companion/android/widgets/ButtonWidgetConfigureActivity.kt
+new file mode 100644
+index 00000000000..bb073afe360
+--- /dev/null
++++ b/app/src/main/java/io/homeassistant/companion/android/widgets/ButtonWidgetConfigureActivity.kt
+@@ -0,0 +1,87 @@
++package io.homeassistant.companion.android.widgets
++
++import android.app.Activity
++import android.appwidget.AppWidgetManager
++import android.content.ComponentName
++import android.content.Intent
++import android.os.Bundle
++import android.view.View
++import android.widget.Spinner
++import io.homeassistant.companion.android.R
++import kotlinx.android.synthetic.main.widget_button_configure.*
++
++class ButtonWidgetConfigureActivity : Activity() {
++    private var appWidgetId = AppWidgetManager.INVALID_APPWIDGET_ID
++
++    private var onClickListener = View.OnClickListener {
++        val context = this@ButtonWidgetConfigureActivity
++
++        // Set up a broadcast intent and pass the service call data as extras
++        val intent = Intent()
++        intent.action = ButtonWidget.RECEIVE_DATA
++        intent.component = ComponentName(context, ButtonWidget::class.java)
++        intent.putExtra(
++            ButtonWidget.EXTRA_DOMAIN,
++            context.widget_text_config_domain.text.toString()
++        )
++        intent.putExtra(
++            ButtonWidget.EXTRA_SERVICE,
++            context.widget_text_config_service.text.toString()
++        )
++        intent.putExtra(
++            ButtonWidget.EXTRA_SERVICE_DATA,
++            context.widget_text_config_service_data.text.toString()
++        )
++        intent.putExtra(
++            ButtonWidget.EXTRA_LABEL,
++            context.widget_text_config_label.text.toString()
++        )
++        intent.putExtra(
++            ButtonWidget.EXTRA_ICON,
++            context.widget_config_spinner.selectedItemId.toInt()
++        )
++        intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, appWidgetId)
++        context.sendBroadcast(intent)
++
++        // Make sure we pass back the original appWidgetId
++        setResult(RESULT_OK, Intent().putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, appWidgetId))
++        finish()
++    }
++
++    public override fun onCreate(icicle: Bundle?) {
++        super.onCreate(icicle)
++
++        // Set the result to CANCELED.  This will cause the widget host to cancel
++        // out of the widget placement if the user presses the back button.
++        setResult(RESULT_CANCELED)
++
++        setContentView(R.layout.widget_button_configure)
++        findViewById<View>(R.id.add_button).setOnClickListener(onClickListener)
++
++        // Find the widget id from the intent.
++        val intent = intent
++        val extras = intent.extras
++        if (extras != null) {
++            appWidgetId = extras.getInt(
++                AppWidgetManager.EXTRA_APPWIDGET_ID, AppWidgetManager.INVALID_APPWIDGET_ID
++            )
++        }
++
++        // If this activity was started with an intent without an app widget ID, finish with an error.
++        if (appWidgetId == AppWidgetManager.INVALID_APPWIDGET_ID) {
++            finish()
++            return
++        }
++
++        // Set up icon spinner
++        val icons = intArrayOf(
++            R.drawable.ic_flash_on_black_24dp,
++            R.drawable.ic_lightbulb_outline_black_24dp,
++            R.drawable.ic_home_black_24dp,
++            R.drawable.ic_power_settings_new_black_24dp
++        )
++
++        findViewById<Spinner>(R.id.widget_config_spinner).adapter =
++            ButtonWidgetConfigSpinnerAdaptor(this, icons)
++    }
++}
+diff --git a/app/src/main/java/io/homeassistant/companion/android/widgets/ProviderComponent.kt b/app/src/main/java/io/homeassistant/companion/android/widgets/ProviderComponent.kt
+new file mode 100644
+index 00000000000..fc19fe04d3e
+--- /dev/null
++++ b/app/src/main/java/io/homeassistant/companion/android/widgets/ProviderComponent.kt
+@@ -0,0 +1,10 @@
++package io.homeassistant.companion.android.widgets
++
++import dagger.Component
++import io.homeassistant.companion.android.common.dagger.AppComponent
++
++@Component(dependencies = [AppComponent::class])
++interface ProviderComponent {
++
++    fun inject(receiver: ButtonWidget)
++}
+diff --git a/app/src/main/res/drawable/ic_check_black_24dp.xml b/app/src/main/res/drawable/ic_check_black_24dp.xml
+new file mode 100644
+index 00000000000..3c728c59fb4
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_check_black_24dp.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++        android:width="24dp"
++        android:height="24dp"
++        android:viewportWidth="24.0"
++        android:viewportHeight="24.0">
++    <path
++        android:fillColor="#FF000000"
++        android:pathData="M9,16.17L4.83,12l-1.42,1.41L9,19 21,7l-1.41,-1.41z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/ic_circle_green_24dp.xml b/app/src/main/res/drawable/ic_circle_green_24dp.xml
+new file mode 100644
+index 00000000000..45c0961da74
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_circle_green_24dp.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++        android:width="24dp"
++        android:height="24dp"
++        android:viewportWidth="24.0"
++        android:viewportHeight="24.0">
++    <path
++        android:fillColor="#FF00FF00"
++        android:pathData="M12,2C6.48,2 2,6.48 2,12s4.48,10 10,10 10,-4.48 10,-10S17.52,2 12,2z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/ic_circle_red_24dp.xml b/app/src/main/res/drawable/ic_circle_red_24dp.xml
+new file mode 100644
+index 00000000000..5bc90e17e7b
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_circle_red_24dp.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24.0"
++    android:viewportHeight="24.0">
++    <path
++        android:fillColor="#FFFF0000"
++        android:pathData="M12,2C6.48,2 2,6.48 2,12s4.48,10 10,10 10,-4.48 10,-10S17.52,2 12,2z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/ic_circle_white_24dp.xml b/app/src/main/res/drawable/ic_circle_white_24dp.xml
+new file mode 100644
+index 00000000000..dccfa357698
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_circle_white_24dp.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++        android:width="24dp"
++        android:height="24dp"
++        android:viewportWidth="24.0"
++        android:viewportHeight="24.0">
++    <path
++        android:fillColor="#FFFFFFFF"
++        android:pathData="M12,2C6.48,2 2,6.48 2,12s4.48,10 10,10 10,-4.48 10,-10S17.52,2 12,2z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/ic_clear_black_24dp.xml b/app/src/main/res/drawable/ic_clear_black_24dp.xml
+new file mode 100644
+index 00000000000..ede4b7108d5
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_clear_black_24dp.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++        android:width="24dp"
++        android:height="24dp"
++        android:viewportWidth="24.0"
++        android:viewportHeight="24.0">
++    <path
++        android:fillColor="#FF000000"
++        android:pathData="M19,6.41L17.59,5 12,10.59 6.41,5 5,6.41 10.59,12 5,17.59 6.41,19 12,13.41 17.59,19 19,17.59 13.41,12z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/ic_flash_on_black_24dp.xml b/app/src/main/res/drawable/ic_flash_on_black_24dp.xml
+new file mode 100644
+index 00000000000..a3c81cc3861
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_flash_on_black_24dp.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++        android:width="24dp"
++        android:height="24dp"
++        android:viewportWidth="24.0"
++        android:viewportHeight="24.0">
++    <path
++        android:fillColor="#FF000000"
++        android:pathData="M7,2v11h3v9l7,-12h-4l4,-8z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/ic_home_black_24dp.xml b/app/src/main/res/drawable/ic_home_black_24dp.xml
+new file mode 100644
+index 00000000000..70fb2910c01
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_home_black_24dp.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++        android:width="24dp"
++        android:height="24dp"
++        android:viewportWidth="24.0"
++        android:viewportHeight="24.0">
++    <path
++        android:fillColor="#FF000000"
++        android:pathData="M10,20v-6h4v6h5v-8h3L12,3 2,12h3v8z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/ic_lightbulb_outline_black_24dp.xml b/app/src/main/res/drawable/ic_lightbulb_outline_black_24dp.xml
+new file mode 100644
+index 00000000000..2a8e9d74ae3
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_lightbulb_outline_black_24dp.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++        android:width="24dp"
++        android:height="24dp"
++        android:viewportWidth="24.0"
++        android:viewportHeight="24.0">
++    <path
++        android:fillColor="#FF000000"
++        android:pathData="M9,21c0,0.55 0.45,1 1,1h4c0.55,0 1,-0.45 1,-1v-1L9,20v1zM12,2C8.14,2 5,5.14 5,9c0,2.38 1.19,4.47 3,5.74L8,17c0,0.55 0.45,1 1,1h6c0.55,0 1,-0.45 1,-1v-2.26c1.81,-1.27 3,-3.36 3,-5.74 0,-3.86 -3.14,-7 -7,-7zM14.85,13.1l-0.85,0.6L14,16h-4v-2.3l-0.85,-0.6C7.8,12.16 7,10.63 7,9c0,-2.76 2.24,-5 5,-5s5,2.24 5,5c0,1.63 -0.8,3.16 -2.15,4.1z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/ic_power_settings_new_black_24dp.xml b/app/src/main/res/drawable/ic_power_settings_new_black_24dp.xml
+new file mode 100644
+index 00000000000..26272ab8db0
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_power_settings_new_black_24dp.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++        android:width="24dp"
++        android:height="24dp"
++        android:viewportWidth="24.0"
++        android:viewportHeight="24.0">
++    <path
++        android:fillColor="#FF000000"
++        android:pathData="M13,3h-2v10h2L13,3zM17.83,5.17l-1.42,1.42C17.99,7.86 19,9.81 19,12c0,3.87 -3.13,7 -7,7s-7,-3.13 -7,-7c0,-2.19 1.01,-4.14 2.58,-5.42L6.17,5.17C4.23,6.82 3,9.26 3,12c0,4.97 4.03,9 9,9s9,-4.03 9,-9c0,-2.74 -1.23,-5.18 -3.17,-6.83z"/>
++</vector>
+diff --git a/app/src/main/res/layout/widget_button.xml b/app/src/main/res/layout/widget_button.xml
+new file mode 100644
+index 00000000000..204714f31a5
+--- /dev/null
++++ b/app/src/main/res/layout/widget_button.xml
+@@ -0,0 +1,59 @@
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:minHeight="40dp"
++    android:minWidth="40dp"
++    android:orientation="vertical"
++    android:padding="@dimen/widget_margin">
++
++    <FrameLayout
++        android:id="@+id/widgetImageButtonFrameLayout"
++        android:layout_width="match_parent"
++        android:layout_height="0dp"
++        android:layout_weight="1">
++
++        <ImageView
++            android:id="@+id/widgetImageButtonBackground"
++            android:layout_width="match_parent"
++            android:layout_height="match_parent"
++            android:layout_margin="0dp"
++            android:contentDescription="@string/widget_image_description"
++            android:src="@drawable/ic_circle_white_24dp"
++            android:scaleType="fitCenter"
++            />
++
++        <ImageButton
++            android:id="@+id/widgetImageButton"
++            android:layout_width="match_parent"
++            android:layout_height="match_parent"
++            android:layout_margin="0dp"
++            android:contentDescription="@string/widget_image_description"
++            android:background="@null"
++            android:src="@drawable/ic_flash_on_black_24dp"
++            android:scaleType="centerInside"
++            android:adjustViewBounds="true"
++            />
++
++        <ProgressBar
++            android:id="@+id/widgetProgressBar"
++            android:layout_width="match_parent"
++            android:layout_height="match_parent"
++            android:padding="8dp"
++            android:visibility="invisible"
++            android:indeterminate="true"
++            android:indeterminateTint="@color/colorAccent"
++            />
++    </FrameLayout>
++
++    <TextView
++        android:id="@+id/widgetLabel"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="0dp"
++        android:text="@string/widget_label_placeholder_text"
++        android:textAlignment="center"
++        android:ellipsize="end"
++        android:maxLines="1"
++        android:textColor="@color/colorOnPrimary"
++        android:textSize="12sp" />
++</LinearLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/widget_button_configure.xml b/app/src/main/res/layout/widget_button_configure.xml
+new file mode 100644
+index 00000000000..9c13012eaed
+--- /dev/null
++++ b/app/src/main/res/layout/widget_button_configure.xml
+@@ -0,0 +1,90 @@
++<?xml version="1.0" encoding="utf-8"?>
++<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent" >
++
++    <LinearLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:orientation="vertical"
++        android:padding="16dp">
++
++        <TextView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:text="@string/configure_service_call" />
++
++        <com.google.android.material.textfield.TextInputLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content" >
++
++            <com.google.android.material.textfield.TextInputEditText
++                android:id="@+id/widget_text_config_domain"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:hint="@string/widget_text_hint_service_domain"
++                android:inputType="text" />
++        </com.google.android.material.textfield.TextInputLayout>
++
++        <com.google.android.material.textfield.TextInputLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content" >
++
++            <com.google.android.material.textfield.TextInputEditText
++                android:id="@+id/widget_text_config_service"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:hint="@string/widget_text_hint_service_service"
++                android:inputType="text" />
++        </com.google.android.material.textfield.TextInputLayout>
++
++        <com.google.android.material.textfield.TextInputLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content" >
++
++            <com.google.android.material.textfield.TextInputEditText
++                android:id="@+id/widget_text_config_service_data"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:hint="@string/widget_text_hint_service_data"
++                android:inputType="text" />
++        </com.google.android.material.textfield.TextInputLayout>
++
++        <LinearLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:orientation="horizontal" >
++
++            <TextView
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:layout_gravity="center_vertical"
++                android:text="Icon:" />
++
++            <Spinner
++                android:id="@+id/widget_config_spinner"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content" />
++        </LinearLayout>
++
++        <com.google.android.material.textfield.TextInputLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content" >
++
++            <com.google.android.material.textfield.TextInputEditText
++                android:id="@+id/widget_text_config_label"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:hint="@string/widget_text_hint_label"
++                android:inputType="text" />
++        </com.google.android.material.textfield.TextInputLayout>
++
++        <Button
++            android:id="@+id/add_button"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="8dp"
++            android:text="@string/add_widget" />
++
++    </LinearLayout>
++</ScrollView>
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/widget_image_spinner.xml b/app/src/main/res/layout/widget_image_spinner.xml
+new file mode 100644
+index 00000000000..f552d095937
+--- /dev/null
++++ b/app/src/main/res/layout/widget_image_spinner.xml
+@@ -0,0 +1,15 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:orientation="horizontal" >
++
++    <ImageView
++        android:id="@+id/widget_config_spinner_icon"
++        android:layout_width="40dp"
++        android:layout_height="40dp"
++        android:padding="8dp"
++        android:scaleType="fitCenter"
++        android:contentDescription="@string/widget_spinner_icon" />
++
++</LinearLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/dimens.xml b/app/src/main/res/values/dimens.xml
+index 391c849a8b9..b136fc52708 100644
+--- a/app/src/main/res/values/dimens.xml
++++ b/app/src/main/res/values/dimens.xml
+@@ -2,5 +2,6 @@
+ <resources>
+ 
+     <dimen name="activity_margin">16dp</dimen>
++    <dimen name="widget_margin">8dp</dimen>
+ 
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 780146bc530..82c141734fe 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -40,4 +40,14 @@ integration enabled on your home assistant instance.</string>
+     <string name="error_auth_revoked">It appears that your authorization was revoked, please reconnect to Home Assistant.</string>
+     <string name="select_instance">Select the instance you would \nlike to connect to:</string>
+     <string name="failed_scan">Scanning for Home Assistant failed.</string>
++    <string name="widget_image_description">Home Assistant Widget</string>
++    <string name="configure_service_call">Configure Service Call</string>
++    <string name="configure_widget_label">Widget Label</string>
++    <string name="add_widget">Add widget</string>
++    <string name="widget_text_hint_service_domain">Domain</string>
++    <string name="widget_text_hint_service_service">Service</string>
++    <string name="widget_text_hint_service_data">Entity ID</string>
++    <string name="widget_text_hint_label">Label</string>
++    <string name="widget_label_placeholder_text">Label</string>
++    <string name="widget_spinner_icon">Icon:</string>
+ </resources>
+diff --git a/app/src/main/res/xml/button_widget_info.xml b/app/src/main/res/xml/button_widget_info.xml
+new file mode 100644
+index 00000000000..6052a3bb0b4
+--- /dev/null
++++ b/app/src/main/res/xml/button_widget_info.xml
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8"?>
++<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
++    android:configure="io.homeassistant.companion.android.widgets.ButtonWidgetConfigureActivity"
++    android:initialKeyguardLayout="@layout/widget_button"
++    android:initialLayout="@layout/widget_button"
++    android:minWidth="40dp"
++    android:minHeight="40dp"
++    android:updatePeriodMillis="86400000"
++    android:widgetCategory="home_screen" />
+\ No newline at end of file
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/dagger/AppComponent.kt b/common/src/main/java/io/homeassistant/companion/android/common/dagger/AppComponent.kt
+index c0899efcee0..45ff7a142db 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/common/dagger/AppComponent.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/common/dagger/AppComponent.kt
+@@ -4,6 +4,7 @@ import dagger.Component
+ import io.homeassistant.companion.android.domain.authentication.AuthenticationUseCase
+ import io.homeassistant.companion.android.domain.integration.IntegrationUseCase
+ import io.homeassistant.companion.android.domain.url.UrlUseCase
++import io.homeassistant.companion.android.domain.widgets.WidgetUseCase
+ 
+ @Component(dependencies = [DomainComponent::class])
+ interface AppComponent {
+@@ -13,4 +14,6 @@ interface AppComponent {
+     fun authenticationUseCase(): AuthenticationUseCase
+ 
+     fun integrationUseCase(): IntegrationUseCase
++
++    fun widgetUseCase(): WidgetUseCase
+ }
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/dagger/DataComponent.kt b/common/src/main/java/io/homeassistant/companion/android/common/dagger/DataComponent.kt
+index 8f57e492601..e452be5d65a 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/common/dagger/DataComponent.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/common/dagger/DataComponent.kt
+@@ -4,6 +4,7 @@ import dagger.Component
+ import io.homeassistant.companion.android.domain.authentication.AuthenticationRepository
+ import io.homeassistant.companion.android.domain.integration.IntegrationRepository
+ import io.homeassistant.companion.android.domain.url.UrlRepository
++import io.homeassistant.companion.android.domain.widgets.WidgetRepository
+ 
+ @Component(modules = [DataModule::class])
+ interface DataComponent {
+@@ -13,4 +14,6 @@ interface DataComponent {
+     fun authenticationRepository(): AuthenticationRepository
+ 
+     fun integrationRepository(): IntegrationRepository
++
++    fun widgetRepository(): WidgetRepository
+ }
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/dagger/DataModule.kt b/common/src/main/java/io/homeassistant/companion/android/common/dagger/DataModule.kt
+index 07b51d56ba5..ea3355e1236 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/common/dagger/DataModule.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/common/dagger/DataModule.kt
+@@ -11,10 +11,12 @@ import io.homeassistant.companion.android.data.authentication.AuthenticationServ
+ import io.homeassistant.companion.android.data.integration.IntegrationRepositoryImpl
+ import io.homeassistant.companion.android.data.integration.IntegrationService
+ import io.homeassistant.companion.android.data.url.UrlRepositoryImpl
++import io.homeassistant.companion.android.data.widgets.WidgetRepositoryImpl
+ import io.homeassistant.companion.android.data.wifi.WifiHelper
+ import io.homeassistant.companion.android.domain.authentication.AuthenticationRepository
+ import io.homeassistant.companion.android.domain.integration.IntegrationRepository
+ import io.homeassistant.companion.android.domain.url.UrlRepository
++import io.homeassistant.companion.android.domain.widgets.WidgetRepository
+ import javax.inject.Named
+ 
+ @Module(includes = [DataModule.Declaration::class])
+@@ -22,6 +24,7 @@ class DataModule(
+     private val urlStorage: LocalStorage,
+     private val sessionLocalStorage: LocalStorage,
+     private val integrationLocalStorage: LocalStorage,
++    private val widgetLocalStorage: LocalStorage,
+     private val wifiHelper: WifiHelper,
+     private val deviceId: String
+ ) {
+@@ -49,6 +52,10 @@ class DataModule(
+     @Named("integration")
+     fun provideIntegrationLocalStorage() = integrationLocalStorage
+ 
++    @Provides
++    @Named("widget")
++    fun provideWidgetLocalStorage() = widgetLocalStorage
++
+     @Provides
+     @Named("manufacturer")
+     fun provideDeviceManufacturer(): String = Build.MANUFACTURER
+@@ -75,5 +82,8 @@ class DataModule(
+ 
+         @Binds
+         fun bindIntegrationService(repository: IntegrationRepositoryImpl): IntegrationRepository
++
++        @Binds
++        fun bindWidgetRepositoryImpl(repository: WidgetRepositoryImpl): WidgetRepository
+     }
+ }
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/dagger/DomainComponent.kt b/common/src/main/java/io/homeassistant/companion/android/common/dagger/DomainComponent.kt
+index f67fa8548cf..19c21f2bd65 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/common/dagger/DomainComponent.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/common/dagger/DomainComponent.kt
+@@ -4,6 +4,7 @@ import dagger.Component
+ import io.homeassistant.companion.android.domain.authentication.AuthenticationUseCase
+ import io.homeassistant.companion.android.domain.integration.IntegrationUseCase
+ import io.homeassistant.companion.android.domain.url.UrlUseCase
++import io.homeassistant.companion.android.domain.widgets.WidgetUseCase
+ 
+ @Component(dependencies = [DataComponent::class], modules = [DomainModule::class])
+ interface DomainComponent {
+@@ -13,4 +14,6 @@ interface DomainComponent {
+     fun authenticationUseCase(): AuthenticationUseCase
+ 
+     fun integrationUseCase(): IntegrationUseCase
++
++    fun widgetUseCase(): WidgetUseCase
+ }
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/dagger/DomainModule.kt b/common/src/main/java/io/homeassistant/companion/android/common/dagger/DomainModule.kt
+index 222c743fcc3..0380d34500e 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/common/dagger/DomainModule.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/common/dagger/DomainModule.kt
+@@ -8,6 +8,8 @@ import io.homeassistant.companion.android.domain.integration.IntegrationUseCase
+ import io.homeassistant.companion.android.domain.integration.IntegrationUseCaseImpl
+ import io.homeassistant.companion.android.domain.url.UrlUseCase
+ import io.homeassistant.companion.android.domain.url.UrlUseCaseImpl
++import io.homeassistant.companion.android.domain.widgets.WidgetUseCase
++import io.homeassistant.companion.android.domain.widgets.WidgetUseCaseImpl
+ 
+ @Module
+ interface DomainModule {
+@@ -20,4 +22,7 @@ interface DomainModule {
+ 
+     @Binds
+     fun bindIntegrationUseCase(useCaseImpl: IntegrationUseCaseImpl): IntegrationUseCase
++
++    @Binds
++    fun bindWidgetUseCase(useCaseImpl: WidgetUseCaseImpl): WidgetUseCase
+ }
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/dagger/Graph.kt b/common/src/main/java/io/homeassistant/companion/android/common/dagger/Graph.kt
+index 6b77be43cf4..f2dd3842471 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/common/dagger/Graph.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/common/dagger/Graph.kt
+@@ -49,6 +49,12 @@ class Graph(
+                             Context.MODE_PRIVATE
+                         )
+                     ),
++                    LocalStorageImpl(
++                        application.getSharedPreferences(
++                            "widget",
++                            Context.MODE_PRIVATE
++                        )
++                    ),
+                     WifiHelperImpl(application.getSystemService(Context.WIFI_SERVICE) as WifiManager),
+                     Settings.Secure.getString(application.contentResolver, Settings.Secure.ANDROID_ID)
+                 )
+diff --git a/data/src/main/java/io/homeassistant/companion/android/data/integration/IntegrationRepositoryImpl.kt b/data/src/main/java/io/homeassistant/companion/android/data/integration/IntegrationRepositoryImpl.kt
+index 97304f72e0d..03392772eaf 100644
+--- a/data/src/main/java/io/homeassistant/companion/android/data/integration/IntegrationRepositoryImpl.kt
++++ b/data/src/main/java/io/homeassistant/companion/android/data/integration/IntegrationRepositoryImpl.kt
+@@ -126,6 +126,29 @@ class IntegrationRepositoryImpl @Inject constructor(
+         throw IntegrationException()
+     }
+ 
++    override suspend fun callService(domain: String, service: String, serviceData: HashMap<String, Any>) {
++        var wasSuccess = false
++
++        val serviceCallRequest = ServiceCallRequest(domain, service, serviceData)
++
++        for (it in urlRepository.getApiUrls()) {
++            try {
++                wasSuccess =
++                    integrationService.callService(
++                        it.toHttpUrlOrNull()!!,
++                        IntegrationRequest("call_service", serviceCallRequest)
++                    ).isSuccessful
++            } catch (e: Exception) {
++                // Ignore failure until we are out of URLS to try!
++            }
++            // if we had a successful call we can return
++            if (wasSuccess)
++                return
++        }
++
++        throw IntegrationException()
++    }
++
+     override suspend fun getZones(): Array<Entity<ZoneAttributes>> {
+         val getZonesRequest = IntegrationRequest("get_zones", null)
+         var zones: Array<EntityResponse<ZoneAttributes>>? = null
+diff --git a/data/src/main/java/io/homeassistant/companion/android/data/integration/IntegrationService.kt b/data/src/main/java/io/homeassistant/companion/android/data/integration/IntegrationService.kt
+index 1e47a66ffb2..fb54a57193d 100644
+--- a/data/src/main/java/io/homeassistant/companion/android/data/integration/IntegrationService.kt
++++ b/data/src/main/java/io/homeassistant/companion/android/data/integration/IntegrationService.kt
+@@ -35,6 +35,12 @@ interface IntegrationService {
+         @Body request: IntegrationRequest
+     ): Response<ResponseBody>
+ 
++    @POST
++    suspend fun callService(
++        @Url url: HttpUrl,
++        @Body request: IntegrationRequest
++    ): Response<ResponseBody>
++
+     @POST
+     suspend fun getZones(
+         @Url url: HttpUrl,
+diff --git a/data/src/main/java/io/homeassistant/companion/android/data/integration/ServiceCallRequest.kt b/data/src/main/java/io/homeassistant/companion/android/data/integration/ServiceCallRequest.kt
+new file mode 100644
+index 00000000000..cef7f74d353
+--- /dev/null
++++ b/data/src/main/java/io/homeassistant/companion/android/data/integration/ServiceCallRequest.kt
+@@ -0,0 +1,7 @@
++package io.homeassistant.companion.android.data.integration
++
++data class ServiceCallRequest(
++    val domain: String,
++    val service: String,
++    val serviceData: HashMap<String, Any>
++)
+diff --git a/data/src/main/java/io/homeassistant/companion/android/data/widgets/WidgetRepositoryImpl.kt b/data/src/main/java/io/homeassistant/companion/android/data/widgets/WidgetRepositoryImpl.kt
+new file mode 100644
+index 00000000000..9927c40dc11
+--- /dev/null
++++ b/data/src/main/java/io/homeassistant/companion/android/data/widgets/WidgetRepositoryImpl.kt
+@@ -0,0 +1,84 @@
++package io.homeassistant.companion.android.data.widgets
++
++import io.homeassistant.companion.android.data.LocalStorage
++import io.homeassistant.companion.android.domain.widgets.WidgetRepository
++import javax.inject.Inject
++import javax.inject.Named
++
++class WidgetRepositoryImpl @Inject constructor(
++    @Named("widget") private val localStorage: LocalStorage
++) : WidgetRepository {
++
++    companion object {
++        internal const val PREF_PREFIX_KEY = "widget_"
++        internal const val PREF_KEY_DOMAIN = "domain"
++        internal const val PREF_KEY_SERVICE = "service"
++        internal const val PREF_KEY_SERVICE_DATA = "serviceData"
++        internal const val PREF_KEY_ICON = "icon"
++        internal const val PREF_KEY_LABEL = "label"
++    }
++
++    override suspend fun saveServiceCallData(
++        appWidgetId: Int,
++        domainStr: String,
++        serviceStr: String,
++        serviceDataStr: String
++    ) {
++        saveStringPref(
++            PREF_PREFIX_KEY + PREF_KEY_DOMAIN + appWidgetId,
++            domainStr
++        )
++        saveStringPref(
++            PREF_PREFIX_KEY + PREF_KEY_SERVICE + appWidgetId,
++            serviceStr
++        )
++        saveStringPref(
++            PREF_PREFIX_KEY + PREF_KEY_SERVICE_DATA + appWidgetId,
++            serviceDataStr
++        )
++    }
++
++    override suspend fun loadDomain(appWidgetId: Int): String? {
++        return loadStringPref(PREF_PREFIX_KEY + PREF_KEY_DOMAIN + appWidgetId)
++    }
++
++    override suspend fun loadService(appWidgetId: Int): String? {
++        return loadStringPref(PREF_PREFIX_KEY + PREF_KEY_SERVICE + appWidgetId)
++    }
++
++    override suspend fun loadServiceData(appWidgetId: Int): String? {
++        return loadStringPref(PREF_PREFIX_KEY + PREF_KEY_SERVICE_DATA + appWidgetId)
++    }
++
++    override suspend fun loadIcon(appWidgetId: Int): String? {
++        return loadStringPref(PREF_PREFIX_KEY + PREF_KEY_ICON + appWidgetId)
++    }
++
++    override suspend fun loadLabel(appWidgetId: Int): String? {
++        return loadStringPref(PREF_PREFIX_KEY + PREF_KEY_LABEL + appWidgetId)
++    }
++
++    override suspend fun saveIcon(appWidgetId: Int, resName: String?) {
++        saveStringPref(PREF_PREFIX_KEY + PREF_KEY_ICON + appWidgetId, resName)
++    }
++
++    override suspend fun saveLabel(appWidgetId: Int, data: String?) {
++        saveStringPref(PREF_PREFIX_KEY + PREF_KEY_LABEL + appWidgetId, data)
++    }
++
++    override suspend fun deleteWidgetData(appWidgetId: Int) {
++        saveStringPref(PREF_PREFIX_KEY + PREF_KEY_DOMAIN + appWidgetId, null)
++        saveStringPref(PREF_PREFIX_KEY + PREF_KEY_SERVICE + appWidgetId, null)
++        saveStringPref(PREF_PREFIX_KEY + PREF_KEY_SERVICE_DATA + appWidgetId, null)
++        saveStringPref(PREF_PREFIX_KEY + PREF_KEY_ICON + appWidgetId, null)
++        saveStringPref(PREF_PREFIX_KEY + PREF_KEY_LABEL + appWidgetId, null)
++    }
++
++    private suspend fun saveStringPref(key: String, data: String?) {
++        localStorage.putString(key, data)
++    }
++
++    private suspend fun loadStringPref(key: String): String? {
++        return localStorage.getString(key)
++    }
++}
+diff --git a/data/src/test/java/io/homeassistant/companion/android/data/integration/IntegrationRepositoryImplSpec.kt b/data/src/test/java/io/homeassistant/companion/android/data/integration/IntegrationRepositoryImplSpec.kt
+index 45d19ff06d9..a8d63934b68 100644
+--- a/data/src/test/java/io/homeassistant/companion/android/data/integration/IntegrationRepositoryImplSpec.kt
++++ b/data/src/test/java/io/homeassistant/companion/android/data/integration/IntegrationRepositoryImplSpec.kt
+@@ -532,6 +532,236 @@ object IntegrationRepositoryImplSpec : Spek({
+             }
+         }
+ 
++        describe("call a service") {
++
++            describe("callService cloud url") {
++                val domain = "light"
++                val service = "toggle"
++                val serviceDataMap = hashMapOf<String, Any>("entity_id" to "light.dummy_light")
++
++                val serviceCallRequest = ServiceCallRequest(
++                    domain,
++                    service,
++                    serviceDataMap
++                )
++
++                val integrationRequest = IntegrationRequest(
++                    "call_service",
++                    serviceCallRequest
++                )
++
++                beforeEachTest {
++                    coEvery { urlRepository.getApiUrls() } returns arrayOf(
++                        URL("http://best.com/hook/id"),
++                        URL("http://better.com"),
++                        URL("http://example.com")
++                    )
++                    coEvery {
++                        integrationService.callService(
++                            any(), // "http://example.com/api/webhook/FGHIJ",
++                            any() // integrationRequest
++                        )
++                    } returns Response.success(null)
++                    runBlocking { repository.callService(domain, service, serviceDataMap) }
++                }
++
++                it("should call the service.") {
++                    coVerify {
++                        integrationService.callService(
++                            "http://best.com/hook/id".toHttpUrl(),
++                            integrationRequest
++                        )
++                    }
++                }
++            }
++
++            describe("callService remote ui url") {
++                val domain = "light"
++                val service = "toggle"
++                val serviceDataMap = hashMapOf<String, Any>("entity_id" to "light.dummy_light")
++
++                val serviceCallRequest = ServiceCallRequest(
++                    domain,
++                    service,
++                    serviceDataMap
++                )
++
++                val integrationRequest = IntegrationRequest(
++                    "call_service",
++                    serviceCallRequest
++                )
++
++                beforeEachTest {
++                    coEvery { urlRepository.getApiUrls() } returns arrayOf(
++                        URL("http://better.com/api/webhook/FGHIJ"),
++                        URL("http://example.com")
++                    )
++                    coEvery {
++                        integrationService.callService(
++                            any(), // "http://example.com/api/webhook/FGHIJ",
++                            any() // integrationRequest
++                        )
++                    } returns Response.success(null)
++                    runBlocking { repository.callService(domain, service, serviceDataMap) }
++                }
++
++                it("should call the service.") {
++                    coVerify {
++                        integrationService.callService(
++                            "http://better.com/api/webhook/FGHIJ".toHttpUrl(),
++                            integrationRequest
++                        )
++                    }
++                }
++            }
++
++            describe("callService auth url") {
++                val domain = "light"
++                val service = "toggle"
++                val serviceDataMap = hashMapOf<String, Any>("entity_id" to "light.dummy_light")
++
++                val serviceCallRequest = ServiceCallRequest(
++                    domain,
++                    service,
++                    serviceDataMap
++                )
++
++                val integrationRequest = IntegrationRequest(
++                    "call_service",
++                    serviceCallRequest
++                )
++
++                beforeEachTest {
++                    coEvery { urlRepository.getApiUrls() } returns arrayOf(
++                        URL("http://example.com/api/webhook/FGHIJ")
++                    )
++                    coEvery {
++                        integrationService.callService(
++                            any(), // "http://example.com/api/webhook/FGHIJ",
++                            any() // integrationRequest
++                        )
++                    } returns Response.success(null)
++                    runBlocking { repository.callService(domain, service, serviceDataMap) }
++                }
++
++                it("should call the service.") {
++                    coVerify {
++                        integrationService.callService(
++                            "http://example.com/api/webhook/FGHIJ".toHttpUrl(),
++                            integrationRequest
++                        )
++                    }
++                }
++            }
++
++            describe("callService fail then succeeds") {
++                val domain = "light"
++                val service = "toggle"
++                val serviceDataMap = hashMapOf<String, Any>("entity_id" to "light.dummy_light")
++
++                val serviceCallRequest = ServiceCallRequest(
++                    domain,
++                    service,
++                    serviceDataMap
++                )
++
++                val integrationRequest = IntegrationRequest(
++                    "call_service",
++                    serviceCallRequest
++                )
++
++                beforeEachTest {
++                    coEvery { urlRepository.getApiUrls() } returns arrayOf(
++                        URL("http://best.com/hook/id"),
++                        URL("http://better.com/api/webhook/FGHIJ"),
++                        URL("http://example.com")
++                    )
++                    coEvery {
++                        integrationService.callService(
++                            "http://best.com/hook/id".toHttpUrl(),
++                            any() // integrationRequest
++                        )
++                    } returns mockk {
++                        every { isSuccessful } returns false
++                    }
++                    coEvery {
++                        integrationService.callService(
++                            "http://better.com/api/webhook/FGHIJ".toHttpUrl(),
++                            any() // integrationRequest
++                        )
++                    } returns Response.success(null)
++                    runBlocking { repository.callService(domain, service, serviceDataMap) }
++                }
++
++                it("should call service 2 times") {
++                    coVerifyAll {
++                        integrationService.callService(
++                            "http://best.com/hook/id".toHttpUrl(),
++                            integrationRequest
++                        )
++                        integrationService.callService(
++                            "http://better.com/api/webhook/FGHIJ".toHttpUrl(),
++                            integrationRequest
++                        )
++                    }
++                }
++            }
++
++            describe("callService failure") {
++                val domain = "light"
++                val service = "toggle"
++                val serviceDataMap = hashMapOf<String, Any>("entity_id" to "light.dummy_light")
++
++                lateinit var thrown: Throwable
++
++                beforeEachTest {
++                    coEvery { urlRepository.getApiUrls() } returns arrayOf(
++                        URL("http://best.com/hook/id"),
++                        URL("http://better.com"),
++                        URL("http://example.com")
++                    )
++                    coEvery {
++                        integrationService.callService(
++                            "http://best.com/hook/id".toHttpUrl(),
++                            any() // integrationRequest
++                        )
++                    } returns mockk {
++                        every { isSuccessful } returns false
++                    }
++                    coEvery {
++                        integrationService.callService(
++                            "http://better.com/api/webhook/FGHIJ".toHttpUrl(),
++                            any() // integrationRequest
++                        )
++                    } returns mockk {
++                        every { isSuccessful } returns false
++                    }
++                    coEvery {
++                        integrationService.callService(
++                            "http://example.com/api/webhook/FGHIJ".toHttpUrl(),
++                            any() // integrationRequest
++                        )
++                    } returns mockk {
++                        every { isSuccessful } returns false
++                    }
++
++                    thrown = catchThrowable {
++                        runBlocking {
++                            repository.callService(
++                                domain,
++                                service,
++                                serviceDataMap
++                            )
++                        }
++                    }
++                }
++
++                it("should throw an exception") {
++                    assertThat(thrown).isInstanceOf(IntegrationException::class.java)
++                }
++            }
++        }
++
+         describe("get zones") {
+             beforeEachTest {
+                 coEvery { urlRepository.getApiUrls() } returns arrayOf(
+diff --git a/data/src/test/java/io/homeassistant/companion/android/data/integration/IntegrationServiceSpec.kt b/data/src/test/java/io/homeassistant/companion/android/data/integration/IntegrationServiceSpec.kt
+index 22951f4d80e..14a29a319fb 100644
+--- a/data/src/test/java/io/homeassistant/companion/android/data/integration/IntegrationServiceSpec.kt
++++ b/data/src/test/java/io/homeassistant/companion/android/data/integration/IntegrationServiceSpec.kt
+@@ -80,5 +80,39 @@ object IntegrationServiceSpec : Spek({
+                 assertThat(response.isSuccessful).isTrue()
+             }
+         }
++
++        describe("callService") {
++            lateinit var response: Response<ResponseBody>
++
++            beforeEachTest {
++                val domain = "light"
++                val service = "toggle"
++                val serviceDataMap = hashMapOf<String, Any>("entity_id" to "light.dummy_light")
++
++                val serviceCallRequest = ServiceCallRequest(
++                    domain,
++                    service,
++                    serviceDataMap
++                )
++
++                val integrationRequest = IntegrationRequest(
++                    "call_service",
++                    serviceCallRequest
++                )
++
++                mockService.enqueueResponse(200, "integration/empty.json")
++                response = runBlocking {
++                    mockService.get().callService(mockService.getMockServer().url("/path/to/hook"), integrationRequest)
++                }
++                request = mockService.takeRequest()
++            }
++            it("should serialize request") {
++                assertThat(request.method).isEqualTo("POST")
++                assertThat(request.path).isEqualTo("/path/to/hook")
++            }
++            it("should return success") {
++                assertThat(response.isSuccessful).isTrue()
++            }
++        }
+     }
+ })
+diff --git a/domain/src/main/java/io/homeassistant/companion/android/domain/integration/IntegrationRepository.kt b/domain/src/main/java/io/homeassistant/companion/android/domain/integration/IntegrationRepository.kt
+index 68fa6cc1ac2..1bd2d6e7666 100644
+--- a/domain/src/main/java/io/homeassistant/companion/android/domain/integration/IntegrationRepository.kt
++++ b/domain/src/main/java/io/homeassistant/companion/android/domain/integration/IntegrationRepository.kt
+@@ -19,4 +19,6 @@ interface IntegrationRepository {
+     suspend fun isBackgroundTrackingEnabled(): Boolean
+ 
+     suspend fun getThemeColor(): String
++
++    suspend fun callService(domain: String, service: String, serviceData: HashMap<String, Any>)
+ }
+diff --git a/domain/src/main/java/io/homeassistant/companion/android/domain/integration/IntegrationUseCase.kt b/domain/src/main/java/io/homeassistant/companion/android/domain/integration/IntegrationUseCase.kt
+index b7da49fb017..620efb7f8c3 100644
+--- a/domain/src/main/java/io/homeassistant/companion/android/domain/integration/IntegrationUseCase.kt
++++ b/domain/src/main/java/io/homeassistant/companion/android/domain/integration/IntegrationUseCase.kt
+@@ -18,6 +18,8 @@ interface IntegrationUseCase {
+ 
+     suspend fun updateLocation(updateLocation: UpdateLocation)
+ 
++    suspend fun callService(domain: String, service: String, serviceData: HashMap<String, Any>)
++
+     suspend fun getZones(): Array<Entity<ZoneAttributes>>
+ 
+     suspend fun setZoneTrackingEnabled(enabled: Boolean)
+diff --git a/domain/src/main/java/io/homeassistant/companion/android/domain/integration/IntegrationUseCaseImpl.kt b/domain/src/main/java/io/homeassistant/companion/android/domain/integration/IntegrationUseCaseImpl.kt
+index 01778427fec..3517834ffb1 100644
+--- a/domain/src/main/java/io/homeassistant/companion/android/domain/integration/IntegrationUseCaseImpl.kt
++++ b/domain/src/main/java/io/homeassistant/companion/android/domain/integration/IntegrationUseCaseImpl.kt
+@@ -40,6 +40,10 @@ class IntegrationUseCaseImpl @Inject constructor(
+         return integrationRepository.updateLocation(updateLocation)
+     }
+ 
++    override suspend fun callService(domain: String, service: String, serviceData: HashMap<String, Any>) {
++        return integrationRepository.callService(domain, service, serviceData)
++    }
++
+     override suspend fun getZones(): Array<Entity<ZoneAttributes>> {
+         return integrationRepository.getZones()
+     }
+diff --git a/domain/src/main/java/io/homeassistant/companion/android/domain/widgets/WidgetRepository.kt b/domain/src/main/java/io/homeassistant/companion/android/domain/widgets/WidgetRepository.kt
+new file mode 100644
+index 00000000000..a6d6082e66d
+--- /dev/null
++++ b/domain/src/main/java/io/homeassistant/companion/android/domain/widgets/WidgetRepository.kt
+@@ -0,0 +1,23 @@
++package io.homeassistant.companion.android.domain.widgets
++
++interface WidgetRepository {
++
++    suspend fun saveServiceCallData(
++        appWidgetId: Int,
++        domainStr: String,
++        serviceStr: String,
++        serviceDataStr: String
++    )
++
++    suspend fun loadDomain(appWidgetId: Int): String?
++    suspend fun loadService(appWidgetId: Int): String?
++    suspend fun loadServiceData(appWidgetId: Int): String?
++
++    suspend fun loadIcon(appWidgetId: Int): String?
++    suspend fun loadLabel(appWidgetId: Int): String?
++
++    suspend fun saveIcon(appWidgetId: Int, resName: String?)
++    suspend fun saveLabel(appWidgetId: Int, data: String?)
++
++    suspend fun deleteWidgetData(appWidgetId: Int)
++}
+diff --git a/domain/src/main/java/io/homeassistant/companion/android/domain/widgets/WidgetUseCase.kt b/domain/src/main/java/io/homeassistant/companion/android/domain/widgets/WidgetUseCase.kt
+new file mode 100644
+index 00000000000..158abc1b5ed
+--- /dev/null
++++ b/domain/src/main/java/io/homeassistant/companion/android/domain/widgets/WidgetUseCase.kt
+@@ -0,0 +1,23 @@
++package io.homeassistant.companion.android.domain.widgets
++
++interface WidgetUseCase {
++
++    suspend fun saveServiceCallData(
++        appWidgetId: Int,
++        domainStr: String,
++        serviceStr: String,
++        serviceDataStr: String
++    )
++
++    suspend fun loadDomain(appWidgetId: Int): String?
++    suspend fun loadService(appWidgetId: Int): String?
++    suspend fun loadServiceData(appWidgetId: Int): String?
++
++    suspend fun loadIcon(appWidgetId: Int): String?
++    suspend fun loadLabel(appWidgetId: Int): String?
++
++    suspend fun saveIcon(appWidgetId: Int, resName: String?)
++    suspend fun saveLabel(appWidgetId: Int, data: String?)
++
++    suspend fun deleteWidgetData(appWidgetId: Int)
++}
+diff --git a/domain/src/main/java/io/homeassistant/companion/android/domain/widgets/WidgetUseCaseImpl.kt b/domain/src/main/java/io/homeassistant/companion/android/domain/widgets/WidgetUseCaseImpl.kt
+new file mode 100644
+index 00000000000..188f89578fd
+--- /dev/null
++++ b/domain/src/main/java/io/homeassistant/companion/android/domain/widgets/WidgetUseCaseImpl.kt
+@@ -0,0 +1,54 @@
++package io.homeassistant.companion.android.domain.widgets
++
++import javax.inject.Inject
++
++class WidgetUseCaseImpl @Inject constructor(
++    private val widgetRepository: WidgetRepository
++) : WidgetUseCase {
++
++    override suspend fun saveServiceCallData(
++        appWidgetId: Int,
++        domainStr: String,
++        serviceStr: String,
++        serviceDataStr: String
++    ) {
++        widgetRepository.saveServiceCallData(
++            appWidgetId,
++            domainStr,
++            serviceStr,
++            serviceDataStr
++        )
++    }
++
++    override suspend fun loadDomain(appWidgetId: Int): String? {
++        return widgetRepository.loadDomain(appWidgetId)
++    }
++
++    override suspend fun loadService(appWidgetId: Int): String? {
++        return widgetRepository.loadService(appWidgetId)
++    }
++
++    override suspend fun loadServiceData(appWidgetId: Int): String? {
++        return widgetRepository.loadServiceData(appWidgetId)
++    }
++
++    override suspend fun loadIcon(appWidgetId: Int): String? {
++        return widgetRepository.loadIcon(appWidgetId)
++    }
++
++    override suspend fun loadLabel(appWidgetId: Int): String? {
++        return widgetRepository.loadLabel(appWidgetId)
++    }
++
++    override suspend fun saveIcon(appWidgetId: Int, resName: String?) {
++        widgetRepository.saveIcon(appWidgetId, resName)
++    }
++
++    override suspend fun saveLabel(appWidgetId: Int, data: String?) {
++        widgetRepository.saveLabel(appWidgetId, data)
++    }
++
++    override suspend fun deleteWidgetData(appWidgetId: Int) {
++        widgetRepository.deleteWidgetData(appWidgetId)
++    }
++}
+diff --git a/domain/src/test/java/io/homeassistant/companion/android/domain/integration/IntegrationUseCaseImplSpec.kt b/domain/src/test/java/io/homeassistant/companion/android/domain/integration/IntegrationUseCaseImplSpec.kt
+index 9b8e513f757..43339810cbe 100644
+--- a/domain/src/test/java/io/homeassistant/companion/android/domain/integration/IntegrationUseCaseImplSpec.kt
++++ b/domain/src/test/java/io/homeassistant/companion/android/domain/integration/IntegrationUseCaseImplSpec.kt
+@@ -82,6 +82,17 @@ object IntegrationUseCaseImplSpec : Spek({
+             }
+         }
+ 
++        describe("callService") {
++            val serviceData = mockk<HashMap<String, Any>>()
++            beforeEachTest {
++                runBlocking { useCase.callService("domain", "service", serviceData) }
++            }
++
++            it("should call the repository") {
++                coVerify { integrationRepository.callService("domain", "service", serviceData) }
++            }
++        }
++
+         describe("getZones") {
+             beforeEachTest {
+                 runBlocking { useCase.getZones() }
+diff --git a/domain/src/test/java/io/homeassistant/companion/android/domain/widgets/WidgetUseCaseImplSpec.kt b/domain/src/test/java/io/homeassistant/companion/android/domain/widgets/WidgetUseCaseImplSpec.kt
+new file mode 100644
+index 00000000000..1bbb57e52c3
+--- /dev/null
++++ b/domain/src/test/java/io/homeassistant/companion/android/domain/widgets/WidgetUseCaseImplSpec.kt
+@@ -0,0 +1,124 @@
++package io.homeassistant.companion.android.domain.widgets
++
++import io.mockk.coVerify
++import io.mockk.mockk
++import kotlinx.coroutines.runBlocking
++import org.spekframework.spek2.Spek
++import org.spekframework.spek2.style.specification.describe
++
++object WidgetUseCaseImplSpec : Spek({
++    describe("widget use case") {
++
++        val widgetRepository by memoized {
++            mockk<WidgetRepository>(
++                relaxed = true,
++                relaxUnitFun = true
++            )
++        }
++        val useCase by memoized { WidgetUseCaseImpl(widgetRepository) }
++
++        describe("save service call data") {
++            beforeEachTest {
++                runBlocking {
++                    useCase.saveServiceCallData(
++                        1,
++                        "domain",
++                        "service",
++                        "serviceData"
++                    )
++                }
++            }
++
++            it("should call the repository") {
++                coVerify {
++                    widgetRepository.saveServiceCallData(
++                        1,
++                        "domain",
++                        "service",
++                        "serviceData"
++                    )
++                }
++            }
++        }
++
++        describe("load domain") {
++            beforeEachTest {
++                runBlocking { useCase.loadDomain(1) }
++            }
++
++            it("should call the repository") {
++                coVerify { widgetRepository.loadDomain(1) }
++            }
++        }
++
++        describe("load service") {
++            beforeEachTest {
++                runBlocking { useCase.loadService(1) }
++            }
++
++            it("should call the repository") {
++                coVerify { widgetRepository.loadService(1) }
++            }
++        }
++
++        describe("load service data") {
++            beforeEachTest {
++                runBlocking { useCase.loadServiceData(1) }
++            }
++
++            it("should call the repository") {
++                coVerify { widgetRepository.loadServiceData(1) }
++            }
++        }
++
++        describe("load icon") {
++            beforeEachTest {
++                runBlocking { useCase.loadIcon(1) }
++            }
++
++            it("should call the repository") {
++                coVerify { widgetRepository.loadIcon(1) }
++            }
++        }
++
++        describe("load label") {
++            beforeEachTest {
++                runBlocking { useCase.loadLabel(1) }
++            }
++
++            it("should call the repository") {
++                coVerify { widgetRepository.loadLabel(1) }
++            }
++        }
++
++        describe("save icon") {
++            beforeEachTest {
++                runBlocking { useCase.saveIcon(1, "icon_res_name") }
++            }
++
++            it("should call the repository") {
++                coVerify { widgetRepository.saveIcon(1, "icon_res_name") }
++            }
++        }
++
++        describe("save label") {
++            beforeEachTest {
++                runBlocking { useCase.saveLabel(1, "label") }
++            }
++
++            it("should call the repository") {
++                coVerify { widgetRepository.saveLabel(1, "label") }
++            }
++        }
++
++        describe("delete widget data") {
++            beforeEachTest {
++                runBlocking { useCase.deleteWidgetData(1) }
++            }
++
++            it("should call the repository") {
++                coVerify { widgetRepository.deleteWidgetData(1) }
++            }
++        }
++    }
++})

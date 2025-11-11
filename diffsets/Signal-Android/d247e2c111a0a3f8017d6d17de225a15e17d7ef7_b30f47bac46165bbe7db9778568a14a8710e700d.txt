@@ -1,0 +1,1481 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/WebRtcCallActivity.java b/app/src/main/java/org/thoughtcrime/securesms/WebRtcCallActivity.java
+index dc1531c302b..c5a7436be0f 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/WebRtcCallActivity.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/WebRtcCallActivity.java
+@@ -50,6 +50,7 @@
+ import org.greenrobot.eventbus.Subscribe;
+ import org.greenrobot.eventbus.ThreadMode;
+ import org.signal.core.util.ThreadUtil;
++import org.signal.core.util.concurrent.LifecycleDisposable;
+ import org.signal.core.util.concurrent.SignalExecutors;
+ import org.signal.core.util.logging.Log;
+ import org.signal.libsignal.protocol.IdentityKey;
+@@ -61,6 +62,8 @@
+ import org.thoughtcrime.securesms.components.webrtc.CallStateUpdatePopupWindow;
+ import org.thoughtcrime.securesms.components.webrtc.CallToastPopupWindow;
+ import org.thoughtcrime.securesms.components.webrtc.GroupCallSafetyNumberChangeNotificationUtil;
++import org.thoughtcrime.securesms.components.webrtc.PendingParticipantsBottomSheet;
++import org.thoughtcrime.securesms.components.webrtc.PendingParticipantsView;
+ import org.thoughtcrime.securesms.components.webrtc.WebRtcAudioDevice;
+ import org.thoughtcrime.securesms.components.webrtc.WebRtcAudioOutput;
+ import org.thoughtcrime.securesms.components.webrtc.WebRtcCallView;
+@@ -79,6 +82,7 @@
+ import org.thoughtcrime.securesms.safety.SafetyNumberBottomSheet;
+ import org.thoughtcrime.securesms.service.webrtc.SignalCallManager;
+ import org.thoughtcrime.securesms.sms.MessageSender;
++import org.thoughtcrime.securesms.util.BottomSheetUtil;
+ import org.thoughtcrime.securesms.util.EllapsedTimeFormatter;
+ import org.thoughtcrime.securesms.util.FeatureFlags;
+ import org.thoughtcrime.securesms.util.FullscreenHelper;
+@@ -137,6 +141,7 @@ public class WebRtcCallActivity extends BaseActivity implements SafetyNumberChan
+   private WindowInfoTrackerCallbackAdapter windowInfoTrackerCallbackAdapter;
+   private ThrottledDebouncer               requestNewSizesThrottle;
+   private PictureInPictureParams.Builder   pipBuilderParams;
++  private LifecycleDisposable              lifecycleDisposable;
+ 
+   private Disposable ephemeralStateDisposable = Disposable.empty();
+ 
+@@ -150,6 +155,10 @@ protected void attachBaseContext(@NonNull Context newBase) {
+   @Override
+   public void onCreate(Bundle savedInstanceState) {
+     Log.i(TAG, "onCreate(" + getIntent().getBooleanExtra(EXTRA_STARTED_FROM_FULLSCREEN, false) + ")");
++
++    lifecycleDisposable = new LifecycleDisposable();
++    lifecycleDisposable.bindTo(this);
++
+     getWindow().addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED);
+     getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+     super.onCreate(savedInstanceState);
+@@ -398,6 +407,12 @@ private void initializeViewModel(boolean isLandscapeEnabled) {
+       }
+       viewModel.setIsLandscapeEnabled(info.isInPictureInPictureMode());
+     });
++
++    callScreen.setPendingParticipantsViewListener(new PendingParticipantsViewListener());
++    Disposable disposable = viewModel.getPendingParticipants()
++                                     .subscribe(callScreen::updatePendingParticipantsList);
++
++    lifecycleDisposable.add(disposable);
+   }
+ 
+   private void initializePictureInPictureParams() {
+@@ -949,6 +964,24 @@ private void maybeDisplaySpeakerphonePopup(WebRtcAudioOutput nextOutput) {
+     }
+   }
+ 
++  private class PendingParticipantsViewListener implements PendingParticipantsView.Listener {
++
++    @Override
++    public void onAllowPendingRecipient(@NonNull Recipient pendingRecipient) {
++      ApplicationDependencies.getSignalCallManager().setCallLinkJoinRequestAccepted(pendingRecipient);
++    }
++
++    @Override
++    public void onRejectPendingRecipient(@NonNull Recipient pendingRecipient) {
++      ApplicationDependencies.getSignalCallManager().setCallLinkJoinRequestRejected(pendingRecipient);
++    }
++
++    @Override
++    public void onLaunchPendingRequestsSheet() {
++      new PendingParticipantsBottomSheet().show(getSupportFragmentManager(), BottomSheetUtil.STANDARD_BOTTOM_SHEET_FRAGMENT_TAG);
++    }
++  }
++
+   private class WindowLayoutInfoConsumer implements Consumer<WindowLayoutInfo> {
+ 
+     @Override
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/PendingParticipantsBottomSheet.kt b/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/PendingParticipantsBottomSheet.kt
+new file mode 100644
+index 00000000000..1381113ef13
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/PendingParticipantsBottomSheet.kt
+@@ -0,0 +1,291 @@
++/*
++ * Copyright 2023 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.components.webrtc
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Person
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rxjava3.subscribeAsState
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.vector.ImageVector
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalInspectionMode
++import androidx.compose.ui.res.colorResource
++import androidx.compose.ui.res.pluralStringResource
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.res.vectorResource
++import androidx.compose.ui.tooling.preview.Preview
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.viewinterop.AndroidView
++import androidx.core.os.bundleOf
++import androidx.fragment.app.setFragmentResult
++import org.signal.core.ui.BottomSheets
++import org.signal.core.ui.Buttons
++import org.signal.core.ui.theme.SignalTheme
++import org.thoughtcrime.securesms.R
++import org.thoughtcrime.securesms.components.AvatarImageView
++import org.thoughtcrime.securesms.compose.ComposeBottomSheetDialogFragment
++import org.thoughtcrime.securesms.dependencies.ApplicationDependencies
++import org.thoughtcrime.securesms.recipients.Recipient
++import org.thoughtcrime.securesms.service.webrtc.PendingParticipantCollection
++import org.thoughtcrime.securesms.util.activityViewModel
++import kotlin.time.Duration.Companion.milliseconds
++
++/**
++ * Displays a list of pending participants attempting to join this call.
++ */
++class PendingParticipantsBottomSheet : ComposeBottomSheetDialogFragment() {
++
++  companion object {
++    const val REQUEST_KEY = "PendingParticipantsBottomSheet_result"
++  }
++
++  private val viewModel: WebRtcCallViewModel by activityViewModel {
++    error("Should already exist")
++  }
++
++  override val peekHeightPercentage: Float = 1f
++
++  @Composable
++  override fun SheetContent() {
++    val launchTime = remember {
++      System.currentTimeMillis().milliseconds
++    }
++
++    val participants = viewModel.pendingParticipants
++      .map { it.getAllPendingParticipants(launchTime).toList() }
++      .subscribeAsState(initial = emptyList())
++
++    PendingParticipantsSheet(
++      pendingParticipants = participants.value,
++      onApproveAll = this::onApproveAll,
++      onDenyAll = this::onDenyAll,
++      onApprove = this::onApprove,
++      onDeny = this::onDeny
++    )
++  }
++
++  private fun onApprove(recipient: Recipient) {
++    ApplicationDependencies.getSignalCallManager().setCallLinkJoinRequestAccepted(recipient)
++  }
++
++  private fun onDeny(recipient: Recipient) {
++    ApplicationDependencies.getSignalCallManager().setCallLinkJoinRequestRejected(recipient)
++  }
++
++  private fun onApproveAll() {
++    dismiss()
++    setFragmentResult(REQUEST_KEY, bundleOf(REQUEST_KEY to true))
++  }
++
++  private fun onDenyAll() {
++    dismiss()
++    setFragmentResult(REQUEST_KEY, bundleOf(REQUEST_KEY to false))
++  }
++}
++
++@Preview(showSystemUi = true)
++@Composable
++private fun PendingParticipantsSheetPreview() {
++  SignalTheme(isDarkMode = true) {
++    Surface(shape = RoundedCornerShape(18.dp, 18.dp)) {
++      PendingParticipantsSheet(
++        pendingParticipants = (1 until 7).map {
++          PendingParticipantCollection.Entry(Recipient.UNKNOWN, PendingParticipantCollection.State.PENDING, System.currentTimeMillis().milliseconds)
++        },
++        onApproveAll = {},
++        onDenyAll = {},
++        onApprove = {},
++        onDeny = {}
++      )
++    }
++  }
++}
++
++@Composable
++private fun PendingParticipantsSheet(
++  pendingParticipants: List<PendingParticipantCollection.Entry>,
++  onApproveAll: () -> Unit,
++  onDenyAll: () -> Unit,
++  onApprove: (Recipient) -> Unit,
++  onDeny: (Recipient) -> Unit
++) {
++  Box {
++    Column(
++      horizontalAlignment = Alignment.CenterHorizontally,
++      modifier = Modifier.padding(bottom = 64.dp)
++    ) {
++      BottomSheets.Handle()
++
++      Spacer(Modifier.size(14.dp))
++
++      LazyColumn(
++        horizontalAlignment = Alignment.CenterHorizontally
++      ) {
++        item {
++          Text(
++            text = stringResource(id = R.string.PendingParticipantsBottomSheet__requests_to_join_this_call),
++            style = MaterialTheme.typography.titleLarge
++          )
++        }
++
++        item {
++          Text(
++            text = pluralStringResource(
++              id = R.plurals.PendingParticipantsBottomSheet__d_people_waiting,
++              count = pendingParticipants.size,
++              pendingParticipants.size
++            ),
++            style = MaterialTheme.typography.titleMedium,
++            color = MaterialTheme.colorScheme.onSurfaceVariant
++          )
++        }
++
++        item {
++          Spacer(Modifier.size(24.dp))
++        }
++
++        items(pendingParticipants.size) { index ->
++          PendingParticipantRow(
++            participant = pendingParticipants[index],
++            onApprove = onApprove,
++            onDeny = onDeny
++          )
++        }
++      }
++    }
++
++    Row(
++      modifier = Modifier
++        .align(Alignment.BottomStart)
++        .background(color = MaterialTheme.colorScheme.background)
++        .padding(horizontal = 24.dp, vertical = 16.dp)
++    ) {
++      Spacer(modifier = Modifier.weight(1f))
++
++      TextButton(
++        onClick = onDenyAll
++      ) {
++        Text(
++          text = "Deny all",
++          color = MaterialTheme.colorScheme.onSurface
++        )
++      }
++
++      Spacer(modifier = Modifier.size(8.dp))
++
++      Buttons.LargeTonal(onClick = onApproveAll) {
++        Text(
++          text = "Approve all"
++        )
++      }
++    }
++  }
++}
++
++@Composable
++private fun PendingParticipantRow(
++  participant: PendingParticipantCollection.Entry,
++  onApprove: (Recipient) -> Unit,
++  onDeny: (Recipient) -> Unit
++) {
++  val onApproveCallback = remember(participant.recipient) { { onApprove(participant.recipient) } }
++  val onDenyCallback = remember(participant.recipient) { { onDeny(participant.recipient) } }
++
++  Row(
++    verticalAlignment = Alignment.CenterVertically,
++    modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp)
++  ) {
++    PendingParticipantAvatar(recipient = participant.recipient)
++
++    Text(
++      text = participant.recipient.getDisplayName(LocalContext.current),
++      style = MaterialTheme.typography.bodyLarge,
++      modifier = Modifier
++        .weight(1f)
++        .padding(horizontal = 16.dp)
++    )
++
++    CircularIconButton(
++      symbol = ImageVector.vectorResource(id = R.drawable.symbol_x_compact_bold_16),
++      contentDescription = stringResource(id = R.string.PendingParticipantsBottomSheet__reject),
++      backgroundColor = colorResource(id = R.color.webrtc_hangup_background),
++      onClick = onDenyCallback
++    )
++
++    Spacer(modifier = Modifier.size(24.dp))
++
++    CircularIconButton(
++      symbol = ImageVector.vectorResource(id = R.drawable.symbol_check_compact_bold_16),
++      contentDescription = stringResource(id = R.string.PendingParticipantsBottomSheet__approve),
++      backgroundColor = colorResource(id = R.color.signal_accent_green),
++      onClick = onApproveCallback
++    )
++  }
++}
++
++@Composable
++private fun CircularIconButton(
++  symbol: ImageVector,
++  contentDescription: String?,
++  backgroundColor: Color,
++  onClick: () -> Unit
++) {
++  Icon(
++    imageVector = symbol,
++    contentDescription = contentDescription,
++    modifier = Modifier
++      .size(28.dp)
++      .background(
++        color = backgroundColor,
++        shape = CircleShape
++      )
++      .clickable(onClick = onClick)
++      .padding(6.dp)
++  )
++}
++
++@Composable
++private fun PendingParticipantAvatar(recipient: Recipient) {
++  if (LocalInspectionMode.current) {
++    Icon(
++      imageVector = Icons.Default.Person,
++      contentDescription = null,
++      modifier = Modifier
++        .size(40.dp)
++        .background(
++          color = Color.Red,
++          shape = CircleShape
++        )
++    )
++  } else {
++    AndroidView(
++      factory = ::AvatarImageView,
++      modifier = Modifier.size(40.dp)
++    ) {
++      it.setAvatar(recipient)
++    }
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/PendingParticipantsView.kt b/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/PendingParticipantsView.kt
+new file mode 100644
+index 00000000000..4a8cfb0fe37
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/PendingParticipantsView.kt
+@@ -0,0 +1,88 @@
++/*
++ * Copyright 2023 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.components.webrtc
++
++import android.content.Context
++import android.util.AttributeSet
++import android.view.View
++import android.widget.TextView
++import androidx.constraintlayout.widget.Group
++import com.google.android.material.button.MaterialButton
++import com.google.android.material.card.MaterialCardView
++import org.thoughtcrime.securesms.R
++import org.thoughtcrime.securesms.components.AvatarImageView
++import org.thoughtcrime.securesms.recipients.Recipient
++import org.thoughtcrime.securesms.service.webrtc.PendingParticipantCollection
++import org.thoughtcrime.securesms.util.visible
++
++/**
++ * Card which displays pending participants state.
++ */
++class PendingParticipantsView @JvmOverloads constructor(
++  context: Context,
++  attrs: AttributeSet? = null
++) : MaterialCardView(context, attrs) {
++  init {
++    inflate(context, R.layout.pending_participant_view, this)
++  }
++
++  var listener: Listener? = null
++
++  private val avatar: AvatarImageView = findViewById(R.id.pending_participants_avatar)
++  private val name: TextView = findViewById(R.id.pending_participants_name)
++  private val allow: View = findViewById(R.id.pending_participants_allow)
++  private val reject: View = findViewById(R.id.pending_participants_reject)
++  private val requestsGroup: Group = findViewById(R.id.pending_participants_requests_group)
++  private val requestsButton: MaterialButton = findViewById(R.id.pending_participants_requests)
++
++  init {
++    requestsButton.setOnClickListener {
++      listener?.onLaunchPendingRequestsSheet()
++    }
++  }
++
++  fun applyState(pendingParticipantCollection: PendingParticipantCollection) {
++    val unresolvedPendingParticipants: List<Recipient> = pendingParticipantCollection.getUnresolvedPendingParticipants().map { it.recipient }
++    if (unresolvedPendingParticipants.isEmpty()) {
++      visible = false
++      return
++    }
++
++    val firstRecipient: Recipient = unresolvedPendingParticipants.first()
++    avatar.setAvatar(firstRecipient)
++    name.text = firstRecipient.getShortDisplayName(context)
++
++    allow.setOnClickListener { listener?.onAllowPendingRecipient(firstRecipient) }
++    reject.setOnClickListener { listener?.onRejectPendingRecipient(firstRecipient) }
++
++    if (unresolvedPendingParticipants.size > 1) {
++      val requestCount = unresolvedPendingParticipants.size - 1
++      requestsButton.text = resources.getQuantityString(R.plurals.PendingParticipantsView__plus_d_requests, requestCount, requestCount)
++      requestsGroup.visible = true
++    } else {
++      requestsGroup.visible = false
++    }
++
++    visible = true
++  }
++
++  interface Listener {
++    /**
++     * Given recipient should be admitted to the call
++     */
++    fun onAllowPendingRecipient(pendingRecipient: Recipient)
++
++    /**
++     * Given recipient should be rejected from the call
++     */
++    fun onRejectPendingRecipient(pendingRecipient: Recipient)
++
++    /**
++     * Display the sheet containing all of the requests for the given call
++     */
++    fun onLaunchPendingRequestsSheet()
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/WebRtcCallView.java b/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/WebRtcCallView.java
+index 5a7d6ee7a61..65df1a66489 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/WebRtcCallView.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/WebRtcCallView.java
+@@ -57,6 +57,7 @@
+ import org.thoughtcrime.securesms.recipients.Recipient;
+ import org.thoughtcrime.securesms.recipients.RecipientId;
+ import org.thoughtcrime.securesms.ringrtc.CameraState;
++import org.thoughtcrime.securesms.service.webrtc.PendingParticipantCollection;
+ import org.thoughtcrime.securesms.util.BlurTransformation;
+ import org.thoughtcrime.securesms.util.ThrottledDebouncer;
+ import org.thoughtcrime.securesms.util.ViewUtil;
+@@ -127,10 +128,12 @@ public class WebRtcCallView extends ConstraintLayout {
+   private View                          fullScreenShade;
+   private Toolbar                       collapsedToolbar;
+   private Toolbar                       headerToolbar;
++  private Stub<PendingParticipantsView> pendingParticipantsViewStub;
+ 
+   private WebRtcCallParticipantsPagerAdapter    pagerAdapter;
+   private WebRtcCallParticipantsRecyclerAdapter recyclerAdapter;
+   private PictureInPictureExpansionHelper       pictureInPictureExpansionHelper;
++  private PendingParticipantsView.Listener      pendingParticipantsViewListener;
+ 
+   private final Set<View> incomingCallViews    = new HashSet<>();
+   private final Set<View> topViews             = new HashSet<>();
+@@ -203,6 +206,7 @@ protected void onFinishInflate() {
+     fullScreenShade               = findViewById(R.id.call_screen_full_shade);
+     collapsedToolbar              = findViewById(R.id.webrtc_call_view_toolbar_text);
+     headerToolbar                 = findViewById(R.id.webrtc_call_view_toolbar_no_text);
++    pendingParticipantsViewStub   = new Stub<>(findViewById(R.id.call_screen_pending_recipients));
+ 
+     View      decline                = findViewById(R.id.call_screen_decline_call);
+     View      answerLabel            = findViewById(R.id.call_screen_answer_call_label);
+@@ -424,6 +428,22 @@ public void setMicEnabled(boolean isMicEnabled) {
+     micToggle.setChecked(isMicEnabled, false);
+   }
+ 
++  public void setPendingParticipantsViewListener(@Nullable PendingParticipantsView.Listener listener) {
++    pendingParticipantsViewListener = listener;
++  }
++
++  public void updatePendingParticipantsList(@NonNull PendingParticipantCollection pendingParticipantCollection) {
++    if (pendingParticipantCollection.getUnresolvedPendingParticipants().isEmpty()) {
++      if (pendingParticipantsViewStub.resolved()) {
++        pendingParticipantsViewStub.get().setListener(pendingParticipantsViewListener);
++        pendingParticipantsViewStub.get().applyState(pendingParticipantCollection);
++      }
++    } else {
++      pendingParticipantsViewStub.get().setListener(pendingParticipantsViewListener);
++      pendingParticipantsViewStub.get().applyState(pendingParticipantCollection);
++    }
++  }
++
+   public void updateCallParticipants(@NonNull CallParticipantsViewState callParticipantsViewState) {
+     lastState = callParticipantsViewState;
+ 
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/WebRtcCallViewModel.java b/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/WebRtcCallViewModel.java
+index 19ce09fc106..f8a16717203 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/WebRtcCallViewModel.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/webrtc/WebRtcCallViewModel.java
+@@ -30,6 +30,7 @@
+ import org.thoughtcrime.securesms.recipients.LiveRecipient;
+ import org.thoughtcrime.securesms.recipients.Recipient;
+ import org.thoughtcrime.securesms.recipients.RecipientId;
++import org.thoughtcrime.securesms.service.webrtc.PendingParticipantCollection;
+ import org.thoughtcrime.securesms.service.webrtc.state.WebRtcEphemeralState;
+ import org.thoughtcrime.securesms.util.DefaultValueLiveData;
+ import org.thoughtcrime.securesms.util.NetworkUtil;
+@@ -44,6 +45,10 @@
+ import java.util.Objects;
+ import java.util.Set;
+ 
++import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers;
++import io.reactivex.rxjava3.core.Observable;
++import io.reactivex.rxjava3.subjects.BehaviorSubject;
++
+ public class WebRtcCallViewModel extends ViewModel {
+ 
+   private final MutableLiveData<Boolean>                      microphoneEnabled         = new MutableLiveData<>(true);
+@@ -70,6 +75,8 @@ public class WebRtcCallViewModel extends ViewModel {
+   private final Observer<List<GroupMemberEntry.FullMember>>   groupMemberStateUpdater   = m -> participantsState.setValue(CallParticipantsState.update(participantsState.getValue(), m));
+   private final MutableLiveData<WebRtcEphemeralState>         ephemeralState            = new MutableLiveData<>();
+ 
++  private final BehaviorSubject<PendingParticipantCollection> pendingParticipants = BehaviorSubject.create();
++
+   private final Handler  elapsedTimeHandler      = new Handler(Looper.getMainLooper());
+   private final Runnable elapsedTimeRunnable     = this::handleTick;
+   private final Runnable stopOutgoingRingingMode = this::stopOutgoingRingingMode;
+@@ -183,6 +190,10 @@ public boolean isCallStarting() {
+     return callStarting;
+   }
+ 
++  public @NonNull Observable<PendingParticipantCollection> getPendingParticipants() {
++    return pendingParticipants.observeOn(AndroidSchedulers.mainThread());
++  }
++
+   @MainThread
+   public void setIsInPipMode(boolean isInPipMode) {
+     this.isInPipMode.setValue(isInPipMode);
+@@ -272,6 +283,8 @@ public void updateFromWebRtcViewModel(@NonNull WebRtcViewModel webRtcViewModel,
+                          webRtcViewModel.getParticipantLimit(),
+                          webRtcViewModel.getRecipient().isCallLink());
+ 
++    pendingParticipants.onNext(webRtcViewModel.getPendingParticipants());
++
+     if (newState.isInOutgoingRingingMode()) {
+       cancelTimer();
+       if (!wasInOutgoingRingingMode) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/events/WebRtcViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/events/WebRtcViewModel.kt
+index 899fa4ee685..9f6620fb3a1 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/events/WebRtcViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/events/WebRtcViewModel.kt
+@@ -5,6 +5,7 @@ import org.thoughtcrime.securesms.components.webrtc.BroadcastVideoSink
+ import org.thoughtcrime.securesms.events.CallParticipant.Companion.createLocal
+ import org.thoughtcrime.securesms.recipients.Recipient
+ import org.thoughtcrime.securesms.recipients.RecipientId
++import org.thoughtcrime.securesms.service.webrtc.PendingParticipantCollection
+ import org.thoughtcrime.securesms.service.webrtc.state.WebRtcServiceState
+ import org.thoughtcrime.securesms.webrtc.audio.SignalAudioManager
+ import org.webrtc.PeerConnection
+@@ -92,6 +93,7 @@ class WebRtcViewModel(state: WebRtcServiceState) {
+   val identityChangedParticipants: Set<RecipientId> = state.callInfoState.identityChangedRecipients
+   val remoteDevicesCount: OptionalLong = state.callInfoState.remoteDevicesCount
+   val participantLimit: Long? = state.callInfoState.participantLimit
++  val pendingParticipants: PendingParticipantCollection = state.callInfoState.pendingParticipants
+ 
+   @get:JvmName("shouldRingGroup")
+   val ringGroup: Boolean = state.getCallSetupState(state.callInfoState.activePeer?.callId).ringGroup
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/CallLinkConnectedActionProcessor.kt b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/CallLinkConnectedActionProcessor.kt
+index d61a08e9a7a..385bbf4bb32 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/CallLinkConnectedActionProcessor.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/CallLinkConnectedActionProcessor.kt
+@@ -6,7 +6,15 @@
+ package org.thoughtcrime.securesms.service.webrtc
+ 
+ import org.signal.core.util.logging.Log
++import org.signal.ringrtc.CallException
++import org.signal.ringrtc.GroupCall
++import org.signal.ringrtc.PeekInfo
++import org.thoughtcrime.securesms.database.CallLinkTable
++import org.thoughtcrime.securesms.database.SignalDatabase
++import org.thoughtcrime.securesms.recipients.Recipient
++import org.thoughtcrime.securesms.service.webrtc.links.CallLinkRoomId
+ import org.thoughtcrime.securesms.service.webrtc.state.WebRtcServiceState
++import org.whispersystems.signalservice.api.push.ServiceId
+ 
+ /**
+  * Process actions for when the call link has at least once been connected and joined.
+@@ -25,4 +33,67 @@ class CallLinkConnectedActionProcessor(
+ 
+     return currentState
+   }
++
++  override fun handleGroupJoinedMembershipChanged(currentState: WebRtcServiceState): WebRtcServiceState {
++    Log.i(tag, "handleGroupJoinedMembershipChanged():")
++
++    val superState: WebRtcServiceState = super.handleGroupJoinedMembershipChanged(currentState)
++    val groupCall: GroupCall = superState.callInfoState.requireGroupCall()
++    val peekInfo: PeekInfo = groupCall.peekInfo ?: return superState
++
++    val callLinkRoomId: CallLinkRoomId = superState.callInfoState.callRecipient.requireCallLinkRoomId()
++    val callLink: CallLinkTable.CallLink = SignalDatabase.callLinks.getCallLinkByRoomId(callLinkRoomId) ?: return superState
++
++    if (callLink.credentials?.adminPassBytes == null) {
++      Log.i(tag, "User is not an admin.")
++      return superState
++    }
++
++    Log.i(tag, "Updating pending list with ${peekInfo.pendingUsers.size} entries.")
++    val pendingParticipants: List<Recipient> = peekInfo.pendingUsers.map { Recipient.externalPush(ServiceId.ACI.from(it)) }
++
++    return superState.builder()
++      .changeCallInfoState()
++      .setPendingParticipants(pendingParticipants)
++      .build()
++  }
++
++  override fun handleSetCallLinkJoinRequestAccepted(currentState: WebRtcServiceState, participant: Recipient): WebRtcServiceState {
++    Log.i(tag, "handleSetCallLinkJoinRequestAccepted():")
++
++    val groupCall: GroupCall = currentState.callInfoState.requireGroupCall()
++
++    return try {
++      groupCall.approveUser(participant.requireAci().rawUuid)
++
++      currentState
++        .builder()
++        .changeCallInfoState()
++        .setPendingParticipantApproved(participant)
++        .build()
++    } catch (e: CallException) {
++      Log.w(tag, "Failed to approve user.", e)
++
++      currentState
++    }
++  }
++
++  override fun handleSetCallLinkJoinRequestRejected(currentState: WebRtcServiceState, participant: Recipient): WebRtcServiceState {
++    Log.i(tag, "handleSetCallLinkJoinRequestRejected():")
++
++    val groupCall: GroupCall = currentState.callInfoState.requireGroupCall()
++
++    return try {
++      groupCall.denyUser(participant.requireAci().rawUuid)
++
++      currentState
++        .builder()
++        .changeCallInfoState()
++        .setPendingParticipantRejected(participant)
++        .build()
++    } catch (e: CallException) {
++      Log.w(tag, "Failed to deny user.", e)
++      currentState
++    }
++  }
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/PendingParticipantCollection.kt b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/PendingParticipantCollection.kt
+new file mode 100644
+index 00000000000..332c1c52222
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/PendingParticipantCollection.kt
+@@ -0,0 +1,128 @@
++/*
++ * Copyright 2023 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.service.webrtc
++
++import org.thoughtcrime.securesms.recipients.Recipient
++import org.thoughtcrime.securesms.recipients.RecipientId
++import kotlin.time.Duration
++import kotlin.time.Duration.Companion.milliseconds
++
++/**
++ * Holds state information about what users wish to join a given call link.
++ *
++ * Also holds information about approvals and denials, so that this state is
++ * persisted over the lifecycle of the user's time in the call.
++ */
++data class PendingParticipantCollection(
++  private val participantMap: Map<RecipientId, Entry> = emptyMap(),
++  private val nowProvider: () -> Duration = { System.currentTimeMillis().milliseconds }
++) {
++
++  /**
++   * Creates a new collection with the given recipients applied to it with the following rules:
++   *
++   * 1. If the recipient is already in the collection, ignore it
++   * 1. Otherwise, insert the recipient at the end of the colleciton in the pending state
++   * 1. Any recipients in the resulting collection that are [State.PENDING] and NOT in the passed recipient list are removed.
++   */
++  fun withRecipients(recipients: List<Recipient>): PendingParticipantCollection {
++    val now = nowProvider()
++    val newEntries = recipients.filterNot { it.id in participantMap.keys }.map {
++      it.id to Entry(
++        it,
++        State.PENDING,
++        now
++      )
++    }
++
++    val recipientIds = recipients.map { it.id }
++    val newEntryMap = (participantMap + newEntries).filterNot { it.value.state == State.PENDING && it.key !in recipientIds }
++
++    return copy(participantMap = newEntryMap)
++  }
++
++  /**
++   * Creates a new collection with the given recipient marked as [State.APPROVED]
++   */
++  fun withApproval(recipient: Recipient): PendingParticipantCollection {
++    val now = nowProvider()
++    val entry = Entry(
++      recipient = recipient,
++      state = State.APPROVED,
++      stateChangeAt = now
++    )
++
++    return copy(
++      participantMap = participantMap + (recipient.id to entry)
++    )
++  }
++
++  /**
++   * Creates a new collection with the given recipient marked as [State.DENIED]
++   */
++  fun withDenial(recipient: Recipient): PendingParticipantCollection {
++    val now = nowProvider()
++    val entry = Entry(
++      recipient = recipient,
++      state = State.DENIED,
++      stateChangeAt = now
++    )
++
++    return copy(
++      participantMap = participantMap + (recipient.id to entry)
++    )
++  }
++
++  /**
++   * Gets all of the pending participants in the [State.PENDING] state.
++   */
++  fun getUnresolvedPendingParticipants(): Set<Entry> {
++    return participantMap.values.filter { it.state == State.PENDING }.toSet()
++  }
++
++  /**
++   * Gets all of the pending participants regardless of state. Filterable
++   * via a 'since' parameter so that we only display non-[State.PENDING] entries with
++   * state change timestamps AFTER that parameter. [State.PENDING] entries will always
++   * be returned.
++   *
++   * @param since A timestamp, for which we will only return non-[State.PENDING] occurring afterwards.
++   */
++  fun getAllPendingParticipants(since: Duration): Set<Entry> {
++    return participantMap.values.filter {
++      it.state == State.PENDING || it.stateChangeAt > since
++    }.toSet()
++  }
++
++  /**
++   * A [Recipient] and some [State] metadata
++   */
++  data class Entry(
++    val recipient: Recipient,
++    val state: State,
++    val stateChangeAt: Duration
++  )
++
++  /**
++   * The state of a given recipient's approval
++   */
++  enum class State {
++    /**
++     * No action has been taken
++     */
++    PENDING,
++
++    /**
++     * The user has approved this recipient
++     */
++    APPROVED,
++
++    /**
++     * The user has denied this recipient
++     */
++    DENIED
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/SignalCallManager.java b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/SignalCallManager.java
+index c48ebfb3ba3..973fa0ae9ab 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/SignalCallManager.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/SignalCallManager.java
+@@ -354,6 +354,22 @@ public void dropCall(long callId) {
+     process((s, p) -> p.handleDropCall(s, callId));
+   }
+ 
++  public void setCallLinkJoinRequestAccepted(@NonNull Recipient participant) {
++    process((s, p) -> p.handleSetCallLinkJoinRequestAccepted(s, participant));
++  }
++
++  public void setCallLinkJoinRequestRejected(@NonNull Recipient participant) {
++    process((s, p) -> p.handleSetCallLinkJoinRequestRejected(s, participant));
++  }
++
++  public void removeFromCallLink(@NonNull Recipient participant) {
++    process((s, p) -> p.handleRemoveFromCallLink(s, participant));
++  }
++
++  public void blockFromCallLink(@NonNull Recipient participant) {
++    process((s, p) -> p.handleBlockFromCallLink(s, participant));
++  }
++
+   public void peekCallLinkCall(@NonNull RecipientId id) {
+     if (callManager == null) {
+       Log.i(TAG, "Unable to peekCallLinkCall, call manager is null");
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/WebRtcActionProcessor.java b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/WebRtcActionProcessor.java
+index 6ab8e966463..9823b2ac4aa 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/WebRtcActionProcessor.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/WebRtcActionProcessor.java
+@@ -874,4 +874,32 @@ public WebRtcActionProcessor(@NonNull WebRtcInteractor webRtcInteractor, @NonNul
+   }
+ 
+   //endregion
++
++  //region Call Links
++
++  protected @NonNull WebRtcServiceState handleSetCallLinkJoinRequestAccepted(@NonNull WebRtcServiceState currentState, @NonNull Recipient participant) {
++    Log.i(tag, "handleSetCallLinkJoinRequestAccepted not processed");
++
++    return currentState;
++  }
++
++  protected @NonNull WebRtcServiceState handleSetCallLinkJoinRequestRejected(@NonNull WebRtcServiceState currentState, @NonNull Recipient participant) {
++    Log.i(tag, "handleSetCallLinkJoinRequestRejected not processed");
++
++    return currentState;
++  }
++
++  protected @NonNull WebRtcServiceState handleRemoveFromCallLink(@NonNull WebRtcServiceState currentState, @NonNull Recipient participant) {
++    Log.i(tag, "handleRemoveFromCallLink not processed");
++
++    return currentState;
++  }
++
++  protected @NonNull WebRtcServiceState handleBlockFromCallLink(@NonNull WebRtcServiceState currentState, @NonNull Recipient participant) {
++    Log.i(tag, "handleBlockFromCallLink not processed");
++
++    return currentState;
++  }
++
++  //endregion
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/state/CallInfoState.kt b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/state/CallInfoState.kt
+index 5fa677b548c..285be5641bd 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/state/CallInfoState.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/state/CallInfoState.kt
+@@ -9,9 +9,12 @@ import org.thoughtcrime.securesms.events.WebRtcViewModel
+ import org.thoughtcrime.securesms.recipients.Recipient
+ import org.thoughtcrime.securesms.recipients.RecipientId
+ import org.thoughtcrime.securesms.ringrtc.RemotePeer
++import org.thoughtcrime.securesms.service.webrtc.PendingParticipantCollection
+ 
+ /**
+  * General state of ongoing calls.
++ *
++ * @param pendingParticipants A list of pending users wishing to join a given call link.
+  */
+ data class CallInfoState(
+   var callState: WebRtcViewModel.State = WebRtcViewModel.State.IDLE,
+@@ -24,7 +27,8 @@ data class CallInfoState(
+   @get:JvmName("getGroupCallState") var groupState: WebRtcViewModel.GroupCallState = WebRtcViewModel.GroupCallState.IDLE,
+   var identityChangedRecipients: MutableSet<RecipientId> = mutableSetOf(),
+   var remoteDevicesCount: OptionalLong = OptionalLong.empty(),
+-  var participantLimit: Long? = null
++  var participantLimit: Long? = null,
++  var pendingParticipants: PendingParticipantCollection = PendingParticipantCollection()
+ ) {
+ 
+   val remoteCallParticipants: List<CallParticipant>
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/state/WebRtcServiceStateBuilder.java b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/state/WebRtcServiceStateBuilder.java
+index 67f08b001b6..f5136d8e938 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/state/WebRtcServiceStateBuilder.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/state/WebRtcServiceStateBuilder.java
+@@ -23,6 +23,7 @@
+ import org.webrtc.PeerConnection;
+ 
+ import java.util.Collection;
++import java.util.List;
+ import java.util.Set;
+ 
+ /**
+@@ -342,5 +343,20 @@ public CallInfoStateBuilder() {
+       toBuild.setParticipantLimit(participantLimit);
+       return this;
+     }
++
++    public @NonNull CallInfoStateBuilder setPendingParticipants(@NonNull List<Recipient> pendingParticipants) {
++      toBuild.setPendingParticipants(toBuild.getPendingParticipants().withRecipients(pendingParticipants));
++      return this;
++    }
++
++    public @NonNull CallInfoStateBuilder setPendingParticipantApproved(@NonNull Recipient participant) {
++      toBuild.setPendingParticipants(toBuild.getPendingParticipants().withApproval(participant));
++      return this;
++    }
++
++    public @NonNull CallInfoStateBuilder setPendingParticipantRejected(@NonNull Recipient participant) {
++      toBuild.setPendingParticipants(toBuild.getPendingParticipants().withDenial(participant));
++      return this;
++    }
+   }
+ }
+diff --git a/app/src/main/res/drawable/ic_deny_28_tinted.xml b/app/src/main/res/drawable/ic_deny_28_tinted.xml
+index 986e7d10362..226635b692e 100644
+--- a/app/src/main/res/drawable/ic_deny_28_tinted.xml
++++ b/app/src/main/res/drawable/ic_deny_28_tinted.xml
+@@ -1,5 +1,4 @@
+-<vector xmlns:android="http://schemas.android.com/apk/res/android"
+-    android:width="28dp"
++<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="28dp"
+     android:height="28dp"
+     android:viewportWidth="28"
+     android:viewportHeight="28">
+diff --git a/app/src/main/res/drawable/symbol_check_bold_24.xml b/app/src/main/res/drawable/symbol_check_bold_24.xml
+new file mode 100644
+index 00000000000..90257afa8d1
+--- /dev/null
++++ b/app/src/main/res/drawable/symbol_check_bold_24.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:fillColor="#FF000000"
++        android:pathData="M19.04 5.16c0.46 0.3 0.6 0.91 0.3 1.38l-8.32 13c-0.17 0.27-0.47 0.44-0.8 0.46C9.9 20 9.6 19.87 9.4 19.62l-4.68-5.98c-0.34-0.44-0.26-1.07 0.17-1.4 0.44-0.35 1.07-0.27 1.4 0.16l3.82 4.87 7.56-11.8c0.3-0.47 0.91-0.61 1.38-0.31Z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/symbol_check_compact_bold_16.xml b/app/src/main/res/drawable/symbol_check_compact_bold_16.xml
+new file mode 100644
+index 00000000000..c7ed04cf9cd
+--- /dev/null
++++ b/app/src/main/res/drawable/symbol_check_compact_bold_16.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="16dp"
++    android:height="16dp"
++    android:viewportWidth="16"
++    android:viewportHeight="16">
++    <path
++        android:fillColor="#FF000000"
++        android:pathData="M13.15 2.87c0.35 0.22 0.46 0.68 0.23 1.03l-6 9.5c-0.13 0.2-0.35 0.34-0.6 0.35-0.24 0.01-0.47-0.1-0.62-0.29l-3.5-4.5c-0.26-0.33-0.2-0.8 0.13-1.05 0.33-0.26 0.8-0.2 1.05 0.13L6.7 11.7l5.43-8.6c0.22-0.35 0.68-0.46 1.03-0.23Z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/symbol_x_bold_24.xml b/app/src/main/res/drawable/symbol_x_bold_24.xml
+new file mode 100644
+index 00000000000..e993fa77054
+--- /dev/null
++++ b/app/src/main/res/drawable/symbol_x_bold_24.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:fillColor="#FF000000"
++        android:pathData="M18.7 6.7c0.4-0.38 0.4-1.02 0-1.4-0.38-0.4-1.02-0.4-1.4 0L12 10.58l-5.3-5.3C6.33 4.9 5.69 4.9 5.3 5.3c-0.4 0.4-0.4 1.03 0 1.42L10.58 12l-5.3 5.3c-0.39 0.38-0.39 1.02 0 1.4 0.4 0.4 1.03 0.4 1.42 0L12 13.42l5.3 5.3c0.38 0.39 1.02 0.39 1.4 0 0.4-0.4 0.4-1.03 0-1.42L13.42 12l5.3-5.3Z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/symbol_x_compact_bold_16.xml b/app/src/main/res/drawable/symbol_x_compact_bold_16.xml
+new file mode 100644
+index 00000000000..aa3b09a0c20
+--- /dev/null
++++ b/app/src/main/res/drawable/symbol_x_compact_bold_16.xml
+@@ -0,0 +1,9 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="16dp"
++    android:height="16dp"
++    android:viewportWidth="16"
++    android:viewportHeight="16">
++    <path
++        android:fillColor="#FF000000"
++        android:pathData="M4.53 3.47c-0.3-0.3-0.77-0.3-1.06 0-0.3 0.3-0.3 0.77 0 1.06L6.94 8l-3.47 3.47c-0.3 0.3-0.3 0.77 0 1.06 0.3 0.3 0.77 0.3 1.06 0L8 9.06l3.47 3.47c0.3 0.3 0.77 0.3 1.06 0 0.3-0.3 0.3-0.77 0-1.06L9.06 8l3.47-3.47c0.3-0.3 0.3-0.77 0-1.06-0.3-0.3-0.77-0.3-1.06 0L8 6.94 4.53 3.47Z"/>
++</vector>
+diff --git a/app/src/main/res/layout/call_screen_pending_participants_view.xml b/app/src/main/res/layout/call_screen_pending_participants_view.xml
+new file mode 100644
+index 00000000000..d66d1c03078
+--- /dev/null
++++ b/app/src/main/res/layout/call_screen_pending_participants_view.xml
+@@ -0,0 +1,14 @@
++<?xml version="1.0" encoding="utf-8"?><!--
++  ~ Copyright 2023 Signal Messenger, LLC
++  ~ SPDX-License-Identifier: AGPL-3.0-only
++  -->
++<org.thoughtcrime.securesms.components.webrtc.PendingParticipantsView xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:layout_marginHorizontal="24dp"
++    android:layout_marginBottom="32dp"
++    android:minHeight="72dp"
++    app:cardBackgroundColor="@color/signal_colorSurface3"
++    app:cardCornerRadius="18dp"
++    app:cardElevation="0dp" />
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/pending_participant_view.xml b/app/src/main/res/layout/pending_participant_view.xml
+new file mode 100644
+index 00000000000..6c038072c3c
+--- /dev/null
++++ b/app/src/main/res/layout/pending_participant_view.xml
+@@ -0,0 +1,130 @@
++<?xml version="1.0" encoding="utf-8"?><!--
++  ~ Copyright 2023 Signal Messenger, LLC
++  ~ SPDX-License-Identifier: AGPL-3.0-only
++  -->
++<merge xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:minHeight="72dp"
++    app:cardBackgroundColor="@color/signal_colorSurface3"
++    app:cardCornerRadius="18dp"
++    app:cardElevation="0dp"
++    tools:layout_marginHorizontal="24dp"
++    tools:parentTag="com.google.android.material.card.MaterialCardView">
++
++    <androidx.constraintlayout.widget.ConstraintLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:minHeight="72dp">
++
++        <org.thoughtcrime.securesms.components.AvatarImageView
++            android:id="@+id/pending_participants_avatar"
++            android:layout_width="48dp"
++            android:layout_height="48dp"
++            android:layout_marginStart="12dp"
++            android:layout_marginTop="12dp"
++            app:layout_constraintStart_toStartOf="parent"
++            app:layout_constraintTop_toTopOf="parent"
++            tools:background="@color/red_100" />
++
++        <org.thoughtcrime.securesms.components.emoji.EmojiTextView
++            android:id="@+id/pending_participants_name"
++            android:layout_width="0dp"
++            android:layout_height="wrap_content"
++            android:layout_marginStart="8dp"
++            android:textAppearance="@style/Signal.Text.TitleSmall"
++            android:textColor="@color/signal_colorOnSurface"
++            app:layout_constraintBottom_toTopOf="@id/pending_participants_status"
++            app:layout_constraintStart_toEndOf="@id/pending_participants_avatar"
++            app:layout_constraintTop_toTopOf="@id/pending_participants_avatar"
++            app:layout_constraintVertical_chainStyle="packed"
++            tools:text="Candice" />
++
++        <TextView
++            android:id="@+id/pending_participants_status"
++            android:layout_width="0dp"
++            android:layout_height="wrap_content"
++            android:layout_marginStart="8dp"
++            android:text="@string/PendingParticipantsView__would_like_to_join"
++            android:textAppearance="@style/Signal.Text.BodyMedium"
++            android:textColor="@color/signal_colorOnSurfaceVariant"
++            app:layout_constraintBottom_toBottomOf="@id/pending_participants_avatar"
++            app:layout_constraintStart_toEndOf="@id/pending_participants_avatar"
++            app:layout_constraintTop_toBottomOf="@id/pending_participants_name" />
++
++        <com.google.android.material.imageview.ShapeableImageView
++            android:id="@+id/pending_participants_reject"
++            android:layout_width="48dp"
++            android:layout_height="48dp"
++            android:layout_marginTop="12dp"
++            android:layout_marginEnd="8dp"
++            android:background="@color/webrtc_hangup_background"
++            android:padding="6dp"
++            android:tint="@color/core_white"
++            app:contentPadding="8dp"
++            app:layout_constraintEnd_toStartOf="@id/pending_participants_allow"
++            app:layout_constraintTop_toTopOf="parent"
++            app:shapeAppearanceOverlay="@style/ShapeAppearanceOverlay.Signal.Circle"
++            app:srcCompat="@drawable/symbol_x_24" />
++
++        <com.google.android.material.imageview.ShapeableImageView
++            android:id="@+id/pending_participants_allow"
++            android:layout_width="48dp"
++            android:layout_height="48dp"
++            android:layout_marginTop="12dp"
++            android:layout_marginEnd="6dp"
++            android:background="@color/signal_accent_green"
++            android:padding="6dp"
++            android:tint="@color/core_white"
++            app:contentPadding="8dp"
++            app:layout_constraintEnd_toEndOf="parent"
++            app:layout_constraintTop_toTopOf="parent"
++            app:shapeAppearanceOverlay="@style/ShapeAppearanceOverlay.Signal.Circle"
++            app:srcCompat="@drawable/symbol_check_24" />
++
++        <androidx.constraintlayout.widget.Barrier
++            android:id="@+id/pending_participants_barrier"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            app:barrierDirection="bottom"
++            app:barrierMargin="12dp"
++            app:constraint_referenced_ids="pending_participants_avatar,pending_participants_status,pending_participants_allow,pending_participants_reject" />
++
++        <View
++            android:id="@+id/pending_participants_requests_backdrop"
++            android:layout_width="0dp"
++            android:layout_height="0dp"
++            android:background="@color/signal_colorSurface5"
++            app:layout_constraintBottom_toBottomOf="parent"
++            app:layout_constraintEnd_toEndOf="parent"
++            app:layout_constraintStart_toStartOf="parent"
++            app:layout_constraintTop_toBottomOf="@id/pending_participants_barrier" />
++
++        <com.google.android.material.button.MaterialButton
++            android:id="@+id/pending_participants_requests"
++            style="@style/Signal.Widget.Button.Small.Secondary"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="8dp"
++            android:layout_marginBottom="8dp"
++            android:textColor="@color/signal_colorOnSecondaryContainer"
++            app:backgroundTint="@color/signal_colorSecondaryContainer"
++            app:layout_constraintBottom_toBottomOf="parent"
++            app:layout_constraintEnd_toEndOf="parent"
++            app:layout_constraintStart_toStartOf="parent"
++            app:layout_constraintTop_toBottomOf="@id/pending_participants_barrier"
++            tools:text="+5 requests" />
++
++        <androidx.constraintlayout.widget.Group
++            android:id="@+id/pending_participants_requests_group"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:visibility="gone"
++            app:constraint_referenced_ids="pending_participants_requests,pending_participants_requests_backdrop"
++            tools:visibility="visible" />
++
++    </androidx.constraintlayout.widget.ConstraintLayout>
++
++</merge>
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/webrtc_call_view.xml b/app/src/main/res/layout/webrtc_call_view.xml
+index 1f3b6b08fe7..5ba0cc63880 100644
+--- a/app/src/main/res/layout/webrtc_call_view.xml
++++ b/app/src/main/res/layout/webrtc_call_view.xml
+@@ -474,6 +474,18 @@
+             app:layout_constraintEnd_toEndOf="parent"
+             app:layout_constraintStart_toStartOf="parent" />
+ 
++        <ViewStub
++            android:id="@+id/call_screen_pending_recipients"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginHorizontal="24dp"
++            android:layout_marginBottom="32dp"
++            android:inflatedId="@+id/call_screen_pending_recipients_view"
++            android:layout="@layout/call_screen_pending_participants_view"
++            app:layout_constraintBottom_toTopOf="@id/call_screen_footer_gradient_barrier"
++            app:layout_constraintEnd_toEndOf="parent"
++            app:layout_constraintStart_toStartOf="parent" />
++
+         <androidx.constraintlayout.widget.Barrier
+             android:id="@+id/call_screen_footer_gradient_barrier"
+             android:layout_width="wrap_content"
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 30343c8779b..9a6bc5f4043 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -6193,6 +6193,27 @@
+     <!-- Body of a dialog that is displayed when we experienced a network error when looking up a username. -->
+     <string name="UsernameLinkSettings_qr_result_network_error">Experienced a network error. Please try again.</string>
+ 
++    <!-- PendingParticipantsView -->
++    <!-- Displayed in the popup card when a remote user attempts to join a call link -->
++    <string name="PendingParticipantsView__would_like_to_join">Would like to join…</string>
++    <!-- Displayed in a button on the popup card denoting that there are other pending requests to join a call link -->
++    <plurals name="PendingParticipantsView__plus_d_requests">
++        <item quantity="one">+%1$d request</item>
++        <item quantity="other">+%1$d requests</item>
++    </plurals>
++
++    <!-- PendingParticipantsBottomSheet -->
++    <!-- Title of the bottom sheet displaying requests to join the call link -->
++    <string name="PendingParticipantsBottomSheet__requests_to_join_this_call">Requests to join this call</string>
++    <!-- Subtitle of the bottom sheet denoting the total number of people waiting -->
++    <plurals name="PendingParticipantsBottomSheet__d_people_waiting">
++        <item quantity="one">%1$d person waiting</item>
++        <item quantity="other">%1$d people waiting</item>
++    </plurals>
++    <!-- Content description for rejecting a user -->
++    <string name="PendingParticipantsBottomSheet__reject">Reject</string>
++    <!-- Content desccription for confirming a user -->
++    <string name="PendingParticipantsBottomSheet__approve">Approve</string>
+ 
+     <!-- EOF -->
+ </resources>
+diff --git a/app/src/test/java/org/thoughtcrime/securesms/service/webrtc/PendingParticipantCollectionTest.kt b/app/src/test/java/org/thoughtcrime/securesms/service/webrtc/PendingParticipantCollectionTest.kt
+new file mode 100644
+index 00000000000..abae21412a2
+--- /dev/null
++++ b/app/src/test/java/org/thoughtcrime/securesms/service/webrtc/PendingParticipantCollectionTest.kt
+@@ -0,0 +1,240 @@
++/*
++ * Copyright 2023 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.service.webrtc
++
++import android.app.Application
++import org.junit.Assert.assertEquals
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.thoughtcrime.securesms.database.RecipientDatabaseTestUtils
++import org.thoughtcrime.securesms.recipients.Recipient
++import kotlin.time.Duration
++import kotlin.time.Duration.Companion.milliseconds
++
++@RunWith(RobolectricTestRunner::class)
++@Config(application = Application::class)
++class PendingParticipantCollectionTest {
++
++  private val fakeNowProvider = FakeNowProvider()
++  private val testSubject = PendingParticipantCollection(
++    participantMap = emptyMap(),
++    nowProvider = fakeNowProvider
++  )
++
++  @Test
++  fun `Given an empty collection, when I getUnresolvedPendingParticipants, then I expect an empty set`() {
++    val expected = emptySet<PendingParticipantCollection.Entry>()
++    val actual = testSubject.getUnresolvedPendingParticipants()
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given an empty collection, when I getAllPendingParticipants, then I expect an empty set`() {
++    val expected = emptySet<PendingParticipantCollection.Entry>()
++    val actual = testSubject.getAllPendingParticipants(0.milliseconds)
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given an empty collection, when I withRecipients, then I expect all recipients to be added`() {
++    val recipients = createRecipients(10)
++    val expected = (0 until 10)
++      .map {
++        PendingParticipantCollection.Entry(
++          recipient = recipients[it],
++          state = PendingParticipantCollection.State.PENDING,
++          stateChangeAt = 0.milliseconds
++        )
++      }
++      .toSet()
++
++    val actual = testSubject.withRecipients(recipients).getUnresolvedPendingParticipants()
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given a collection with 10 PENDING entries, when I getAllPendingParticipants, then I expect all entries`() {
++    val recipients = createRecipients(10)
++    val expected = (0 until 10)
++      .map {
++        PendingParticipantCollection.Entry(
++          recipient = recipients[it],
++          state = PendingParticipantCollection.State.PENDING,
++          stateChangeAt = 0.milliseconds
++        )
++      }
++      .toSet()
++
++    val actual = testSubject.withRecipients(recipients).getAllPendingParticipants(0.milliseconds)
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given a collection with 10 PENDING entries and duration in the future, when I getAllPendingParticipants, then I expect all entries`() {
++    val recipients = createRecipients(10)
++    val expected = (0 until 10)
++      .map {
++        PendingParticipantCollection.Entry(
++          recipient = recipients[it],
++          state = PendingParticipantCollection.State.PENDING,
++          stateChangeAt = 0.milliseconds
++        )
++      }
++      .toSet()
++
++    val actual = testSubject.withRecipients(recipients).getAllPendingParticipants(1.milliseconds)
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given a collection with 10 PENDING entries and duration in the past, when I getAllPendingParticipants, then I expect all entries`() {
++    fakeNowProvider.invoke()
++    val recipients = createRecipients(10)
++    val expected = (0 until 10)
++      .map {
++        PendingParticipantCollection.Entry(
++          recipient = recipients[it],
++          state = PendingParticipantCollection.State.PENDING,
++          stateChangeAt = 1.milliseconds
++        )
++      }
++      .toSet()
++
++    val actual = testSubject.withRecipients(recipients).getAllPendingParticipants(0.milliseconds)
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given an approved recipient with a state change after since, when I getAllPendingParticipants, then I expect approved recipient`() {
++    val recipients = createRecipients(2)
++    val subject = testSubject.withRecipients(recipients).withApproval(recipients[0])
++    val expected = PendingParticipantCollection.Entry(
++      recipient = recipients[0],
++      state = PendingParticipantCollection.State.APPROVED,
++      stateChangeAt = 1.milliseconds
++    )
++    val actual = subject.getAllPendingParticipants(0.milliseconds).first()
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given an approved recipient with a state change before since, when I getAllPendingParticipants, then I do not expect the approved recipient`() {
++    val recipients = createRecipients(2)
++    val subject = testSubject.withRecipients(recipients).withApproval(recipients[0])
++    val expected = PendingParticipantCollection.Entry(
++      recipient = recipients[1],
++      state = PendingParticipantCollection.State.PENDING,
++      stateChangeAt = 0.milliseconds
++    )
++    val actual = subject.getAllPendingParticipants(2.milliseconds).first()
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given an approved recipient, when I getUnresolvedPendingParticipants, then I do not expect the approved recipient`() {
++    val recipients = createRecipients(2)
++    val subject = testSubject.withRecipients(recipients).withApproval(recipients[0])
++    val expected = PendingParticipantCollection.Entry(
++      recipient = recipients[1],
++      state = PendingParticipantCollection.State.PENDING,
++      stateChangeAt = 0.milliseconds
++    )
++    val actual = subject.getUnresolvedPendingParticipants().first()
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given a denied recipient with a state change after since, when I getAllPendingParticipants, then I expect denied recipient`() {
++    val recipients = createRecipients(2)
++    val subject = testSubject.withRecipients(recipients).withDenial(recipients[0])
++    val expected = PendingParticipantCollection.Entry(
++      recipient = recipients[0],
++      state = PendingParticipantCollection.State.DENIED,
++      stateChangeAt = 1.milliseconds
++    )
++    val actual = subject.getAllPendingParticipants(0.milliseconds).first()
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given a denied recipient with a state change before since, when I getAllPendingParticipants, then I do not expect the denied recipient`() {
++    val recipients = createRecipients(2)
++    val subject = testSubject.withRecipients(recipients).withDenial(recipients[0])
++    val expected = PendingParticipantCollection.Entry(
++      recipient = recipients[1],
++      state = PendingParticipantCollection.State.PENDING,
++      stateChangeAt = 0.milliseconds
++    )
++    val actual = subject.getAllPendingParticipants(2.milliseconds).first()
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given a denied recipient, when I getUnresolvedPendingParticipants, then I do not expect the denied recipient`() {
++    val recipients = createRecipients(2)
++    val subject = testSubject.withRecipients(recipients).withDenial(recipients[0])
++    val expected = PendingParticipantCollection.Entry(
++      recipient = recipients[1],
++      state = PendingParticipantCollection.State.PENDING,
++      stateChangeAt = 0.milliseconds
++    )
++    val actual = subject.getUnresolvedPendingParticipants().first()
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given a list of PENDING, when I withRecipients with empty list, then I clear the collection`() {
++    val recipients = createRecipients(10)
++    val subject = testSubject.withRecipients(recipients).withRecipients(emptyList())
++    val expected = emptySet<PendingParticipantCollection.Entry>()
++    val actual = subject.getUnresolvedPendingParticipants()
++
++    assertEquals(expected, actual)
++  }
++
++  @Test
++  fun `Given a mixed list, when I withRecipients with empty list, then I clear the PENDINGs`() {
++    val recipients = createRecipients(2)
++    val subject = testSubject.withRecipients(recipients).withApproval(recipients[0]).withRecipients(emptyList())
++    val expected = setOf(
++      PendingParticipantCollection.Entry(
++        recipient = recipients[0],
++        state = PendingParticipantCollection.State.APPROVED,
++        stateChangeAt = 1.milliseconds
++      )
++    )
++    val actual = subject.getAllPendingParticipants(0.milliseconds)
++
++    assertEquals(expected, actual)
++  }
++
++  private fun createRecipients(count: Int): List<Recipient> {
++    return (1..count).map { RecipientDatabaseTestUtils.createRecipient() }
++  }
++
++  private class FakeNowProvider : () -> Duration {
++
++    private val nowIterator = (0 until 500).iterator()
++
++    override fun invoke(): Duration {
++      return nowIterator.next().milliseconds
++    }
++  }
++}

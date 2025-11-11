@@ -1,0 +1,267 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/backup/v2/processor/AccountDataProcessor.kt b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/processor/AccountDataProcessor.kt
+index 0abbd0cc723..cd2cdf1dcb6 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/backup/v2/processor/AccountDataProcessor.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/processor/AccountDataProcessor.kt
+@@ -15,7 +15,6 @@ import org.thoughtcrime.securesms.components.settings.app.subscription.InAppPaym
+ import org.thoughtcrime.securesms.components.settings.app.usernamelinks.UsernameQrCodeColorScheme
+ import org.thoughtcrime.securesms.database.SignalDatabase
+ import org.thoughtcrime.securesms.database.model.InAppPaymentSubscriberRecord
+-import org.thoughtcrime.securesms.database.model.databaseprotos.InAppPaymentData
+ import org.thoughtcrime.securesms.dependencies.AppDependencies
+ import org.thoughtcrime.securesms.jobs.RetrieveProfileAvatarJob
+ import org.thoughtcrime.securesms.keyvalue.PhoneNumberPrivacyValues
+@@ -41,7 +40,6 @@ object AccountDataProcessor {
+ 
+     val donationCurrency = signalStore.donationsValues.getSubscriptionCurrency(InAppPaymentSubscriberRecord.Type.DONATION)
+     val donationSubscriber = db.inAppPaymentSubscriberTable.getByCurrencyCode(donationCurrency.currencyCode, InAppPaymentSubscriberRecord.Type.DONATION)
+-    val donationLatestSubscription = db.inAppPaymentTable.getLatestInAppPaymentByType(InAppPaymentSubscriberRecord.Type.DONATION.inAppPaymentType)
+ 
+     emitter.emit(
+       Frame(
+@@ -73,7 +71,7 @@ object AccountDataProcessor {
+           donationSubscriberData = AccountData.SubscriberData(
+             subscriberId = donationSubscriber?.subscriberId?.bytes?.toByteString() ?: defaultAccountRecord.subscriberId,
+             currencyCode = donationSubscriber?.currency?.currencyCode ?: defaultAccountRecord.subscriberCurrencyCode,
+-            manuallyCancelled = donationLatestSubscription?.data?.cancellation?.reason?.let { it == InAppPaymentData.Cancellation.Reason.MANUAL } ?: SignalStore.donations.isUserManuallyCancelled()
++            manuallyCancelled = signalStore.donationsValues.isDonationSubscriptionManuallyCancelled()
+           )
+         )
+       )
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/internal/donor/InternalDonorErrorConfigurationViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/internal/donor/InternalDonorErrorConfigurationViewModel.kt
+index 8916d28658a..877ca740978 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/internal/donor/InternalDonorErrorConfigurationViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/internal/donor/InternalDonorErrorConfigurationViewModel.kt
+@@ -143,8 +143,8 @@ class InternalDonorErrorConfigurationViewModel : ViewModel() {
+   }
+ 
+   private fun handleSubscriptionExpiration(state: InternalDonorErrorConfigurationState) {
++    SignalStore.donations.updateLocalStateForLocalSubscribe(InAppPaymentSubscriberRecord.Type.DONATION)
+     SignalStore.donations.setExpiredBadge(state.selectedBadge)
+-    SignalStore.donations.clearUserManuallyCancelled()
+     handleSubscriptionPaymentFailure(state)
+   }
+ 
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/InAppPaymentsRepository.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/InAppPaymentsRepository.kt
+index f2e30684c06..1ff0b947270 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/InAppPaymentsRepository.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/InAppPaymentsRepository.kt
+@@ -53,6 +53,7 @@ import java.util.Optional
+ import kotlin.jvm.optionals.getOrNull
+ import kotlin.time.Duration
+ import kotlin.time.Duration.Companion.days
++import kotlin.time.Duration.Companion.seconds
+ 
+ /**
+  * Unifies legacy access and new access to in app payment data.
+@@ -319,18 +320,30 @@ object InAppPaymentsRepository {
+   }
+ 
+   /**
+-   * Checks if the latest subscription was manually cancelled by the user. We bias towards what the database tells us and
+-   * fall back on the SignalStore value (which is deprecated and will be removed in a future release)
++   * Checks whether the user marked subscriptions of the given type as manually cancelled.
+    */
+   @JvmStatic
+-  @WorkerThread
+   fun isUserManuallyCancelled(subscriberType: InAppPaymentSubscriberRecord.Type): Boolean {
+-    val latestSubscription = SignalDatabase.inAppPayments.getLatestInAppPaymentByType(subscriberType.inAppPaymentType)
++    return if (subscriberType == InAppPaymentSubscriberRecord.Type.DONATION) {
++      SignalStore.donations.isDonationSubscriptionManuallyCancelled()
++    } else {
++      SignalStore.donations.isBackupSubscriptionManuallyCancelled()
++    }
++  }
+ 
+-    return if (latestSubscription == null) {
+-      SignalStore.donations.isUserManuallyCancelled()
++  /**
++   * Returns the last end of period stored in the key-value store for donations, 0 for backups, used by the keep-alive job.
++   *
++   * This is safe because, at worse, we'll end up getting a 409 and skipping redemption for a badge or backups.
++   * During the keep-alive, we will insert a new InAppPayment record that will contain the proper end-of-period from the active
++   * subscription, so the next time it runs calling this method will be avoided entirely.
++   */
++  @JvmStatic
++  fun getFallbackLastEndOfPeriod(subscriberType: InAppPaymentSubscriberRecord.Type): Duration {
++    return if (subscriberType == InAppPaymentSubscriberRecord.Type.DONATION) {
++      SignalStore.donations.getLastEndOfPeriod().seconds
+     } else {
+-      latestSubscription.data.cancellation?.reason == InAppPaymentData.Cancellation.Reason.MANUAL
++      0.seconds
+     }
+   }
+ 
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversationlist/ConversationListFragment.java b/app/src/main/java/org/thoughtcrime/securesms/conversationlist/ConversationListFragment.java
+index 214acf3b690..df6096178a3 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversationlist/ConversationListFragment.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversationlist/ConversationListFragment.java
+@@ -498,14 +498,14 @@ public void onResume() {
+     boolean                            isWatermarkPriorToTimestamp        = subscriptionFailureWatermark < subscriptionFailureTimestamp;
+ 
+     if (unexpectedSubscriptionCancellation != null &&
+-        !SignalStore.donations().isUserManuallyCancelled() &&
++        !SignalStore.donations().isDonationSubscriptionManuallyCancelled() &&
+         SignalStore.donations().showCantProcessDialog() &&
+         isWatermarkPriorToTimestamp)
+     {
+       Log.w(TAG, "Displaying bottom sheet for unexpected cancellation: " + unexpectedSubscriptionCancellation, true);
+       MonthlyDonationCanceledBottomSheetDialogFragment.show(getChildFragmentManager());
+       SignalStore.donations().setUnexpectedSubscriptionCancelationWatermark(subscriptionFailureTimestamp);
+-    } else if (unexpectedSubscriptionCancellation != null && SignalStore.donations().isUserManuallyCancelled()) {
++    } else if (unexpectedSubscriptionCancellation != null && SignalStore.donations().isDonationSubscriptionManuallyCancelled()) {
+       Log.w(TAG, "Unexpected cancellation detected but not displaying dialog because user manually cancelled their subscription: " + unexpectedSubscriptionCancellation, true);
+       SignalStore.donations().setUnexpectedSubscriptionCancelationWatermark(subscriptionFailureTimestamp);
+     } else if (unexpectedSubscriptionCancellation != null && !SignalStore.donations().showCantProcessDialog()) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/InAppPaymentKeepAliveJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/InAppPaymentKeepAliveJob.kt
+index fc6cc53f75a..2860c90c499 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/InAppPaymentKeepAliveJob.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/InAppPaymentKeepAliveJob.kt
+@@ -212,7 +212,7 @@ class InAppPaymentKeepAliveJob private constructor(
+ 
+     return if (current == null) {
+       val oldInAppPayment = SignalDatabase.inAppPayments.getByLatestEndOfPeriod(type.inAppPaymentType)
+-      val oldEndOfPeriod = oldInAppPayment?.endOfPeriod ?: SignalStore.donations.getLastEndOfPeriod().seconds
++      val oldEndOfPeriod = oldInAppPayment?.endOfPeriod ?: InAppPaymentsRepository.getFallbackLastEndOfPeriod(type)
+       if (oldEndOfPeriod > endOfCurrentPeriod) {
+         warn(type, "Active subscription returned an old end-of-period. Exiting. (old: $oldEndOfPeriod, new: $endOfCurrentPeriod)")
+         return null
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/keyvalue/DonationsValues.kt b/app/src/main/java/org/thoughtcrime/securesms/keyvalue/DonationsValues.kt
+index 241fd055e77..6a4501eb786 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/keyvalue/DonationsValues.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/keyvalue/DonationsValues.kt
+@@ -57,7 +57,8 @@ class DonationsValues internal constructor(store: KeyValueStore) : SignalStoreVa
+ 
+     private const val EXPIRED_BADGE = "donation.expired.badge"
+     private const val EXPIRED_GIFT_BADGE = "donation.expired.gift.badge"
+-    private const val USER_MANUALLY_CANCELLED = "donation.user.manually.cancelled"
++    private const val USER_MANUALLY_CANCELLED_DONATION = "donation.user.manually.cancelled"
++    private const val USER_MANUALLY_CANCELLED_BACKUPS = "donation.user.manually.cancelled.backups"
+     private const val KEY_LEVEL_OPERATION_PREFIX = "donation.level.operation."
+     private const val KEY_LEVEL_HISTORY = "donation.level.history"
+     private const val DISPLAY_BADGES_ON_PROFILE = "donation.display.badges.on.profile"
+@@ -337,6 +338,9 @@ class DonationsValues internal constructor(store: KeyValueStore) : SignalStoreVa
+     putLong(KEY_LAST_KEEP_ALIVE_LAUNCH, timestamp)
+   }
+ 
++  /**
++   * Returns the last end-of-period we have tried to redeem for a badge subscription
++   */
+   fun getLastEndOfPeriod(): Long {
+     return getLong(KEY_LAST_END_OF_PERIOD_SECONDS, 0L)
+   }
+@@ -353,19 +357,12 @@ class DonationsValues internal constructor(store: KeyValueStore) : SignalStoreVa
+     return TimeUnit.SECONDS.toMillis(getLastEndOfPeriod()) > System.currentTimeMillis()
+   }
+ 
+-  @Deprecated("Use InAppPaymentsRepository.isUserManuallyCancelled instead.")
+-  fun isUserManuallyCancelled(): Boolean {
+-    return getBoolean(USER_MANUALLY_CANCELLED, false)
+-  }
+-
+-  @Deprecated("Manual cancellation is stored in InAppPayment records. We should no longer need to set this value.")
+-  fun markUserManuallyCancelled() {
+-    return putBoolean(USER_MANUALLY_CANCELLED, true)
++  fun isDonationSubscriptionManuallyCancelled(): Boolean {
++    return getBoolean(USER_MANUALLY_CANCELLED_DONATION, false)
+   }
+ 
+-  @Deprecated("Manual cancellation is stored in InAppPayment records. We no longer need to clear this value.")
+-  fun clearUserManuallyCancelled() {
+-    remove(USER_MANUALLY_CANCELLED)
++  fun isBackupSubscriptionManuallyCancelled(): Boolean {
++    return getBoolean(USER_MANUALLY_CANCELLED_BACKUPS, false)
+   }
+ 
+   fun setDisplayBadgesOnProfile(enabled: Boolean) {
+@@ -448,10 +445,10 @@ class DonationsValues internal constructor(store: KeyValueStore) : SignalStoreVa
+   fun updateLocalStateForManualCancellation(subscriberType: InAppPaymentSubscriberRecord.Type) {
+     synchronized(subscriberType) {
+       Log.d(TAG, "[updateLocalStateForManualCancellation] Clearing donation values.")
++      clearLevelOperations()
+ 
+       if (subscriberType == InAppPaymentSubscriberRecord.Type.DONATION) {
+         setLastEndOfPeriod(0L)
+-        clearLevelOperations()
+         setUnexpectedSubscriptionCancelationChargeFailure(null)
+         unexpectedSubscriptionCancelationReason = null
+         unexpectedSubscriptionCancelationTimestamp = 0L
+@@ -464,7 +461,9 @@ class DonationsValues internal constructor(store: KeyValueStore) : SignalStoreVa
+           Log.d(TAG, "[updateLocalStateForManualCancellation] Clearing expired badge.")
+           setExpiredBadge(null)
+         }
+-        SignalStore.donations.markUserManuallyCancelled()
++        markDonationManuallyCancelled()
++      } else {
++        markBackupSubscriptionpManuallyCancelled()
+       }
+ 
+       val subscriber = InAppPaymentsRepository.getSubscriber(subscriberType)
+@@ -486,11 +485,12 @@ class DonationsValues internal constructor(store: KeyValueStore) : SignalStoreVa
+   @WorkerThread
+   fun updateLocalStateForLocalSubscribe(subscriberType: InAppPaymentSubscriberRecord.Type) {
+     synchronized(subscriberType) {
++      clearLevelOperations()
++
+       if (subscriberType == InAppPaymentSubscriberRecord.Type.DONATION) {
+         Log.d(TAG, "[updateLocalStateForLocalSubscribe] Clearing donation values.")
+ 
+-        clearUserManuallyCancelled()
+-        clearLevelOperations()
++        clearDonationManuallyCancelled()
+         setUnexpectedSubscriptionCancelationChargeFailure(null)
+         unexpectedSubscriptionCancelationReason = null
+         unexpectedSubscriptionCancelationTimestamp = 0L
+@@ -502,6 +502,8 @@ class DonationsValues internal constructor(store: KeyValueStore) : SignalStoreVa
+           Log.d(TAG, "[updateLocalStateForLocalSubscribe] Clearing expired badge.")
+           setExpiredBadge(null)
+         }
++      } else {
++        clearBackupSubscriptionManuallyCancelled()
+       }
+ 
+       val subscriber = InAppPaymentsRepository.requireSubscriber(subscriberType)
+@@ -634,4 +636,20 @@ class DonationsValues internal constructor(store: KeyValueStore) : SignalStoreVa
+       }
+     }
+   }
++
++  private fun markBackupSubscriptionpManuallyCancelled() {
++    return putBoolean(USER_MANUALLY_CANCELLED_BACKUPS, true)
++  }
++
++  private fun clearBackupSubscriptionManuallyCancelled() {
++    remove(USER_MANUALLY_CANCELLED_BACKUPS)
++  }
++
++  private fun markDonationManuallyCancelled() {
++    return putBoolean(USER_MANUALLY_CANCELLED_DONATION, true)
++  }
++
++  private fun clearDonationManuallyCancelled() {
++    remove(USER_MANUALLY_CANCELLED_DONATION)
++  }
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/logsubmit/LogSectionBadges.java b/app/src/main/java/org/thoughtcrime/securesms/logsubmit/LogSectionBadges.java
+index 747d1c4642a..2df27241489 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/logsubmit/LogSectionBadges.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/logsubmit/LogSectionBadges.java
+@@ -43,7 +43,9 @@ final class LogSectionBadges implements LogSection {
+                                 .append("InAppPaymentData.Error          : ").append(getError(latestRecurringDonation.getData())).append("\n")
+                                 .append("InAppPaymentData.Cancellation   : ").append(getCancellation(latestRecurringDonation.getData())).append("\n")
+                                 .append("DisplayBadgesOnProfile          : ").append(SignalStore.donations().getDisplayBadgesOnProfile()).append("\n")
+-                                .append("ShouldCancelBeforeNextAttempt   : ").append(InAppPaymentsRepository.getShouldCancelSubscriptionBeforeNextSubscribeAttempt(InAppPaymentSubscriberRecord.Type.DONATION)).append("\n");
++                                .append("ShouldCancelBeforeNextAttempt   : ").append(InAppPaymentsRepository.getShouldCancelSubscriptionBeforeNextSubscribeAttempt(InAppPaymentSubscriberRecord.Type.DONATION)).append("\n")
++                                .append("IsUserManuallyCancelledDonation : ").append(SignalStore.donations().isDonationSubscriptionManuallyCancelled()).append("\n");
++
+     } else {
+       return new StringBuilder().append("Badge Count                             : ").append(Recipient.self().getBadges().size()).append("\n")
+                                 .append("ExpiredBadge                            : ").append(SignalStore.donations().getExpiredBadge() != null).append("\n")
+@@ -52,7 +54,7 @@ final class LogSectionBadges implements LogSection {
+                                 .append("SubscriptionEndOfPeriodConversionStarted: ").append(SignalStore.donations().getSubscriptionEndOfPeriodConversionStarted()).append("\n")
+                                 .append("SubscriptionEndOfPeriodRedemptionStarted: ").append(SignalStore.donations().getSubscriptionEndOfPeriodRedemptionStarted()).append("\n")
+                                 .append("SubscriptionEndOfPeriodRedeemed         : ").append(SignalStore.donations().getSubscriptionEndOfPeriodRedeemed()).append("\n")
+-                                .append("IsUserManuallyCancelled                 : ").append(SignalStore.donations().isUserManuallyCancelled()).append("\n")
++                                .append("IsUserManuallyCancelledDonation         : ").append(SignalStore.donations().isDonationSubscriptionManuallyCancelled()).append("\n")
+                                 .append("DisplayBadgesOnProfile                  : ").append(SignalStore.donations().getDisplayBadgesOnProfile()).append("\n")
+                                 .append("SubscriptionRedemptionFailed            : ").append(SignalStore.donations().getSubscriptionRedemptionFailed()).append("\n")
+                                 .append("ShouldCancelBeforeNextAttempt           : ").append(SignalStore.donations().getShouldCancelSubscriptionBeforeNextSubscribeAttempt()).append("\n")

@@ -1,0 +1,821 @@
+diff --git a/android-components/components/browser/engine-gecko-nightly/src/main/java/mozilla/components/browser/engine/gecko/GeckoEngineView.kt b/android-components/components/browser/engine-gecko-nightly/src/main/java/mozilla/components/browser/engine/gecko/GeckoEngineView.kt
+index 038a0d9fd491..14f06596c125 100644
+--- a/android-components/components/browser/engine-gecko-nightly/src/main/java/mozilla/components/browser/engine/gecko/GeckoEngineView.kt
++++ b/android-components/components/browser/engine-gecko-nightly/src/main/java/mozilla/components/browser/engine/gecko/GeckoEngineView.kt
+@@ -90,13 +90,6 @@ class GeckoEngineView @JvmOverloads constructor(
+     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+     internal var currentSelection: BasicSelectionActionDelegate? = null
+ 
+-    /**
+-     * Cache of the last valid input result we got from GeckoView.
+-     */
+-    @Suppress("Deprecation")
+-    @VisibleForTesting
+-    internal var lastInputResult: EngineView.InputResult = EngineView.InputResult.INPUT_RESULT_UNHANDLED
+-
+     override var selectionActionDelegate: SelectionActionDelegate? = null
+ 
+     init {
+@@ -175,25 +168,7 @@ class GeckoEngineView @JvmOverloads constructor(
+     override fun canScrollVerticallyDown() =
+         true // waiting for this issue https://bugzilla.mozilla.org/show_bug.cgi?id=1507569
+ 
+-    @Suppress("MagicNumber", "Deprecation")
+-    override fun getInputResult(): EngineView.InputResult {
+-        // Direct mapping of GeckoView's returned values.
+-        // If not fail fast to allow for a quick fix.
+-        val input = geckoView.inputResult
+-        lastInputResult = when (input) {
+-            0 -> EngineView.InputResult.INPUT_RESULT_UNHANDLED
+-            1 -> EngineView.InputResult.INPUT_RESULT_HANDLED
+-            2 -> EngineView.InputResult.INPUT_RESULT_HANDLED_CONTENT
+-            3 -> {
+-                // Drop this result and return the previous.
+-                // See https://bugzilla.mozilla.org/show_bug.cgi?id=1687430 for details
+-                lastInputResult
+-            }
+-            else -> throw IllegalArgumentException("Unexpected geckoView.inputResult: \"$input\"")
+-        }
+-
+-        return lastInputResult
+-    }
++    override fun getInputResultDetail() = geckoView.inputResultDetail
+ 
+     override fun setVerticalClipping(clippingHeight: Int) {
+         geckoView.setVerticalClipping(clippingHeight)
+diff --git a/android-components/components/browser/engine-gecko-nightly/src/main/java/mozilla/components/browser/engine/gecko/NestedGeckoView.kt b/android-components/components/browser/engine-gecko-nightly/src/main/java/mozilla/components/browser/engine/gecko/NestedGeckoView.kt
+index a1ba885563ab..25b32c6963e4 100644
+--- a/android-components/components/browser/engine-gecko-nightly/src/main/java/mozilla/components/browser/engine/gecko/NestedGeckoView.kt
++++ b/android-components/components/browser/engine-gecko-nightly/src/main/java/mozilla/components/browser/engine/gecko/NestedGeckoView.kt
+@@ -10,10 +10,8 @@ import androidx.annotation.VisibleForTesting
+ import androidx.core.view.NestedScrollingChild
+ import androidx.core.view.NestedScrollingChildHelper
+ import androidx.core.view.ViewCompat
+-import mozilla.components.concept.engine.EngineView
++import mozilla.components.concept.engine.InputResultDetail
+ import org.mozilla.geckoview.GeckoView
+-import org.mozilla.geckoview.PanZoomController.INPUT_RESULT_HANDLED
+-import org.mozilla.geckoview.PanZoomController.INPUT_RESULT_UNHANDLED
+ 
+ /**
+  * geckoView that supports nested scrolls (for using in a CoordinatorLayout).
+@@ -44,11 +42,11 @@ open class NestedGeckoView(context: Context) : GeckoView(context), NestedScrolli
+     internal var childHelper: NestedScrollingChildHelper = NestedScrollingChildHelper(this)
+ 
+     /**
+-     * Integer indicating how user's MotionEvent was handled.
++     * How user's MotionEvent will be handled.
+      *
+-     * There must be a 1-1 relation between this values and [EngineView.InputResult]'s.
++     * @see InputResultDetail
+      */
+-    internal var inputResult: Int = INPUT_RESULT_UNHANDLED
++    internal var inputResultDetail = InputResultDetail.newInstance(true)
+ 
+     init {
+         isNestedScrollingEnabled = true
+@@ -62,7 +60,8 @@ open class NestedGeckoView(context: Context) : GeckoView(context), NestedScrolli
+ 
+         when (action) {
+             MotionEvent.ACTION_MOVE -> {
+-                val allowScroll = !shouldPinOnScreen() && inputResult == INPUT_RESULT_HANDLED
++                val allowScroll = !shouldPinOnScreen() && inputResultDetail.isTouchHandledByBrowser()
++
+                 var deltaY = lastY - eventY
+ 
+                 if (allowScroll && dispatchNestedPreScroll(0, deltaY, scrollConsumed, scrollOffset)) {
+@@ -99,7 +98,7 @@ open class NestedGeckoView(context: Context) : GeckoView(context), NestedScrolli
+                 stopNestedScroll()
+                 // Reset handled status so that parents of this View would not get the old value
+                 // when querying it for a newly started touch event.
+-                inputResult = INPUT_RESULT_UNHANDLED
++                inputResultDetail = InputResultDetail.newInstance(true)
+             }
+         }
+ 
+@@ -121,9 +120,9 @@ open class NestedGeckoView(context: Context) : GeckoView(context), NestedScrolli
+     internal fun updateInputResult(event: MotionEvent) {
+         super.onTouchEventForDetailResult(event)
+             .accept {
+-                // This should never be null.
+-                // Prefer to crash and investigate after rather than not knowing about problems with this.
+-                inputResult = it?.handledResult()!!
++                inputResultDetail = inputResultDetail.copy(
++                    it?.handledResult(), it?.scrollableDirections(), it?.overscrollDirections()
++                )
+                 startNestedScroll(ViewCompat.SCROLL_AXIS_VERTICAL)
+             }
+     }
+diff --git a/android-components/components/browser/engine-gecko-nightly/src/test/java/mozilla/components/browser/engine/gecko/GeckoEngineViewTest.kt b/android-components/components/browser/engine-gecko-nightly/src/test/java/mozilla/components/browser/engine/gecko/GeckoEngineViewTest.kt
+index 37288c748cd3..6d99f123e351 100644
+--- a/android-components/components/browser/engine-gecko-nightly/src/test/java/mozilla/components/browser/engine/gecko/GeckoEngineViewTest.kt
++++ b/android-components/components/browser/engine-gecko-nightly/src/test/java/mozilla/components/browser/engine/gecko/GeckoEngineViewTest.kt
+@@ -12,7 +12,6 @@ import android.view.View
+ import androidx.test.ext.junit.runners.AndroidJUnit4
+ import mozilla.components.browser.engine.gecko.GeckoEngineView.Companion.DARK_COVER
+ import mozilla.components.browser.engine.gecko.selection.GeckoSelectionActionDelegate
+-import mozilla.components.concept.engine.EngineView
+ import mozilla.components.concept.engine.mediaquery.PreferredColorScheme
+ import mozilla.components.concept.engine.selection.SelectionActionDelegate
+ import mozilla.components.support.test.argumentCaptor
+@@ -22,6 +21,7 @@ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertNotNull
+ import org.junit.Assert.assertNull
++import org.junit.Assert.assertSame
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ import org.junit.runner.RunWith
+@@ -278,55 +278,11 @@ class GeckoEngineViewTest {
+         assertFalse(engineView.canClearSelection())
+     }
+ 
+-    @Suppress("Deprecation")
+     @Test
+-    fun `currentInputResult should default to EngineView#InputResult#INPUT_RESULT_UNHANDLED`() {
++    fun `GIVEN a GeckoView WHEN EngineView returns the InputResultDetail THEN the value from the GeckoView is used`() {
+         val engineView = GeckoEngineView(context)
++        val geckoview = engineView.geckoView
+ 
+-        assertEquals(EngineView.InputResult.INPUT_RESULT_UNHANDLED, engineView.lastInputResult)
+-    }
+-
+-    @Suppress("Deprecation")
+-    @Test
+-    fun `getInputResult should do a 1-1 mapping of the values received from GeckoView and cache the result`() {
+-        val engineView = GeckoEngineView(context)
+-        engineView.geckoView = mock()
+-
+-        whenever(engineView.geckoView.inputResult).thenReturn(0)
+-        assertEquals(EngineView.InputResult.INPUT_RESULT_UNHANDLED, engineView.getInputResult())
+-        assertEquals(EngineView.InputResult.INPUT_RESULT_UNHANDLED, engineView.lastInputResult)
+-
+-        whenever(engineView.geckoView.inputResult).thenReturn(1)
+-        assertEquals(EngineView.InputResult.INPUT_RESULT_HANDLED, engineView.getInputResult())
+-        assertEquals(EngineView.InputResult.INPUT_RESULT_HANDLED, engineView.lastInputResult)
+-
+-        whenever(engineView.geckoView.inputResult).thenReturn(2)
+-        assertEquals(EngineView.InputResult.INPUT_RESULT_HANDLED_CONTENT, engineView.getInputResult())
+-        assertEquals(EngineView.InputResult.INPUT_RESULT_HANDLED_CONTENT, engineView.lastInputResult)
+-    }
+-
+-    @Suppress("Deprecation")
+-    @Test
+-    fun `INPUT_RESULD_IGNORED should be ignored`() {
+-        val engineView = GeckoEngineView(context)
+-        engineView.geckoView = mock()
+-
+-        whenever(engineView.geckoView.inputResult).thenReturn(1)
+-        assertEquals(EngineView.InputResult.INPUT_RESULT_HANDLED, engineView.getInputResult())
+-        assertEquals(EngineView.InputResult.INPUT_RESULT_HANDLED, engineView.lastInputResult)
+-
+-        whenever(engineView.geckoView.inputResult).thenReturn(3)
+-        assertEquals(EngineView.InputResult.INPUT_RESULT_HANDLED, engineView.getInputResult())
+-        assertEquals(EngineView.InputResult.INPUT_RESULT_HANDLED, engineView.lastInputResult)
+-    }
+-
+-    @Suppress("Deprecation")
+-    @Test(expected = IllegalArgumentException::class)
+-    fun `Values other than 0, 1, 2, 3 received as input results from GeckoView should throw`() {
+-        val engineView = GeckoEngineView(context)
+-        engineView.geckoView = mock()
+-
+-        whenever(engineView.geckoView.inputResult).thenReturn(4)
+-        engineView.getInputResult()
++        assertSame(geckoview.inputResultDetail, engineView.getInputResultDetail())
+     }
+ }
+diff --git a/android-components/components/browser/engine-gecko-nightly/src/test/java/mozilla/components/browser/engine/gecko/NestedGeckoViewTest.kt b/android-components/components/browser/engine-gecko-nightly/src/test/java/mozilla/components/browser/engine/gecko/NestedGeckoViewTest.kt
+index a9b9a91273ff..b5d95681bc17 100644
+--- a/android-components/components/browser/engine-gecko-nightly/src/test/java/mozilla/components/browser/engine/gecko/NestedGeckoViewTest.kt
++++ b/android-components/components/browser/engine-gecko-nightly/src/test/java/mozilla/components/browser/engine/gecko/NestedGeckoViewTest.kt
+@@ -19,6 +19,7 @@ import mozilla.components.support.test.argumentCaptor
+ import mozilla.components.support.test.mock
+ import mozilla.components.support.test.mockMotionEvent
+ import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ import org.junit.runner.RunWith
+@@ -28,7 +29,6 @@ import org.mockito.Mockito.spy
+ import org.mockito.Mockito.times
+ import org.mockito.Mockito.verify
+ import org.mozilla.geckoview.PanZoomController.INPUT_RESULT_HANDLED
+-import org.mozilla.geckoview.PanZoomController.INPUT_RESULT_UNHANDLED
+ import org.robolectric.Robolectric.buildActivity
+ 
+ @RunWith(AndroidJUnit4::class)
+@@ -97,7 +97,7 @@ class NestedGeckoViewTest {
+         val nestedWebView = spy(NestedGeckoView(context))
+         val mockChildHelper: NestedScrollingChildHelper = mock()
+         nestedWebView.childHelper = mockChildHelper
+-        nestedWebView.inputResult = INPUT_RESULT_HANDLED
++        nestedWebView.inputResultDetail = nestedWebView.inputResultDetail.copy(INPUT_RESULT_HANDLED)
+         doReturn(true).`when`(nestedWebView).callSuperOnTouchEvent(any())
+ 
+         doReturn(true).`when`(mockChildHelper).dispatchNestedPreScroll(
+@@ -127,19 +127,23 @@ class NestedGeckoViewTest {
+     @Test
+     fun `verify onTouchEvent when ACTION_UP or ACTION_CANCEL`() {
+         val nestedWebView = spy(NestedGeckoView(context))
+-        nestedWebView.inputResult = INPUT_RESULT_HANDLED
++        nestedWebView.inputResultDetail = nestedWebView.inputResultDetail.copy(INPUT_RESULT_HANDLED)
+         val mockChildHelper: NestedScrollingChildHelper = mock()
+         nestedWebView.childHelper = mockChildHelper
+         doReturn(true).`when`(nestedWebView).callSuperOnTouchEvent(any())
+ 
+         nestedWebView.onTouchEvent(mockMotionEvent(ACTION_UP))
+         verify(mockChildHelper).stopNestedScroll()
+-        assertEquals(INPUT_RESULT_UNHANDLED, nestedWebView.inputResult)
++        // ACTION_UP should call "inputResultDetail.reset()". Test that call's effect.
++        assertTrue(nestedWebView.inputResultDetail.isTouchUnhandled())
++        assertFalse(nestedWebView.inputResultDetail.isTouchHandledByBrowser())
+ 
+-        nestedWebView.inputResult = INPUT_RESULT_HANDLED
++        nestedWebView.inputResultDetail = nestedWebView.inputResultDetail.copy(INPUT_RESULT_HANDLED)
+         nestedWebView.onTouchEvent(mockMotionEvent(ACTION_CANCEL))
+         verify(mockChildHelper, times(2)).stopNestedScroll()
+-        assertEquals(INPUT_RESULT_UNHANDLED, nestedWebView.inputResult)
++        // ACTION_CANCEL should call "inputResultDetail.reset()". Test that call's effect.
++        assertTrue(nestedWebView.inputResultDetail.isTouchUnhandled())
++        assertFalse(nestedWebView.inputResultDetail.isTouchHandledByBrowser())
+ 
+         // onTouchEventForResult should be called only for ACTION_DOWN
+         verify(nestedWebView, times(0)).updateInputResult(any())
+diff --git a/android-components/components/browser/engine-system/src/main/java/mozilla/components/browser/engine/system/NestedWebView.kt b/android-components/components/browser/engine-system/src/main/java/mozilla/components/browser/engine/system/NestedWebView.kt
+index 50a4bbd3315a..0bb5e8a54c47 100644
+--- a/android-components/components/browser/engine-system/src/main/java/mozilla/components/browser/engine/system/NestedWebView.kt
++++ b/android-components/components/browser/engine-system/src/main/java/mozilla/components/browser/engine/system/NestedWebView.kt
+@@ -6,18 +6,20 @@ package mozilla.components.browser.engine.system
+ 
+ import android.annotation.SuppressLint
+ import android.content.Context
+-import androidx.core.view.NestedScrollingChild
+-import androidx.core.view.NestedScrollingChildHelper
+ import android.view.MotionEvent
+-import android.view.MotionEvent.ACTION_MOVE
++import android.view.MotionEvent.ACTION_CANCEL
+ import android.view.MotionEvent.ACTION_DOWN
++import android.view.MotionEvent.ACTION_MOVE
+ import android.view.MotionEvent.ACTION_UP
+-import android.view.MotionEvent.ACTION_CANCEL
+ import android.view.MotionEvent.obtain
+ import android.webkit.WebView
+ import androidx.annotation.VisibleForTesting
++import androidx.core.view.NestedScrollingChild
++import androidx.core.view.NestedScrollingChildHelper
+ import androidx.core.view.ViewCompat
+-import mozilla.components.concept.engine.EngineView
++import mozilla.components.concept.engine.INPUT_HANDLED
++import mozilla.components.concept.engine.INPUT_UNHANDLED
++import mozilla.components.concept.engine.InputResultDetail
+ 
+ /**
+  * WebView that supports nested scrolls (for using in a CoordinatorLayout).
+@@ -46,18 +48,12 @@ class NestedWebView(context: Context) : WebView(context), NestedScrollingChild {
+     internal var childHelper: NestedScrollingChildHelper = NestedScrollingChildHelper(this)
+ 
+     /**
+-     * Integer indicating how user's MotionEvent was handled.
++     * How user's MotionEvent will be handled.
+      *
+-     * There must be a 1-1 relation between this values and [EngineView.InputResult]'s.
+-     */
+-    @Suppress("Deprecation")
+-    internal val inputResult: Int
+-        get() = getInputResult(eventHandled)
+-
+-    /**
+-     * Holder for if the previous [android.view.MotionEvent] was handled by us or not.
++     * @see InputResultDetail
+      */
+-    private var eventHandled: Boolean = false
++    @VisibleForTesting
++    internal var inputResultDetail = InputResultDetail.newInstance()
+ 
+     init {
+         isNestedScrollingEnabled = true
+@@ -104,7 +100,8 @@ class NestedWebView(context: Context) : WebView(context), NestedScrollingChild {
+         }
+ 
+         // Execute event handler from parent class in all cases
+-        eventHandled = super.onTouchEvent(event)
++        val eventHandled = callSuperOnTouchEvent(event)
++        updateInputResult(eventHandled)
+ 
+         // Recycle previously obtained event
+         event.recycle()
+@@ -112,6 +109,11 @@ class NestedWebView(context: Context) : WebView(context), NestedScrollingChild {
+         return eventHandled
+     }
+ 
++    @VisibleForTesting
++    internal fun callSuperOnTouchEvent(event: MotionEvent): Boolean {
++        return super.onTouchEvent(event)
++    }
++
+     // NestedScrollingChild
+ 
+     override fun setNestedScrollingEnabled(enabled: Boolean) {
+@@ -156,12 +158,14 @@ class NestedWebView(context: Context) : WebView(context), NestedScrollingChild {
+         return childHelper.dispatchNestedPreFling(velocityX, velocityY)
+     }
+ 
+-    @Suppress("Deprecation")
+-    private fun getInputResult(eventHandled: Boolean): Int {
+-        return if (eventHandled) {
+-            EngineView.InputResult.INPUT_RESULT_HANDLED.value
+-        } else {
+-            EngineView.InputResult.INPUT_RESULT_UNHANDLED.value
+-        }
++    @VisibleForTesting
++    internal fun updateInputResult(eventHandled: Boolean) {
++        inputResultDetail = inputResultDetail.copy(
++            if (eventHandled) {
++                INPUT_HANDLED
++            } else {
++                INPUT_UNHANDLED
++            }
++        )
+     }
+ }
+diff --git a/android-components/components/browser/engine-system/src/main/java/mozilla/components/browser/engine/system/SystemEngineView.kt b/android-components/components/browser/engine-system/src/main/java/mozilla/components/browser/engine/system/SystemEngineView.kt
+index 07ba15ddc908..bc0ffc24132c 100644
+--- a/android-components/components/browser/engine-system/src/main/java/mozilla/components/browser/engine/system/SystemEngineView.kt
++++ b/android-components/components/browser/engine-system/src/main/java/mozilla/components/browser/engine/system/SystemEngineView.kt
+@@ -53,6 +53,7 @@ import mozilla.components.concept.engine.EngineSession
+ import mozilla.components.concept.engine.EngineSession.TrackingProtectionPolicy
+ import mozilla.components.concept.engine.EngineView
+ import mozilla.components.concept.engine.HitResult
++import mozilla.components.concept.engine.InputResultDetail
+ import mozilla.components.concept.engine.content.blocking.Tracker
+ import mozilla.components.concept.engine.prompt.PromptRequest
+ import mozilla.components.concept.engine.request.RequestInterceptor.InterceptionResponse
+@@ -694,15 +695,9 @@ class SystemEngineView @JvmOverloads constructor(
+ 
+     override fun canScrollVerticallyDown() = session?.webView?.canScrollVertically(1) ?: false
+ 
+-    @Suppress("Deprecation")
+-    override fun getInputResult(): EngineView.InputResult {
+-        (session?.webView as? NestedWebView)?.let { nestedWebView ->
+-            // Direct mapping of WebView's returned values.
+-            // There should be a 1-1 relation. If not fail fast to allow for a quick fix.
+-            return EngineView.InputResult.values().first { it.value == nestedWebView.inputResult }
+-        }
+-        // Let's be preventive about not knowing if user's touch was handled and say no.
+-        return EngineView.InputResult.INPUT_RESULT_UNHANDLED
++    override fun getInputResultDetail(): InputResultDetail {
++        return (session?.webView as? NestedWebView)?.inputResultDetail
++            ?: InputResultDetail.newInstance()
+     }
+ 
+     override fun captureThumbnail(onFinish: (Bitmap?) -> Unit) {
+diff --git a/android-components/components/browser/engine-system/src/test/java/mozilla/components/browser/engine/system/NestedWebViewTest.kt b/android-components/components/browser/engine-system/src/test/java/mozilla/components/browser/engine/system/NestedWebViewTest.kt
+index c2a7de532a70..61c021fb57e4 100644
+--- a/android-components/components/browser/engine-system/src/test/java/mozilla/components/browser/engine/system/NestedWebViewTest.kt
++++ b/android-components/components/browser/engine-system/src/test/java/mozilla/components/browser/engine/system/NestedWebViewTest.kt
+@@ -11,16 +11,18 @@ import android.view.MotionEvent.ACTION_UP
+ import androidx.core.view.NestedScrollingChildHelper
+ import androidx.core.view.ViewCompat.SCROLL_AXIS_VERTICAL
+ import androidx.test.ext.junit.runners.AndroidJUnit4
++import mozilla.components.support.test.any
+ import mozilla.components.support.test.mock
+ import mozilla.components.support.test.mockMotionEvent
+ import mozilla.components.support.test.robolectric.testContext
+ import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ import org.junit.runner.RunWith
+-import org.mockito.Mockito.any
+ import org.mockito.Mockito.anyInt
+ import org.mockito.Mockito.doReturn
++import org.mockito.Mockito.spy
+ import org.mockito.Mockito.times
+ import org.mockito.Mockito.verify
+ 
+@@ -113,4 +115,45 @@ class NestedWebViewTest {
+         nestedWebView.onTouchEvent(mockMotionEvent(ACTION_CANCEL))
+         verify(mockChildHelper, times(2)).stopNestedScroll()
+     }
++
++    @Test
++    fun `GIVEN NestedWebView WHEN a new instance is created THEN a properly configured InputResultDetail is created`() {
++        val nestedWebView = NestedWebView(testContext)
++
++        assertTrue(nestedWebView.inputResultDetail.isTouchUnhandled())
++        assertFalse(nestedWebView.inputResultDetail.canScrollToLeft())
++        assertFalse(nestedWebView.inputResultDetail.canScrollToTop())
++        assertFalse(nestedWebView.inputResultDetail.canScrollToRight())
++        assertFalse(nestedWebView.inputResultDetail.canScrollToBottom())
++        assertFalse(nestedWebView.inputResultDetail.canOverscrollLeft())
++        assertFalse(nestedWebView.inputResultDetail.canOverscrollTop())
++        assertFalse(nestedWebView.inputResultDetail.canOverscrollRight())
++        assertFalse(nestedWebView.inputResultDetail.canOverscrollBottom())
++    }
++
++    @Test
++    fun `GIVEN NestedWebView WHEN onTouchEvent is called THEN updateInputResult is called with the result of whether the touch is handled or not`() {
++        val nestedWebView = spy(NestedWebView(testContext))
++
++        doReturn(true).`when`(nestedWebView).callSuperOnTouchEvent(any())
++        nestedWebView.onTouchEvent(mockMotionEvent(ACTION_DOWN))
++        verify(nestedWebView).updateInputResult(true)
++
++        doReturn(false).`when`(nestedWebView).callSuperOnTouchEvent(any())
++        nestedWebView.onTouchEvent(mockMotionEvent(ACTION_DOWN))
++        verify(nestedWebView).updateInputResult(false)
++    }
++
++    @Test
++    fun `GIVEN an instance of InputResultDetail WHEN updateInputResult called THEN it sets whether the touch was handled`() {
++        val nestedWebView = NestedWebView(testContext)
++
++        assertTrue(nestedWebView.inputResultDetail.isTouchUnhandled())
++
++        nestedWebView.updateInputResult(true)
++        assertTrue(nestedWebView.inputResultDetail.isTouchHandledByBrowser())
++
++        nestedWebView.updateInputResult(false)
++        assertTrue(nestedWebView.inputResultDetail.isTouchUnhandled())
++    }
+ }
+diff --git a/android-components/components/browser/engine-system/src/test/java/mozilla/components/browser/engine/system/SystemEngineViewTest.kt b/android-components/components/browser/engine-system/src/test/java/mozilla/components/browser/engine/system/SystemEngineViewTest.kt
+index b1c9cdfd49da..e733c3af4330 100644
+--- a/android-components/components/browser/engine-system/src/test/java/mozilla/components/browser/engine/system/SystemEngineViewTest.kt
++++ b/android-components/components/browser/engine-system/src/test/java/mozilla/components/browser/engine/system/SystemEngineViewTest.kt
+@@ -36,6 +36,7 @@ import mozilla.components.concept.engine.EngineSession
+ import mozilla.components.concept.engine.EngineSession.TrackingProtectionPolicy
+ import mozilla.components.concept.engine.EngineSession.TrackingProtectionPolicy.TrackingCategory
+ import mozilla.components.concept.engine.HitResult
++import mozilla.components.concept.engine.InputResultDetail
+ import mozilla.components.concept.engine.content.blocking.Tracker
+ import mozilla.components.concept.engine.history.HistoryTrackingDelegate
+ import mozilla.components.concept.engine.permission.PermissionRequest
+@@ -58,6 +59,7 @@ import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertNotEquals
+ import org.junit.Assert.assertNotNull
+ import org.junit.Assert.assertNull
++import org.junit.Assert.assertSame
+ import org.junit.Assert.assertTrue
+ import org.junit.Assert.fail
+ import org.junit.Test
+@@ -1565,4 +1567,35 @@ class SystemEngineViewTest {
+         assertEquals(authRequest.userName, userName)
+         assertEquals(authRequest.password, password)
+     }
++
++    @Test
++    fun `GIVEN SystemEngineView WHEN getInputResultDetail is called THEN it returns the instance from webView`() {
++        val engineView = SystemEngineView(testContext)
++        val engineSession = SystemEngineSession(testContext)
++        val webView = spy(NestedWebView(testContext))
++        engineSession.webView = webView
++        engineView.render(engineSession)
++        val inputResult = InputResultDetail.newInstance()
++        doReturn(inputResult).`when`(webView).inputResultDetail
++
++        assertSame(inputResult, engineView.getInputResultDetail())
++    }
++
++    @Test
++    fun `GIVEN SystemEngineView WHEN getInputResultDetail is called THEN it returns a new default instance if not available from webView`() {
++        val engineView = spy(SystemEngineView(testContext))
++
++        val result = engineView.getInputResultDetail()
++
++        assertNotNull(result)
++        assertTrue(result.isTouchUnhandled())
++        assertFalse(result.canScrollToLeft())
++        assertFalse(result.canScrollToTop())
++        assertFalse(result.canScrollToRight())
++        assertFalse(result.canScrollToBottom())
++        assertFalse(result.canOverscrollLeft())
++        assertFalse(result.canOverscrollTop())
++        assertFalse(result.canOverscrollRight())
++        assertFalse(result.canOverscrollBottom())
++    }
+ }
+diff --git a/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/behavior/BrowserToolbarBehavior.kt b/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/behavior/BrowserToolbarBehavior.kt
+index 78349e17af1d..b00ce2a653c9 100644
+--- a/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/behavior/BrowserToolbarBehavior.kt
++++ b/android-components/components/browser/toolbar/src/main/java/mozilla/components/browser/toolbar/behavior/BrowserToolbarBehavior.kt
+@@ -77,10 +77,11 @@ class BrowserToolbarBehavior(
+      * - the website is not scrollable
+      * - the website handles the touch events itself through it's own touch event listeners.
+      */
+-    @Suppress("Deprecation")
+     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+     internal val shouldScroll: Boolean
+-        get() = engineView?.getInputResult() == EngineView.InputResult.INPUT_RESULT_HANDLED && isScrollEnabled
++        get() = engineView?.getInputResultDetail()?.let {
++                (it.canScrollToBottom() || it.canScrollToTop()) && isScrollEnabled
++            } ?: false
+ 
+     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+     internal var gesturesDetector: BrowserGestureDetector = createGestureDetector()
+@@ -233,7 +234,6 @@ class BrowserToolbarBehavior(
+             }
+         ))
+ 
+-    @Suppress("Deprecation")
+     @VisibleForTesting
+     internal fun startNestedScroll(axes: Int, type: Int, toolbar: BrowserToolbar): Boolean {
+         return if (shouldScroll && axes == ViewCompat.SCROLL_AXIS_VERTICAL) {
+@@ -241,7 +241,7 @@ class BrowserToolbarBehavior(
+             shouldSnapAfterScroll = type == ViewCompat.TYPE_TOUCH
+             yTranslator.cancelInProgressTranslation()
+             true
+-        } else if (engineView?.getInputResult() == EngineView.InputResult.INPUT_RESULT_UNHANDLED) {
++        } else if (engineView?.getInputResultDetail()?.isTouchUnhandled() == true) {
+             // Force expand the toolbar if event is unhandled, otherwise user could get stuck in a
+             // state where they cannot show the toolbar
+             yTranslator.cancelInProgressTranslation()
+diff --git a/android-components/components/browser/toolbar/src/test/java/mozilla/components/browser/toolbar/behavior/BrowserToolbarBehaviorTest.kt b/android-components/components/browser/toolbar/src/test/java/mozilla/components/browser/toolbar/behavior/BrowserToolbarBehaviorTest.kt
+index 8bedc2172964..060ec739e49b 100644
+--- a/android-components/components/browser/toolbar/src/test/java/mozilla/components/browser/toolbar/behavior/BrowserToolbarBehaviorTest.kt
++++ b/android-components/components/browser/toolbar/src/test/java/mozilla/components/browser/toolbar/behavior/BrowserToolbarBehaviorTest.kt
+@@ -17,6 +17,7 @@ import com.google.android.material.snackbar.Snackbar
+ import mozilla.components.browser.toolbar.BrowserToolbar
+ import mozilla.components.concept.engine.EngineSession
+ import mozilla.components.concept.engine.EngineView
++import mozilla.components.concept.engine.InputResultDetail
+ import mozilla.components.concept.engine.selection.SelectionActionDelegate
+ import mozilla.components.support.test.any
+ import mozilla.components.support.test.mock
+@@ -103,6 +104,29 @@ class BrowserToolbarBehaviorTest {
+         assertFalse(acceptsNestedScroll)
+     }
+ 
++    @Test
++    fun `GIVEN a gesture that doesn't scroll the toolbar WHEN startNestedScroll THEN toolbar is expanded and nested scroll not accepted`() {
++        val behavior = spy(BrowserToolbarBehavior(testContext, null, ToolbarPosition.BOTTOM))
++        val engineView: EngineView = mock()
++        val inputResultDetail: InputResultDetail = mock()
++        val yTranslator: BrowserToolbarYTranslator = mock()
++        behavior.yTranslator = yTranslator
++        doReturn(false).`when`(behavior).shouldScroll
++        doReturn(true).`when`(inputResultDetail).isTouchUnhandled()
++        behavior.engineView = engineView
++        doReturn(inputResultDetail).`when`(engineView).getInputResultDetail()
++
++        val acceptsNestedScroll = behavior.startNestedScroll(
++            axes = ViewCompat.SCROLL_AXIS_VERTICAL,
++            type = ViewCompat.TYPE_TOUCH,
++            toolbar = mock()
++        )
++
++        verify(yTranslator).cancelInProgressTranslation()
++        verify(yTranslator).expandWithAnimation(any())
++        assertFalse(acceptsNestedScroll)
++    }
++
+     @Test
+     fun `Behavior should not accept nested scrolls on the horizontal axis`() {
+         val behavior = spy(BrowserToolbarBehavior(testContext, null, ToolbarPosition.BOTTOM))
+@@ -302,74 +326,71 @@ class BrowserToolbarBehaviorTest {
+         verify(behavior).tryToScrollVertically(-100f)
+     }
+ 
+-    @Suppress("Deprecation")
+     @Test
+-    fun `Behaviour shouldScroll if EngineView handled the MotionEvent and scrolling is enabled`() {
++    fun `GIVEN a null InputResultDetail from the EngineView WHEN shouldScroll is called THEN it returns false`() {
+         val behavior = BrowserToolbarBehavior(testContext, null, ToolbarPosition.BOTTOM)
+-        val engineView: EngineView = mock()
+-        `when`(engineView.getInputResult()).thenReturn(EngineView.InputResult.INPUT_RESULT_HANDLED)
+-        behavior.engineView = engineView
+-        behavior.isScrollEnabled = true
+-
+-        assertTrue(behavior.shouldScroll)
+-    }
+-
+-    @Suppress("Deprecation")
+-    @Test
+-    fun `Behaviour !shouldScroll if EngineView handled the MotionEvent and scrolling is !enabled`() {
+-        val behavior = BrowserToolbarBehavior(testContext, null, ToolbarPosition.BOTTOM)
+-        val engineView: EngineView = mock()
+-        `when`(engineView.getInputResult()).thenReturn(EngineView.InputResult.INPUT_RESULT_HANDLED)
+-        behavior.engineView = engineView
+-        behavior.isScrollEnabled = false
++        behavior.engineView = null
++        assertFalse(behavior.shouldScroll)
++        behavior.engineView = mock()
++        `when`(behavior.engineView!!.getInputResultDetail()).thenReturn(null)
+ 
+         assertFalse(behavior.shouldScroll)
+     }
+ 
+-    @Suppress("Deprecation")
+     @Test
+-    fun `Behaviour !shouldScroll if EngineView didn't handle the MotionEvent and scrolling is enabled`() {
++    fun `GIVEN an InputResultDetail with the right values and scroll enabled WHEN shouldScroll is called THEN it returns true`() {
+         val behavior = BrowserToolbarBehavior(testContext, null, ToolbarPosition.BOTTOM)
+         val engineView: EngineView = mock()
+-        `when`(engineView.getInputResult()).thenReturn(EngineView.InputResult.INPUT_RESULT_UNHANDLED)
+         behavior.engineView = engineView
+         behavior.isScrollEnabled = true
++        val validInputResultDetail: InputResultDetail = mock()
++        doReturn(validInputResultDetail).`when`(engineView).getInputResultDetail()
+ 
+-        assertFalse(behavior.shouldScroll)
++        doReturn(true).`when`(validInputResultDetail).canScrollToBottom()
++        doReturn(false).`when`(validInputResultDetail).canScrollToTop()
++        assertTrue(behavior.shouldScroll)
++
++        doReturn(false).`when`(validInputResultDetail).canScrollToBottom()
++        doReturn(true).`when`(validInputResultDetail).canScrollToTop()
++        assertTrue(behavior.shouldScroll)
++
++        doReturn(true).`when`(validInputResultDetail).canScrollToBottom()
++        doReturn(true).`when`(validInputResultDetail).canScrollToTop()
++        assertTrue(behavior.shouldScroll)
+     }
+ 
+-    @Suppress("Deprecation")
+     @Test
+-    fun `Behaviour !shouldScroll if EngineView didn't handle the MotionEvent and scrolling is !enabled`() {
++    fun `GIVEN an InputResultDetail with the right values but with scroll disabled WHEN shouldScroll is called THEN it returns false`() {
+         val behavior = BrowserToolbarBehavior(testContext, null, ToolbarPosition.BOTTOM)
+-        val engineView: EngineView = mock()
+-        `when`(engineView.getInputResult()).thenReturn(EngineView.InputResult.INPUT_RESULT_UNHANDLED)
+-        behavior.engineView = engineView
++        behavior.engineView = mock()
+         behavior.isScrollEnabled = false
++        val validInputResultDetail: InputResultDetail = mock()
++        doReturn(true).`when`(validInputResultDetail).canScrollToBottom()
++        doReturn(true).`when`(validInputResultDetail).canScrollToTop()
+ 
+         assertFalse(behavior.shouldScroll)
+     }
+ 
+-    @Suppress("Deprecation")
+     @Test
+-    fun `Behaviour !shouldScroll if EngineView didn't handle the MotionEvent but the website and scrolling is enabled`() {
++    fun `GIVEN scroll enabled but EngineView cannot scroll to bottom WHEN shouldScroll is called THEN it returns false`() {
+         val behavior = BrowserToolbarBehavior(testContext, null, ToolbarPosition.BOTTOM)
+-        val engineView: EngineView = mock()
+-        `when`(engineView.getInputResult()).thenReturn(EngineView.InputResult.INPUT_RESULT_HANDLED_CONTENT)
+-        behavior.engineView = engineView
++        behavior.engineView = mock()
+         behavior.isScrollEnabled = true
++        val validInputResultDetail: InputResultDetail = mock()
++        doReturn(false).`when`(validInputResultDetail).canScrollToBottom()
++        doReturn(true).`when`(validInputResultDetail).canScrollToTop()
+ 
+         assertFalse(behavior.shouldScroll)
+     }
+ 
+-    @Suppress("Deprecation")
+     @Test
+-    fun `Behaviour !shouldScroll if EngineView didn't handle the MotionEvent but the website and scrolling is !enabled`() {
++    fun `GIVEN scroll enabled but EngineView cannot scroll to top WHEN shouldScroll is called THEN it returns false`() {
+         val behavior = BrowserToolbarBehavior(testContext, null, ToolbarPosition.BOTTOM)
+-        val engineView: EngineView = mock()
+-        `when`(engineView.getInputResult()).thenReturn(EngineView.InputResult.INPUT_RESULT_HANDLED_CONTENT)
+-        behavior.engineView = engineView
+-        behavior.isScrollEnabled = false
++        behavior.engineView = mock()
++        behavior.isScrollEnabled = true
++        val validInputResultDetail: InputResultDetail = mock()
++        doReturn(true).`when`(validInputResultDetail).canScrollToBottom()
++        doReturn(false).`when`(validInputResultDetail).canScrollToTop()
+ 
+         assertFalse(behavior.shouldScroll)
+     }
+diff --git a/android-components/components/concept/engine/src/main/java/mozilla/components/concept/engine/EngineView.kt b/android-components/components/concept/engine/src/main/java/mozilla/components/concept/engine/EngineView.kt
+index 1ded7001dba7..ac8e3e00929e 100644
+--- a/android-components/components/concept/engine/src/main/java/mozilla/components/concept/engine/EngineView.kt
++++ b/android-components/components/concept/engine/src/main/java/mozilla/components/concept/engine/EngineView.kt
+@@ -102,7 +102,7 @@ interface EngineView {
+     /**
+      * @return [InputResultDetail] indicating how user's last [android.view.MotionEvent] was handled.
+      */
+-    fun getInputResultDetail(): InputResultDetail = InputResultDetail()
++    fun getInputResultDetail(): InputResultDetail = InputResultDetail.newInstance()
+ 
+     /**
+      * Request a screenshot of the visible portion of the web page currently being rendered.
+diff --git a/android-components/components/concept/engine/src/main/java/mozilla/components/concept/engine/InputResultDetail.kt b/android-components/components/concept/engine/src/main/java/mozilla/components/concept/engine/InputResultDetail.kt
+index 42d6cc4e1aba..6cf982a94e8e 100644
+--- a/android-components/components/concept/engine/src/main/java/mozilla/components/concept/engine/InputResultDetail.kt
++++ b/android-components/components/concept/engine/src/main/java/mozilla/components/concept/engine/InputResultDetail.kt
+@@ -14,24 +14,21 @@ import androidx.annotation.VisibleForTesting
+  *
+  * @see [InputResultDetail.isTouchUnhandled]
+  */
+-@VisibleForTesting
+-internal const val INPUT_UNHANDLED = 0
++const val INPUT_UNHANDLED = 0
+ 
+ /**
+  * The touch event is consumed by the [EngineView]
+  *
+  * @see [InputResultDetail.isTouchHandledByBrowser]
+  */
+-@VisibleForTesting
+-internal const val INPUT_HANDLED = 1
++const val INPUT_HANDLED = 1
+ 
+ /**
+  * The touch event is consumed by the website through it's own touch listeners.
+  *
+  * @see [InputResultDetail.isTouchHandledByWebsite]
+  */
+-@VisibleForTesting
+-internal const val INPUT_HANDLED_CONTENT = 2
++const val INPUT_HANDLED_CONTENT = 2
+ 
+ /**
+  * The website content is not scrollable.
+diff --git a/android-components/components/feature/session/src/main/java/mozilla/components/feature/session/SwipeRefreshFeature.kt b/android-components/components/feature/session/src/main/java/mozilla/components/feature/session/SwipeRefreshFeature.kt
+index 21cc248aa7a4..f80b85cdd984 100644
+--- a/android-components/components/feature/session/src/main/java/mozilla/components/feature/session/SwipeRefreshFeature.kt
++++ b/android-components/components/feature/session/src/main/java/mozilla/components/feature/session/SwipeRefreshFeature.kt
+@@ -75,8 +75,7 @@ class SwipeRefreshFeature(
+     @Suppress("Deprecation")
+     override fun canChildScrollUp(parent: SwipeRefreshLayout, child: View?) =
+         if (child is EngineView) {
+-            child.canScrollVerticallyUp() ||
+-                (child.getInputResult() == EngineView.InputResult.INPUT_RESULT_HANDLED_CONTENT)
++            !child.getInputResultDetail().canOverscrollTop()
+         } else {
+             true
+         }
+diff --git a/android-components/components/feature/session/src/test/java/mozilla/components/feature/session/SwipeRefreshFeatureTest.kt b/android-components/components/feature/session/src/test/java/mozilla/components/feature/session/SwipeRefreshFeatureTest.kt
+index 515c810161e5..975b35628c7f 100644
+--- a/android-components/components/feature/session/src/test/java/mozilla/components/feature/session/SwipeRefreshFeatureTest.kt
++++ b/android-components/components/feature/session/src/test/java/mozilla/components/feature/session/SwipeRefreshFeatureTest.kt
+@@ -6,7 +6,6 @@ package mozilla.components.feature.session
+ 
+ import android.content.Context
+ import android.graphics.Bitmap
+-import android.view.ViewGroup
+ import android.widget.FrameLayout
+ import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+ import androidx.test.ext.junit.runners.AndroidJUnit4
+@@ -22,17 +21,18 @@ import mozilla.components.browser.state.state.createTab
+ import mozilla.components.browser.state.store.BrowserStore
+ import mozilla.components.concept.engine.EngineSession
+ import mozilla.components.concept.engine.EngineView
++import mozilla.components.concept.engine.InputResultDetail
+ import mozilla.components.concept.engine.selection.SelectionActionDelegate
+ import mozilla.components.support.test.ext.joinBlocking
+ import mozilla.components.support.test.libstate.ext.waitUntilIdle
+ import mozilla.components.support.test.mock
+-import mozilla.components.support.test.robolectric.testContext
+ import org.junit.After
+ import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertTrue
+ import org.junit.Before
+ import org.junit.Test
+ import org.junit.runner.RunWith
++import org.mockito.Mockito.doReturn
+ import org.mockito.Mockito.reset
+ import org.mockito.Mockito.times
+ import org.mockito.Mockito.verify
+@@ -74,15 +74,15 @@ class SwipeRefreshFeatureTest {
+     }
+ 
+     @Test
+-    fun `gesture should only work if EngineView cannot be scrolled up`() {
+-        val engineView = DummyEngineView(testContext).apply {
+-            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+-        }
++    fun `gesture should only work if the content can be overscrolled`() {
++        val engineView: DummyEngineView = mock()
++        val inputResultDetail: InputResultDetail = mock()
++        doReturn(inputResultDetail).`when`(engineView).getInputResultDetail()
+ 
+-        engineView.scrollY = 0
++        doReturn(true).`when`(inputResultDetail).canOverscrollTop()
+         assertFalse(refreshFeature.canChildScrollUp(mockLayout, engineView))
+ 
+-        engineView.scrollY = 100
++        doReturn(false).`when`(inputResultDetail).canOverscrollTop()
+         assertTrue(refreshFeature.canChildScrollUp(mockLayout, engineView))
+     }
+ 
+@@ -134,7 +134,6 @@ class SwipeRefreshFeatureTest {
+     }
+ 
+     private open class DummyEngineView(context: Context) : FrameLayout(context), EngineView {
+-        override fun canScrollVerticallyUp() = scrollY > 0
+         override fun setVerticalClipping(clippingHeight: Int) {}
+         override fun setDynamicToolbarMaxHeight(height: Int) {}
+         override fun captureThumbnail(onFinish: (Bitmap?) -> Unit) = Unit
+diff --git a/android-components/docs/changelog.md b/android-components/docs/changelog.md
+index 4853627a69e6..60afcfecc5c9 100644
+--- a/android-components/docs/changelog.md
++++ b/android-components/docs/changelog.md
+@@ -12,6 +12,10 @@ permalink: /changelog/
+ * [Gecko](https://github.com/mozilla-mobile/android-components/blob/master/buildSrc/src/main/java/Gecko.kt)
+ * [Configuration](https://github.com/mozilla-mobile/android-components/blob/master/.config.yml)
+ 
++* **browser-toolbar**
++* **feature-session**
++  * 🚒️ **Various issues related to the dynamic toolbar and pull to refresh will be fixed with with GeckoView offering more details about how the touch event will be handled.
++
+ * **concept-engine**
+   * ⚠️ **EngineView#InputResult is deprecated in favor of InputResultDetail which offers more details about how a touch event will be handled.
+ 

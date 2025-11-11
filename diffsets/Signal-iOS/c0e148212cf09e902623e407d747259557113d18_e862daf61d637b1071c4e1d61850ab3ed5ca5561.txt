@@ -1,0 +1,154 @@
+diff --git a/SignalServiceKit/src/Messages/Attachments/V2/TSAttachment+TSResource.swift b/SignalServiceKit/src/Messages/Attachments/V2/TSAttachment+TSResource.swift
+index 72359b13494..d3275eb0d62 100644
+--- a/SignalServiceKit/src/Messages/Attachments/V2/TSAttachment+TSResource.swift
++++ b/SignalServiceKit/src/Messages/Attachments/V2/TSAttachment+TSResource.swift
+@@ -74,6 +74,22 @@ extension TSAttachmentStream: TSResourceStream {
+         return URL(fileURLWithPath: filePath)
+     }
+ 
++    public func decryptedLongText() -> String? {
++        guard let fileUrl = self.originalMediaURL else {
++            return nil
++        }
++
++        guard let data = try? Data(contentsOf: fileUrl) else {
++            return nil
++        }
++
++        guard let text = String(data: data, encoding: .utf8) else {
++            owsFailDebug("Can't parse oversize text data.")
++            return nil
++        }
++        return text
++    }
++
+     public func decryptedImage() async throws -> UIImage {
+         // TSAttachments keep the file decrypted on disk.
+         guard let originalImage = self.originalImage else {
+diff --git a/SignalServiceKit/src/Messages/Attachments/V2/TSResourceStream.swift b/SignalServiceKit/src/Messages/Attachments/V2/TSResourceStream.swift
+index 625ebbec0bd..a62f4558f5c 100644
+--- a/SignalServiceKit/src/Messages/Attachments/V2/TSResourceStream.swift
++++ b/SignalServiceKit/src/Messages/Attachments/V2/TSResourceStream.swift
+@@ -57,6 +57,9 @@ public protocol TSResourceStream: TSResource {
+ 
+     func fileURLForDeletion() throws -> URL
+ 
++    /// Interprets the data on disk as a string with standard encoding (utf-8, but thats an implementation detail).
++    func decryptedLongText() -> String?
++
+     func decryptedImage() async throws -> UIImage
+ 
+     var concreteStreamType: ConcreteTSResourceStream { get }
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSErrorMessage.swift b/SignalServiceKit/src/Messages/Interactions/TSErrorMessage.swift
+index 7e9786d5e4e..25b0b43daf1 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSErrorMessage.swift
++++ b/SignalServiceKit/src/Messages/Interactions/TSErrorMessage.swift
+@@ -101,7 +101,7 @@ public class TSErrorMessageBuilder: TSMessageBuilder {
+ extension TSErrorMessage {
+ 
+     public func plaintextBody(_ tx: SDSAnyReadTransaction) -> String {
+-        return self.rawBody(with: tx) ?? ""
++        return self.rawBody(transaction: tx) ?? ""
+     }
+ 
+     @objc
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSMessage.h b/SignalServiceKit/src/Messages/Interactions/TSMessage.h
+index 818716431f0..aaeca7f6474 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSMessage.h
++++ b/SignalServiceKit/src/Messages/Interactions/TSMessage.h
+@@ -183,11 +183,6 @@ NS_DESIGNATED_INITIALIZER NS_SWIFT_NAME(init(grdbId:uniqueId:receivedAtTimestamp
+ - (void)removeAttachment:(TSAttachment *)attachment
+              transaction:(SDSAnyWriteTransaction *)transaction NS_SWIFT_NAME(removeAttachment(_:transaction:));
+ 
+-// The raw body contains placeholders for things like mentions and is not
+-// user friendly. If you want a constant string representing the body of
+-// this message, this is it.
+-- (nullable NSString *)rawBodyWithTransaction:(SDSAnyReadTransaction *)transaction;
+-
+ - (BOOL)shouldStartExpireTimer;
+ 
+ - (BOOL)hasRenderableContentWithTransaction:(SDSAnyReadTransaction *)transaction
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSMessage.m b/SignalServiceKit/src/Messages/Interactions/TSMessage.m
+index 06b9b001a69..d1fe76f2f13 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSMessage.m
++++ b/SignalServiceKit/src/Messages/Interactions/TSMessage.m
+@@ -390,19 +390,6 @@ - (NSString *)debugDescription
+     }
+ }
+ 
+-- (nullable NSString *)rawBodyWithTransaction:(SDSAnyReadTransaction *)transaction
+-{
+-    NSString *_Nullable oversizeText = [self oversizeTextWithTransaction:transaction];
+-    if (oversizeText) {
+-        return oversizeText;
+-    }
+-
+-    if (self.body.length > 0) {
+-        return self.body;
+-    }
+-
+-    return nil;
+-}
+ 
+ - (void)anyWillInsertWithTransaction:(SDSAnyWriteTransaction *)transaction
+ {
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSMessage.swift b/SignalServiceKit/src/Messages/Interactions/TSMessage.swift
+index 9ae7b53abe7..e4c750518f4 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSMessage.swift
++++ b/SignalServiceKit/src/Messages/Interactions/TSMessage.swift
+@@ -75,26 +75,14 @@ public extension TSMessage {
+             .ids.map(\.bridgeUniqueId)
+     }
+ 
+-    @objc
+-    func oversizeText(transaction: SDSAnyReadTransaction) -> String? {
+-        guard
+-            let attachment = self.oversizeTextAttachment(transaction: transaction)?.bridge,
+-            let attachmentStream = attachment as? TSAttachmentStream,
+-            let fileUrl = attachmentStream.originalMediaURL
+-        else {
+-            return nil
+-        }
+-
+-        guard let data = try? Data(contentsOf: fileUrl) else {
+-            //        OWSFailDebug(@"Can't load oversize text data.");
+-            return nil
+-        }
+-
+-        guard let text = String(data: data, encoding: .utf8) else {
+-            owsFailDebug("Can't parse oversize text data.")
+-            return nil
++    /// The raw body contains placeholders for things like mentions and is not user friendly.
++    /// If you want a constant string representing the body of this message, this is it.
++    @objc(rawBodyWithTransaction:)
++    func rawBody(transaction: SDSAnyReadTransaction) -> String? {
++        if let oversizeText = self.oversizeTextAttachment(transaction: transaction)?.asStream()?.decryptedLongText() {
++            return oversizeText
+         }
+-        return text
++        return self.body?.nilIfEmpty
+     }
+ 
+     func failedAttachments(transaction: SDSAnyReadTransaction) -> [TSAttachmentPointer] {
+@@ -531,7 +519,7 @@ public extension TSMessage {
+             )
+         }
+ 
+-        let bodyDescription = self.rawBody(with: tx)
++        let bodyDescription = self.rawBody(transaction: tx)
+         if
+             bodyDescription == nil,
+             let storyReactionEmoji,
+diff --git a/SignalServiceKit/src/Storage/FullTextSearchFinder.swift b/SignalServiceKit/src/Storage/FullTextSearchFinder.swift
+index 1aa37c52b41..0a684ac4a51 100644
+--- a/SignalServiceKit/src/Storage/FullTextSearchFinder.swift
++++ b/SignalServiceKit/src/Storage/FullTextSearchFinder.swift
+@@ -688,7 +688,7 @@ class AnySearchIndexer: Dependencies {
+     }
+ 
+     private static let messageIndexer: SearchIndexer<TSMessage> = SearchIndexer { (message: TSMessage, transaction: SDSAnyReadTransaction) in
+-        if let bodyText = message.rawBody(with: transaction) {
++        if let bodyText = message.rawBody(transaction: transaction) {
+             return bodyText
+         }
+         return ""

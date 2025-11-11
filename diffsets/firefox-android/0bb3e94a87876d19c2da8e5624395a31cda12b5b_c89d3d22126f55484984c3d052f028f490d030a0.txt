@@ -1,0 +1,764 @@
+diff --git a/focus-android/app/build.gradle b/focus-android/app/build.gradle
+index fa0bf664e133..9f4bf49c4fde 100644
+--- a/focus-android/app/build.gradle
++++ b/focus-android/app/build.gradle
+@@ -225,6 +225,7 @@ dependencies {
+     implementation "org.mozilla.components:support-utils:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:ui-autocomplete:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:ui-colors:${AndroidComponents.VERSION}"
++    implementation "org.mozilla.components:feature-webcompat-reporter:${AndroidComponents.VERSION}"
+ 
+     implementation project(':service-telemetry')
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/browser/integration/MvpBrowserMenuController.kt b/focus-android/app/src/main/java/org/mozilla/focus/browser/integration/MvpBrowserMenuController.kt
+new file mode 100644
+index 000000000000..11462bd72120
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/browser/integration/MvpBrowserMenuController.kt
+@@ -0,0 +1,114 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++package org.mozilla.focus.browser.integration
++
++import androidx.preference.PreferenceManager
++import mozilla.components.browser.state.selector.findCustomTabOrSelectedTab
++import mozilla.components.browser.state.state.SessionState
++import mozilla.components.browser.state.state.createTab
++import org.mozilla.focus.R
++import org.mozilla.focus.activity.InstallFirefoxActivity
++import org.mozilla.focus.ext.requireComponents
++import org.mozilla.focus.fragment.BrowserFragment
++import org.mozilla.focus.menu.ToolbarMenu
++import org.mozilla.focus.open.OpenWithFragment
++import org.mozilla.focus.state.AppAction
++import org.mozilla.focus.state.Screen
++import org.mozilla.focus.telemetry.TelemetryWrapper
++import org.mozilla.focus.utils.Browsers
++
++class MvpBrowserMenuController(
++    private val fragment: BrowserFragment,
++    private val findInPageIntegration: FindInPageIntegration?,
++    private val shareCallback: () -> Unit,
++    private val addToHomeScreenCallback: (url: String, title: String) -> Unit
++) {
++
++    val tab: SessionState
++        get() = fragment.requireComponents.store.state.findCustomTabOrSelectedTab()
++        // Workaround for tab not existing temporarily.
++            ?: createTab("about:blank")
++
++    fun handleMenuInteraction(item: ToolbarMenu.Item) {
++        when (item) {
++            is ToolbarMenu.Item.Back -> onBackPressed()
++            is ToolbarMenu.Item.Forward -> onForwardPressed()
++            is ToolbarMenu.Item.Reload -> onReloadPressed()
++            is ToolbarMenu.Item.Stop -> onStopPressed()
++            is ToolbarMenu.Item.Share -> onSharePressed()
++            is ToolbarMenu.Item.FindInPage -> onFindInPagePressed()
++            is ToolbarMenu.Item.RequestDesktop -> onRequestDesktopPressed(item.isChecked)
++            is ToolbarMenu.Item.AddToHomeScreen -> onAddToHomeScreenPressed()
++            is ToolbarMenu.Item.OpenInApp -> onOpenInPressed()
++            is ToolbarMenu.Item.Settings -> onSettingsPressed()
++        }
++    }
++
++    private fun onBackPressed() {
++        fragment.requireComponents.sessionUseCases.goBack(tab.id)
++    }
++
++    private fun onForwardPressed() {
++        fragment.requireComponents.sessionUseCases.goForward(tab.id)
++    }
++
++    private fun onReloadPressed() {
++        fragment.requireComponents.sessionUseCases.reload(tab.id)
++    }
++
++    private fun onStopPressed() {
++        fragment.requireComponents.sessionUseCases.stopLoading(tab.id)
++    }
++
++    private fun onSharePressed() {
++        shareCallback()
++    }
++
++    private fun onFindInPagePressed() {
++        findInPageIntegration?.show(tab)
++        TelemetryWrapper.findInPageMenuEvent()
++    }
++
++    private fun onRequestDesktopPressed(checked: Boolean) {
++        if (checked) {
++            PreferenceManager.getDefaultSharedPreferences(fragment.requireContext()).edit()
++                .putBoolean(
++                    fragment.requireContext().getString(R.string.has_requested_desktop),
++                    true
++                ).apply()
++        }
++
++        fragment.requireComponents.sessionUseCases.requestDesktopSite(checked, tab.id)
++    }
++
++    private fun onAddToHomeScreenPressed() {
++        addToHomeScreenCallback(tab.content.url, tab.content.title)
++    }
++
++    private fun onOpenInPressed() {
++        val browsers = Browsers(fragment.requireContext(), tab.content.url)
++
++        val apps = browsers.installedBrowsers
++        val store = if (browsers.hasFirefoxBrandedBrowserInstalled())
++            null
++        else
++            InstallFirefoxActivity.resolveAppStore(fragment.requireContext())
++
++        val openWithFragment = OpenWithFragment.newInstance(
++            apps,
++            tab.content.url,
++            store
++        )
++        @Suppress("DEPRECATION")
++        openWithFragment.show(fragment.requireFragmentManager(), OpenWithFragment.FRAGMENT_TAG)
++
++        TelemetryWrapper.openSelectionEvent()
++    }
++
++    private fun onSettingsPressed() {
++        fragment.requireComponents.appStore.dispatch(
++            AppAction.OpenSettings(page = Screen.Settings.Page.Start)
++        )
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
+index 0374055e7555..793ef3bd51d2 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
+@@ -61,10 +61,12 @@ import org.mozilla.focus.browser.binding.TabCountBinding
+ import org.mozilla.focus.browser.integration.BrowserToolbarIntegration
+ import org.mozilla.focus.browser.integration.FindInPageIntegration
+ import org.mozilla.focus.browser.integration.FullScreenIntegration
++import org.mozilla.focus.browser.integration.MvpBrowserMenuController
+ import org.mozilla.focus.downloads.DownloadService
+ import org.mozilla.focus.ext.ifCustomTab
+ import org.mozilla.focus.ext.isCustomTab
+ import org.mozilla.focus.ext.requireComponents
++import org.mozilla.focus.menu.browser.MvpBrowserMenu
+ import org.mozilla.focus.open.OpenWithFragment
+ import org.mozilla.focus.popup.PopupUtils
+ import org.mozilla.focus.state.AppAction
+@@ -73,6 +75,7 @@ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.utils.AppPermissionCodes.REQUEST_CODE_DOWNLOAD_PERMISSIONS
+ import org.mozilla.focus.utils.AppPermissionCodes.REQUEST_CODE_PROMPT_PERMISSIONS
+ import org.mozilla.focus.utils.Browsers
++import org.mozilla.focus.utils.MvpFeatureManager
+ import org.mozilla.focus.utils.FeatureFlags
+ import org.mozilla.focus.utils.StatusBarUtils
+ import org.mozilla.focus.utils.SupportUtils
+@@ -126,35 +129,11 @@ class BrowserFragment :
+     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
+         val view = inflater.inflate(R.layout.fragment_browser, container, false)
+ 
+-        val browserToolbar = view.findViewById<BrowserToolbar>(R.id.browserToolbar)
+-
+-        toolbarIntegration.set(
+-            BrowserToolbarIntegration(
+-                requireComponents.store,
+-                browserToolbar,
+-                fragment = this,
+-                customTabId = if (tab.isCustomTab()) { tab.id } else { null },
+-                customTabsUseCases = requireComponents.customTabsUseCases,
+-                sessionUseCases = requireComponents.sessionUseCases
+-            ),
+-            owner = this,
+-            view = browserToolbar
+-        )
+-
+-        browserToolbar.display.onUrlClicked = {
+-            edit()
+-            false // Do not switch to edit mode
+-        }
+-
+-        browserToolbar.display.menuController = BrowserMenuControllerAdapter(this)
+-
+         urlBar = view.findViewById(R.id.urlbar)
+         statusBar = view.findViewById(R.id.status_bar_background)
+ 
+         popupTint = view.findViewById(R.id.popup_tint)
+ 
+-        browserToolbar.display.setOnUrlLongClickListener { onUrlLongClicked() }
+-
+         return view
+     }
+ 
+@@ -253,6 +232,8 @@ class BrowserFragment :
+             view = statusBar!!
+         )
+ 
++        customizeToolbar(view)
++
+         val customTabConfig = tab.ifCustomTab()?.config
+         if (customTabConfig != null) {
+             initialiseCustomTabUi(view, customTabConfig)
+@@ -261,6 +242,47 @@ class BrowserFragment :
+         }
+     }
+ 
++    private fun customizeToolbar(view: View) {
++        val browserToolbar = view.findViewById<BrowserToolbar>(R.id.browserToolbar)
++
++        toolbarIntegration.set(
++            BrowserToolbarIntegration(
++                requireComponents.store,
++                browserToolbar,
++                fragment = this,
++                customTabId = if (tab.isCustomTab()) { tab.id } else { null },
++                customTabsUseCases = requireComponents.customTabsUseCases,
++                sessionUseCases = requireComponents.sessionUseCases
++            ),
++            owner = this,
++            view = browserToolbar
++        )
++        if (MvpFeatureManager.isEnabled) {
++            val controller = MvpBrowserMenuController(
++                this,
++                findInPageIntegration.get(),
++                ::shareCurrentUrl,
++                ::showAddToHomescreenDialog
++            )
++            val browserMenu = MvpBrowserMenu(
++                context = requireContext(),
++                store = requireComponents.store,
++                onItemTapped = { controller.handleMenuInteraction(it) }
++            )
++            browserToolbar.display.menuBuilder = browserMenu.menuBuilder
++        } else {
++            browserToolbar.display.menuController = BrowserMenuControllerAdapter(this)
++        }
++
++        with(browserToolbar.display) {
++            onUrlClicked = {
++                edit()
++                false // Do not switch to edit mode
++            }
++            setOnUrlLongClickListener { onUrlLongClicked() }
++        }
++    }
++
+     private fun initialiseNormalBrowserUi(view: View) {
+         val eraseButton = view.findViewById<FloatingEraseButton>(R.id.erase)
+         eraseButton.setOnClickListener(this)
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/menu/ToolbarMenu.kt b/focus-android/app/src/main/java/org/mozilla/focus/menu/ToolbarMenu.kt
+new file mode 100644
+index 000000000000..4d19e7f5ef2d
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/menu/ToolbarMenu.kt
+@@ -0,0 +1,26 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++package org.mozilla.focus.menu
++
++import mozilla.components.browser.menu.BrowserMenuBuilder
++import mozilla.components.browser.menu.item.BrowserMenuItemToolbar
++
++interface ToolbarMenu {
++
++    sealed class Item {
++        data class Reload(val bypassCache: Boolean) : Item()
++        data class RequestDesktop(val isChecked: Boolean) : Item()
++        object Back : Item()
++        object Forward : Item()
++        object Share : Item()
++        object FindInPage : Item()
++        object AddToHomeScreen : Item()
++        object OpenInApp : Item()
++        object Settings : Item()
++        object Stop : Item()
++    }
++
++    val menuBuilder: BrowserMenuBuilder
++    val menuToolbar: BrowserMenuItemToolbar
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/menu/browser/MvpBrowserMenu.kt b/focus-android/app/src/main/java/org/mozilla/focus/menu/browser/MvpBrowserMenu.kt
+new file mode 100644
+index 000000000000..467cbb23bf42
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/menu/browser/MvpBrowserMenu.kt
+@@ -0,0 +1,156 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++package org.mozilla.focus.menu.browser
++
++import android.content.Context
++import mozilla.components.browser.menu.BrowserMenuBuilder
++import mozilla.components.browser.menu.BrowserMenuHighlight
++import mozilla.components.browser.menu.item.BrowserMenuHighlightableItem
++import mozilla.components.browser.menu.item.BrowserMenuImageSwitch
++import mozilla.components.browser.menu.item.BrowserMenuImageText
++import mozilla.components.browser.menu.item.BrowserMenuItemToolbar
++import mozilla.components.browser.menu.item.WebExtensionPlaceholderMenuItem
++import mozilla.components.browser.state.selector.selectedTab
++import mozilla.components.browser.state.state.TabSessionState
++import mozilla.components.browser.state.store.BrowserStore
++import mozilla.components.feature.webcompat.reporter.WebCompatReporterFeature
++import org.mozilla.focus.R
++import org.mozilla.focus.menu.ToolbarMenu
++import org.mozilla.focus.theme.ThemeManager
++
++/**
++ * The overflow menu shown in the BrowserFragment containing page actions like "Refresh", "Share" etc.
++ */
++class MvpBrowserMenu(
++    private val context: Context,
++    private val store: BrowserStore,
++    private val onItemTapped: (ToolbarMenu.Item) -> Unit = {},
++) : ToolbarMenu {
++
++    private val selectedSession: TabSessionState?
++        get() = store.state.selectedTab
++
++    override val menuBuilder by lazy { BrowserMenuBuilder(mvpMenuItems) }
++
++    override val menuToolbar by lazy {
++        val back = BrowserMenuItemToolbar.TwoStateButton(
++            primaryImageResource = R.drawable.ic_back,
++            primaryContentDescription = context.getString(R.string.content_description_back),
++            primaryImageTintResource = ThemeManager.resolveAttribute(R.attr.primaryText, context),
++            isInPrimaryState = {
++                selectedSession?.content?.canGoBack ?: true
++            },
++            secondaryImageTintResource = ThemeManager.resolveAttribute(R.attr.disabled, context),
++            disableInSecondaryState = true,
++            longClickListener = { onItemTapped.invoke(ToolbarMenu.Item.Back) }
++        ) {
++            onItemTapped.invoke(ToolbarMenu.Item.Back)
++        }
++
++        val forward = BrowserMenuItemToolbar.TwoStateButton(
++            primaryImageResource = R.drawable.ic_forward,
++            primaryContentDescription = context.getString(R.string.content_description_forward),
++            primaryImageTintResource = ThemeManager.resolveAttribute(R.attr.primaryText, context),
++            isInPrimaryState = {
++                selectedSession?.content?.canGoForward ?: true
++            },
++            secondaryImageTintResource = ThemeManager.resolveAttribute(R.attr.disabled, context),
++            disableInSecondaryState = true,
++            longClickListener = { onItemTapped.invoke(ToolbarMenu.Item.Forward) }
++        ) {
++            onItemTapped.invoke(ToolbarMenu.Item.Forward)
++        }
++
++        val refresh = BrowserMenuItemToolbar.TwoStateButton(
++            primaryImageResource = R.drawable.ic_refresh,
++            primaryContentDescription = context.getString(R.string.content_description_reload),
++            primaryImageTintResource = ThemeManager.resolveAttribute(R.attr.primaryText, context),
++            isInPrimaryState = {
++                selectedSession?.content?.loading == false
++            },
++            secondaryImageResource = R.drawable.ic_stop,
++            secondaryContentDescription = context.getString(R.string.content_description_stop),
++            secondaryImageTintResource = ThemeManager.resolveAttribute(R.attr.primaryText, context),
++            disableInSecondaryState = false,
++            longClickListener = { onItemTapped.invoke(ToolbarMenu.Item.Reload(bypassCache = true)) }
++        ) {
++            if (selectedSession?.content?.loading == true) {
++                onItemTapped.invoke(ToolbarMenu.Item.Stop)
++            } else {
++                onItemTapped.invoke(ToolbarMenu.Item.Reload(bypassCache = false))
++            }
++        }
++        val share = BrowserMenuItemToolbar.Button(
++            imageResource = R.drawable.ic_mvp_share,
++            contentDescription = context.getString(R.string.menu_share),
++            listener = {
++                onItemTapped.invoke(ToolbarMenu.Item.Share)
++            }
++        )
++        BrowserMenuItemToolbar(listOf(back, forward, refresh, share))
++    }
++
++    val mvpMenuItems by lazy {
++        val findInPage = BrowserMenuImageText(
++            label = context.getString(R.string.find_in_page),
++            imageResource = R.drawable.ic_search,
++        ) {
++            onItemTapped.invoke(ToolbarMenu.Item.FindInPage)
++        }
++
++        val desktopMode = BrowserMenuImageSwitch(
++            imageResource = R.drawable.ic_device_desktop,
++            label = context.getString(R.string.mvp_preference_performance_request_desktop_site),
++            initialState = {
++                selectedSession?.content?.desktopMode ?: false
++            }
++        ) { checked ->
++            onItemTapped.invoke(ToolbarMenu.Item.RequestDesktop(checked))
++        }
++
++        val reportSiteIssue = WebExtensionPlaceholderMenuItem(
++            id = WebCompatReporterFeature.WEBCOMPAT_REPORTER_EXTENSION_ID
++        )
++
++        val addToHomescreen = BrowserMenuImageText(
++            label = context.getString(R.string.menu_add_to_home_screen),
++            imageResource = R.drawable.ic_add_to_home_screen,
++        ) {
++            onItemTapped.invoke(ToolbarMenu.Item.AddToHomeScreen)
++        }
++
++        val openInApp = BrowserMenuHighlightableItem(
++            label = context.getString(R.string.menu_open_with_a_browser2),
++            startImageResource = R.drawable.ic_help,
++            textColorResource = ThemeManager.resolveAttribute(R.attr.primaryText, context),
++            highlight = BrowserMenuHighlight.HighPriority(
++                backgroundTint = ThemeManager.resolveAttribute(R.attr.primaryText, context),
++                canPropagate = false
++            )
++        ) {
++            onItemTapped.invoke(ToolbarMenu.Item.OpenInApp)
++        }
++
++        val settings = BrowserMenuHighlightableItem(
++            label = context.getString(R.string.menu_settings),
++            startImageResource = R.drawable.ic_mvp_settings,
++            textColorResource = ThemeManager.resolveAttribute(R.attr.primaryText, context),
++            highlight = BrowserMenuHighlight.HighPriority(
++                backgroundTint = ThemeManager.resolveAttribute(R.attr.primaryText, context),
++                canPropagate = false
++            )
++        ) {
++            onItemTapped.invoke(ToolbarMenu.Item.Settings)
++        }
++        listOfNotNull(
++            menuToolbar,
++            findInPage,
++            desktopMode,
++            reportSiteIssue,
++            addToHomescreen,
++            openInApp,
++            settings
++        )
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/theme/ThemeManager.kt b/focus-android/app/src/main/java/org/mozilla/focus/theme/ThemeManager.kt
+new file mode 100644
+index 000000000000..13d07d3e0c05
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/theme/ThemeManager.kt
+@@ -0,0 +1,18 @@
++/* -*- Mode: Java; c-basic-offset: 4; tab-width: 4; indent-tabs-mode: nil; -*-
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++package org.mozilla.focus.theme
++
++import android.content.Context
++import android.util.TypedValue
++
++object ThemeManager {
++    fun resolveAttribute(attribute: Int, context: Context): Int {
++        val typedValue = TypedValue()
++        val theme = context.theme
++        theme.resolveAttribute(attribute, typedValue, true)
++
++        return typedValue.resourceId
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/utils/MvpFeatureManager.kt b/focus-android/app/src/main/java/org/mozilla/focus/utils/MvpFeatureManager.kt
+new file mode 100644
+index 000000000000..b5ddfad7e773
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/utils/MvpFeatureManager.kt
+@@ -0,0 +1,11 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++package org.mozilla.focus.utils
++
++/**
++ * Feature flag for MVP
++ */
++object MvpFeatureManager {
++    const val isEnabled = true
++}
+diff --git a/focus-android/app/src/main/res/drawable/ic_add_to_home_screen.xml b/focus-android/app/src/main/res/drawable/ic_add_to_home_screen.xml
+new file mode 100644
+index 000000000000..cd588ed5ccb7
+--- /dev/null
++++ b/focus-android/app/src/main/res/drawable/ic_add_to_home_screen.xml
+@@ -0,0 +1,28 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++  <path
++      android:pathData="M15.535,10.526L17.135,12.126C17.449,12.44 17.228,12.977 16.784,12.98L12.551,13L12,12.449L12.021,8.217C12.023,7.773 12.56,7.552 12.875,7.866L14.471,9.462L19.72,4.22C20.013,3.927 20.488,3.927 20.781,4.22C21.074,4.513 21.074,4.988 20.781,5.281L15.535,10.526Z"
++      android:fillColor="@color/primary_text"/>
++  <path
++      android:pathData="M7.6,14H6.4L6,14.4V15.6L6.4,16H7.6L8,15.6V14.4L7.6,14Z"
++      android:fillColor="@color/primary_text"/>
++  <path
++      android:pathData="M10.6,14H9.4L9,14.4V15.6L9.4,16H10.6L11,15.6V14.4L10.6,14Z"
++      android:fillColor="@color/primary_text"/>
++  <path
++      android:pathData="M13.6,14H12.4L12,14.4V15.6L12.4,16H13.6L14,15.6V14.4L13.6,14Z"
++      android:fillColor="@color/primary_text"/>
++  <path
++      android:pathData="M10.6,11H9.4L9,11.4V12.6L9.4,13H10.6L11,12.6V11.4L10.6,11Z"
++      android:fillColor="@color/primary_text"/>
++  <path
++      android:pathData="M14.5,2H5.5C4.119,2 3,3.119 3,4.5V19.5C3,20.881 4.119,22 5.5,22H14.5C15.881,22 17,20.881 17,19.5V15.225C17,14.811 16.664,14.475 16.25,14.475C15.836,14.475 15.5,14.811 15.5,15.225V17H4.5V4.3L5.3,3.5H14.7L15.5,4.3V5C15.5,5.414 15.836,5.75 16.25,5.75C16.664,5.75 17,5.414 17,5V4.5C17,3.119 15.881,2 14.5,2ZM8.75,19H11.25C11.664,19 12,19.336 12,19.75C12,20.164 11.664,20.5 11.25,20.5H8.75C8.336,20.5 8,20.164 8,19.75C8,19.336 8.336,19 8.75,19Z"
++      android:fillColor="@color/primary_text"/>
++</vector>
+diff --git a/focus-android/app/src/main/res/drawable/ic_checkbox.xml b/focus-android/app/src/main/res/drawable/ic_checkbox.xml
+new file mode 100644
+index 000000000000..b9b2ecb2d127
+--- /dev/null
++++ b/focus-android/app/src/main/res/drawable/ic_checkbox.xml
+@@ -0,0 +1,17 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<shape xmlns:android="http://schemas.android.com/apk/res/android"
++    android:shape="rectangle">
++    <solid android:color="@android:color/transparent" />
++    <stroke
++        android:width="2dp"
++        android:color="@color/primary_text" />
++    <corners android:radius="4dp" />
++    <padding
++        android:bottom="4dp"
++        android:left="4dp"
++        android:right="4dp"
++        android:top="4dp" />
++</shape>
+diff --git a/focus-android/app/src/main/res/drawable/ic_device_desktop.xml b/focus-android/app/src/main/res/drawable/ic_device_desktop.xml
+index cb32559cb776..5326198e4a7d 100644
+--- a/focus-android/app/src/main/res/drawable/ic_device_desktop.xml
++++ b/focus-android/app/src/main/res/drawable/ic_device_desktop.xml
+@@ -9,5 +9,5 @@
+     android:viewportHeight="24">
+   <path
+       android:pathData="m4,6c0,-0.5523 0.4477,-1 1,-1h14c0.5523,0 1,0.4477 1,1v11h2v1c0,0.5523 -0.4477,1 -1,1h-18c-0.5523,0 -1,-0.4477 -1,-1v-1h2zM10,17v1h4v-1zM6,7v9h12v-9z"
+-      android:fillColor="#f9f9fa"/>
++      android:fillColor="@color/primary_text"/>
+ </vector>
+diff --git a/focus-android/app/src/main/res/drawable/ic_help.xml b/focus-android/app/src/main/res/drawable/ic_help.xml
+new file mode 100644
+index 000000000000..99e26c6b6dfa
+--- /dev/null
++++ b/focus-android/app/src/main/res/drawable/ic_help.xml
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++  <path
++      android:pathData="M11.75,14C11.336,14 11,13.664 11,13.25V12.291C11,11.646 11.452,11.085 12.074,10.955C12.81,10.803 13.344,10.146 13.344,9.394C13.344,8.515 12.629,7.8 11.75,7.8C11.07,7.8 10.465,8.231 10.243,8.8721C10.107,9.264 9.682,9.474 9.289,9.3361C8.897,9.201 8.69,8.774 8.825,8.382C9.256,7.1371 10.432,6.3 11.75,6.3C13.456,6.3 14.844,7.688 14.844,9.394C14.844,10.812 13.865,12.055 12.5,12.396V13.25C12.5,13.664 12.164,14 11.75,14Z"
++      android:fillColor="@color/primary_text"/>
++  <path
++      android:pathData="M12.2,17H11.3L11,16.7V15.8L11.3,15.5H12.2L12.5,15.8V16.7L12.2,17Z"
++      android:fillColor="@color/primary_text"/>
++  <path
++      android:pathData="M11.75,4C16.161,4 19.75,7.589 19.75,12C19.75,16.411 16.161,20 11.75,20C7.339,20 3.75,16.411 3.75,12C3.75,7.589 7.339,4 11.75,4ZM11.75,2.5C6.503,2.5 2.25,6.753 2.25,12C2.25,17.247 6.503,21.5 11.75,21.5C16.997,21.5 21.25,17.247 21.25,12C21.25,6.753 16.997,2.5 11.75,2.5Z"
++      android:fillColor="@color/primary_text"/>
++</vector>
+diff --git a/focus-android/app/src/main/res/drawable/ic_home.xml b/focus-android/app/src/main/res/drawable/ic_home.xml
+index c9f9749fb64a..eb99bda3f31f 100644
+--- a/focus-android/app/src/main/res/drawable/ic_home.xml
++++ b/focus-android/app/src/main/res/drawable/ic_home.xml
+@@ -8,6 +8,6 @@
+     android:viewportHeight="24"
+     android:viewportWidth="24">
+     <path
+-        android:fillColor="#f9f9fa"
++        android:fillColor="@color/primary_text"
+         android:pathData="m11.2929,2.2929c0.3905,-0.3905 1.0237,-0.3905 1.4142,0l9,9c0.3905,0.3905 0.3905,1.0237 0,1.4142s-1.0237,0.3905 -1.4142,0l-1.2929,-1.2929v7.5858c0,1.6569 -1.3431,3 -3,3h-8c-1.6569,0 -3,-1.3431 -3,-3v-7.5858l-1.2929,1.2929c-0.3905,0.3905 -1.0237,0.3905 -1.4142,0 -0.3905,-0.3905 -0.3905,-1.0237 0,-1.4142zM12,4.4142 L7,9.4142v9.5858c0,0.5523 0.4477,1 1,1h1v-6c0,-1.1046 0.8954,-2 2,-2h2c1.1046,0 2,0.8954 2,2v6h1c0.5523,0 1,-0.4477 1,-1v-9.5858zM14,16.5c0,-0.2761 -0.2239,-0.5 -0.5,-0.5 -0.2762,0 -0.5,0.2239 -0.5,0.5s0.2238,0.5 0.5,0.5c0.2761,0 0.5,-0.2239 0.5,-0.5z" />
+ </vector>
+diff --git a/focus-android/app/src/main/res/drawable/ic_lightbulb.xml b/focus-android/app/src/main/res/drawable/ic_lightbulb.xml
+new file mode 100644
+index 000000000000..b3d5a09c5029
+--- /dev/null
++++ b/focus-android/app/src/main/res/drawable/ic_lightbulb.xml
+@@ -0,0 +1,16 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++  <path
++      android:pathData="M15.25,22H8.75C8.336,22 8,21.664 8,21.25C8,20.836 8.336,20.5 8.75,20.5H15.25C15.664,20.5 16,20.836 16,21.25C16,21.664 15.664,22 15.25,22Z"
++      android:fillColor="@color/primary_text"/>
++  <path
++      android:pathData="M13.8944,17.999H10.1074C9.1414,17.999 8.3184,17.307 8.1524,16.355L7.7424,13.998C5.7944,12.417 4.8984,9.998 5.3454,7.52C5.8264,4.853 7.9214,2.693 10.5574,2.145C12.6004,1.724 14.6814,2.219 16.2694,3.511C17.8574,4.803 18.7674,6.717 18.7674,8.762C18.7674,10.796 17.8534,12.701 16.2584,13.996L15.8484,16.354C15.6834,17.307 14.8604,17.999 13.8944,17.999ZM11.9864,3.498C11.6134,3.498 11.2374,3.536 10.8624,3.614C8.8194,4.039 7.1954,5.715 6.8224,7.786C6.4714,9.73 7.1804,11.626 8.7184,12.858C8.9794,13.068 9.1544,13.36 9.2094,13.68L9.6294,16.096L10.1064,16.497H13.8934L14.3704,16.096L14.7904,13.68C14.8464,13.359 15.0204,13.068 15.2794,12.859C16.5424,11.847 17.2664,10.355 17.2664,8.763C17.2664,7.172 16.5574,5.681 15.3214,4.675C14.3764,3.905 13.2024,3.498 11.9864,3.498Z"
++      android:fillColor="@color/primary_text"/>
++</vector>
+diff --git a/focus-android/app/src/main/res/drawable/ic_mvp_settings.xml b/focus-android/app/src/main/res/drawable/ic_mvp_settings.xml
+new file mode 100644
+index 000000000000..2077950c3448
+--- /dev/null
++++ b/focus-android/app/src/main/res/drawable/ic_mvp_settings.xml
+@@ -0,0 +1,16 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++  <path
++      android:pathData="M12.7911,22H11.2171C10.3301,22 9.5392,21.404 9.2951,20.552L8.7851,18.775C8.4291,18.604 8.0822,18.402 7.7481,18.171L5.9472,18.619C5.0872,18.833 4.1761,18.447 3.7322,17.679L2.9451,16.315C2.5052,15.553 2.6212,14.576 3.2262,13.938L4.5251,12.568C4.5092,12.381 4.5002,12.192 4.5002,12C4.5002,11.798 4.5111,11.598 4.5282,11.4L3.2411,10.067C2.6251,9.429 2.5041,8.447 2.9481,7.678L3.7352,6.315C4.1741,5.553 5.0771,5.164 5.9342,5.37L7.7741,5.812C8.1002,5.587 8.4382,5.392 8.7842,5.226L9.2942,3.449C9.5401,2.596 10.3301,2 11.2171,2H12.7911C13.6701,2 14.4591,2.589 14.7091,3.432L15.2441,5.237C15.5781,5.399 15.9071,5.591 16.2251,5.811L18.0651,5.369C18.9191,5.167 19.8251,5.554 20.2641,6.314L21.0511,7.677C21.4951,8.445 21.3741,9.427 20.7581,10.066L19.4721,11.4C19.4901,11.598 19.5001,11.797 19.5001,12C19.5001,12.192 19.4911,12.381 19.4751,12.568L20.7741,13.938C21.3791,14.575 21.4951,15.553 21.0551,16.314L20.2681,17.677C19.8241,18.446 18.9141,18.833 18.0531,18.617L16.2521,18.169C15.9261,18.396 15.5881,18.594 15.2431,18.762L14.7081,20.567C14.4591,21.411 13.6701,22 12.7911,22ZM7.7252,16.63L8.3622,16.762C8.7851,17.085 9.2341,17.347 9.6981,17.54L10.1301,18.025L10.7361,20.137C10.7981,20.35 10.9951,20.499 11.2171,20.499H12.7911C13.0111,20.499 13.2081,20.352 13.2701,20.141L13.9021,18.007L14.3301,17.529C14.7801,17.339 15.2201,17.081 15.6371,16.761L16.2741,16.629L18.4151,17.162C18.6281,17.215 18.8571,17.119 18.9691,16.926L19.7561,15.563C19.8661,15.373 19.8371,15.128 19.6861,14.969L18.1491,13.348L17.9481,12.74C17.9791,12.499 18.0001,12.252 18.0001,12C18.0001,11.738 17.9771,11.482 17.9441,11.229L18.1481,10.612L19.6791,9.025C19.8331,8.866 19.8631,8.62 19.7521,8.429L18.9651,7.065C18.8561,6.875 18.6301,6.778 18.4151,6.829L16.2401,7.351L15.6131,7.22C15.2001,6.908 14.7681,6.655 14.3301,6.47L13.9031,5.992L13.2711,3.859C13.2081,3.647 13.0111,3.5 12.7911,3.5H11.2171C10.9951,3.5 10.7981,3.649 10.7361,3.862L10.1301,5.974L9.6971,6.459C9.2441,6.647 8.8032,6.903 8.3871,7.218L7.7592,7.351L5.5841,6.829C5.3702,6.778 5.1441,6.875 5.0342,7.065L4.2471,8.428C4.1361,8.62 4.1672,8.866 4.3201,9.025L5.8512,10.612L6.0552,11.229C6.0231,11.482 6.0002,11.738 6.0002,12C6.0002,12.252 6.0212,12.499 6.0511,12.742L5.8512,13.35L4.3141,14.971C4.1631,15.131 4.1342,15.375 4.2442,15.565L5.0311,16.928C5.1421,17.12 5.3721,17.217 5.5851,17.163L7.7252,16.63Z"
++      android:fillColor="@color/primary_text"/>
++  <path
++      android:pathData="M12,15.5C10.07,15.5 8.5,13.93 8.5,12C8.5,10.07 10.07,8.5 12,8.5C13.93,8.5 15.5,10.07 15.5,12C15.5,13.93 13.93,15.5 12,15.5ZM12,10C10.897,10 10,10.897 10,12C10,13.103 10.897,14 12,14C13.103,14 14,13.103 14,12C14,10.897 13.103,10 12,10Z"
++      android:fillColor="@color/primary_text"/>
++</vector>
+diff --git a/focus-android/app/src/main/res/drawable/ic_mvp_share.xml b/focus-android/app/src/main/res/drawable/ic_mvp_share.xml
+new file mode 100644
+index 000000000000..38d7f5387851
+--- /dev/null
++++ b/focus-android/app/src/main/res/drawable/ic_mvp_share.xml
+@@ -0,0 +1,13 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++  <path
++      android:pathData="M18.406,14.12C17.501,13.878 16.559,14.003 15.75,14.469C15.372,14.687 15.05,14.973 14.783,15.303L9.879,12.852C10.014,12.299 10.02,11.719 9.884,11.164L14.788,8.702C15.45,9.519 16.445,10 17.496,10C17.797,10 18.103,9.961 18.405,9.88C20.269,9.381 21.379,7.458 20.88,5.594C20.638,4.692 20.059,3.937 19.249,3.469C18.44,3.003 17.498,2.878 16.593,3.12C14.745,3.615 13.643,5.509 14.111,7.362L9.215,9.821C9.135,9.722 9.066,9.617 8.974,9.525C7.609,8.16 5.389,8.16 4.023,9.525C2.66,10.889 2.66,13.11 4.023,14.474C4.706,15.157 5.602,15.497 6.498,15.497C7.395,15.497 8.291,15.156 8.974,14.474C9.062,14.386 9.118,14.28 9.194,14.185L14.111,16.642C13.645,18.49 14.747,20.383 16.594,20.878C16.896,20.96 17.202,21 17.506,21C18.113,21 18.711,20.841 19.249,20.53C20.059,20.062 20.638,19.307 20.88,18.405C21.38,16.542 20.269,14.619 18.406,14.12ZM16.982,4.57C17.155,4.523 17.33,4.501 17.504,4.501C17.85,4.501 18.192,4.592 18.5,4.77C18.962,5.037 19.293,5.467 19.431,5.984C19.716,7.048 19.082,8.147 18.017,8.432C17.084,8.685 16.109,8.233 15.693,7.36C15.641,7.251 15.599,7.135 15.568,7.019C15.283,5.954 15.917,4.855 16.982,4.57ZM7.913,13.414C7.134,14.192 5.863,14.194 5.083,13.414C4.304,12.635 4.304,11.365 5.083,10.586C5.473,10.196 5.985,10.001 6.497,10.001C7.01,10.001 7.523,10.196 7.912,10.586C8.692,11.365 8.692,12.635 7.913,13.414ZM19.431,18.017C19.293,18.534 18.962,18.964 18.5,19.231C18.037,19.499 17.498,19.572 16.982,19.43C15.916,19.145 15.283,18.046 15.568,16.982C15.807,16.09 16.617,15.501 17.499,15.501C17.671,15.501 17.844,15.522 18.017,15.569C19.082,15.854 19.716,16.953 19.431,18.017Z"
++      android:fillColor="@color/primary_text"/>
++</vector>
+diff --git a/focus-android/app/src/main/res/drawable/ic_open_in.xml b/focus-android/app/src/main/res/drawable/ic_open_in.xml
+index 028bd6d99f72..e29e6559b58c 100644
+--- a/focus-android/app/src/main/res/drawable/ic_open_in.xml
++++ b/focus-android/app/src/main/res/drawable/ic_open_in.xml
+@@ -3,5 +3,5 @@
+    - License, v. 2.0. If a copy of the MPL was not distributed with this
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+ <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+-    <path android:fillColor="#FFFFFF" android:pathData="M7 5C5.895 5 5 5.895 5 7v10c0 1.105 0.895 2 2 2h10c1.105 0 2-0.895 2-2v-1c0-0.552 0.448-1 1-1s1 0.448 1 1v1c0 2.21-1.79 4-4 4H7c-2.21 0-4-1.79-4-4V7c0-2.21 1.79-4 4-4h1c0.552 0 1 0.448 1 1S8.552 5 8 5H7zm6 0c-0.552 0-1-0.448-1-1s0.448-1 1-1h7c0.552 0 1 0.448 1 1v7c0 0.552-0.448 1-1 1s-1-0.448-1-1V6.414l-6.293 6.293c-0.39 0.39-1.024 0.39-1.414 0-0.39-0.39-0.39-1.024 0-1.414L17.586 5H13z"/>
++    <path android:fillColor="@color/primary_text" android:pathData="M7 5C5.895 5 5 5.895 5 7v10c0 1.105 0.895 2 2 2h10c1.105 0 2-0.895 2-2v-1c0-0.552 0.448-1 1-1s1 0.448 1 1v1c0 2.21-1.79 4-4 4H7c-2.21 0-4-1.79-4-4V7c0-2.21 1.79-4 4-4h1c0.552 0 1 0.448 1 1S8.552 5 8 5H7zm6 0c-0.552 0-1-0.448-1-1s0.448-1 1-1h7c0.552 0 1 0.448 1 1v7c0 0.552-0.448 1-1 1s-1-0.448-1-1V6.414l-6.293 6.293c-0.39 0.39-1.024 0.39-1.414 0-0.39-0.39-0.39-1.024 0-1.414L17.586 5H13z"/>
+ </vector>
+diff --git a/focus-android/app/src/main/res/drawable/ic_search.xml b/focus-android/app/src/main/res/drawable/ic_search.xml
+index 09c48e50fd4a..82a6996dfb2d 100644
+--- a/focus-android/app/src/main/res/drawable/ic_search.xml
++++ b/focus-android/app/src/main/res/drawable/ic_search.xml
+@@ -9,5 +9,5 @@
+     android:viewportHeight="24">
+   <path
+       android:pathData="M4,9.5C4,6.4624 6.4624,4 9.5,4C12.5376,4 15,6.4624 15,9.5C15,12.5376 12.5376,15 9.5,15C6.4624,15 4,12.5376 4,9.5ZM9.5,2C5.3579,2 2,5.3579 2,9.5C2,13.6421 5.3579,17 9.5,17C11.2105,17 12.7873,16.4274 14.0491,15.4633L20.2929,21.7071C20.6834,22.0976 21.3166,22.0976 21.7071,21.7071C22.0976,21.3166 22.0976,20.6834 21.7071,20.2929L15.4633,14.0491C16.4274,12.7873 17,11.2105 17,9.5C17,5.3579 13.6421,2 9.5,2Z"
+-      android:fillColor="#FFFFFF"/>
++      android:fillColor="@color/primary_text"/>
+ </vector>
+diff --git a/focus-android/app/src/main/res/drawable/ic_settings.xml b/focus-android/app/src/main/res/drawable/ic_settings.xml
+index 14b35d3d8d9a..567091dfab52 100644
+--- a/focus-android/app/src/main/res/drawable/ic_settings.xml
++++ b/focus-android/app/src/main/res/drawable/ic_settings.xml
+@@ -9,5 +9,5 @@
+     android:viewportHeight="24">
+   <path
+       android:pathData="m12,22c-0.5523,0 -1,-0.4477 -1,-1v-3.083c-0.9117,-0.1529 -1.7536,-0.5114 -2.4766,-1.0263l-2.1803,2.1804c-0.3905,0.3905 -1.0237,0.3905 -1.4142,0 -0.3905,-0.3906 -0.3905,-1.0237 0,-1.4142l2.1803,-2.1804c-0.5148,-0.7229 -0.8734,-1.5648 -1.0263,-2.4765h-3.083c-0.5523,0 -1,-0.4477 -1,-1 0,-0.5523 0.4477,-1 1,-1l3.083,-0c0.153,-0.9117 0.5115,-1.7536 1.0263,-2.4765l-2.1803,-2.1803c-0.3905,-0.3905 -0.3905,-1.0237 0,-1.4142 0.3905,-0.3905 1.0237,-0.3905 1.4142,0l2.1803,2.1803c0.7229,-0.5148 1.5649,-0.8734 2.4766,-1.0263v-3.083c0,-0.5523 0.4477,-1 1,-1 0.5523,0 1,0.4477 1,1v3.083c0.9117,0.153 1.7536,0.5115 2.4765,1.0263l2.1804,-2.1803c0.3905,-0.3905 1.0237,-0.3905 1.4142,0 0.3905,0.3905 0.3905,1.0237 0,1.4142l-2.1804,2.1803c0.5149,0.7229 0.8734,1.5649 1.0263,2.4765l3.083,0c0.5523,0 1,0.4477 1,1 0,0.5523 -0.4477,1 -1,1h-3.083c-0.1529,0.9117 -0.5114,1.7536 -1.0263,2.4765l2.1804,2.1804c0.3905,0.3905 0.3905,1.0236 0,1.4142 -0.3906,0.3905 -1.0237,0.3905 -1.4143,0l-2.1803,-2.1804c-0.7229,0.5149 -1.5648,0.8734 -2.4765,1.0263v3.083c0,0.5523 -0.4477,1 -1,1zM8,12c0,2.2091 1.7909,4 4,4 2.2091,0 4,-1.7909 4,-4 0,-2.2091 -1.7909,-4 -4,-4 -2.2091,0 -4,1.7909 -4,4z"
+-      android:fillColor="#f9f9fa"/>
++      android:fillColor="@color/primary_text"/>
+ </vector>
+diff --git a/focus-android/app/src/main/res/drawable/ic_share.xml b/focus-android/app/src/main/res/drawable/ic_share.xml
+index 1fbb51d3f874..a1ce838dc975 100644
+--- a/focus-android/app/src/main/res/drawable/ic_share.xml
++++ b/focus-android/app/src/main/res/drawable/ic_share.xml
+@@ -9,5 +9,5 @@
+     android:viewportHeight="24">
+   <path
+       android:pathData="M18,9C19.6569,9 21,7.6569 21,6C21,4.3431 19.6569,3 18,3C16.3431,3 15,4.3431 15,6C15,6.1255 15.0077,6.2492 15.0227,6.3706L8.0826,9.8406C7.543,9.3201 6.8089,9 6,9C4.3432,9 3,10.3431 3,12C3,13.6569 4.3432,15 6,15C6.8089,15 7.543,14.6799 8.0826,14.1594L15.0227,17.6294C15.0077,17.7508 15,17.8745 15,18C15,19.6569 16.3431,21 18,21C19.6569,21 21,19.6569 21,18C21,16.3431 19.6569,15 18,15C17.1911,15 16.457,15.3202 15.9174,15.8407L8.9773,12.3706C8.9923,12.2492 9,12.1255 9,12C9,11.8745 8.9923,11.7508 8.9773,11.6294L15.9174,8.1593C16.457,8.6798 17.1911,9 18,9Z"
+-      android:fillColor="#FFFFFF"/>
++      android:fillColor="@color/primary_text"/>
+ </vector>
+diff --git a/focus-android/app/src/main/res/layout/focus_preference.xml b/focus-android/app/src/main/res/layout/focus_preference.xml
+index 134b2ed1e6a8..b3607836a106 100644
+--- a/focus-android/app/src/main/res/layout/focus_preference.xml
++++ b/focus-android/app/src/main/res/layout/focus_preference.xml
+@@ -60,7 +60,6 @@
+             android:layout_below="@android:id/title"
+             android:layout_alignStart="@android:id/title"
+             android:textAppearance="?android:attr/textAppearanceListItemSecondary"
+-            android:textColor="?android:attr/textColorSecondary"
+             android:maxLines="10" />
+ 
+     </RelativeLayout>
+diff --git a/focus-android/app/src/main/res/values/attrs.xml b/focus-android/app/src/main/res/values/attrs.xml
+index 03da1a52ca57..cc8d83dde4c1 100644
+--- a/focus-android/app/src/main/res/values/attrs.xml
++++ b/focus-android/app/src/main/res/values/attrs.xml
+@@ -3,6 +3,9 @@
+    - License, v. 2.0. If a copy of the MPL was not distributed with this
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+ <resources>
++    <attr name="primaryText" format="reference" />
++    <attr name="disabled" format="reference" />
++
+    <declare-styleable name="ResizableKeyboardViewDelegate">
+        <attr name="viewsToHideWhenActivated" format="reference" />
+        <attr name="animate" format="boolean" />
+diff --git a/focus-android/app/src/main/res/values/colors.xml b/focus-android/app/src/main/res/values/colors.xml
+index ab43595b6392..be01db7d6320 100644
+--- a/focus-android/app/src/main/res/values/colors.xml
++++ b/focus-android/app/src/main/res/values/colors.xml
+@@ -6,7 +6,8 @@
+     <color name="colorPrimary">#ff272727</color>
+     <color name="colorPrimaryDark">#6c3b6e</color>
+     <color name="colorAccent">@color/focusContrastPink</color>
+-
++    <color name="primary_text">#ffffff</color>
++    <color name="disabled">#66FBFBFE</color>
+     <color name="focusContrastPink">#e452B9</color>
+ 
+     <color name="colorSettingsTint">#f9f9fa</color>
+diff --git a/focus-android/app/src/main/res/values/strings.xml b/focus-android/app/src/main/res/values/strings.xml
+index 7e7eb3ddf567..0653865a487c 100644
+--- a/focus-android/app/src/main/res/values/strings.xml
++++ b/focus-android/app/src/main/res/values/strings.xml
+@@ -569,6 +569,7 @@
+ 
+     <!-- Checkbox menu item text to request desktop site -->
+     <string name="preference_performance_request_desktop_site">Request desktop site</string>
++    <string name="mvp_preference_performance_request_desktop_site">Desktop site</string>
+ 
+     <!-- Displayed after a user long presses on the URL in a custom tab to copy the URL -->
+     <string name="custom_tab_copy_url_action">URL copied</string>
+diff --git a/focus-android/app/src/main/res/values/styles.xml b/focus-android/app/src/main/res/values/styles.xml
+index 506accd9e7d5..c26125f63762 100644
+--- a/focus-android/app/src/main/res/values/styles.xml
++++ b/focus-android/app/src/main/res/values/styles.xml
+@@ -10,8 +10,10 @@
+ 
+         <item name="android:windowContentTransitions">true</item>
+         <item name="popupMenuStyle">@style/PopupMenu</item>
++        <item name="disabled">@color/disabled</item>
+ 
+         <!-- Use the same colors for both themes until light theme it will be implemented -->
++        <item name="primaryText">@color/primary_text</item>
+         <item name="colorControlNormal">@color/photonWhite</item>
+         <item name="android:textColorSecondary">@color/photonWhite</item>
+ 

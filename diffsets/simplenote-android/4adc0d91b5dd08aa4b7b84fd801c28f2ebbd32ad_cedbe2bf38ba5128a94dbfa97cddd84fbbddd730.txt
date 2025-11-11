@@ -1,0 +1,700 @@
+diff --git a/Simplenote/src/main/java/com/automattic/simplenote/NoteEditorFragment.java b/Simplenote/src/main/java/com/automattic/simplenote/NoteEditorFragment.java
+index f4855cc7e..95258e672 100644
+--- a/Simplenote/src/main/java/com/automattic/simplenote/NoteEditorFragment.java
++++ b/Simplenote/src/main/java/com/automattic/simplenote/NoteEditorFragment.java
+@@ -36,6 +36,7 @@
+ import android.widget.ImageView;
+ import android.widget.LinearLayout;
+ import android.widget.PopupWindow;
++import android.widget.SeekBar;
+ import android.widget.TextView;
+ import android.widget.Toast;
+ import android.widget.ToggleButton;
+@@ -48,18 +49,24 @@
+ import com.automattic.simplenote.utils.DisplayUtils;
+ import com.automattic.simplenote.utils.MatchOffsetHighlighter;
+ import com.automattic.simplenote.utils.PrefUtils;
+-import com.automattic.simplenote.utils.SpaceTokenizer;
+-import com.automattic.simplenote.widgets.SimplenoteEditText;
+ import com.automattic.simplenote.utils.SimplenoteLinkify;
++import com.automattic.simplenote.utils.SpaceTokenizer;
+ import com.automattic.simplenote.utils.TagsMultiAutoCompleteTextView;
+ import com.automattic.simplenote.utils.TagsMultiAutoCompleteTextView.OnTagAddedListener;
+ import com.automattic.simplenote.utils.TextHighlighter;
++import com.automattic.simplenote.widgets.SimplenoteEditText;
++import com.automattic.simplenote.widgets.bottomsheet.BottomSheetLayout;
++import com.automattic.simplenote.widgets.bottomsheet.OnSheetDismissedListener;
+ import com.simperium.client.Bucket;
+ import com.simperium.client.BucketObjectMissingException;
+ import com.simperium.client.Query;
+ 
++import org.json.JSONObject;
++
+ import java.text.NumberFormat;
++import java.util.ArrayList;
+ import java.util.Calendar;
++import java.util.Map;
+ 
+ public class NoteEditorFragment extends Fragment implements Bucket.Listener<Note>, TextWatcher, OnTagAddedListener, View.OnFocusChangeListener, SimplenoteEditText.OnSelectionChangedListener {
+ 
+@@ -67,6 +74,7 @@ public class NoteEditorFragment extends Fragment implements Bucket.Listener<Note
+     public static final String ARG_NEW_NOTE = "new_note";
+     static public final String ARG_MATCH_OFFSETS = "match_offsets";
+     private static final int AUTOSAVE_DELAY_MILLIS = 2000;
++    private static final int MAX_REVISIONS = 30;
+ 
+     private Note mNote;
+     private Bucket<Note> mNotesBucket;
+@@ -74,9 +82,16 @@ public class NoteEditorFragment extends Fragment implements Bucket.Listener<Note
+     private SimplenoteEditText mContentEditText;
+     private TagsMultiAutoCompleteTextView mTagView;
+     private PopupWindow mInfoPopupWindow;
++    private BottomSheetLayout mBottomSheet;
++
++    private View mHistoryView;
++    private SeekBar mHistorySeekBar;
++
+     private ToggleButton mPinButton;
++
+     private Handler mAutoSaveHandler;
+     private Handler mPublishTimeoutHandler;
++
+     private LinearLayout mPlaceholderView;
+     private CursorAdapter mAutocompleteAdapter;
+     private boolean mIsNewNote, mIsLoadingNote;
+@@ -89,6 +104,7 @@ public class NoteEditorFragment extends Fragment implements Bucket.Listener<Note
+     private MatchOffsetHighlighter.SpanFactory mMatchHighlighter;
+     private String mMatchOffsets;
+     private int mCurrentCursorPosition;
++    private ArrayList<Note> mNoteRevisionsList;
+ 
+     /**
+      * Mandatory empty constructor for the fragment manager to instantiate the
+@@ -167,6 +183,7 @@ public View onCreateView(LayoutInflater inflater, ViewGroup container, Bundle sa
+         mTagView = (TagsMultiAutoCompleteTextView) rootView.findViewById(R.id.tag_view);
+         mTagView.setTokenizer(new SpaceTokenizer());
+         mTagView.setOnFocusChangeListener(this);
++        mBottomSheet = (BottomSheetLayout)rootView.findViewById(R.id.bottomsheet);
+ 
+         mHighlighter = new MatchOffsetHighlighter(mMatchHighlighter, mContentEditText);
+ 
+@@ -199,9 +216,59 @@ public void onClick(View v) {
+             setIsNewNote(getArguments().getBoolean(ARG_NEW_NOTE, false));
+         }
+ 
++        configureHistoryView();
++
+ 		return rootView;
+ 	}
+ 
++    private void configureHistoryView() {
++        mHistoryView = LayoutInflater.from(getActivity()).inflate(R.layout.history_view, mBottomSheet, false);
++        mHistorySeekBar = (SeekBar) mHistoryView.findViewById(R.id.seek_bar);
++        mHistorySeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
++            @Override
++            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
++                if (mNoteRevisionsList == null || !mBottomSheet.isSheetShowing()) {
++                    return;
++                }
++
++                if (progress == mNoteRevisionsList.size()) {
++                    mContentEditText.setText(mNote.getContent());
++                } else if (progress < mNoteRevisionsList.size() && mNoteRevisionsList.get(progress) != null) {
++                    Note revisedNote = mNoteRevisionsList.get(progress);
++                    mContentEditText.setText(revisedNote.getContent());
++                }
++            }
++
++            @Override
++            public void onStartTrackingTouch(SeekBar seekBar) {
++                // noop
++            }
++
++            @Override
++            public void onStopTrackingTouch(SeekBar seekBar) {
++                // noop
++            }
++        });
++
++        View cancelHistoryButton = mHistoryView.findViewById(R.id.cancel_history_button);
++        cancelHistoryButton.setOnClickListener(new View.OnClickListener() {
++            @Override
++            public void onClick(View v) {
++                mContentEditText.setText(mNote.getContent());
++                mBottomSheet.dismissSheet();
++            }
++        });
++
++        View restoreHistoryButton = mHistoryView.findViewById(R.id.restore_history_button);
++        restoreHistoryButton.setOnClickListener(new View.OnClickListener() {
++            @Override
++            public void onClick(View v) {
++                mBottomSheet.dismissSheet();
++                saveAndSyncNote();
++            }
++        });
++    }
++
+     @Override
+     public void onResume() {
+         super.onResume();
+@@ -344,6 +411,9 @@ private void showInfoPopup(View view) {
+         updateInfoPopup();
+ 
+         mInfoPopupWindow.showAsDropDown(view);
++
++        // Request revisions for the current note
++        mNotesBucket.getRevisions(mNote, MAX_REVISIONS, mRevisionsRequestCallbacks);
+     }
+ 
+     // update the content of the popupview
+@@ -360,6 +430,7 @@ private void updateInfoPopup() {
+         ImageButton publishCopyButton = (ImageButton) popupView.findViewById(R.id.publish_copy_url);
+         ImageButton publishShareButton = (ImageButton) popupView.findViewById(R.id.publish_share_url);
+         View actionsView = popupView.findViewById(R.id.publish_actions);
++        final View historyButton = popupView.findViewById(R.id.history_button);
+ 
+         final ViewSwitcher viewSwitcher = (ViewSwitcher) popupView.findViewById(R.id.publish_view_switcher);
+ 
+@@ -446,6 +517,41 @@ public void onClick(View v) {
+                 viewSwitcher.showPrevious();
+             }
+         }
++
++        historyButton.setEnabled(mNote.getVersion() > 1);
++        if (historyButton.isEnabled()) {
++            historyButton.setAlpha(1.0f);
++        } else {
++            historyButton.setAlpha(0.5f);
++        }
++
++        historyButton.setOnClickListener(new View.OnClickListener() {
++            @Override
++            public void onClick(View view) {
++                saveNote();
++                mBottomSheet.showWithSheetView(mHistoryView, null, new OnSheetDismissedListener() {
++                    @Override
++                    public void onDismissed(BottomSheetLayout bottomSheetLayout, BottomSheetLayout.DismissalType type) {
++                        if (type == BottomSheetLayout.DismissalType.CANCELED) {
++                            mContentEditText.setText(mNote.getContent());
++                        }
++                    }
++                });
++                mBottomSheet.showWithSheetView(mHistoryView);
++                mInfoPopupWindow.dismiss();
++            }
++        });
++    }
++
++    private void updateHistoryProgressBar() {
++        if (mHistorySeekBar == null) return;
++
++        int totalRevs = mNoteRevisionsList == null ? 0 : mNoteRevisionsList.size();
++        mHistorySeekBar.setMax(totalRevs);
++        mHistorySeekBar.setProgress(totalRevs);
++
++        mHistoryView.findViewById(R.id.history_loading_view).setVisibility(View.GONE);
++        mHistoryView.findViewById(R.id.history_slider_view).setVisibility(View.VISIBLE);
+     }
+ 
+     private boolean noteIsEmpty() {
+@@ -631,12 +737,12 @@ private void attemptAutoList(Editable editable) {
+         mCurrentCursorPosition = mContentEditText.getSelectionStart();
+         AutoBullet.apply(editable, oldCursorPosition, mCurrentCursorPosition);
+         mCurrentCursorPosition = mContentEditText.getSelectionStart();
+-        android.util.Log.d("Simplenote", "==> post cursor position:" + mCurrentCursorPosition);
+     }
+ 
+     private void saveAndSyncNote() {
+-        if (mNote == null)
++        if (mNote == null) {
+             return;
++        }
+ 
+         new saveNoteTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+     }
+@@ -765,7 +871,8 @@ protected void onPostExecute(Void nada) {
+     }
+ 
+     private void saveNote() {
+-        if (mNote == null) {
++        // Don't save if the history view is showing
++        if (mNote == null || mBottomSheet.isSheetShowing()) {
+             return;
+         }
+ 
+@@ -805,7 +912,7 @@ private void saveNote() {
+         public boolean onCreateActionMode(ActionMode mode, Menu menu) {
+             // Inflate a menu resource providing context menu items
+             MenuInflater inflater = mode.getMenuInflater();
+-            if (inflater != null){
++            if (inflater != null) {
+                 inflater.inflate(R.menu.view_link, menu);
+                 mViewLinkMenuItem = menu.findItem(R.id.menu_view_link);
+                 mode.setTitle(getString(R.string.link));
+@@ -1027,4 +1134,38 @@ public void onBeforeUpdateObject(Bucket<Note> bucket, Note note) {
+ 
+         note.setContent(getNoteContentString());
+     }
++
++    private Bucket.RevisionsRequestCallbacks<Note> mRevisionsRequestCallbacks = new
++            Bucket.RevisionsRequestCallbacks<Note>() {
++                // Note: These callbacks won't be running on the main thread
++                @Override
++                public void onComplete(Map<Integer, Note> revisionsMap) {
++                    if (!isAdded()) return;
++
++                    // Convert map to an array list, to work better with the 0-index based seekbar
++                    mNoteRevisionsList = new ArrayList<>(revisionsMap.values());
++                    getActivity().runOnUiThread(new Runnable() {
++                        @Override
++                        public void run() {
++                            updateHistoryProgressBar();
++                        }
++                    });
++                }
++
++                @Override
++                public void onRevision(String key, int version, JSONObject object) {}
++
++                @Override
++                public void onError(Throwable exception) {
++                    if (!isAdded() || mHistoryView == null) return;
++
++                    getActivity().runOnUiThread(new Runnable() {
++                        @Override
++                        public void run() {
++                            mHistoryView.findViewById(R.id.history_progress_bar).setVisibility(View.GONE);
++                            mHistoryView.findViewById(R.id.history_error_text).setVisibility(View.VISIBLE);
++                        }
++                    });
++                }
++            };
+ }
+diff --git a/Simplenote/src/main/res/layout/fragment_note_editor.xml b/Simplenote/src/main/res/layout/fragment_note_editor.xml
+index b83c44607..d947ebff9 100644
+--- a/Simplenote/src/main/res/layout/fragment_note_editor.xml
++++ b/Simplenote/src/main/res/layout/fragment_note_editor.xml
+@@ -1,95 +1,102 @@
+-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+-    xmlns:tools="http://schemas.android.com/tools"
+-    android:id="@+id/note_editor"
++<com.automattic.simplenote.widgets.bottomsheet.BottomSheetLayout
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    android:id="@+id/bottomsheet"
+     android:layout_width="match_parent"
+-    android:layout_height="match_parent"
+-    android:fillViewport="true"
+-    android:layout_weight="3.5">
++    android:layout_height="match_parent">
+ 
+-    <FrameLayout
++    <ScrollView xmlns:tools="http://schemas.android.com/tools"
++        android:id="@+id/note_editor"
+         android:layout_width="match_parent"
+-        android:layout_height="wrap_content">
++        android:layout_height="match_parent"
++        android:layout_weight="3.5"
++        android:fillViewport="true">
+ 
+-        <LinearLayout
+-            android:layout_width="fill_parent"
+-            android:layout_height="fill_parent"
+-            android:paddingBottom="@dimen/padding_large"
+-            android:orientation="vertical">
++        <FrameLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:animateLayoutChanges="true">
+ 
+-            <RelativeLayout
+-                android:focusable="true"
+-                android:focusableInTouchMode="true"
++            <LinearLayout
+                 android:layout_width="fill_parent"
+-                android:layout_height="wrap_content"
+-                android:paddingLeft="@dimen/padding_large"
+-                android:paddingRight="@dimen/padding_large"
+-                android:layout_marginTop="@dimen/padding_small">
++                android:layout_height="fill_parent"
++                android:orientation="vertical"
++                android:paddingBottom="@dimen/padding_large">
+ 
+-                <ToggleButton
+-                    android:id="@+id/pinButton"
+-                    android:layout_width="32dp"
+-                    android:layout_height="32dp"
+-                    android:layout_marginTop="8dp"
+-                    android:layout_alignParentRight="true"
+-                    android:layout_marginLeft="4dp"
+-                    android:textOn=""
+-                    android:textOff=""
+-                    android:background="?attr/pinIconSelector" />
+-
+-                <com.automattic.simplenote.utils.TagsMultiAutoCompleteTextView
+-                    android:id="@+id/tag_view"
++                <RelativeLayout
+                     android:layout_width="fill_parent"
+                     android:layout_height="wrap_content"
+-                    android:minHeight="48dp"
+-                    android:layout_toLeftOf="@id/pinButton"
+-                    android:hint="@string/tag_hint"
+-                    android:completionThreshold="1"
+-                	android:textColor="?attr/noteEditorTextColor"
+-					android:textColorHint="?attr/hintTextColor"
+-                    android:inputType="textNoSuggestions"
+-                    android:imeOptions="actionNext"
+-                    android:nextFocusForward="@+id/note_content"
+-                    android:nextFocusUp="@id/tag_view"
+-                    android:nextFocusLeft="@id/tag_view"
+-                    android:textSize="16sp"
+-                    android:longClickable="false"
+-                    android:layout_marginLeft="-4dp" />
++                    android:layout_marginTop="@dimen/padding_small"
++                    android:focusable="true"
++                    android:focusableInTouchMode="true"
++                    android:paddingLeft="@dimen/padding_large"
++                    android:paddingRight="@dimen/padding_large">
+ 
+-            </RelativeLayout>
++                    <ToggleButton
++                        android:id="@+id/pinButton"
++                        android:layout_width="32dp"
++                        android:layout_height="32dp"
++                        android:layout_alignParentRight="true"
++                        android:layout_marginLeft="4dp"
++                        android:layout_marginTop="8dp"
++                        android:background="?attr/pinIconSelector"
++                        android:textOff=""
++                        android:textOn="" />
+ 
+-            <com.automattic.simplenote.widgets.SimplenoteEditText
+-                android:id="@+id/note_content"
+-                android:layout_width="fill_parent"
+-                android:layout_height="0dp"
+-                android:layout_weight="1"
+-                android:gravity="top"
+-                android:textColor="?attr/noteEditorTextColor"
+-                android:textColorLink="@color/simplenote_blue"
+-                android:textSize="18sp"
+-                android:inputType="textMultiLine|textCapSentences|textAutoCorrect"
+-                android:scrollHorizontally="false"
+-                android:paddingTop="@dimen/padding_small"
+-                android:paddingBottom="@dimen/padding_small"
+-                android:paddingLeft="@dimen/padding_large"
+-                android:paddingRight="@dimen/padding_large"
+-                android:background="@null"
+-                tools:context=".NoteEditorFragment" />
+-        </LinearLayout>
++                    <com.automattic.simplenote.utils.TagsMultiAutoCompleteTextView
++                        android:id="@+id/tag_view"
++                        android:layout_width="fill_parent"
++                        android:layout_height="wrap_content"
++                        android:layout_marginLeft="-4dp"
++                        android:layout_toLeftOf="@id/pinButton"
++                        android:completionThreshold="1"
++                        android:hint="@string/tag_hint"
++                        android:imeOptions="actionNext"
++                        android:inputType="textNoSuggestions"
++                        android:longClickable="false"
++                        android:minHeight="48dp"
++                        android:nextFocusForward="@+id/note_content"
++                        android:nextFocusLeft="@id/tag_view"
++                        android:nextFocusUp="@id/tag_view"
++                        android:textColor="?attr/noteEditorTextColor"
++                        android:textColorHint="?attr/hintTextColor"
++                        android:textSize="16sp" />
++
++                </RelativeLayout>
+ 
+-        <LinearLayout
+-            android:id="@+id/placeholder"
+-            android:layout_width="fill_parent"
+-            android:layout_height="fill_parent"
+-            android:background="?attr/mainBackgroundColor"
+-            android:gravity="center"
+-            android:visibility="gone">
++                <com.automattic.simplenote.widgets.SimplenoteEditText
++                    android:id="@+id/note_content"
++                    android:layout_width="fill_parent"
++                    android:layout_height="0dp"
++                    android:layout_weight="1"
++                    android:background="@null"
++                    android:gravity="top"
++                    android:inputType="textMultiLine|textCapSentences|textAutoCorrect"
++                    android:paddingBottom="@dimen/padding_small"
++                    android:paddingLeft="@dimen/padding_large"
++                    android:paddingRight="@dimen/padding_large"
++                    android:paddingTop="@dimen/padding_small"
++                    android:scrollHorizontally="false"
++                    android:textColor="?attr/noteEditorTextColor"
++                    android:textColorLink="@color/simplenote_blue"
++                    android:textSize="18sp"
++                    tools:context=".NoteEditorFragment" />
++            </LinearLayout>
++
++            <LinearLayout
++                android:id="@+id/placeholder"
++                android:layout_width="fill_parent"
++                android:layout_height="fill_parent"
++                android:background="?attr/mainBackgroundColor"
++                android:gravity="center"
++                android:visibility="gone">
+ 
+-            <ImageView
+-                android:layout_width="160dp"
+-                android:layout_height="160dp"
+-                android:src="@drawable/login_logo"
+-                android:scaleType="centerInside"
+-                android:tint="?attr/placeholderLogoColor" />
+-        </LinearLayout>
+-    </FrameLayout>
+-</ScrollView>
++                <ImageView
++                    android:layout_width="160dp"
++                    android:layout_height="160dp"
++                    android:scaleType="centerInside"
++                    android:src="@drawable/login_logo"
++                    android:tint="?attr/placeholderLogoColor" />
++            </LinearLayout>
++        </FrameLayout>
++    </ScrollView>
++</com.automattic.simplenote.widgets.bottomsheet.BottomSheetLayout>
+\ No newline at end of file
+diff --git a/Simplenote/src/main/res/layout/history_view.xml b/Simplenote/src/main/res/layout/history_view.xml
+index 17103b2f6..c164ba06e 100644
+--- a/Simplenote/src/main/res/layout/history_view.xml
++++ b/Simplenote/src/main/res/layout/history_view.xml
+@@ -1,52 +1,83 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     android:id="@+id/history_view"
+     android:layout_width="match_parent"
+     android:layout_height="wrap_content"
++    android:animateLayoutChanges="true"
+     android:background="@color/simplenote_blue_translucent"
+     android:orientation="vertical"
+-    android:paddingBottom="@dimen/padding_extra_large"
+-    android:paddingLeft="@dimen/padding_medium"
+-    android:paddingRight="@dimen/padding_medium"
+-    android:paddingTop="@dimen/padding_medium">
+-
+-    <SeekBar
+-        android:id="@+id/seek_bar"
+-        android:layout_width="match_parent"
+-        android:layout_height="48dp"
+-        android:progressTint="@color/white"
+-        android:thumbTint="@color/simplenote_blue_accent" />
++    android:padding="@dimen/padding_medium">
+ 
+     <LinearLayout
++        android:id="@+id/history_loading_view"
+         android:layout_width="wrap_content"
+         android:layout_height="wrap_content"
+-        android:layout_gravity="end"
+-        android:orientation="horizontal"
+-        android:paddingLeft="@dimen/padding_medium"
+-        android:paddingRight="@dimen/padding_medium">
++        android:layout_gravity="center"
++        android:orientation="vertical">
+ 
+-        <com.automattic.simplenote.widgets.SourceSansTextView
+-            android:id="@+id/cancel_history_button"
++        <ProgressBar
++            android:id="@+id/history_progress_bar"
+             android:layout_width="wrap_content"
+             android:layout_height="wrap_content"
+-            android:background="@drawable/selectable_background_simplestyle"
+-            android:padding="@dimen/padding_small"
+-            android:text="@string/cancel"
+-            android:textAllCaps="true"
+-            android:textColor="@color/white"
+-            android:textSize="16sp"
+-            android:textStyle="bold" />
++            android:indeterminate="true" />
+ 
+         <com.automattic.simplenote.widgets.SourceSansTextView
+-            android:id="@+id/restore_history_button"
++            android:id="@+id/history_error_text"
+             android:layout_width="wrap_content"
+             android:layout_height="wrap_content"
+-            android:background="@drawable/selectable_background_simplestyle"
+-            android:padding="@dimen/padding_small"
+-            android:text="@string/restore"
+-            android:textAllCaps="true"
+-            android:textColor="@color/white"
+             android:textSize="16sp"
+-            android:textStyle="bold" />
++            android:textColor="@color/white"
++            android:text="@string/error_history"
++            android:visibility="gone" />
++
++    </LinearLayout>
++
++    <LinearLayout
++        android:id="@+id/history_slider_view"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent"
++        android:orientation="vertical"
++        android:visibility="gone">
++
++        <SeekBar
++            android:id="@+id/seek_bar"
++            android:layout_width="match_parent"
++            android:layout_height="48dp"
++            android:progressTint="@color/white"
++            android:thumbTint="@color/simplenote_blue_accent" />
++
++        <LinearLayout
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_gravity="end"
++            android:orientation="horizontal"
++            android:paddingLeft="@dimen/padding_medium"
++            android:paddingRight="@dimen/padding_medium">
++
++            <com.automattic.simplenote.widgets.SourceSansTextView
++                android:id="@+id/cancel_history_button"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:background="@drawable/selectable_background_simplestyle"
++                android:padding="@dimen/padding_small"
++                android:text="@string/cancel"
++                android:textAllCaps="true"
++                android:textColor="@color/white"
++                android:textSize="16sp"
++                android:textStyle="bold" />
++
++            <com.automattic.simplenote.widgets.SourceSansTextView
++                android:id="@+id/restore_history_button"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:background="@drawable/selectable_background_simplestyle"
++                android:padding="@dimen/padding_small"
++                android:text="@string/restore"
++                android:textAllCaps="true"
++                android:textColor="@color/white"
++                android:textSize="16sp"
++                android:textStyle="bold" />
++        </LinearLayout>
++
+     </LinearLayout>
+-</LinearLayout>
+\ No newline at end of file
++</FrameLayout>
+\ No newline at end of file
+diff --git a/Simplenote/src/main/res/layout/popup_info.xml b/Simplenote/src/main/res/layout/popup_info.xml
+index 58a845b8c..6f17da498 100644
+--- a/Simplenote/src/main/res/layout/popup_info.xml
++++ b/Simplenote/src/main/res/layout/popup_info.xml
+@@ -31,14 +31,15 @@
+             android:gravity="center"
+             android:orientation="vertical">
+ 
+-
+             <LinearLayout
+                 android:id="@+id/publish_note_button"
+                 android:layout_width="wrap_content"
+                 android:layout_height="wrap_content"
+                 android:background="@drawable/welcome_button_selector"
+                 android:paddingLeft="@dimen/padding_large"
++                android:paddingStart="@dimen/padding_large"
+                 android:paddingRight="@dimen/padding_small"
++                android:paddingEnd="@dimen/padding_small"
+                 android:paddingBottom="@dimen/padding_large"
+                 android:paddingTop="@dimen/padding_large"
+                 android:divider="@drawable/vertical_divider_blue"
+@@ -50,6 +51,7 @@
+                     android:layout_width="wrap_content"
+                     android:layout_height="wrap_content"
+                     android:paddingRight="@dimen/padding_small"
++                    android:paddingEnd="@dimen/padding_small"
+                     android:textSize="18sp"
+                     android:textColor="@color/white"
+                     android:text="@string/publish" />
+@@ -94,6 +96,7 @@
+                         android:layout_height="wrap_content"
+                         android:layout_gravity="center_vertical"
+                         android:layout_marginLeft="8dp"
++                        android:layout_marginStart="8dp"
+                         android:background="@drawable/selectable_background_simplestyle"
+                         android:contentDescription="@string/content_description_copy_button"
+                         android:src="@drawable/ic_content_copy_white_24dp" />
+@@ -104,6 +107,7 @@
+                         android:layout_height="wrap_content"
+                         android:layout_gravity="center_vertical"
+                         android:layout_marginLeft="8dp"
++                        android:layout_marginStart="8dp"
+                         android:background="@drawable/selectable_background_simplestyle"
+                         android:contentDescription="@string/content_description_copy_button"
+                         android:src="@drawable/ic_share_white_24dp" />
+@@ -111,6 +115,21 @@
+                 </LinearLayout>
+ 
+             </LinearLayout>
++
++            <com.automattic.simplenote.widgets.SourceSansTextView
++                android:id="@+id/history_button"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:textSize="18sp"
++                android:textColor="@color/white"
++                android:layout_marginTop="@dimen/padding_small"
++                android:padding="@dimen/padding_small"
++                android:drawableLeft="@drawable/ic_av_timer_white_18dp"
++                android:drawableStart="@drawable/ic_av_timer_white_18dp"
++                android:drawablePadding="@dimen/padding_extra_small"
++                android:background="@drawable/selectable_background_simplestyle"
++                android:text="@string/history" />
++
+         </LinearLayout>
+ 
+         <LinearLayout
+diff --git a/Simplenote/src/main/res/values-sw600dp/dimens.xml b/Simplenote/src/main/res/values-sw600dp/dimens.xml
+index 601c77ea3..fdd98df4a 100644
+--- a/Simplenote/src/main/res/values-sw600dp/dimens.xml
++++ b/Simplenote/src/main/res/values-sw600dp/dimens.xml
+@@ -2,4 +2,5 @@
+ <resources>
+     <dimen name="nav_row_height">64dp</dimen>
+     <dimen name="nav_header_size">136dp</dimen>
++    <dimen name="bottomsheet_default_sheet_width">446dp</dimen>
+ </resources>
+diff --git a/Simplenote/src/main/res/values/colors.xml b/Simplenote/src/main/res/values/colors.xml
+index 04651067d..d36bac7b4 100644
+--- a/Simplenote/src/main/res/values/colors.xml
++++ b/Simplenote/src/main/res/values/colors.xml
+@@ -5,6 +5,7 @@
+ <resources>
+ 
+     <color name="simplenote_blue">#448AC9</color>
++    <color name="simplenote_blue_translucent">#DD448AC9</color>
+     <color name="simplenote_blue_light">#EEF3F8</color>
+     <color name="simplenote_blue_accent">#69bae9</color>
+     <color name="simplenote_blue_dark">#30628f</color>
+diff --git a/Simplenote/src/main/res/values/dimens.xml b/Simplenote/src/main/res/values/dimens.xml
+index ca14089c7..4c63798af 100644
+--- a/Simplenote/src/main/res/values/dimens.xml
++++ b/Simplenote/src/main/res/values/dimens.xml
+@@ -17,4 +17,6 @@
+ 
+     <!-- Lollipop requires a margin for the sign out preference, see values-v21/dimens.xml -->
+     <dimen name="settings_sign_out_margin">0dp</dimen>
++
++    <dimen name="bottomsheet_default_sheet_width">0dp</dimen>
+ </resources>
+\ No newline at end of file
+diff --git a/Simplenote/src/main/res/values/strings.xml b/Simplenote/src/main/res/values/strings.xml
+index fe3654455..cadd5f2ee 100644
+--- a/Simplenote/src/main/res/values/strings.xml
++++ b/Simplenote/src/main/res/values/strings.xml
+@@ -157,4 +157,7 @@
+     <!-- Note: These need to be manually copied to the Wear app strings -->
+     <string name="noted">Noted</string>
+     <string name="error">Error</string>
++    <string name="restore">Restore</string>
++    <string name="history">History</string>
++    <string name="error_history">Couldn\'t retrieve history.</string>
+ </resources>
+\ No newline at end of file

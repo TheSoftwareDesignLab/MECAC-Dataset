@@ -1,0 +1,246 @@
+diff --git a/SignalServiceKit/MessageBackup/Archivers/ChatItem/MessageBackup+InteractionTypes.swift b/SignalServiceKit/MessageBackup/Archivers/ChatItem/MessageBackup+InteractionTypes.swift
+index 0db58c64d29..2417d7abb09 100644
+--- a/SignalServiceKit/MessageBackup/Archivers/ChatItem/MessageBackup+InteractionTypes.swift
++++ b/SignalServiceKit/MessageBackup/Archivers/ChatItem/MessageBackup+InteractionTypes.swift
+@@ -50,7 +50,7 @@ extension MessageBackup {
+         let expireStartDate: UInt64?
+         let expiresInMs: UInt64?
+         let isSealedSender: Bool
+-        let chatItemType: ChatItemType
++        private(set) var chatItemType: ChatItemType
+ 
+         /// - SeeAlso: ``TSMessage/isSmsMessageRestoredFromBackup``
+         let isSmsPreviouslyRestoredFromBackup: Bool
+@@ -63,6 +63,28 @@ extension MessageBackup {
+             pastRevisions.append(pastRevision)
+         }
+ 
++        // MARK: -
++
++        /// Returns whether the `chatItemType` of the latest or any prior
++        /// revision passes the given predicate.
++        func anyRevisionContainsChatItemType(where predicate: (ChatItemType) -> Bool) -> Bool {
++            let allChatItemTypes = [chatItemType] + pastRevisions.map(\.chatItemType)
++            return allChatItemTypes.contains(where: predicate)
++        }
++
++        /// Runs the given `block` on the `chatItemType` of the latest and any
++        /// prior revisions, replacing each with the result of the `block`.
++        mutating func mutateChatItemTypes(block: (ChatItemType) -> ChatItemType) {
++            chatItemType = block(chatItemType)
++            pastRevisions = pastRevisions.map { _pastRevision in
++                var pastRevision = _pastRevision
++                pastRevision.chatItemType = block(_pastRevision.chatItemType)
++                return pastRevision
++            }
++        }
++
++        // MARK: - Construction
++
+         public enum AuthorAddress {
+             case localUser
+             case contact(MessageBackup.ContactAddress)
+@@ -183,6 +205,8 @@ extension MessageBackup {
+         }
+     }
+ 
++    // MARK: -
++
+     enum SkippableInteraction {
+         enum SkippableGroupUpdate {
+             /// This is a group update from back when we kept raw strings on
+diff --git a/SignalServiceKit/MessageBackup/Archivers/ChatItem/MessageBackupChatItemArchiverImpl.swift b/SignalServiceKit/MessageBackup/Archivers/ChatItem/MessageBackupChatItemArchiverImpl.swift
+index 496e47eb1b7..388162497dc 100644
+--- a/SignalServiceKit/MessageBackup/Archivers/ChatItem/MessageBackupChatItemArchiverImpl.swift
++++ b/SignalServiceKit/MessageBackup/Archivers/ChatItem/MessageBackupChatItemArchiverImpl.swift
+@@ -226,7 +226,7 @@ public class MessageBackupChatItemArchiverImpl: MessageBackupChatItemArchiver {
+             return .success
+         }
+ 
+-        let details: MessageBackup.InteractionArchiveDetails
++        var details: MessageBackup.InteractionArchiveDetails
+         switch archiveInteractionResult {
+         case .success(let deets):
+             details = deets
+@@ -245,45 +245,29 @@ public class MessageBackupChatItemArchiverImpl: MessageBackupChatItemArchiver {
+ 
+         // We may skip archiving messages based on their expiration
+         // (disappearing message) details.
+-        let shouldSkipBasedOnExpiration: Bool = {
+-            guard
+-                let expiresInMs = details.expiresInMs,
+-                expiresInMs > 0
+-            else {
+-                // If the message isn't expiring, no reason to skip.
+-                return false
+-            }
+-
+-            if expiresInMs <= context.includedContentFilter.minExpirationTimeMs {
+-                // If the expire timer was less than our minimum, we can always
+-                // skip.
+-                return true
+-            } else if let expireStartDate = details.expireStartDate {
+-                // If the expiration timer has started, check whether the
+-                // remaining time before it expires is sufficient.
+-                let expirationDate = expireStartDate + expiresInMs
+-                let minExpirationDate = context.startTimestampMs + context.includedContentFilter.minRemainingTimeUntilExpirationMs
+-
+-                return expirationDate <= minExpirationDate
+-            } else {
+-                return false
+-            }
+-        }()
+-        if shouldSkipBasedOnExpiration {
++        if shouldSkipMessageBasedOnExpiration(
++            details: details,
++            context: context
++        ) {
+             // Skip, but treat as a success.
+             return .success
+         }
+ 
+-        let chatItem = buildChatItem(
+-            fromDetails: details,
+-            chatId: chatId
+-        )
++        // A bug on iOS allowed us to create edits of voice notes that contained
++        // text as well, which are not allowed in a Backup. Sanitize before
++        // writing that disallowed content to the stream.
++        sanitizeVoiceNotesWithText(details: &details)
+ 
+         let error = Self.writeFrameToStream(
+             stream,
+             objectId: interaction.uniqueInteractionId,
+             frameBencher: frameBencher
+         ) {
++            let chatItem = buildChatItem(
++                fromDetails: details,
++                chatId: chatId
++            )
++
+             var frame = BackupProto_Frame()
+             frame.item = .chatItem(chatItem)
+             return frame
+@@ -299,6 +283,80 @@ public class MessageBackupChatItemArchiverImpl: MessageBackupChatItemArchiver {
+         }
+     }
+ 
++    /// Strips the "voice message" flag from the attachments of all revisions
++    /// of the given message, if any of those revisions include both a voice
++    /// message and text.
++    ///
++    /// This works around an issue in which iOS allowed editing of voice
++    /// messages such that they could get body text added, by converting those
++    /// messages to "text messages with a non-voice-message audio attachment".
++    private func sanitizeVoiceNotesWithText(
++        details: inout MessageBackup.InteractionArchiveDetails
++    ) {
++        let anyRevisionContainsVoiceNoteAndText = details.anyRevisionContainsChatItemType { chatItemType -> Bool in
++            switch chatItemType {
++            case .standardMessage(let standardMessageProto):
++                let hasText = standardMessageProto.hasText
++                let hasVoiceNote = standardMessageProto.attachments.contains {
++                    $0.flag == .voiceMessage
++                }
++
++                return hasText && hasVoiceNote
++            default:
++                return false
++            }
++        }
++
++        guard anyRevisionContainsVoiceNoteAndText else { return }
++
++        details.mutateChatItemTypes { _chatItemType -> MessageBackup.InteractionArchiveDetails.ChatItemType in
++            switch _chatItemType {
++            case .standardMessage(var standardMessageProto):
++                standardMessageProto.attachments = standardMessageProto.attachments.map { attachment in
++                    if attachment.flag == .voiceMessage {
++                        var _attachment = attachment
++                        _attachment.flag = .none
++                        return _attachment
++                    }
++
++                    return attachment
++                }
++
++                return .standardMessage(standardMessageProto)
++            default:
++                return _chatItemType
++            }
++        }
++    }
++
++    private func shouldSkipMessageBasedOnExpiration(
++        details: MessageBackup.InteractionArchiveDetails,
++        context: MessageBackup.ArchivingContext
++    ) -> Bool {
++        guard
++            let expiresInMs = details.expiresInMs,
++            expiresInMs > 0
++        else {
++            // If the message isn't expiring, no reason to skip.
++            return false
++        }
++
++        if expiresInMs <= context.includedContentFilter.minExpirationTimeMs {
++            // If the expire timer was less than our minimum, we can always
++            // skip.
++            return true
++        } else if let expireStartDate = details.expireStartDate {
++            // If the expiration timer has started, check whether the
++            // remaining time before it expires is sufficient.
++            let expirationDate = expireStartDate + expiresInMs
++            let minExpirationDate = context.startTimestampMs + context.includedContentFilter.minRemainingTimeUntilExpirationMs
++
++            return expirationDate <= minExpirationDate
++        } else {
++            return false
++        }
++    }
++
+     private func buildChatItem(
+         fromDetails details: MessageBackup.InteractionArchiveDetails,
+         chatId: MessageBackup.ChatId
+diff --git a/SignalServiceKit/MessageBackup/Archivers/ChatItem/MessageBackupTSMessageContentsArchiver.swift b/SignalServiceKit/MessageBackup/Archivers/ChatItem/MessageBackupTSMessageContentsArchiver.swift
+index a140f59e433..039551e6b57 100644
+--- a/SignalServiceKit/MessageBackup/Archivers/ChatItem/MessageBackupTSMessageContentsArchiver.swift
++++ b/SignalServiceKit/MessageBackup/Archivers/ChatItem/MessageBackupTSMessageContentsArchiver.swift
+@@ -305,7 +305,6 @@ class MessageBackupTSMessageContentsArchiver: MessageBackupProtoArchiver {
+         // Every "StandardMessage" must have either a body or body attachments;
+         // if neither is set this stays false and we fail the message.
+         var hasPrimaryContent = false
+-        var hasText = false
+ 
+         if let messageBody = message.body?.nilIfEmpty {
+             hasPrimaryContent = true
+@@ -322,7 +321,6 @@ class MessageBackupTSMessageContentsArchiver: MessageBackupProtoArchiver {
+                 return errorResult
+             }
+             standardMessage.text = text
+-            hasText = true
+ 
+             // Oversize text is only ever a thing _alongside_ body text, the body
+             // text is a prefix of the oversize text.
+@@ -347,20 +345,9 @@ class MessageBackupTSMessageContentsArchiver: MessageBackupProtoArchiver {
+             context: context
+         )
+         switch bodyAttachmentsResult.bubbleUp(ChatItemType.self, partialErrors: &partialErrors) {
+-        case .continue(var bodyAttachmentProtos):
++        case .continue(let bodyAttachmentProtos):
+             if !bodyAttachmentProtos.isEmpty {
+                 hasPrimaryContent = true
+-                if hasText, bodyAttachmentProtos.first?.flag == .voiceMessage {
+-                    // Drop the voice message flag if text is nonempty.
+-                    bodyAttachmentProtos = bodyAttachmentProtos.map {
+-                        guard $0.flag == .voiceMessage else {
+-                            return $0
+-                        }
+-                        var proto = $0
+-                        proto.flag = .none
+-                        return proto
+-                    }
+-                }
+                 standardMessage.attachments = bodyAttachmentProtos
+             }
+         case .bubbleUpError(let errorResult):

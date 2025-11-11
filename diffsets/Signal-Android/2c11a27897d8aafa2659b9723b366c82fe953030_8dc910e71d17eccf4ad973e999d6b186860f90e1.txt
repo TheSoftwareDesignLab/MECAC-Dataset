@@ -1,0 +1,130 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/database/SearchTable.kt b/app/src/main/java/org/thoughtcrime/securesms/database/SearchTable.kt
+index f83f7856d64..5eaaa273d6a 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/database/SearchTable.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/database/SearchTable.kt
+@@ -33,7 +33,10 @@ class SearchTable(context: Context, databaseHelper: SignalDatabase) : DatabaseTa
+ 
+     @Language("sql")
+     val CREATE_TABLE = arrayOf(
+-      "CREATE VIRTUAL TABLE $FTS_TABLE_NAME USING fts5($BODY, $THREAD_ID UNINDEXED, content=${MessageTable.TABLE_NAME}, content_rowid=${MessageTable.ID})"
++      // We've taken the default of tokenize value of "unicode61 categories 'L* N* Co'" and added the Sc (currency) and So (emoji) categories to allow searching for those characters.
++      // https://www.sqlite.org/fts5.html#tokenizers
++      // https://www.compart.com/en/unicode/category
++      """CREATE VIRTUAL TABLE $FTS_TABLE_NAME USING fts5($BODY, $THREAD_ID UNINDEXED, content=${MessageTable.TABLE_NAME}, content_rowid=${MessageTable.ID}, tokenize = "unicode61 categories 'L* N* Co Sc So'")"""
+     )
+ 
+     private const val TRIGGER_AFTER_INSERT = "message_ai"
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/database/helpers/SignalDatabaseMigrations.kt b/app/src/main/java/org/thoughtcrime/securesms/database/helpers/SignalDatabaseMigrations.kt
+index e984809abf3..a37568082d4 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/database/helpers/SignalDatabaseMigrations.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/database/helpers/SignalDatabaseMigrations.kt
+@@ -96,6 +96,7 @@ import org.thoughtcrime.securesms.database.helpers.migration.V235_AttachmentUuid
+ import org.thoughtcrime.securesms.database.helpers.migration.V236_FixInAppSubscriberCurrencyIfAble
+ import org.thoughtcrime.securesms.database.helpers.migration.V237_ResetGroupForceUpdateTimestamps
+ import org.thoughtcrime.securesms.database.helpers.migration.V238_AddGroupSendEndorsementsColumns
++import org.thoughtcrime.securesms.database.helpers.migration.V239_MessageFullTextSearchEmojiSupport
+ 
+ /**
+  * Contains all of the database migrations for [SignalDatabase]. Broken into a separate file for cleanliness.
+@@ -194,10 +195,11 @@ object SignalDatabaseMigrations {
+     235 to V235_AttachmentUuidColumn,
+     236 to V236_FixInAppSubscriberCurrencyIfAble,
+     237 to V237_ResetGroupForceUpdateTimestamps,
+-    238 to V238_AddGroupSendEndorsementsColumns
++    238 to V238_AddGroupSendEndorsementsColumns,
++    239 to V239_MessageFullTextSearchEmojiSupport
+   )
+ 
+-  const val DATABASE_VERSION = 238
++  const val DATABASE_VERSION = 239
+ 
+   @JvmStatic
+   fun migrate(context: Application, db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/database/helpers/migration/V239_MessageFullTextSearchEmojiSupport.kt b/app/src/main/java/org/thoughtcrime/securesms/database/helpers/migration/V239_MessageFullTextSearchEmojiSupport.kt
+new file mode 100644
+index 00000000000..6b5cf4ac300
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/database/helpers/migration/V239_MessageFullTextSearchEmojiSupport.kt
+@@ -0,0 +1,55 @@
++/*
++ * Copyright 2024 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.database.helpers.migration
++
++import android.app.Application
++import net.zetetic.database.sqlcipher.SQLiteDatabase
++
++/**
++ * Recreates the message FTS stuff, but with a tokenizer property that lets us search for emoji.
++ * This is paired with an ApplicationMigration to rebuild the message index in the background.
++ */
++@Suppress("ClassName")
++object V239_MessageFullTextSearchEmojiSupport : SignalDatabaseMigration {
++
++  const val FTS_TABLE_NAME = "message_fts"
++
++  override fun migrate(context: Application, db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
++    db.execSQL("DROP TABLE IF EXISTS $FTS_TABLE_NAME")
++    db.execSQL("DROP TABLE IF EXISTS ${FTS_TABLE_NAME}_config")
++    db.execSQL("DROP TABLE IF EXISTS ${FTS_TABLE_NAME}_content")
++    db.execSQL("DROP TABLE IF EXISTS ${FTS_TABLE_NAME}_data")
++    db.execSQL("DROP TABLE IF EXISTS ${FTS_TABLE_NAME}_idx")
++    db.execSQL("DROP TRIGGER IF EXISTS message_ai")
++    db.execSQL("DROP TRIGGER IF EXISTS message_ad")
++    db.execSQL("DROP TRIGGER IF EXISTS message_au")
++
++    db.execSQL("""CREATE VIRTUAL TABLE message_fts USING fts5(body, thread_id UNINDEXED, content=message, content_rowid=_id, tokenize = "unicode61 categories 'L* N* Co Sc So'")""")
++
++    db.execSQL(
++      """
++      CREATE TRIGGER message_ai AFTER INSERT ON message BEGIN
++        INSERT INTO message_fts(rowid, body, thread_id) VALUES (new._id, new.body, new.thread_id);
++      END;
++      """
++    )
++    db.execSQL(
++      """
++      CREATE TRIGGER message_ad AFTER DELETE ON message BEGIN
++        INSERT INTO message_fts(message_fts, rowid, body, thread_id) VALUES('delete', old._id, old.body, old.thread_id);
++      END;
++    """
++    )
++    db.execSQL(
++      """
++      CREATE TRIGGER message_au AFTER UPDATE ON message BEGIN
++        INSERT INTO message_fts(message_fts, rowid, body, thread_id) VALUES('delete', old._id, old.body, old.thread_id);
++        INSERT INTO message_fts(rowid, body, thread_id) VALUES (new._id, new.body, new.thread_id);
++      END;
++      """
++    )
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/migrations/ApplicationMigrations.java b/app/src/main/java/org/thoughtcrime/securesms/migrations/ApplicationMigrations.java
+index 4f0674d9bcc..7343b8968f9 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/migrations/ApplicationMigrations.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/migrations/ApplicationMigrations.java
+@@ -150,9 +150,10 @@ static final class Version {
+     static final int SUBSCRIBER_ID                 = 105;
+     static final int CONTACT_LINK_REBUILD          = 106;
+     static final int DELETE_SYNC_CAPABILITY        = 107;
++    static final int REBUILD_MESSAGE_FTS_INDEX_5   = 108;
+   }
+ 
+-  public static final int CURRENT_VERSION = 107;
++  public static final int CURRENT_VERSION = 108;
+ 
+  /**
+    * This *must* be called after the {@link JobManager} has been instantiated, but *before* the call
+@@ -683,6 +684,10 @@ private static LinkedHashMap<Integer, MigrationJob> getMigrationJobs(@NonNull Co
+       jobs.put(Version.DELETE_SYNC_CAPABILITY, new AttributesMigrationJob());
+     }
+ 
++    if (lastSeenVersion < Version.REBUILD_MESSAGE_FTS_INDEX_5) {
++      jobs.put(Version.REBUILD_MESSAGE_FTS_INDEX_5, new RebuildMessageSearchIndexMigrationJob());
++    }
++
+     return jobs;
+   }
+ 

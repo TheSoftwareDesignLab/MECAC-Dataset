@@ -1,0 +1,222 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7a1b2fd0f..d2b693f67 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
+ 
+ - Viewer: display more items in tag/copy/move quick action choosers
+ 
++### Fixed
++
++- multiple widget setup after device reboot
++
+ ## <a id="v1.11.8"></a>[v1.11.8] - 2024-07-19
+ 
+ ### Added
+diff --git a/android/app/src/main/kotlin/deckers/thibault/aves/HomeWidgetProvider.kt b/android/app/src/main/kotlin/deckers/thibault/aves/HomeWidgetProvider.kt
+index 079ad5d30..f42bb2e8e 100644
+--- a/android/app/src/main/kotlin/deckers/thibault/aves/HomeWidgetProvider.kt
++++ b/android/app/src/main/kotlin/deckers/thibault/aves/HomeWidgetProvider.kt
+@@ -11,12 +11,18 @@ import android.graphics.Bitmap
+ import android.net.Uri
+ import android.os.Build
+ import android.os.Bundle
++import android.os.Handler
++import android.os.Looper
+ import android.util.Log
+ import android.util.SizeF
+ import android.widget.RemoteViews
+ import app.loup.streams_channel.StreamsChannel
+ import deckers.thibault.aves.channel.AvesByteSendingMethodCodec
+-import deckers.thibault.aves.channel.calls.*
++import deckers.thibault.aves.channel.calls.DeviceHandler
++import deckers.thibault.aves.channel.calls.MediaFetchBytesHandler
++import deckers.thibault.aves.channel.calls.MediaFetchObjectHandler
++import deckers.thibault.aves.channel.calls.MediaStoreHandler
++import deckers.thibault.aves.channel.calls.StorageHandler
+ import deckers.thibault.aves.channel.streams.ImageByteStreamHandler
+ import deckers.thibault.aves.channel.streams.MediaStoreStreamHandler
+ import deckers.thibault.aves.model.FieldMap
+@@ -26,8 +32,14 @@ import io.flutter.FlutterInjector
+ import io.flutter.embedding.engine.FlutterEngine
+ import io.flutter.embedding.engine.dart.DartExecutor
+ import io.flutter.plugin.common.MethodChannel
+-import kotlinx.coroutines.*
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
+ import java.nio.ByteBuffer
++import kotlin.coroutines.Continuation
+ import kotlin.coroutines.resume
+ import kotlin.coroutines.resumeWithException
+ import kotlin.coroutines.suspendCoroutine
+@@ -108,37 +120,25 @@ class HomeWidgetProvider : AppWidgetProvider() {
+ 
+         val isNightModeOn = (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+ 
++        val params = hashMapOf(
++            "widgetId" to widgetId,
++            "sizesDip" to sizesDip,
++            "devicePixelRatio" to getDevicePixelRatio(),
++            "drawEntryImage" to drawEntryImage,
++            "reuseEntry" to reuseEntry,
++            "isSystemThemeDark" to isNightModeOn,
++        ).apply {
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++                put("cornerRadiusPx", context.resources.getDimension(android.R.dimen.system_app_widget_background_radius))
++            }
++        }
++
+         initFlutterEngine(context)
+-        val messenger = flutterEngine!!.dartExecutor
+-        val channel = MethodChannel(messenger, WIDGET_DRAW_CHANNEL)
+         try {
+-            val props = suspendCoroutine<Any?> { cont ->
++            val props = suspendCoroutine { cont ->
+                 defaultScope.launch {
+                     FlutterUtils.runOnUiThread {
+-                        channel.invokeMethod("drawWidget", hashMapOf(
+-                            "widgetId" to widgetId,
+-                            "sizesDip" to sizesDip,
+-                            "devicePixelRatio" to getDevicePixelRatio(),
+-                            "drawEntryImage" to drawEntryImage,
+-                            "reuseEntry" to reuseEntry,
+-                            "isSystemThemeDark" to isNightModeOn,
+-                        ).apply {
+-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+-                                put("cornerRadiusPx", context.resources.getDimension(android.R.dimen.system_app_widget_background_radius))
+-                            }
+-                        }, object : MethodChannel.Result {
+-                            override fun success(result: Any?) {
+-                                cont.resume(result)
+-                            }
+-
+-                            override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+-                                cont.resumeWithException(Exception("$errorCode: $errorMessage\n$errorDetails"))
+-                            }
+-
+-                            override fun notImplemented() {
+-                                cont.resumeWithException(Exception("not implemented"))
+-                            }
+-                        })
++                        tryDrawWidget(params, cont, 0)
+                     }
+                 }
+             }
+@@ -150,6 +150,30 @@ class HomeWidgetProvider : AppWidgetProvider() {
+         return null
+     }
+ 
++    private fun tryDrawWidget(params: HashMap<String, Any>, cont: Continuation<Any?>, drawRetry: Int) {
++        val messenger = flutterEngine!!.dartExecutor
++        val channel = MethodChannel(messenger, WIDGET_DRAW_CHANNEL)
++        channel.invokeMethod("drawWidget", params, object : MethodChannel.Result {
++            override fun success(result: Any?) {
++                cont.resume(result)
++            }
++
++            override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
++                cont.resumeWithException(Exception("$errorCode: $errorMessage\n$errorDetails"))
++            }
++
++            override fun notImplemented() {
++                if (drawRetry > DRAW_RETRY_MAX) {
++                    cont.resumeWithException(Exception("not implemented"))
++                } else {
++                    Handler(Looper.getMainLooper()).postDelayed({
++                        tryDrawWidget(params, cont, drawRetry + 1)
++                    }, 2000L)
++                }
++            }
++        })
++    }
++
+     private fun updateWidgetImage(
+         context: Context,
+         appWidgetManager: AppWidgetManager,
+@@ -271,6 +295,7 @@ class HomeWidgetProvider : AppWidgetProvider() {
+         private val LOG_TAG = LogUtils.createTag<HomeWidgetProvider>()
+         private const val WIDGET_DART_ENTRYPOINT = "widgetMain"
+         private const val WIDGET_DRAW_CHANNEL = "deckers.thibault/aves/widget_draw"
++        private const val DRAW_RETRY_MAX = 5
+ 
+         private var flutterEngine: FlutterEngine? = null
+         private var imageByteFetchJob: Job? = null
+diff --git a/lib/utils/android_file_utils.dart b/lib/utils/android_file_utils.dart
+index 5c4cbe6db..327485eeb 100644
+--- a/lib/utils/android_file_utils.dart
++++ b/lib/utils/android_file_utils.dart
+@@ -7,6 +7,8 @@ import 'package:flutter/foundation.dart';
+ 
+ final AndroidFileUtils androidFileUtils = AndroidFileUtils._private();
+ 
++enum _State { uninitialized, initializing, initialized }
++
+ class AndroidFileUtils {
+   // cf https://developer.android.com/reference/android/content/ContentResolver#SCHEME_CONTENT
+   static const contentScheme = 'content';
+@@ -27,13 +29,19 @@ class AndroidFileUtils {
+   late final String dcimPath, downloadPath, moviesPath, picturesPath, avesVideoCapturesPath;
+   late final Set<String> videoCapturesPaths;
+   Set<StorageVolume> storageVolumes = {};
+-  bool _initialized = false;
++  _State _initialized = _State.uninitialized;
+ 
+   AndroidFileUtils._private();
+ 
+   Future<void> init() async {
+-    if (_initialized) return;
++    if (_initialized == _State.uninitialized) {
++      _initialized = _State.initializing;
++      await _doInit();
++      _initialized = _State.initialized;
++    }
++  }
+ 
++  Future<void> _doInit() async {
+     separator = pContext.separator;
+     await _initStorageVolumes();
+     vaultRoot = await storageService.getVaultRoot();
+@@ -50,8 +58,6 @@ class AndroidFileUtils {
+       // from Aves
+       avesVideoCapturesPath,
+     };
+-
+-    _initialized = true;
+   }
+ 
+   Future<void> _initStorageVolumes() async {
+diff --git a/lib/widget_common.dart b/lib/widget_common.dart
+index 34a8067cb..7432c4e7e 100644
+--- a/lib/widget_common.dart
++++ b/lib/widget_common.dart
+@@ -18,11 +18,13 @@ import 'package:flutter/services.dart';
+ const _widgetDrawChannel = MethodChannel('deckers.thibault/aves/widget_draw');
+ 
+ void widgetMainCommon(AppFlavor flavor) async {
++  debugPrint('Widget main start');
+   WidgetsFlutterBinding.ensureInitialized();
+   initPlatformServices();
+   await settings.init(monitorPlatformSettings: false);
+   await reportService.init();
+ 
++  debugPrint('Widget channel method handling setup');
+   _widgetDrawChannel.setMethodCallHandler((call) async {
+     // widget settings may be modified in a different process after channel setup
+     await settings.reload();
+diff --git a/lib/widgets/home_widget.dart b/lib/widgets/home_widget.dart
+index 6f6d4a509..5344627ea 100644
+--- a/lib/widgets/home_widget.dart
++++ b/lib/widgets/home_widget.dart
+@@ -36,7 +36,7 @@ class HomeWidgetPainter {
+     final widthPx = sizeDip.width * devicePixelRatio;
+     final heightPx = sizeDip.height * devicePixelRatio;
+     final widgetSizePx = Size(widthPx, heightPx);
+-    debugPrint('draw widget for $sizeDip dp ($widgetSizePx px), entry=$entry');
++    debugPrint('Draw widget for ${sizeDip.width}x${sizeDip.height} dp (${widgetSizePx.width}x${widgetSizePx.height} px), entry=$entry');
+     final ui.Image? entryImage;
+     if (entry != null) {
+       final extent = shape.extentPx(widgetSizePx, entry!) / devicePixelRatio;

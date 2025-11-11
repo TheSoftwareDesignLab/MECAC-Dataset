@@ -1,0 +1,227 @@
+diff --git a/Signal/Registration/RegistrationCoordinatorImpl.swift b/Signal/Registration/RegistrationCoordinatorImpl.swift
+index c0ab44e2457..5f3a95ae573 100644
+--- a/Signal/Registration/RegistrationCoordinatorImpl.swift
++++ b/Signal/Registration/RegistrationCoordinatorImpl.swift
+@@ -473,7 +473,7 @@ public class RegistrationCoordinatorImpl: RegistrationCoordinator {
+             Logger.info("Finished restore")
+         }.recover(on: schedulers.main) { error in
+             let (guarantee, future) = Guarantee<Void>.pending()
+-            self.deps.messageBackupErrorPresenter.forcePresentDuringRegistration {
++            self.deps.messageBackupErrorPresenter.presentOverTopmostViewController {
+                 future.resolve()
+             }
+             return guarantee
+diff --git a/Signal/src/ViewControllers/AppSettings/Internal/InternalSettingsViewController.swift b/Signal/src/ViewControllers/AppSettings/Internal/InternalSettingsViewController.swift
+index 9e54c69c45f..4ea34919bb0 100644
+--- a/Signal/src/ViewControllers/AppSettings/Internal/InternalSettingsViewController.swift
++++ b/Signal/src/ViewControllers/AppSettings/Internal/InternalSettingsViewController.swift
+@@ -277,9 +277,11 @@ private extension InternalSettingsViewController {
+             canCancel: false
+         ) { modal in
+             func dismissModalAndToast(_ message: String) {
+-                modal.dismiss {
+-                    self.presentToast(text: message)
+-                }
++                DependenciesBridge.shared.messageBackupErrorPresenter.presentOverTopmostViewController(completion: {
++                    modal.dismiss {
++                        self.presentToast(text: message)
++                    }
++                })
+             }
+ 
+             Task {
+@@ -301,7 +303,7 @@ private extension InternalSettingsViewController {
+                             )
+                             activityVC.popoverPresentationController?.sourceView = self.view
+                             activityVC.completionWithItemsHandler = { _, _, _, _ in
+-                                modal.dismiss()
++                                dismissModalAndToast("Done")
+                             }
+                             modal.present(activityVC, animated: true)
+                         }
+diff --git a/Signal/src/ViewControllers/HomeView/Chat List/ChatListViewController.swift b/Signal/src/ViewControllers/HomeView/Chat List/ChatListViewController.swift
+index 0c849ea2f4a..0a14599953b 100644
+--- a/Signal/src/ViewControllers/HomeView/Chat List/ChatListViewController.swift	
++++ b/Signal/src/ViewControllers/HomeView/Chat List/ChatListViewController.swift	
+@@ -183,6 +183,8 @@ public class ChatListViewController: OWSViewController, HomeTabViewController {
+         }
+     }
+ 
++    private var hasPresentedBackupErrors = false
++
+     public override func viewDidAppear(_ animated: Bool) {
+         super.viewDidAppear(animated)
+ 
+@@ -194,6 +196,11 @@ public class ChatListViewController: OWSViewController, HomeTabViewController {
+             presentGetStartedBannerIfNecessary()
+         }
+ 
++        if !hasPresentedBackupErrors {
++            hasPresentedBackupErrors = true
++            DependenciesBridge.shared.messageBackupErrorPresenter.presentOverTopmostViewController(completion: {})
++        }
++
+         // Whether or not the theme has changed, always ensure
+         // the right theme is applied. The initial collapsed
+         // state of the split view controller is determined between
+diff --git a/Signal/src/ViewControllers/MessageBackup/MessageBackupInternalErrorViewController.swift b/Signal/src/ViewControllers/MessageBackup/MessageBackupInternalErrorViewController.swift
+index c811e65c4ce..d43ba4c7c22 100644
+--- a/Signal/src/ViewControllers/MessageBackup/MessageBackupInternalErrorViewController.swift
++++ b/Signal/src/ViewControllers/MessageBackup/MessageBackupInternalErrorViewController.swift
+@@ -10,13 +10,11 @@ import UIKit
+ /// For internal (nightly) use only. Produces MessageBackupErrorPresenterInternal.
+ class MessageBackupErrorPresenterFactoryInternal: MessageBackupErrorPresenterFactory {
+     func build(
+-        appReadiness: AppReadiness,
+         db: any DB,
+         keyValueStoreFactory: KeyValueStoreFactory,
+         tsAccountManager: TSAccountManager
+     ) -> MessageBackupErrorPresenter {
+         return MessageBackupErrorPresenterInternal(
+-            appReadiness: appReadiness,
+             db: db,
+             keyValueStoreFactory: keyValueStoreFactory,
+             tsAccountManager: tsAccountManager
+@@ -27,7 +25,6 @@ class MessageBackupErrorPresenterFactoryInternal: MessageBackupErrorPresenterFac
+ /// For internal (nightly) use only. Presents MessageBackupInternalErrorViewController when backups emits errors.
+ class MessageBackupErrorPresenterInternal: MessageBackupErrorPresenter {
+ 
+-    private let appReadiness: AppReadiness
+     private let db: any DB
+     private let tsAccountManager: TSAccountManager
+ 
+@@ -37,26 +34,13 @@ class MessageBackupErrorPresenterInternal: MessageBackupErrorPresenter {
+     private static let hasBeenDisplayedKey = "hasBeenDisplayed"
+ 
+     init(
+-        appReadiness: AppReadiness,
+         db: any DB,
+         keyValueStoreFactory: KeyValueStoreFactory,
+         tsAccountManager: TSAccountManager
+     ) {
+-        self.appReadiness = appReadiness
+         self.db = db
+         self.tsAccountManager = tsAccountManager
+         self.kvStore = keyValueStoreFactory.keyValueStore(collection: "MessageBackupErrorPresenterImpl")
+-
+-        NotificationCenter.default.addObserver(
+-            self,
+-            selector: #selector(presentErrorsIfNeededWithDelay),
+-            name: .registrationStateDidChange,
+-            object: nil
+-        )
+-
+-        appReadiness.runNowOrWhenUIDidBecomeReadySync { [weak self] in
+-            self?.presentErrorsIfNeededWithDelay()
+-        }
+     }
+ 
+     func persistErrors(_ errors: [SignalServiceKit.MessageBackup.CollapsedErrorLog], tx outerTx: DBWriteTransaction) {
+@@ -90,44 +74,16 @@ class MessageBackupErrorPresenterInternal: MessageBackupErrorPresenter {
+             self.db.write { innerTx in
+                 self.kvStore.setString(stringified, key: Self.stringifiedErrorsKey, transaction: innerTx)
+                 self.kvStore.setBool(false, key: Self.hasBeenDisplayedKey, transaction: innerTx)
+-
+-                innerTx.addAsyncCompletion(on: DispatchQueue.main) { [weak self] in
+-                    self?.presentErrorsIfNeeded()
+-                }
+             }
+         }
+     }
+ 
+-    private var forceDuringRegistration = false
+-
+-    func forcePresentDuringRegistration(completion: @escaping () -> Void) {
+-        self.forceDuringRegistration = true
+-        self.presentErrorsIfNeeded(completion: completion)
+-    }
+-
+-    @objc
+-    private func presentErrorsIfNeededWithDelay() {
+-        // Introduce a small delay to get the UI set up.
+-        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(2)) {
+-            self.presentErrorsIfNeeded()
+-        }
+-    }
+-
+-    private func presentErrorsIfNeeded(completion: (() -> Void)? = nil) {
+-        defer { self.forceDuringRegistration = false }
++    func presentOverTopmostViewController(completion: @escaping () -> Void) {
+         guard FeatureFlags.messageBackupErrorDisplay else {
+-            completion?()
+-            return
+-        }
+-        guard forceDuringRegistration || appReadiness.isUIReady else {
+-            completion?()
++            completion()
+             return
+         }
+         let isRegistered = tsAccountManager.registrationStateWithMaybeSneakyTransaction.isRegistered
+-        guard forceDuringRegistration || isRegistered else {
+-            completion?()
+-            return
+-        }
+         let errorString: String? = db.write { tx in
+             if kvStore.getBool(Self.hasBeenDisplayedKey, defaultValue: false, transaction: tx) {
+                 return nil
+@@ -137,7 +93,7 @@ class MessageBackupErrorPresenterInternal: MessageBackupErrorPresenter {
+             return errorString
+         }
+         guard let errorString else {
+-            completion?()
++            completion()
+             return
+         }
+ 
+diff --git a/SignalServiceKit/Environment/AppSetup.swift b/SignalServiceKit/Environment/AppSetup.swift
+index 0226f62fd45..9e98336664a 100644
+--- a/SignalServiceKit/Environment/AppSetup.swift
++++ b/SignalServiceKit/Environment/AppSetup.swift
+@@ -1029,7 +1029,6 @@ public class AppSetup {
+         let mrbkStore = MediaRootBackupKeyStore(keyValueStoreFactory: keyValueStoreFactory)
+ 
+         let messageBackupErrorPresenter = messageBackupErrorPresenterFactory.build(
+-            appReadiness: appReadiness,
+             db: db,
+             keyValueStoreFactory: keyValueStoreFactory,
+             tsAccountManager: tsAccountManager
+diff --git a/SignalServiceKit/MessageBackup/MessageBackupErrorPresenter.swift b/SignalServiceKit/MessageBackup/MessageBackupErrorPresenter.swift
+index 0f092caf027..9ac9b572d6a 100644
+--- a/SignalServiceKit/MessageBackup/MessageBackupErrorPresenter.swift
++++ b/SignalServiceKit/MessageBackup/MessageBackupErrorPresenter.swift
+@@ -6,7 +6,6 @@
+ public protocol MessageBackupErrorPresenterFactory {
+ 
+     func build(
+-        appReadiness: AppReadiness,
+         db: any DB,
+         keyValueStoreFactory: KeyValueStoreFactory,
+         tsAccountManager: TSAccountManager
+@@ -21,8 +20,8 @@ public protocol MessageBackupErrorPresenter {
+     /// We only care to hold onto the latest set of backup errors.
+     func persistErrors(_ errors: [MessageBackup.CollapsedErrorLog], tx: DBWriteTransaction)
+ 
+-    /// Force presentation during registration; calls completion when presentation has finished.
+-    func forcePresentDuringRegistration(completion: @escaping () -> Void)
++    /// Present over the current view controller; calls completion when presentation has finished.
++    func presentOverTopmostViewController(completion: @escaping () -> Void)
+ }
+ 
+ public class NoOpMessageBackupErrorPresenterFactory: MessageBackupErrorPresenterFactory {
+@@ -30,7 +29,6 @@ public class NoOpMessageBackupErrorPresenterFactory: MessageBackupErrorPresenter
+     public init() {}
+ 
+     public func build(
+-        appReadiness: AppReadiness,
+         db: any DB,
+         keyValueStoreFactory: KeyValueStoreFactory,
+         tsAccountManager: TSAccountManager
+@@ -47,7 +45,7 @@ public class NoOpMessageBackupErrorPresenter: MessageBackupErrorPresenter {
+         // do nothing
+     }
+ 
+-    public func forcePresentDuringRegistration(completion: @escaping () -> Void) {
++    public func presentOverTopmostViewController(completion: @escaping () -> Void) {
+         // do nothing
+     }
+ }

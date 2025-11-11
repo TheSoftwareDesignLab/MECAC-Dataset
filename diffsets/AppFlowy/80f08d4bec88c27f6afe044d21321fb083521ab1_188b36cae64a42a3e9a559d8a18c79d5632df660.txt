@@ -1,0 +1,2342 @@
+diff --git a/frontend/appflowy_flutter/assets/translations/en.json b/frontend/appflowy_flutter/assets/translations/en.json
+index 94e1b062fc98a..826dda7532da4 100644
+--- a/frontend/appflowy_flutter/assets/translations/en.json
++++ b/frontend/appflowy_flutter/assets/translations/en.json
+@@ -436,7 +436,7 @@
+       "firstDayOfWeek": "Start week on",
+       "layoutDateField": "Layout calendar by",
+       "noDateTitle": "No Date",
+-      "emptyNoDate": "No unscheduled events"
++      "noDateHint": "Unscheduled events will show up here"
+     }
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/calendar/application/calendar_bloc.dart b/frontend/appflowy_flutter/lib/plugins/database_view/calendar/application/calendar_bloc.dart
+index ececc2b392cd9..151c26cb01780 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/calendar/application/calendar_bloc.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/calendar/application/calendar_bloc.dart
+@@ -8,6 +8,7 @@ import 'package:appflowy_backend/protobuf/flowy-folder2/protobuf.dart';
+ import 'package:appflowy_backend/protobuf/flowy-database2/protobuf.dart';
+ import 'package:calendar_view/calendar_view.dart';
+ import 'package:dartz/dartz.dart';
++import 'package:fixnum/fixnum.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+ import 'package:freezed_annotation/freezed_annotation.dart';
+ 
+@@ -62,10 +63,11 @@ class CalendarBloc extends Bloc<CalendarEvent, CalendarState> {
+           createEvent: (DateTime date, String title) async {
+             await _createEvent(date, title);
+           },
++          moveEvent: (CalendarDayEvent event, DateTime date) async {
++            await _moveEvent(event, date);
++          },
+           didCreateEvent: (CalendarEventData<CalendarDayEvent> event) {
+-            emit(
+-              state.copyWith(editEvent: event),
+-            );
++            emit(state.copyWith(editingEvent: event));
+           },
+           updateCalendarLayoutSetting:
+               (CalendarLayoutSettingPB layoutSetting) async {
+@@ -79,11 +81,7 @@ class CalendarBloc extends Bloc<CalendarEvent, CalendarState> {
+             if (index != -1) {
+               allEvents[index] = eventData;
+             }
+-            emit(
+-              state.copyWith(
+-                allEvents: allEvents,
+-              ),
+-            );
++            emit(state.copyWith(allEvents: allEvents, updateEvent: eventData));
+           },
+           didDeleteEvents: (List<RowId> deletedRowIds) {
+             var events = [...state.allEvents];
+@@ -185,6 +183,30 @@ class CalendarBloc extends Bloc<CalendarEvent, CalendarState> {
+     );
+   }
+ 
++  Future<void> _moveEvent(CalendarDayEvent event, DateTime date) async {
++    final timestamp = _eventTimestamp(event, date);
++    final payload = MoveCalendarEventPB(
++      cellPath: CellIdPB(
++        viewId: viewId,
++        rowId: event.eventId,
++        fieldId: event.dateFieldId,
++      ),
++      timestamp: timestamp,
++    );
++    return DatabaseEventMoveCalendarEvent(payload).send().then((result) {
++      return result.fold(
++        (_) async {
++          final modifiedEvent = await _loadEvent(event.eventId);
++          add(CalendarEvent.didUpdateEvent(modifiedEvent!));
++        },
++        (err) {
++          Log.error(err);
++          return null;
++        },
++      );
++    });
++  }
++
+   Future<void> _updateCalendarLayoutSetting(
+     CalendarLayoutSettingPB layoutSetting,
+   ) async {
+@@ -238,26 +260,27 @@ class CalendarBloc extends Bloc<CalendarEvent, CalendarState> {
+     CalendarEventPB eventPB,
+   ) {
+     final fieldInfo = fieldInfoByFieldId[eventPB.dateFieldId];
+-    if (fieldInfo != null) {
+-      final eventData = CalendarDayEvent(
+-        event: eventPB,
+-        eventId: eventPB.rowId,
+-        dateFieldId: eventPB.dateFieldId,
+-      );
+-
+-      // The timestamp is using UTC in the backend, so we need to convert it
+-      // to local time.
+-      final date = DateTime.fromMillisecondsSinceEpoch(
+-        eventPB.timestamp.toInt() * 1000,
+-      );
+-      return CalendarEventData(
+-        title: eventPB.title,
+-        date: date,
+-        event: eventData,
+-      );
+-    } else {
++    if (fieldInfo == null) {
+       return null;
+     }
++
++    // timestamp is stored as seconds, but constructor requires milliseconds
++    final date = DateTime.fromMillisecondsSinceEpoch(
++      eventPB.timestamp.toInt() * 1000,
++    );
++
++    final eventData = CalendarDayEvent(
++      event: eventPB,
++      eventId: eventPB.rowId,
++      dateFieldId: eventPB.dateFieldId,
++      date: date,
++    );
++
++    return CalendarEventData(
++      title: eventPB.title,
++      date: date,
++      event: eventData,
++    );
+   }
+ 
+   void _startListening() {
+@@ -266,28 +289,37 @@ class CalendarBloc extends Bloc<CalendarEvent, CalendarState> {
+         if (isClosed) return;
+       },
+       onFieldsChanged: (fieldInfos) {
+-        if (isClosed) return;
++        if (isClosed) {
++          return;
++        }
+         fieldInfoByFieldId = {
+           for (var fieldInfo in fieldInfos) fieldInfo.field.id: fieldInfo
+         };
+       },
+-      onRowsCreated: ((rowIds) async {
++      onRowsCreated: (rowIds) async {
++        if (isClosed) {
++          return;
++        }
+         for (final id in rowIds) {
+           final event = await _loadEvent(id);
+           if (event != null && !isClosed) {
+             add(CalendarEvent.didReceiveEvent(event));
+           }
+         }
+-      }),
++      },
+       onRowsDeleted: (rowIds) {
+-        if (isClosed) return;
++        if (isClosed) {
++          return;
++        }
+         add(CalendarEvent.didDeleteEvents(rowIds));
+       },
+       onRowsUpdated: (rowIds) async {
+-        if (isClosed) return;
++        if (isClosed) {
++          return;
++        }
+         for (final id in rowIds) {
+           final event = await _loadEvent(id);
+-          if (event != null && isEventDayChanged(event)) {
++          if (event != null) {
+             if (isEventDayChanged(event)) {
+               add(CalendarEvent.didDeleteEvents([id]));
+               add(CalendarEvent.didReceiveEvent(event));
+@@ -317,7 +349,9 @@ class CalendarBloc extends Bloc<CalendarEvent, CalendarState> {
+ 
+   void _didReceiveLayoutSetting(LayoutSettingPB layoutSetting) {
+     if (layoutSetting.hasCalendar()) {
+-      if (isClosed) return;
++      if (isClosed) {
++        return;
++      }
+       add(CalendarEvent.didReceiveCalendarSettings(layoutSetting.calendar));
+     }
+   }
+@@ -329,17 +363,20 @@ class CalendarBloc extends Bloc<CalendarEvent, CalendarState> {
+     }
+   }
+ 
+-  bool isEventDayChanged(
+-    CalendarEventData<CalendarDayEvent> event,
+-  ) {
++  bool isEventDayChanged(CalendarEventData<CalendarDayEvent> event) {
+     final index = state.allEvents.indexWhere(
+       (element) => element.event!.eventId == event.event!.eventId,
+     );
+-    if (index != -1) {
+-      return state.allEvents[index].date.day != event.date.day;
+-    } else {
++    if (index == -1) {
+       return false;
+     }
++    return state.allEvents[index].date.day != event.date.day;
++  }
++
++  Int64 _eventTimestamp(CalendarDayEvent event, DateTime date) {
++    final time =
++        event.date.hour * 3600 + event.date.minute * 60 + event.date.second;
++    return Int64(date.millisecondsSinceEpoch ~/ 1000 + time);
+   }
+ }
+ 
+@@ -381,6 +418,10 @@ class CalendarEvent with _$CalendarEvent {
+   const factory CalendarEvent.createEvent(DateTime date, String title) =
+       _CreateEvent;
+ 
++  // Called when moving an event
++  const factory CalendarEvent.moveEvent(CalendarDayEvent event, DateTime date) =
++      _MoveEvent;
++
+   // Called when updating the calendar's layout settings
+   const factory CalendarEvent.updateCalendarLayoutSetting(
+     CalendarLayoutSettingPB layoutSetting,
+@@ -401,7 +442,7 @@ class CalendarState with _$CalendarState {
+     // events by row id
+     required Events allEvents,
+     required Events initialEvents,
+-    CalendarEventData<CalendarDayEvent>? editEvent,
++    CalendarEventData<CalendarDayEvent>? editingEvent,
+     CalendarEventData<CalendarDayEvent>? newEvent,
+     CalendarEventData<CalendarDayEvent>? updateEvent,
+     required List<String> deleteEventIds,
+@@ -439,14 +480,12 @@ class CalendarEditingRow {
+   });
+ }
+ 
+-class CalendarDayEvent {
+-  final CalendarEventPB event;
+-  final String dateFieldId;
+-  final String eventId;
+-
+-  CalendarDayEvent({
+-    required this.dateFieldId,
+-    required this.eventId,
+-    required this.event,
+-  });
++@freezed
++class CalendarDayEvent with _$CalendarDayEvent {
++  const factory CalendarDayEvent({
++    required CalendarEventPB event,
++    required String dateFieldId,
++    required String eventId,
++    required DateTime date,
++  }) = _CalendarDayEvent;
+ }
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/calendar_day.dart b/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/calendar_day.dart
+index 6a7afc9b260af..bc929a6fdeca2 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/calendar_day.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/calendar_day.dart
+@@ -13,6 +13,7 @@ import 'package:flowy_infra_ui/flowy_infra_ui.dart';
+ import 'package:flowy_infra_ui/style_widget/hover.dart';
+ import 'package:flutter/material.dart';
+ import 'package:provider/provider.dart';
++import 'package:table_calendar/table_calendar.dart';
+ 
+ import '../../grid/presentation/layout/sizes.dart';
+ import '../../widgets/row/cells/select_option_cell/extension.dart';
+@@ -47,187 +48,83 @@ class CalendarDayCard extends StatelessWidget {
+       backgroundColor = AFThemeExtension.of(context).lightGreyHover;
+     }
+ 
+-    return ChangeNotifierProvider(
+-      create: (_) => _CardEnterNotifier(),
+-      builder: (context, child) {
+-        Widget? multipleCards;
+-        if (events.isNotEmpty) {
+-          multipleCards = Flexible(
+-            child: ListView.separated(
+-              itemBuilder: (BuildContext context, int index) =>
+-                  _buildCard(context, events[index]),
+-              itemCount: events.length,
+-              padding: const EdgeInsets.fromLTRB(8.0, 0, 8.0, 8.0),
+-              separatorBuilder: (BuildContext context, int index) =>
+-                  VSpace(GridSize.typeOptionSeparatorHeight),
+-            ),
+-          );
+-        }
+-
+-        final child = Column(
+-          mainAxisSize: MainAxisSize.min,
+-          children: [
+-            _Header(
+-              date: date,
+-              isInMonth: isInMonth,
+-              isToday: isToday,
+-              onCreate: () => onCreateEvent(date),
+-            ),
+-
+-            // Add a separator between the header and the content.
+-            VSpace(GridSize.typeOptionSeparatorHeight),
+-
+-            // Use SizedBox instead of ListView if there are no cards.
+-            multipleCards ?? const SizedBox(),
+-          ],
+-        );
+-
+-        return Container(
+-          color: backgroundColor,
+-          child: GestureDetector(
+-            onDoubleTap: () => onCreateEvent(date),
+-            child: MouseRegion(
+-              cursor: SystemMouseCursors.basic,
+-              onEnter: (p) => notifyEnter(context, true),
+-              onExit: (p) => notifyEnter(context, false),
+-              child: Padding(
+-                padding: const EdgeInsets.only(top: 8.0),
+-                child: child,
+-              ),
+-            ),
+-          ),
+-        );
+-      },
+-    );
+-  }
+-
+-  Widget _buildCard(BuildContext context, CalendarDayEvent event) {
+-    final styles = <FieldType, CardCellStyle>{
+-      FieldType.Number: NumberCardCellStyle(10),
+-      FieldType.URL: URLCardCellStyle(10),
+-    };
+-
+-    final cellBuilder = CardCellBuilder<String>(
+-      _rowCache.cellCache,
+-      styles: styles,
+-    );
+-
+-    final rowInfo = _rowCache.getRow(event.eventId);
+-    final renderHook = RowCardRenderHook<String>();
+-    renderHook.addTextCellHook((cellData, primaryFieldId, _) {
+-      if (cellData.isEmpty) {
+-        return const SizedBox();
+-      }
+-      return Align(
+-        alignment: Alignment.centerLeft,
+-        child: FlowyText.medium(
+-          cellData,
+-          textAlign: TextAlign.left,
+-          fontSize: 11,
+-          maxLines: null, // Enable multiple lines
+-        ),
+-      );
+-    });
++    return LayoutBuilder(
++      builder: (BuildContext context, BoxConstraints constraints) {
++        return ChangeNotifierProvider(
++          create: (_) => _CardEnterNotifier(),
++          builder: (context, child) {
++            final child = Column(
++              mainAxisSize: MainAxisSize.min,
++              crossAxisAlignment: CrossAxisAlignment.end,
++              children: [
++                _Header(
++                  date: date,
++                  isInMonth: isInMonth,
++                  isToday: isToday,
++                ),
+ 
+-    renderHook.addDateCellHook((cellData, cardData, _) {
+-      return Align(
+-        alignment: Alignment.centerLeft,
+-        child: Padding(
+-          padding: const EdgeInsets.symmetric(vertical: 2),
+-          child: Row(
+-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+-            children: [
+-              Flexible(
+-                flex: 3,
+-                child: FlowyText.regular(
+-                  cellData.date,
+-                  fontSize: 10,
+-                  color: Theme.of(context).hintColor,
+-                  overflow: TextOverflow.ellipsis,
++                // Add a separator between the header and the content.
++                VSpace(GridSize.typeOptionSeparatorHeight),
++
++                // List of cards or empty space
++                if (events.isNotEmpty)
++                  _EventList(
++                    events: events,
++                    viewId: viewId,
++                    rowCache: _rowCache,
++                    constraints: constraints,
++                  ),
++              ],
++            );
++
++            return Stack(
++              children: <Widget>[
++                GestureDetector(
++                  onDoubleTap: () => onCreateEvent(date),
++                  child: Container(color: backgroundColor),
+                 ),
+-              ),
+-              Flexible(
+-                child: FlowyText.regular(
+-                  cellData.time,
+-                  fontSize: 10,
+-                  color: Theme.of(context).hintColor,
+-                  overflow: TextOverflow.ellipsis,
++                DragTarget<CalendarDayEvent>(
++                  builder: (context, candidate, __) {
++                    return Stack(
++                      fit: StackFit.expand,
++                      children: [
++                        if (candidate.isNotEmpty)
++                          Container(
++                            color: Theme.of(context)
++                                .colorScheme
++                                .secondaryContainer,
++                          ),
++                        Padding(
++                          padding: const EdgeInsets.only(top: 8.0),
++                          child: child,
++                        )
++                      ],
++                    );
++                  },
++                  onWillAccept: (CalendarDayEvent? event) {
++                    if (event == null) {
++                      return false;
++                    }
++                    return !isSameDay(event.date, date);
++                  },
++                  onAccept: (CalendarDayEvent event) {
++                    context
++                        .read<CalendarBloc>()
++                        .add(CalendarEvent.moveEvent(event, date));
++                  },
+                 ),
+-              )
+-            ],
+-          ),
+-        ),
+-      );
+-    });
+-
+-    renderHook.addSelectOptionHook((selectedOptions, cardData, _) {
+-      if (selectedOptions.isEmpty) {
+-        return const SizedBox.shrink();
+-      }
+-      final children = selectedOptions.map(
+-        (option) {
+-          return SelectOptionTag.fromOption(
+-            context: context,
+-            option: option,
+-          );
+-        },
+-      ).toList();
+-
+-      return IntrinsicHeight(
+-        child: Padding(
+-          padding: const EdgeInsets.symmetric(vertical: 2),
+-          child: SizedBox.expand(
+-            child: Wrap(spacing: 4, runSpacing: 4, children: children),
+-          ),
+-        ),
+-      );
+-    });
+-
+-    // renderHook.addDateFieldHook((cellData, cardData) {
+-
+-    final card = RowCard<String>(
+-      // Add the key here to make sure the card is rebuilt when the cells
+-      // in this row are updated.
+-      key: ValueKey(event.eventId),
+-      row: rowInfo!.rowPB,
+-      viewId: viewId,
+-      rowCache: _rowCache,
+-      cardData: event.dateFieldId,
+-      isEditing: false,
+-      cellBuilder: cellBuilder,
+-      openCard: (context) => showEventDetails(
+-        context: context,
+-        event: event,
+-        viewId: viewId,
+-        rowCache: _rowCache,
+-      ),
+-      styleConfiguration: const RowCardStyleConfiguration(
+-        showAccessory: false,
+-        cellPadding: EdgeInsets.zero,
+-      ),
+-      renderHook: renderHook,
+-      onStartEditing: () {},
+-      onEndEditing: () {},
+-    );
+-
+-    return FlowyHover(
+-      style: HoverStyle(
+-        hoverColor: Theme.of(context).colorScheme.tertiaryContainer,
+-        foregroundColorOnHover: Theme.of(context).colorScheme.onBackground,
+-      ),
+-      child: Container(
+-        padding: const EdgeInsets.symmetric(horizontal: 2),
+-        decoration: BoxDecoration(
+-          border: Border.fromBorderSide(
+-            BorderSide(
+-              color: Theme.of(context).dividerColor,
+-              width: 1.5,
+-            ),
+-          ),
+-          borderRadius: Corners.s6Border,
+-        ),
+-        child: card,
+-      ),
++                _NewEventButton(onCreate: () => onCreateEvent(date)),
++                MouseRegion(
++                  onEnter: (p) => notifyEnter(context, true),
++                  onExit: (p) => notifyEnter(context, false),
++                  opaque: false,
++                  hitTestBehavior: HitTestBehavior.translucent,
++                ),
++              ],
++            );
++          },
++        );
++      },
+     );
+   }
+ 
+@@ -243,55 +140,49 @@ class _Header extends StatelessWidget {
+   final bool isToday;
+   final bool isInMonth;
+   final DateTime date;
+-  final VoidCallback onCreate;
+   const _Header({
+     required this.isToday,
+     required this.isInMonth,
+     required this.date,
+-    required this.onCreate,
+     Key? key,
+   }) : super(key: key);
+ 
+   @override
+   Widget build(BuildContext context) {
+-    return Consumer<_CardEnterNotifier>(
+-      builder: (context, notifier, _) {
+-        final badge = _DayBadge(
+-          isToday: isToday,
+-          isInMonth: isInMonth,
+-          date: date,
+-        );
+-
+-        return Padding(
+-          padding: const EdgeInsets.symmetric(horizontal: 8.0),
+-          child: Row(
+-            children: [
+-              if (notifier.onEnter) _NewEventButton(onClick: onCreate),
+-              const Spacer(),
+-              badge,
+-            ],
+-          ),
+-        );
+-      },
++    return Padding(
++      padding: const EdgeInsets.symmetric(horizontal: 8.0),
++      child: _DayBadge(
++        isToday: isToday,
++        isInMonth: isInMonth,
++        date: date,
++      ),
+     );
+   }
+ }
+ 
+ class _NewEventButton extends StatelessWidget {
+-  final VoidCallback onClick;
+-  const _NewEventButton({
+-    required this.onClick,
+-    Key? key,
+-  }) : super(key: key);
++  final VoidCallback onCreate;
++  const _NewEventButton({required this.onCreate, Key? key}) : super(key: key);
+ 
+   @override
+   Widget build(BuildContext context) {
+-    return FlowyIconButton(
+-      onPressed: onClick,
+-      iconPadding: EdgeInsets.zero,
+-      icon: const FlowySvg(name: "home/add"),
+-      hoverColor: AFThemeExtension.of(context).lightGreyHover,
+-      width: 22,
++    return Consumer<_CardEnterNotifier>(
++      builder: (context, notifier, _) {
++        if (!notifier.onEnter) {
++          return const SizedBox.shrink();
++        }
++        return Padding(
++          padding: const EdgeInsets.all(8.0),
++          child: FlowyIconButton(
++            onPressed: onCreate,
++            iconPadding: EdgeInsets.zero,
++            icon: const FlowySvg(name: "home/add"),
++            fillColor: Theme.of(context).colorScheme.background,
++            hoverColor: AFThemeExtension.of(context).lightGreyHover,
++            width: 22,
++          ),
++        );
++      },
+     );
+   }
+ }
+@@ -322,6 +213,7 @@ class _DayBadge extends StatelessWidget {
+     }
+ 
+     return Row(
++      mainAxisAlignment: MainAxisAlignment.end,
+       children: [
+         if (date.day == 1) FlowyText.medium(monthString),
+         Container(
+@@ -344,6 +236,199 @@ class _DayBadge extends StatelessWidget {
+   }
+ }
+ 
++class _EventList extends StatelessWidget {
++  final List<CalendarDayEvent> events;
++  final String viewId;
++  final RowCache rowCache;
++  final BoxConstraints constraints;
++
++  const _EventList({
++    required this.events,
++    required this.viewId,
++    required this.rowCache,
++    required this.constraints,
++    Key? key,
++  }) : super(key: key);
++
++  @override
++  Widget build(BuildContext context) {
++    return Flexible(
++      child: ListView.separated(
++        itemBuilder: (BuildContext context, int index) => _EventCard(
++          event: events[index],
++          viewId: viewId,
++          rowCache: rowCache,
++          constraints: constraints,
++        ),
++        itemCount: events.length,
++        padding: const EdgeInsets.fromLTRB(8.0, 0, 8.0, 8.0),
++        separatorBuilder: (BuildContext context, int index) =>
++            VSpace(GridSize.typeOptionSeparatorHeight),
++        shrinkWrap: true,
++      ),
++    );
++  }
++}
++
++class _EventCard extends StatelessWidget {
++  final CalendarDayEvent event;
++  final String viewId;
++  final RowCache rowCache;
++  final BoxConstraints constraints;
++
++  const _EventCard({
++    required this.event,
++    required this.viewId,
++    required this.rowCache,
++    required this.constraints,
++    Key? key,
++  }) : super(key: key);
++
++  @override
++  Widget build(BuildContext context) {
++    final rowInfo = rowCache.getRow(event.eventId);
++    final styles = <FieldType, CardCellStyle>{
++      FieldType.Number: NumberCardCellStyle(10),
++      FieldType.URL: URLCardCellStyle(10),
++    };
++    final cellBuilder = CardCellBuilder<String>(
++      rowCache.cellCache,
++      styles: styles,
++    );
++    final renderHook = _calendarEventCardRenderHook(context);
++
++    final card = RowCard<String>(
++      // Add the key here to make sure the card is rebuilt when the cells
++      // in this row are updated.
++      key: ValueKey(event.eventId),
++      row: rowInfo!.rowPB,
++      viewId: viewId,
++      rowCache: rowCache,
++      cardData: event.dateFieldId,
++      isEditing: false,
++      cellBuilder: cellBuilder,
++      openCard: (context) => showEventDetails(
++        context: context,
++        event: event,
++        viewId: viewId,
++        rowCache: rowCache,
++      ),
++      styleConfiguration: RowCardStyleConfiguration(
++        showAccessory: false,
++        cellPadding: EdgeInsets.zero,
++        hoverStyle: HoverStyle(
++          hoverColor: AFThemeExtension.of(context).lightGreyHover,
++          foregroundColorOnHover: Theme.of(context).colorScheme.onBackground,
++        ),
++      ),
++      renderHook: renderHook,
++      onStartEditing: () {},
++      onEndEditing: () {},
++    );
++
++    final decoration = BoxDecoration(
++      border: Border.fromBorderSide(
++        BorderSide(color: Theme.of(context).dividerColor),
++      ),
++      borderRadius: Corners.s6Border,
++    );
++
++    return Draggable<CalendarDayEvent>(
++      data: event,
++      feedback: ConstrainedBox(
++        constraints: BoxConstraints(
++          maxWidth: constraints.maxWidth - 16.0,
++        ),
++        child: Container(
++          decoration: decoration.copyWith(
++            color: AFThemeExtension.of(context).lightGreyHover,
++          ),
++          child: card,
++        ),
++      ),
++      child: Container(
++        decoration: decoration,
++        child: card,
++      ),
++    );
++  }
++
++  RowCardRenderHook<String> _calendarEventCardRenderHook(BuildContext context) {
++    final renderHook = RowCardRenderHook<String>();
++    renderHook.addTextCellHook((cellData, primaryFieldId, _) {
++      if (cellData.isEmpty) {
++        return const SizedBox.shrink();
++      }
++      return Align(
++        alignment: Alignment.centerLeft,
++        child: FlowyText.medium(
++          cellData,
++          textAlign: TextAlign.left,
++          fontSize: 11,
++          maxLines: null, // Enable multiple lines
++        ),
++      );
++    });
++
++    renderHook.addDateCellHook((cellData, cardData, _) {
++      return Align(
++        alignment: Alignment.centerLeft,
++        child: Padding(
++          padding: const EdgeInsets.symmetric(vertical: 2),
++          child: Row(
++            mainAxisAlignment: MainAxisAlignment.spaceBetween,
++            children: [
++              Flexible(
++                flex: 3,
++                child: FlowyText.regular(
++                  cellData.date,
++                  fontSize: 10,
++                  color: Theme.of(context).hintColor,
++                  overflow: TextOverflow.ellipsis,
++                ),
++              ),
++              if (cellData.includeTime)
++                Flexible(
++                  child: FlowyText.regular(
++                    cellData.time,
++                    fontSize: 10,
++                    color: Theme.of(context).hintColor,
++                    overflow: TextOverflow.ellipsis,
++                  ),
++                )
++            ],
++          ),
++        ),
++      );
++    });
++
++    renderHook.addSelectOptionHook((selectedOptions, cardData, _) {
++      if (selectedOptions.isEmpty) {
++        return const SizedBox.shrink();
++      }
++      final children = selectedOptions.map(
++        (option) {
++          return SelectOptionTag.fromOption(
++            context: context,
++            option: option,
++          );
++        },
++      ).toList();
++
++      return IntrinsicHeight(
++        child: Padding(
++          padding: const EdgeInsets.symmetric(vertical: 2),
++          child: SizedBox.expand(
++            child: Wrap(spacing: 4, runSpacing: 4, children: children),
++          ),
++        ),
++      );
++    });
++
++    return renderHook;
++  }
++}
++
+ class _CardEnterNotifier extends ChangeNotifier {
+   bool _onEnter = false;
+ 
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/calendar_page.dart b/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/calendar_page.dart
+index 059eab1f12750..388c82df66e77 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/calendar_page.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/calendar_page.dart
+@@ -74,12 +74,12 @@ class _CalendarPageState extends State<CalendarPage> {
+               },
+             ),
+             BlocListener<CalendarBloc, CalendarState>(
+-              listenWhen: (p, c) => p.editEvent != c.editEvent,
++              listenWhen: (p, c) => p.editingEvent != c.editingEvent,
+               listener: (context, state) {
+-                if (state.editEvent != null) {
++                if (state.editingEvent != null) {
+                   showEventDetails(
+                     context: context,
+-                    event: state.editEvent!.event!,
++                    event: state.editingEvent!.event!,
+                     viewId: widget.view.id,
+                     rowCache: _calendarBloc.rowCache,
+                   );
+@@ -96,6 +96,20 @@ class _CalendarPageState extends State<CalendarPage> {
+                 }
+               },
+             ),
++            BlocListener<CalendarBloc, CalendarState>(
++              // When an event is rescheduled
++              listenWhen: (p, c) => p.updateEvent != c.updateEvent,
++              listener: (context, state) {
++                if (state.updateEvent != null) {
++                  _eventController.removeWhere(
++                    (element) =>
++                        element.event!.eventId ==
++                        state.updateEvent!.event!.eventId,
++                  );
++                  _eventController.add(state.updateEvent!);
++                }
++              },
++            ),
+           ],
+           child: BlocBuilder<CalendarBloc, CalendarState>(
+             builder: (context, state) {
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/toolbar/calendar_toolbar.dart b/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/toolbar/calendar_toolbar.dart
+index f6b18b7322735..5a88391f770c5 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/toolbar/calendar_toolbar.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/toolbar/calendar_toolbar.dart
+@@ -38,11 +38,6 @@ class _SettingButton extends StatefulWidget {
+ }
+ 
+ class _SettingButtonState extends State<_SettingButton> {
+-  @override
+-  void initState() {
+-    super.initState();
+-  }
+-
+   @override
+   Widget build(BuildContext context) {
+     return AppFlowyPopover(
+@@ -111,6 +106,7 @@ class _UnscheduleEventsButtonState extends State<_UnscheduleEventsButton> {
+           direction: PopoverDirection.bottomWithCenterAligned,
+           controller: _controller,
+           offset: const Offset(0, 8),
++          constraints: const BoxConstraints(maxWidth: 300, maxHeight: 600),
+           child: FlowyTextButton(
+             "${LocaleKeys.calendar_settings_noDateTitle.tr()} (${unscheduledEvents.length})",
+             fillColor: Colors.transparent,
+@@ -118,31 +114,31 @@ class _UnscheduleEventsButtonState extends State<_UnscheduleEventsButton> {
+             padding: GridSize.typeOptionContentInsets,
+           ),
+           popupBuilder: (context) {
+-            if (unscheduledEvents.isEmpty) {
+-              return SizedBox(
+-                height: GridSize.popoverItemHeight,
+-                child: Center(
+-                  child: FlowyText.medium(
+-                    LocaleKeys.calendar_settings_emptyNoDate.tr(),
+-                    color: Theme.of(context).hintColor,
+-                  ),
++            final cells = <Widget>[
++              FlowyText.medium(
++                LocaleKeys.calendar_settings_noDateHint.tr(),
++                color: Theme.of(context).hintColor,
++                overflow: TextOverflow.ellipsis,
++              ),
++              const VSpace(10),
++              ...unscheduledEvents.map(
++                (e) => _UnscheduledEventItem(
++                  event: e,
++                  onPressed: () {
++                    showEventDetails(
++                      context: context,
++                      event: e.event!,
++                      viewId: viewId,
++                      rowCache: rowCache,
++                    );
++                    _controller.close();
++                  },
+                 ),
+-              );
+-            }
++              )
++            ];
+             return ListView.separated(
+-              itemBuilder: (context, index) => _UnscheduledEventItem(
+-                event: unscheduledEvents[index],
+-                onPressed: () {
+-                  showEventDetails(
+-                    context: context,
+-                    event: unscheduledEvents[index].event!,
+-                    viewId: viewId,
+-                    rowCache: rowCache,
+-                  );
+-                  _controller.close();
+-                },
+-              ),
+-              itemCount: unscheduledEvents.length,
++              itemBuilder: (context, index) => cells[index],
++              itemCount: cells.length,
+               separatorBuilder: (context, index) =>
+                   VSpace(GridSize.typeOptionSeparatorHeight),
+               shrinkWrap: true,
+@@ -167,12 +163,9 @@ class _UnscheduledEventItem extends StatelessWidget {
+   Widget build(BuildContext context) {
+     return SizedBox(
+       height: GridSize.popoverItemHeight,
+-      child: FlowyTextButton(
+-        event.title,
+-        fillColor: Colors.transparent,
+-        hoverColor: AFThemeExtension.of(context).lightGreyHover,
+-        padding: GridSize.typeOptionContentInsets,
+-        onPressed: onPressed,
++      child: FlowyButton(
++        text: FlowyText.medium(event.title),
++        onTap: onPressed,
+       ),
+     );
+   }
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/widgets/card/card.dart b/frontend/appflowy_flutter/lib/plugins/database_view/widgets/card/card.dart
+index 8ddebafb11fa9..2f4f30fe7e0df 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/widgets/card/card.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/widgets/card/card.dart
+@@ -5,6 +5,7 @@ import 'package:appflowy_backend/protobuf/flowy-database2/row_entities.pb.dart';
+ import 'package:appflowy_popover/appflowy_popover.dart';
+ import 'package:flowy_infra/image.dart';
+ import 'package:flowy_infra_ui/flowy_infra_ui.dart';
++import 'package:flowy_infra_ui/style_widget/hover.dart';
+ import 'package:flutter/foundation.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+@@ -68,9 +69,9 @@ class RowCard<CustomCardData> extends StatefulWidget {
+ }
+ 
+ class _RowCardState<T> extends State<RowCard<T>> {
+-  late CardBloc _cardBloc;
+-  late EditableRowNotifier rowNotifier;
+-  late PopoverController popoverController;
++  late final CardBloc _cardBloc;
++  late final EditableRowNotifier rowNotifier;
++  late final PopoverController popoverController;
+   AccessoryType? accessoryType;
+ 
+   @override
+@@ -209,9 +210,24 @@ class _CardContent<CustomCardData> extends StatelessWidget {
+ 
+   @override
+   Widget build(BuildContext context) {
+-    return Column(
+-      mainAxisSize: MainAxisSize.min,
+-      children: _makeCells(context, cells),
++    if (styleConfiguration.hoverStyle != null) {
++      return FlowyHover(
++        style: styleConfiguration.hoverStyle,
++        child: Padding(
++          padding: styleConfiguration.cardPadding,
++          child: Column(
++            mainAxisSize: MainAxisSize.min,
++            children: _makeCells(context, cells),
++          ),
++        ),
++      );
++    }
++    return Padding(
++      padding: styleConfiguration.cardPadding,
++      child: Column(
++        mainAxisSize: MainAxisSize.min,
++        children: _makeCells(context, cells),
++      ),
+     );
+   }
+ 
+@@ -298,9 +314,13 @@ class _CardEditOption extends StatelessWidget with CardAccessory {
+ class RowCardStyleConfiguration {
+   final bool showAccessory;
+   final EdgeInsets cellPadding;
++  final EdgeInsets cardPadding;
++  final HoverStyle? hoverStyle;
+ 
+   const RowCardStyleConfiguration({
+     this.showAccessory = true,
+     this.cellPadding = const EdgeInsets.only(left: 4, right: 4),
++    this.cardPadding = const EdgeInsets.all(8),
++    this.hoverStyle,
+   });
+ }
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/widgets/card/container/card_container.dart b/frontend/appflowy_flutter/lib/plugins/database_view/widgets/card/container/card_container.dart
+index a6dab3b113b34..1616fa39ab023 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/widgets/card/container/card_container.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/widgets/card/container/card_container.dart
+@@ -1,6 +1,5 @@
+ import 'package:flutter/material.dart';
+ import 'package:provider/provider.dart';
+-import 'package:styled_widget/styled_widget.dart';
+ 
+ import 'accessory.dart';
+ 
+@@ -45,12 +44,9 @@ class RowCardContainer extends StatelessWidget {
+           return GestureDetector(
+             behavior: HitTestBehavior.opaque,
+             onTap: () => openCard(context),
+-            child: Padding(
+-              padding: const EdgeInsets.all(8),
+-              child: ConstrainedBox(
+-                constraints: const BoxConstraints(minHeight: 30),
+-                child: container,
+-              ),
++            child: ConstrainedBox(
++              constraints: const BoxConstraints(minHeight: 30),
++              child: container,
+             ),
+           );
+         },
+@@ -78,10 +74,14 @@ class _CardEnterRegion extends StatelessWidget {
+         List<Widget> children = [child];
+         if (onEnter) {
+           children.add(
+-            CardAccessoryContainer(
+-              accessories: accessories,
+-              onTapAccessory: onTapAccessory,
+-            ).positioned(right: 0),
++            Positioned(
++              top: 8.0,
++              right: 8.0,
++              child: CardAccessoryContainer(
++                accessories: accessories,
++                onTapAccessory: onTapAccessory,
++              ),
++            ),
+           );
+         }
+ 
+diff --git a/frontend/rust-lib/flowy-database2/Cargo.toml b/frontend/rust-lib/flowy-database2/Cargo.toml
+index 74e4409779eb4..16415613f4cca 100644
+--- a/frontend/rust-lib/flowy-database2/Cargo.toml
++++ b/frontend/rust-lib/flowy-database2/Cargo.toml
+@@ -37,8 +37,8 @@ anyhow = "1.0"
+ async-stream = "0.3.4"
+ rayon = "1.6.1"
+ nanoid = "0.4.0"
+-chrono-tz = "0.8.1"
+ async-trait = "0.1"
++chrono-tz = "0.8.2"
+ csv = "1.1.6"
+ 
+ strum = "0.21"
+diff --git a/frontend/rust-lib/flowy-database2/src/entities/calendar_entities.rs b/frontend/rust-lib/flowy-database2/src/entities/calendar_entities.rs
+index ddeba2eb2d527..986a5436df74c 100644
+--- a/frontend/rust-lib/flowy-database2/src/entities/calendar_entities.rs
++++ b/frontend/rust-lib/flowy-database2/src/entities/calendar_entities.rs
+@@ -4,6 +4,8 @@ use flowy_error::ErrorCode;
+ use crate::entities::parser::NotEmptyStr;
+ use crate::services::setting::{CalendarLayout, CalendarLayoutSetting};
+ 
++use super::CellIdPB;
++
+ #[derive(Debug, Clone, Eq, PartialEq, Default, ProtoBuf)]
+ pub struct CalendarLayoutSettingPB {
+   #[pb(index = 1)]
+@@ -127,11 +129,8 @@ pub struct RepeatedCalendarEventPB {
+ #[derive(Debug, Clone, Default, ProtoBuf)]
+ pub struct MoveCalendarEventPB {
+   #[pb(index = 1)]
+-  pub row_id: String,
++  pub cell_path: CellIdPB,
+ 
+   #[pb(index = 2)]
+-  pub field_id: String,
+-
+-  #[pb(index = 3)]
+   pub timestamp: i64,
+ }
+diff --git a/frontend/rust-lib/flowy-database2/src/entities/type_option_entities/date_entities.rs b/frontend/rust-lib/flowy-database2/src/entities/type_option_entities/date_entities.rs
+index bc5292dc95b45..ea21443493ff5 100644
+--- a/frontend/rust-lib/flowy-database2/src/entities/type_option_entities/date_entities.rs
++++ b/frontend/rust-lib/flowy-database2/src/entities/type_option_entities/date_entities.rs
+@@ -20,9 +20,6 @@ pub struct DateCellDataPB {
+ 
+   #[pb(index = 4)]
+   pub include_time: bool,
+-
+-  #[pb(index = 5)]
+-  pub timezone_id: String,
+ }
+ 
+ #[derive(Clone, Debug, Default, ProtoBuf)]
+@@ -38,9 +35,6 @@ pub struct DateChangesetPB {
+ 
+   #[pb(index = 4, one_of)]
+   pub include_time: Option<bool>,
+-
+-  #[pb(index = 5, one_of)]
+-  pub timezone_id: Option<String>,
+ }
+ 
+ // Date
+@@ -53,6 +47,9 @@ pub struct DateTypeOptionPB {
+   pub time_format: TimeFormatPB,
+ 
+   #[pb(index = 3)]
++  pub timezone_id: String,
++
++  #[pb(index = 4)]
+   pub field_type: FieldType,
+ }
+ 
+@@ -61,6 +58,7 @@ impl From<DateTypeOption> for DateTypeOptionPB {
+     Self {
+       date_format: data.date_format.into(),
+       time_format: data.time_format.into(),
++      timezone_id: data.timezone_id,
+       field_type: data.field_type,
+     }
+   }
+@@ -71,6 +69,7 @@ impl From<DateTypeOptionPB> for DateTypeOption {
+     Self {
+       date_format: data.date_format.into(),
+       time_format: data.time_format.into(),
++      timezone_id: data.timezone_id,
+       field_type: data.field_type,
+     }
+   }
+diff --git a/frontend/rust-lib/flowy-database2/src/event_handler.rs b/frontend/rust-lib/flowy-database2/src/event_handler.rs
+index 10379052514ec..7c0f010c02b1c 100644
+--- a/frontend/rust-lib/flowy-database2/src/event_handler.rs
++++ b/frontend/rust-lib/flowy-database2/src/event_handler.rs
+@@ -512,7 +512,6 @@ pub(crate) async fn update_date_cell_handler(
+     date: data.date,
+     time: data.time,
+     include_time: data.include_time,
+-    timezone_id: data.timezone_id,
+   };
+   let database_editor = manager.get_database_with_view_id(&cell_id.view_id).await?;
+   database_editor
+@@ -677,3 +676,26 @@ pub(crate) async fn get_calendar_event_handler(
+     Some(event) => data_result_ok(event),
+   }
+ }
++
++#[tracing::instrument(level = "debug", skip(data, manager), err)]
++pub(crate) async fn move_calendar_event_handler(
++  data: AFPluginData<MoveCalendarEventPB>,
++  manager: AFPluginState<Arc<DatabaseManager2>>,
++) -> FlowyResult<()> {
++  let data = data.into_inner();
++  let cell_id: CellIdParams = data.cell_path.try_into()?;
++  let cell_changeset = DateCellChangeset {
++    date: Some(data.timestamp.to_string()),
++    ..Default::default()
++  };
++  let database_editor = manager.get_database_with_view_id(&cell_id.view_id).await?;
++  database_editor
++    .update_cell_with_changeset(
++      &cell_id.view_id,
++      cell_id.row_id,
++      &cell_id.field_id,
++      cell_changeset,
++    )
++    .await?;
++  Ok(())
++}
+diff --git a/frontend/rust-lib/flowy-database2/src/event_map.rs b/frontend/rust-lib/flowy-database2/src/event_map.rs
+index 373351e73b4ad..564a433f930fd 100644
+--- a/frontend/rust-lib/flowy-database2/src/event_map.rs
++++ b/frontend/rust-lib/flowy-database2/src/event_map.rs
+@@ -61,6 +61,7 @@ pub fn init(database_manager: Arc<DatabaseManager2>) -> AFPlugin {
+         // Calendar
+         .event(DatabaseEvent::GetAllCalendarEvents, get_calendar_events_handler)
+         .event(DatabaseEvent::GetCalendarEvent, get_calendar_event_handler)
++        .event(DatabaseEvent::MoveCalendarEvent, move_calendar_event_handler)
+         // Layout setting
+         .event(DatabaseEvent::SetLayoutSetting, set_layout_setting_handler)
+         .event(DatabaseEvent::GetLayoutSetting, get_layout_setting_handler)
+diff --git a/frontend/rust-lib/flowy-database2/src/services/cell/cell_operation.rs b/frontend/rust-lib/flowy-database2/src/services/cell/cell_operation.rs
+index 5429752916948..4fef578a8d85e 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/cell/cell_operation.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/cell/cell_operation.rs
+@@ -213,7 +213,6 @@ pub fn insert_date_cell(timestamp: i64, include_time: Option<bool>, field: &Fiel
+     date: Some(timestamp.to_string()),
+     time: None,
+     include_time,
+-    timezone_id: None,
+   })
+   .unwrap();
+   apply_cell_changeset(cell_data, None, field, None).unwrap()
+diff --git a/frontend/rust-lib/flowy-database2/src/services/database_view/view_editor.rs b/frontend/rust-lib/flowy-database2/src/services/database_view/view_editor.rs
+index 01e89fb4fb00a..d3b3204883f12 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/database_view/view_editor.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/database_view/view_editor.rs
+@@ -714,7 +714,7 @@ impl DatabaseViewEditor {
+ 
+     Some(CalendarEventPB {
+       row_id: row_id.into_inner(),
+-      date_field_id: primary_field.id.clone(),
++      date_field_id: date_field.id.clone(),
+       title,
+       timestamp,
+     })
+@@ -752,7 +752,6 @@ impl DatabaseViewEditor {
+ 
+     let mut events: Vec<CalendarEventPB> = vec![];
+     for text_cell in text_cells {
+-      let title_field_id = text_cell.field_id.clone();
+       let row_id = text_cell.row_id.clone();
+       let timestamp = timestamp_by_row_id
+         .get(&row_id)
+@@ -766,7 +765,7 @@ impl DatabaseViewEditor {
+ 
+       let event = CalendarEventPB {
+         row_id: row_id.into_inner(),
+-        date_field_id: title_field_id,
++        date_field_id: calendar_setting.field_id.clone(),
+         title,
+         timestamp,
+       };
+diff --git a/frontend/rust-lib/flowy-database2/src/services/field/type_options/date_type_option/date_tests.rs b/frontend/rust-lib/flowy-database2/src/services/field/type_options/date_type_option/date_tests.rs
+index 69d885058f485..0eed0db7cc7e1 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/field/type_options/date_type_option/date_tests.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/field/type_options/date_type_option/date_tests.rs
+@@ -14,7 +14,7 @@ mod tests {
+ 
+   #[test]
+   fn date_type_option_date_format_test() {
+-    let mut type_option = DateTypeOption::new(FieldType::DateTime);
++    let mut type_option = DateTypeOption::test();
+     let field = FieldBuilder::from_field_type(FieldType::DateTime).build();
+     for date_format in DateFormat::iter() {
+       type_option.date_format = date_format;
+@@ -27,7 +27,6 @@ mod tests {
+               date: Some("1647251762".to_owned()),
+               time: None,
+               include_time: None,
+-              timezone_id: None,
+             },
+             None,
+             "Mar 14, 2022",
+@@ -41,7 +40,6 @@ mod tests {
+               date: Some("1647251762".to_owned()),
+               time: None,
+               include_time: None,
+-              timezone_id: None,
+             },
+             None,
+             "2022/03/14",
+@@ -55,7 +53,6 @@ mod tests {
+               date: Some("1647251762".to_owned()),
+               time: None,
+               include_time: None,
+-              timezone_id: None,
+             },
+             None,
+             "2022-03-14",
+@@ -69,7 +66,6 @@ mod tests {
+               date: Some("1647251762".to_owned()),
+               time: None,
+               include_time: None,
+-              timezone_id: None,
+             },
+             None,
+             "03/14/2022",
+@@ -83,7 +79,6 @@ mod tests {
+               date: Some("1647251762".to_owned()),
+               time: None,
+               include_time: None,
+-              timezone_id: None,
+             },
+             None,
+             "14/03/2022",
+@@ -95,7 +90,7 @@ mod tests {
+ 
+   #[test]
+   fn date_type_option_different_time_format_test() {
+-    let mut type_option = DateTypeOption::new(FieldType::DateTime);
++    let mut type_option = DateTypeOption::test();
+     let field = FieldBuilder::from_field_type(FieldType::DateTime).build();
+ 
+     for time_format in TimeFormat::iter() {
+@@ -109,7 +104,6 @@ mod tests {
+               date: Some("1653609600".to_owned()),
+               time: None,
+               include_time: Some(true),
+-              timezone_id: Some("Etc/UTC".to_owned()),
+             },
+             None,
+             "May 27, 2022 00:00",
+@@ -121,7 +115,6 @@ mod tests {
+               date: Some("1653609600".to_owned()),
+               time: Some("9:00".to_owned()),
+               include_time: Some(true),
+-              timezone_id: Some("Etc/UTC".to_owned()),
+             },
+             None,
+             "May 27, 2022 09:00",
+@@ -133,7 +126,6 @@ mod tests {
+               date: Some("1653609600".to_owned()),
+               time: Some("23:00".to_owned()),
+               include_time: Some(true),
+-              timezone_id: Some("Etc/UTC".to_owned()),
+             },
+             None,
+             "May 27, 2022 23:00",
+@@ -147,7 +139,6 @@ mod tests {
+               date: Some("1653609600".to_owned()),
+               time: None,
+               include_time: Some(true),
+-              timezone_id: Some("Etc/UTC".to_owned()),
+             },
+             None,
+             "May 27, 2022 12:00 AM",
+@@ -159,7 +150,6 @@ mod tests {
+               date: Some("1653609600".to_owned()),
+               time: Some("9:00 AM".to_owned()),
+               include_time: Some(true),
+-              timezone_id: Some("Etc/UTC".to_owned()),
+             },
+             None,
+             "May 27, 2022 09:00 AM",
+@@ -171,7 +161,6 @@ mod tests {
+               date: Some("1653609600".to_owned()),
+               time: Some("11:23 pm".to_owned()),
+               include_time: Some(true),
+-              timezone_id: Some(chrono_tz::Tz::Etc__UTC.to_string()),
+             },
+             None,
+             "May 27, 2022 11:23 PM",
+@@ -184,7 +173,7 @@ mod tests {
+   #[test]
+   fn date_type_option_invalid_date_str_test() {
+     let field_type = FieldType::DateTime;
+-    let type_option = DateTypeOption::new(field_type.clone());
++    let type_option = DateTypeOption::test();
+     let field = FieldBuilder::from_field_type(field_type).build();
+     assert_date(
+       &type_option,
+@@ -193,7 +182,6 @@ mod tests {
+         date: Some("abc".to_owned()),
+         time: None,
+         include_time: None,
+-        timezone_id: None,
+       },
+       None,
+       "",
+@@ -204,7 +192,7 @@ mod tests {
+   #[should_panic]
+   fn date_type_option_invalid_include_time_str_test() {
+     let field_type = FieldType::DateTime;
+-    let type_option = DateTypeOption::new(field_type.clone());
++    let type_option = DateTypeOption::test();
+     let field = FieldBuilder::from_field_type(field_type).build();
+ 
+     assert_date(
+@@ -214,7 +202,6 @@ mod tests {
+         date: Some("1653609600".to_owned()),
+         time: Some("1:".to_owned()),
+         include_time: Some(true),
+-        timezone_id: Some("Etc/UTC".to_owned()),
+       },
+       None,
+       "May 27, 2022 01:00",
+@@ -225,7 +212,7 @@ mod tests {
+   #[should_panic]
+   fn date_type_option_empty_include_time_str_test() {
+     let field_type = FieldType::DateTime;
+-    let type_option = DateTypeOption::new(field_type.clone());
++    let type_option = DateTypeOption::test();
+     let field = FieldBuilder::from_field_type(field_type).build();
+ 
+     assert_date(
+@@ -235,7 +222,6 @@ mod tests {
+         date: Some("1653609600".to_owned()),
+         time: Some("".to_owned()),
+         include_time: Some(true),
+-        timezone_id: None,
+       },
+       None,
+       "May 27, 2022 01:00",
+@@ -245,7 +231,7 @@ mod tests {
+   #[test]
+   fn date_type_midnight_include_time_str_test() {
+     let field_type = FieldType::DateTime;
+-    let type_option = DateTypeOption::new(field_type.clone());
++    let type_option = DateTypeOption::test();
+     let field = FieldBuilder::from_field_type(field_type).build();
+     assert_date(
+       &type_option,
+@@ -254,7 +240,6 @@ mod tests {
+         date: Some("1653609600".to_owned()),
+         time: Some("00:00".to_owned()),
+         include_time: Some(true),
+-        timezone_id: Some("Etc/UTC".to_owned()),
+       },
+       None,
+       "May 27, 2022 00:00",
+@@ -266,7 +251,7 @@ mod tests {
+   #[test]
+   #[should_panic]
+   fn date_type_option_twelve_hours_include_time_str_in_twenty_four_hours_format() {
+-    let type_option = DateTypeOption::new(FieldType::DateTime);
++    let type_option = DateTypeOption::test();
+     let field = FieldBuilder::from_field_type(FieldType::DateTime).build();
+     assert_date(
+       &type_option,
+@@ -275,7 +260,6 @@ mod tests {
+         date: Some("1653609600".to_owned()),
+         time: Some("1:00 am".to_owned()),
+         include_time: Some(true),
+-        timezone_id: Some("Etc/UTC".to_owned()),
+       },
+       None,
+       "May 27, 2022 01:00 AM",
+@@ -288,7 +272,7 @@ mod tests {
+   #[should_panic]
+   fn date_type_option_twenty_four_hours_include_time_str_in_twelve_hours_format() {
+     let field_type = FieldType::DateTime;
+-    let mut type_option = DateTypeOption::new(field_type.clone());
++    let mut type_option = DateTypeOption::test();
+     type_option.time_format = TimeFormat::TwelveHour;
+     let field = FieldBuilder::from_field_type(field_type).build();
+ 
+@@ -299,7 +283,6 @@ mod tests {
+         date: Some("1653609600".to_owned()),
+         time: Some("20:00".to_owned()),
+         include_time: Some(true),
+-        timezone_id: None,
+       },
+       None,
+       "May 27, 2022 08:00 PM",
+@@ -338,7 +321,7 @@ mod tests {
+   #[test]
+   #[should_panic]
+   fn update_date_keep_time() {
+-    let type_option = DateTypeOption::new(FieldType::DateTime);
++    let type_option = DateTypeOption::test();
+     let field = FieldBuilder::from_field_type(FieldType::DateTime).build();
+ 
+     let old_cell_data = initialize_date_cell(
+@@ -347,7 +330,6 @@ mod tests {
+         date: Some("1700006400".to_owned()),
+         time: Some("08:00".to_owned()),
+         include_time: Some(true),
+-        timezone_id: Some("Etc/UTC".to_owned()),
+       },
+     );
+     assert_date(
+@@ -357,7 +339,6 @@ mod tests {
+         date: Some("1701302400".to_owned()),
+         time: None,
+         include_time: None,
+-        timezone_id: None,
+       },
+       Some(old_cell_data),
+       "Nov 30, 2023 08:00",
+@@ -366,7 +347,7 @@ mod tests {
+ 
+   #[test]
+   fn update_time_keep_date() {
+-    let type_option = DateTypeOption::new(FieldType::DateTime);
++    let type_option = DateTypeOption::test();
+     let field = FieldBuilder::from_field_type(FieldType::DateTime).build();
+ 
+     let old_cell_data = initialize_date_cell(
+@@ -375,7 +356,6 @@ mod tests {
+         date: Some("1700006400".to_owned()),
+         time: Some("08:00".to_owned()),
+         include_time: Some(true),
+-        timezone_id: Some("Etc/UTC".to_owned()),
+       },
+     );
+     assert_date(
+@@ -385,103 +365,12 @@ mod tests {
+         date: None,
+         time: Some("14:00".to_owned()),
+         include_time: None,
+-        timezone_id: Some("Etc/UTC".to_owned()),
+       },
+       Some(old_cell_data),
+       "Nov 15, 2023 14:00",
+     );
+   }
+ 
+-  #[test]
+-  fn timezone_no_daylight_saving_time() {
+-    let type_option = DateTypeOption::new(FieldType::DateTime);
+-    let field = FieldBuilder::from_field_type(FieldType::DateTime).build();
+-
+-    assert_date(
+-      &type_option,
+-      &field,
+-      DateCellChangeset {
+-        date: Some("1672963200".to_owned()),
+-        time: None,
+-        include_time: Some(true),
+-        timezone_id: Some("Asia/Tokyo".to_owned()),
+-      },
+-      None,
+-      "Jan 06, 2023 09:00",
+-    );
+-    assert_date(
+-      &type_option,
+-      &field,
+-      DateCellChangeset {
+-        date: Some("1685404800".to_owned()),
+-        time: None,
+-        include_time: Some(true),
+-        timezone_id: Some("Asia/Tokyo".to_owned()),
+-      },
+-      None,
+-      "May 30, 2023 09:00",
+-    );
+-  }
+-
+-  #[test]
+-  fn timezone_with_daylight_saving_time() {
+-    let type_option = DateTypeOption::new(FieldType::DateTime);
+-    let field = FieldBuilder::from_field_type(FieldType::DateTime).build();
+-
+-    assert_date(
+-      &type_option,
+-      &field,
+-      DateCellChangeset {
+-        date: Some("1672963200".to_owned()),
+-        time: None,
+-        include_time: Some(true),
+-        timezone_id: Some("Europe/Paris".to_owned()),
+-      },
+-      None,
+-      "Jan 06, 2023 01:00",
+-    );
+-    assert_date(
+-      &type_option,
+-      &field,
+-      DateCellChangeset {
+-        date: Some("1685404800".to_owned()),
+-        time: None,
+-        include_time: Some(true),
+-        timezone_id: Some("Europe/Paris".to_owned()),
+-      },
+-      None,
+-      "May 30, 2023 02:00",
+-    );
+-  }
+-
+-  #[test]
+-  fn change_timezone() {
+-    let type_option = DateTypeOption::new(FieldType::DateTime);
+-    let field = FieldBuilder::from_field_type(FieldType::DateTime).build();
+-
+-    let old_cell_data = initialize_date_cell(
+-      &type_option,
+-      DateCellChangeset {
+-        date: Some("1672963200".to_owned()),
+-        time: None,
+-        include_time: Some(true),
+-        timezone_id: Some("Asia/China".to_owned()),
+-      },
+-    );
+-    assert_date(
+-      &type_option,
+-      &field,
+-      DateCellChangeset {
+-        date: None,
+-        time: None,
+-        include_time: None,
+-        timezone_id: Some("America/Los_Angeles".to_owned()),
+-      },
+-      Some(old_cell_data),
+-      "Jan 05, 2023 16:00",
+-    );
+-  }
+-
+   fn assert_date(
+     type_option: &DateTypeOption,
+     field: &Field,
+diff --git a/frontend/rust-lib/flowy-database2/src/services/field/type_options/date_type_option/date_type_option.rs b/frontend/rust-lib/flowy-database2/src/services/field/type_options/date_type_option/date_type_option.rs
+index f8446fbf98f66..3b820c3dd336a 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/field/type_options/date_type_option/date_type_option.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/field/type_options/date_type_option/date_type_option.rs
+@@ -6,8 +6,8 @@ use crate::services::field::{
+   TypeOptionTransform,
+ };
+ use chrono::format::strftime::StrftimeItems;
+-use chrono::{DateTime, Local, NaiveDateTime, NaiveTime, Offset, TimeZone};
+-use chrono_tz::{Tz, UTC};
++use chrono::{DateTime, FixedOffset, Local, NaiveDateTime, NaiveTime, Offset, TimeZone};
++use chrono_tz::Tz;
+ use collab::core::any_map::AnyMapExtension;
+ use collab_database::fields::{Field, TypeOptionData, TypeOptionDataBuilder};
+ use collab_database::rows::Cell;
+@@ -19,10 +19,11 @@ use std::str::FromStr;
+ /// The [DateTypeOption] is used by [FieldType::Date], [FieldType::UpdatedAt], and [FieldType::CreatedAt].
+ /// So, storing the field type is necessary to distinguish the field type.
+ /// Most of the cases, each [FieldType] has its own [TypeOption] implementation.
+-#[derive(Clone, Debug, Serialize, Deserialize)]
++#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+ pub struct DateTypeOption {
+   pub date_format: DateFormat,
+   pub time_format: TimeFormat,
++  pub timezone_id: String,
+   pub field_type: FieldType,
+ }
+ 
+@@ -43,6 +44,7 @@ impl From<TypeOptionData> for DateTypeOption {
+       .get_i64_value("time_format")
+       .map(TimeFormat::from)
+       .unwrap_or_default();
++    let timezone_id = data.get_str_value("timezone_id").unwrap_or_default();
+     let field_type = data
+       .get_i64_value("field_type")
+       .map(FieldType::from)
+@@ -50,6 +52,7 @@ impl From<TypeOptionData> for DateTypeOption {
+     Self {
+       date_format,
+       time_format,
++      timezone_id,
+       field_type,
+     }
+   }
+@@ -60,6 +63,7 @@ impl From<DateTypeOption> for TypeOptionData {
+     TypeOptionDataBuilder::new()
+       .insert_i64_value("date_format", data.date_format.value())
+       .insert_i64_value("time_format", data.time_format.value())
++      .insert_str_value("timezone_id", data.timezone_id)
+       .insert_i64_value("field_type", data.field_type.value())
+       .build()
+   }
+@@ -81,25 +85,27 @@ impl TypeOptionCellData for DateTypeOption {
+ impl DateTypeOption {
+   pub fn new(field_type: FieldType) -> Self {
+     Self {
+-      date_format: Default::default(),
+-      time_format: Default::default(),
+       field_type,
++      ..Default::default()
++    }
++  }
++
++  pub fn test() -> Self {
++    Self {
++      timezone_id: "Etc/UTC".to_owned(),
++      field_type: FieldType::DateTime,
++      ..Self::default()
+     }
+   }
+ 
+   fn today_desc_from_timestamp(&self, cell_data: DateCellData) -> DateCellDataPB {
+     let timestamp = cell_data.timestamp.unwrap_or_default();
+     let include_time = cell_data.include_time;
+-    let timezone_id = cell_data.timezone_id;
+ 
+     let (date, time) = match cell_data.timestamp {
+       Some(timestamp) => {
+         let naive = chrono::NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap();
+-        let offset = match Tz::from_str(&timezone_id) {
+-          Ok(timezone) => timezone.offset_from_utc_datetime(&naive).fix(),
+-          Err(_) => *Local::now().offset(),
+-        };
+-
++        let offset = self.get_timezone_offset(naive);
+         let date_time = DateTime::<Local>::from_utc(naive, offset);
+ 
+         let fmt = self.date_format.format_str();
+@@ -117,13 +123,11 @@ impl DateTypeOption {
+       time,
+       include_time,
+       timestamp,
+-      timezone_id,
+     }
+   }
+ 
+   fn timestamp_from_parsed_time_previous_and_new_timestamp(
+     &self,
+-    timezone: Tz,
+     parsed_time: Option<NaiveTime>,
+     previous_timestamp: Option<i64>,
+     changeset_timestamp: Option<i64>,
+@@ -131,15 +135,21 @@ impl DateTypeOption {
+     if let Some(time) = parsed_time {
+       // a valid time is provided, so we replace the time component of old
+       // (or new timestamp if provided) with it.
++      let utc_date = changeset_timestamp
++        .or(previous_timestamp)
++        .map(|timestamp| NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap())
++        .unwrap();
++      let offset = self.get_timezone_offset(utc_date);
++
+       let local_date = changeset_timestamp.or(previous_timestamp).map(|timestamp| {
+-        timezone
++        offset
+           .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap())
+           .date_naive()
+       });
+ 
+       match local_date {
+         Some(date) => {
+-          let local_datetime = timezone
++          let local_datetime = offset
+             .from_local_datetime(&NaiveDateTime::new(date, time))
+             .unwrap();
+ 
+@@ -151,6 +161,19 @@ impl DateTypeOption {
+       changeset_timestamp.or(previous_timestamp)
+     }
+   }
++
++  /// returns offset of Tz timezone if provided or of the local timezone otherwise
++  fn get_timezone_offset(&self, date_time: NaiveDateTime) -> FixedOffset {
++    let current_timezone_offset = Local::now().offset().fix();
++    if self.timezone_id.is_empty() {
++      current_timezone_offset
++    } else {
++      match Tz::from_str(&self.timezone_id) {
++        Ok(timezone) => timezone.offset_from_utc_datetime(&date_time).fix(),
++        Err(_) => current_timezone_offset,
++      }
++    }
++  }
+ }
+ 
+ impl TypeOptionTransform for DateTypeOption {}
+@@ -190,34 +213,26 @@ impl CellDataChangeset for DateTypeOption {
+     cell: Option<Cell>,
+   ) -> FlowyResult<(Cell, <Self as TypeOption>::CellData)> {
+     // old date cell data
+-    let (previous_timestamp, include_time, timezone_id) = match cell {
+-      None => (None, false, "".to_owned()),
++    let (previous_timestamp, include_time) = match cell {
+       Some(cell) => {
+         let cell_data = DateCellData::from(&cell);
+-        (
+-          cell_data.timestamp,
+-          cell_data.include_time,
+-          cell_data.timezone_id,
+-        )
++        (cell_data.timestamp, cell_data.include_time)
+       },
++      None => (None, false),
+     };
+ 
+-    // update include_time and timezone_id if necessary
++    // update include_time if necessary
+     let include_time = changeset.include_time.unwrap_or(include_time);
+-    let timezone_id = changeset
+-      .timezone_id
+-      .as_ref()
+-      .map(|timezone_id| timezone_id.to_owned())
+-      .unwrap_or_else(|| timezone_id);
+-
+-    // Calculate the timezone-aware timestamp. If a new timestamp is included
+-    // in the changeset without an accompanying time string, the old timestamp
+-    // will simply be overwritten. Meaning, in order to change the day without
+-    // changing the time, the old time string should be passed in as well.
++
++    // Calculate the timestamp in the time zone specified in type option. If
++    // a new timestamp is included in the changeset without an accompanying
++    // time string, the old timestamp will simply be overwritten. Meaning, in
++    // order to change the day without changing the time, the old time string
++    // should be passed in as well.
++
+     let changeset_timestamp = changeset.date_timestamp();
+ 
+-    // parse the time string, which is in the timezone corresponding to
+-    // timezone_id or local
++    // parse the time string, which is in the local timezone
+     let parsed_time = match (include_time, changeset.time) {
+       (true, Some(time_str)) => {
+         let result = NaiveTime::parse_from_str(&time_str, self.time_format.format_str());
+@@ -232,22 +247,7 @@ impl CellDataChangeset for DateTypeOption {
+       _ => Ok(None),
+     }?;
+ 
+-    // Tz timezone if provided, local timezone otherwise
+-    let current_timezone_offset = UTC
+-      .offset_from_local_datetime(&Local::now().naive_local())
+-      .unwrap();
+-    let current_timezone = Tz::from_offset(&current_timezone_offset);
+-    let timezone = if timezone_id.is_empty() {
+-      current_timezone
+-    } else {
+-      match Tz::from_str(&timezone_id) {
+-        Ok(timezone) => timezone,
+-        Err(_) => current_timezone,
+-      }
+-    };
+-
+     let timestamp = self.timestamp_from_parsed_time_previous_and_new_timestamp(
+-      timezone,
+       parsed_time,
+       previous_timestamp,
+       changeset_timestamp,
+@@ -256,7 +256,6 @@ impl CellDataChangeset for DateTypeOption {
+     let cell_data = DateCellData {
+       timestamp,
+       include_time,
+-      timezone_id,
+     };
+ 
+     let cell_wrapper: DateCellDataWrapper = (self.field_type.clone(), cell_data.clone()).into();
+diff --git a/frontend/rust-lib/flowy-database2/src/services/field/type_options/date_type_option/date_type_option_entities.rs b/frontend/rust-lib/flowy-database2/src/services/field/type_options/date_type_option/date_type_option_entities.rs
+index ff8fa9d497e05..84dbb215edaff 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/field/type_options/date_type_option/date_type_option_entities.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/field/type_options/date_type_option/date_type_option_entities.rs
+@@ -17,12 +17,11 @@ use crate::services::cell::{
+ };
+ use crate::services::field::CELL_DATA;
+ 
+-#[derive(Clone, Debug, Serialize, Deserialize)]
++#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+ pub struct DateCellChangeset {
+   pub date: Option<String>,
+   pub time: Option<String>,
+   pub include_time: Option<bool>,
+-  pub timezone_id: Option<String>,
+ }
+ 
+ impl DateCellChangeset {
+@@ -51,8 +50,6 @@ pub struct DateCellData {
+   pub timestamp: Option<i64>,
+   #[serde(default)]
+   pub include_time: bool,
+-  #[serde(default)]
+-  pub timezone_id: String,
+ }
+ 
+ impl From<&Cell> for DateCellData {
+@@ -60,13 +57,10 @@ impl From<&Cell> for DateCellData {
+     let timestamp = cell
+       .get_str_value(CELL_DATA)
+       .and_then(|data| data.parse::<i64>().ok());
+-
+     let include_time = cell.get_bool_value("include_time").unwrap_or_default();
+-    let timezone_id = cell.get_str_value("timezone_id").unwrap_or_default();
+     Self {
+       timestamp,
+       include_time,
+-      timezone_id,
+     }
+   }
+ }
+@@ -96,7 +90,6 @@ impl From<DateCellDataWrapper> for Cell {
+     new_cell_builder(field_type)
+       .insert_str_value(CELL_DATA, timestamp_string)
+       .insert_bool_value("include_time", data.include_time)
+-      .insert_str_value("timezone_id", data.timezone_id)
+       .build()
+   }
+ }
+@@ -131,7 +124,6 @@ impl<'de> serde::Deserialize<'de> for DateCellData {
+         Ok(DateCellData {
+           timestamp: Some(value),
+           include_time: false,
+-          timezone_id: "".to_owned(),
+         })
+       }
+ 
+@@ -148,7 +140,6 @@ impl<'de> serde::Deserialize<'de> for DateCellData {
+       {
+         let mut timestamp: Option<i64> = None;
+         let mut include_time: Option<bool> = None;
+-        let mut timezone_id: Option<String> = None;
+ 
+         while let Some(key) = map.next_key()? {
+           match key {
+@@ -158,20 +149,15 @@ impl<'de> serde::Deserialize<'de> for DateCellData {
+             "include_time" => {
+               include_time = map.next_value()?;
+             },
+-            "timezone_id" => {
+-              timezone_id = map.next_value()?;
+-            },
+             _ => {},
+           }
+         }
+ 
+         let include_time = include_time.unwrap_or_default();
+-        let timezone_id = timezone_id.unwrap_or_default();
+ 
+         Ok(DateCellData {
+           timestamp,
+           include_time,
+-          timezone_id,
+         })
+       }
+     }
+diff --git a/frontend/rust-lib/flowy-database2/src/services/field/type_options/text_type_option/text_tests.rs b/frontend/rust-lib/flowy-database2/src/services/field/type_options/text_type_option/text_tests.rs
+index a7335c6729c69..e69fceb2fe475 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/field/type_options/text_type_option/text_tests.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/field/type_options/text_type_option/text_tests.rs
+@@ -27,7 +27,6 @@ mod tests {
+     let data = DateCellData {
+       timestamp: Some(1647251762),
+       include_time: true,
+-      timezone_id: "".to_owned(),
+     };
+ 
+     assert_eq!(
+diff --git a/frontend/rust-lib/flowy-database2/src/services/field/type_options/type_option.rs b/frontend/rust-lib/flowy-database2/src/services/field/type_options/type_option.rs
+index 4686ba055d37c..d00d1c70fc20e 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/field/type_options/type_option.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/field/type_options/type_option.rs
+@@ -37,7 +37,7 @@ pub trait TypeOption {
+   /// Represents as the corresponding field type cell changeset.
+   /// The changeset must implements the `FromCellChangesetString` and the `ToCellChangesetString` trait.
+   /// These two traits are auto implemented for `String`.
+-  ///  
++  ///
+   type CellChangeset: FromCellChangeset + ToCellChangeset;
+ 
+   ///  For the moment, the protobuf type only be used in the FFI of `Dart`. If the decoded cell
+@@ -221,9 +221,8 @@ pub fn default_type_option_data_from_type(field_type: &FieldType) -> TypeOptionD
+     FieldType::RichText => RichTextTypeOption::default().into(),
+     FieldType::Number => NumberTypeOption::default().into(),
+     FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => DateTypeOption {
+-      date_format: Default::default(),
+-      time_format: Default::default(),
+       field_type: field_type.clone(),
++      ..Default::default()
+     }
+     .into(),
+     FieldType::SingleSelect => SingleSelectTypeOption::default().into(),
+diff --git a/frontend/rust-lib/flowy-database2/tests/database/database_editor.rs b/frontend/rust-lib/flowy-database2/tests/database/database_editor.rs
+index b08e75f624ad9..7c1fac34611b0 100644
+--- a/frontend/rust-lib/flowy-database2/tests/database/database_editor.rs
++++ b/frontend/rust-lib/flowy-database2/tests/database/database_editor.rs
+@@ -316,14 +316,12 @@ impl<'a> TestRowBuilder<'a> {
+     data: &str,
+     time: Option<String>,
+     include_time: Option<bool>,
+-    timezone_id: Option<String>,
+     field_type: &FieldType,
+   ) -> String {
+     let value = serde_json::to_string(&DateCellChangeset {
+       date: Some(data.to_string()),
+       time,
+       include_time,
+-      timezone_id,
+     })
+     .unwrap();
+     let date_field = self.field_with_type(field_type);
+diff --git a/frontend/rust-lib/flowy-database2/tests/database/field_test/util.rs b/frontend/rust-lib/flowy-database2/tests/database/field_test/util.rs
+index 057436b8011eb..f42684b347105 100644
+--- a/frontend/rust-lib/flowy-database2/tests/database/field_test/util.rs
++++ b/frontend/rust-lib/flowy-database2/tests/database/field_test/util.rs
+@@ -46,6 +46,7 @@ pub fn create_date_field(grid_id: &str, field_type: FieldType) -> (CreateFieldPa
+   let date_type_option = DateTypeOption {
+     date_format: DateFormat::US,
+     time_format: TimeFormat::TwentyFourHour,
++    timezone_id: "Etc/UTC".to_owned(),
+     field_type: field_type.clone(),
+   };
+ 
+@@ -82,7 +83,6 @@ pub fn make_date_cell_string(s: &str) -> String {
+     date: Some(s.to_string()),
+     time: None,
+     include_time: Some(false),
+-    timezone_id: None,
+   })
+   .unwrap()
+ }
+diff --git a/frontend/rust-lib/flowy-database2/tests/database/mock_data/board_mock_data.rs b/frontend/rust-lib/flowy-database2/tests/database/mock_data/board_mock_data.rs
+index 3a4546358ddc2..4437366f7ea16 100644
+--- a/frontend/rust-lib/flowy-database2/tests/database/mock_data/board_mock_data.rs
++++ b/frontend/rust-lib/flowy-database2/tests/database/mock_data/board_mock_data.rs
+@@ -42,6 +42,7 @@ pub fn make_test_board() -> DatabaseData {
+         let date_type_option = DateTypeOption {
+           date_format: DateFormat::US,
+           time_format: TimeFormat::TwentyFourHour,
++          timezone_id: "Etc/UTC".to_owned(),
+           field_type: field_type.clone(),
+         };
+         let name = match field_type {
+@@ -125,14 +126,9 @@ pub fn make_test_board() -> DatabaseData {
+             FieldType::RichText => row_builder.insert_text_cell("A"),
+             FieldType::Number => row_builder.insert_number_cell("1"),
+             // 1647251762 => Mar 14,2022
+-            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => row_builder
+-              .insert_date_cell(
+-                "1647251762",
+-                None,
+-                None,
+-                Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-                &field_type,
+-              ),
++            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => {
++              row_builder.insert_date_cell("1647251762", None, None, &field_type)
++            },
+             FieldType::SingleSelect => {
+               row_builder.insert_single_select_cell(|mut options| options.remove(0))
+             },
+@@ -150,14 +146,9 @@ pub fn make_test_board() -> DatabaseData {
+             FieldType::RichText => row_builder.insert_text_cell("B"),
+             FieldType::Number => row_builder.insert_number_cell("2"),
+             // 1647251762 => Mar 14,2022
+-            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => row_builder
+-              .insert_date_cell(
+-                "1647251762",
+-                None,
+-                None,
+-                Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-                &field_type,
+-              ),
++            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => {
++              row_builder.insert_date_cell("1647251762", None, None, &field_type)
++            },
+             FieldType::SingleSelect => {
+               row_builder.insert_single_select_cell(|mut options| options.remove(0))
+             },
+@@ -174,14 +165,9 @@ pub fn make_test_board() -> DatabaseData {
+             FieldType::RichText => row_builder.insert_text_cell("C"),
+             FieldType::Number => row_builder.insert_number_cell("3"),
+             // 1647251762 => Mar 14,2022
+-            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => row_builder
+-              .insert_date_cell(
+-                "1647251762",
+-                None,
+-                None,
+-                Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-                &field_type,
+-              ),
++            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => {
++              row_builder.insert_date_cell("1647251762", None, None, &field_type)
++            },
+             FieldType::SingleSelect => {
+               row_builder.insert_single_select_cell(|mut options| options.remove(1))
+             },
+@@ -201,14 +187,9 @@ pub fn make_test_board() -> DatabaseData {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell("DA"),
+             FieldType::Number => row_builder.insert_number_cell("4"),
+-            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => row_builder
+-              .insert_date_cell(
+-                "1668704685",
+-                None,
+-                None,
+-                Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-                &field_type,
+-              ),
++            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => {
++              row_builder.insert_date_cell("1668704685", None, None, &field_type)
++            },
+             FieldType::SingleSelect => {
+               row_builder.insert_single_select_cell(|mut options| options.remove(1))
+             },
+@@ -223,14 +204,9 @@ pub fn make_test_board() -> DatabaseData {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell("AE"),
+             FieldType::Number => row_builder.insert_number_cell(""),
+-            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => row_builder
+-              .insert_date_cell(
+-                "1668359085",
+-                None,
+-                None,
+-                Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-                &field_type,
+-              ),
++            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => {
++              row_builder.insert_date_cell("1668359085", None, None, &field_type)
++            },
+             FieldType::SingleSelect => {
+               row_builder.insert_single_select_cell(|mut options| options.remove(2))
+             },
+diff --git a/frontend/rust-lib/flowy-database2/tests/database/mock_data/calendar_mock_data.rs b/frontend/rust-lib/flowy-database2/tests/database/mock_data/calendar_mock_data.rs
+index 4f13551155d15..0345acfd3a5ea 100644
+--- a/frontend/rust-lib/flowy-database2/tests/database/mock_data/calendar_mock_data.rs
++++ b/frontend/rust-lib/flowy-database2/tests/database/mock_data/calendar_mock_data.rs
+@@ -46,13 +46,9 @@ pub fn make_test_calendar() -> DatabaseData {
+         for field_type in FieldType::iter() {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell("A"),
+-            FieldType::DateTime => row_builder.insert_date_cell(
+-              "1678090778",
+-              None,
+-              None,
+-              Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-              &field_type,
+-            ),
++            FieldType::DateTime => {
++              row_builder.insert_date_cell("1678090778", None, None, &field_type)
++            },
+             _ => "".to_owned(),
+           };
+         }
+@@ -61,13 +57,9 @@ pub fn make_test_calendar() -> DatabaseData {
+         for field_type in FieldType::iter() {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell("B"),
+-            FieldType::DateTime => row_builder.insert_date_cell(
+-              "1677917978",
+-              None,
+-              None,
+-              Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-              &field_type,
+-            ),
++            FieldType::DateTime => {
++              row_builder.insert_date_cell("1677917978", None, None, &field_type)
++            },
+             _ => "".to_owned(),
+           };
+         }
+@@ -76,13 +68,9 @@ pub fn make_test_calendar() -> DatabaseData {
+         for field_type in FieldType::iter() {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell("C"),
+-            FieldType::DateTime => row_builder.insert_date_cell(
+-              "1679213978",
+-              None,
+-              None,
+-              Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-              &field_type,
+-            ),
++            FieldType::DateTime => {
++              row_builder.insert_date_cell("1679213978", None, None, &field_type)
++            },
+             _ => "".to_owned(),
+           };
+         }
+@@ -91,13 +79,9 @@ pub fn make_test_calendar() -> DatabaseData {
+         for field_type in FieldType::iter() {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell("D"),
+-            FieldType::DateTime => row_builder.insert_date_cell(
+-              "1678695578",
+-              None,
+-              None,
+-              Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-              &field_type,
+-            ),
++            FieldType::DateTime => {
++              row_builder.insert_date_cell("1678695578", None, None, &field_type)
++            },
+             _ => "".to_owned(),
+           };
+         }
+@@ -106,13 +90,9 @@ pub fn make_test_calendar() -> DatabaseData {
+         for field_type in FieldType::iter() {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell("E"),
+-            FieldType::DateTime => row_builder.insert_date_cell(
+-              "1678695578",
+-              None,
+-              None,
+-              Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-              &field_type,
+-            ),
++            FieldType::DateTime => {
++              row_builder.insert_date_cell("1678695578", None, None, &field_type)
++            },
+             _ => "".to_owned(),
+           };
+         }
+diff --git a/frontend/rust-lib/flowy-database2/tests/database/mock_data/grid_mock_data.rs b/frontend/rust-lib/flowy-database2/tests/database/mock_data/grid_mock_data.rs
+index 40791b8099385..e144878a25d57 100644
+--- a/frontend/rust-lib/flowy-database2/tests/database/mock_data/grid_mock_data.rs
++++ b/frontend/rust-lib/flowy-database2/tests/database/mock_data/grid_mock_data.rs
+@@ -42,6 +42,7 @@ pub fn make_test_grid() -> DatabaseData {
+         let date_type_option = DateTypeOption {
+           date_format: DateFormat::US,
+           time_format: TimeFormat::TwentyFourHour,
++          timezone_id: "Etc/UTC".to_owned(),
+           field_type: field_type.clone(),
+         };
+         let name = match field_type {
+@@ -123,14 +124,9 @@ pub fn make_test_grid() -> DatabaseData {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell("A"),
+             FieldType::Number => row_builder.insert_number_cell("1"),
+-            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => row_builder
+-              .insert_date_cell(
+-                "1647251762",
+-                None,
+-                None,
+-                Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-                &field_type,
+-              ),
++            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => {
++              row_builder.insert_date_cell("1647251762", None, None, &field_type)
++            },
+             FieldType::MultiSelect => row_builder
+               .insert_multi_select_cell(|mut options| vec![options.remove(0), options.remove(0)]),
+             FieldType::Checkbox => row_builder.insert_checkbox_cell("true"),
+@@ -149,14 +145,9 @@ pub fn make_test_grid() -> DatabaseData {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell(""),
+             FieldType::Number => row_builder.insert_number_cell("2"),
+-            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => row_builder
+-              .insert_date_cell(
+-                "1647251762",
+-                None,
+-                None,
+-                Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-                &field_type,
+-              ),
++            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => {
++              row_builder.insert_date_cell("1647251762", None, None, &field_type)
++            },
+             FieldType::MultiSelect => row_builder
+               .insert_multi_select_cell(|mut options| vec![options.remove(0), options.remove(1)]),
+             FieldType::Checkbox => row_builder.insert_checkbox_cell("true"),
+@@ -169,14 +160,9 @@ pub fn make_test_grid() -> DatabaseData {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell("C"),
+             FieldType::Number => row_builder.insert_number_cell("3"),
+-            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => row_builder
+-              .insert_date_cell(
+-                "1647251762",
+-                None,
+-                None,
+-                Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-                &field_type,
+-              ),
++            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => {
++              row_builder.insert_date_cell("1647251762", None, None, &field_type)
++            },
+             FieldType::SingleSelect => {
+               row_builder.insert_single_select_cell(|mut options| options.remove(0))
+             },
+@@ -193,14 +179,9 @@ pub fn make_test_grid() -> DatabaseData {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell("DA"),
+             FieldType::Number => row_builder.insert_number_cell("14"),
+-            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => row_builder
+-              .insert_date_cell(
+-                "1668704685",
+-                None,
+-                None,
+-                Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-                &field_type,
+-              ),
++            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => {
++              row_builder.insert_date_cell("1668704685", None, None, &field_type)
++            },
+             FieldType::SingleSelect => {
+               row_builder.insert_single_select_cell(|mut options| options.remove(0))
+             },
+@@ -214,14 +195,9 @@ pub fn make_test_grid() -> DatabaseData {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell("AE"),
+             FieldType::Number => row_builder.insert_number_cell(""),
+-            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => row_builder
+-              .insert_date_cell(
+-                "1668359085",
+-                None,
+-                None,
+-                Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-                &field_type,
+-              ),
++            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => {
++              row_builder.insert_date_cell("1668359085", None, None, &field_type)
++            },
+             FieldType::SingleSelect => {
+               row_builder.insert_single_select_cell(|mut options| options.remove(1))
+             },
+@@ -236,14 +212,9 @@ pub fn make_test_grid() -> DatabaseData {
+           match field_type {
+             FieldType::RichText => row_builder.insert_text_cell("AE"),
+             FieldType::Number => row_builder.insert_number_cell("5"),
+-            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => row_builder
+-              .insert_date_cell(
+-                "1671938394",
+-                None,
+-                None,
+-                Some(chrono_tz::Tz::Etc__GMTPlus8.to_string()),
+-                &field_type,
+-              ),
++            FieldType::DateTime | FieldType::UpdatedAt | FieldType::CreatedAt => {
++              row_builder.insert_date_cell("1671938394", None, None, &field_type)
++            },
+             FieldType::SingleSelect => {
+               row_builder.insert_single_select_cell(|mut options| options.remove(1))
+             },
+diff --git a/frontend/rust-lib/flowy-database2/tests/database/share_test/export_test.rs b/frontend/rust-lib/flowy-database2/tests/database/share_test/export_test.rs
+index aa549fc05caec..684763a045537 100644
+--- a/frontend/rust-lib/flowy-database2/tests/database/share_test/export_test.rs
++++ b/frontend/rust-lib/flowy-database2/tests/database/share_test/export_test.rs
+@@ -33,7 +33,7 @@ A,$1,2022/03/14,,"Google,Facebook",Yes,AppFlowy website - https://www.appflowy.i
+ C,$3,2022/03/14,Completed,Facebook,No,,,2022/03/14,2022/03/14
+ DA,$14,2022/11/17,Completed,,No,,,2022/11/17,2022/11/17
+ AE,,2022/11/13,Planned,,No,,,2022/11/13,2022/11/13
+-AE,$5,2022/12/24,Planned,,Yes,,,2022/12/24,2022/12/24
++AE,$5,2022/12/25,Planned,,Yes,,,2022/12/25,2022/12/25
+ "#;
+   println!("{}", s);
+   assert_eq!(s, expected);
+diff --git a/frontend/rust-lib/flowy-database2/tests/database/sort_test/single_sort_test.rs b/frontend/rust-lib/flowy-database2/tests/database/sort_test/single_sort_test.rs
+index 96db2ce396ff5..7b338467f6f5a 100644
+--- a/frontend/rust-lib/flowy-database2/tests/database/sort_test/single_sort_test.rs
++++ b/frontend/rust-lib/flowy-database2/tests/database/sort_test/single_sort_test.rs
+@@ -184,7 +184,7 @@ async fn sort_date_by_descending_test() {
+         "2022/03/14",
+         "2022/11/17",
+         "2022/11/13",
+-        "2022/12/24",
++        "2022/12/25",
+       ],
+     },
+     InsertSort {
+@@ -194,7 +194,7 @@ async fn sort_date_by_descending_test() {
+     AssertCellContentOrder {
+       field_id: date_field.id.clone(),
+       orders: vec![
+-        "2022/12/24",
++        "2022/12/25",
+         "2022/11/17",
+         "2022/11/13",
+         "2022/03/14",

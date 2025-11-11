@@ -1,0 +1,224 @@
+diff --git a/focus-android/app/build.gradle b/focus-android/app/build.gradle
+index 2d721d47b096..0a97f905d900 100644
+--- a/focus-android/app/build.gradle
++++ b/focus-android/app/build.gradle
+@@ -159,6 +159,7 @@ dependencies {
+     implementation "org.mozilla.components:ui-colors:$mozilla_components_version"
+ 
+     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
++    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:${coroutines_version}"
+ 
+     focusImplementation 'com.adjust.sdk:adjust-android:4.11.4'
+     focusImplementation 'com.android.installreferrer:installreferrer:1.1' // Required by Adjust
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
+index 1307de560e9c..354b6b76fdfb 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
+@@ -22,6 +22,7 @@ import mozilla.components.support.utils.SafeIntent
+ import org.mozilla.focus.R
+ import org.mozilla.focus.activity.CustomTabActivity.Companion.CUSTOM_TAB_ID
+ import org.mozilla.focus.biometrics.Biometrics
++import org.mozilla.focus.browser.binding.NavigationBinding
+ import org.mozilla.focus.ext.components
+ import org.mozilla.focus.fragment.BrowserFragment
+ import org.mozilla.focus.fragment.FirstrunFragment
+@@ -37,7 +38,7 @@ import org.mozilla.focus.utils.ViewUtils
+ 
+ @Suppress("TooManyFunctions")
+ open class MainActivity : LocaleAwareAppCompatActivity() {
+-    protected open val isCustomTabMode: Boolean
++    internal open val isCustomTabMode: Boolean
+         get() = false
+ 
+     protected open val currentTabForActivity: SessionState?
+@@ -49,6 +50,8 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+ 
+     private var previousSessionCount = 0
+ 
++    private val navigation by lazy { NavigationBinding(components.store, activity = this) }
++
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+ 
+@@ -83,8 +86,6 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+             TelemetryWrapper.openFromIconEvent()
+         }
+ 
+-        registerSessionObserver()
+-
+         val launchCount = Settings.getInstance(this).getAppLaunchCount()
+         PreferenceManager.getDefaultSharedPreferences(this)
+                 .edit()
+@@ -92,37 +93,6 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+                 .apply()
+     }
+ 
+-    private fun registerSessionObserver() {
+-        @Suppress("DEPRECATION")
+-        components.sessionManager.register(object : SessionManager.Observer {
+-            override fun onSessionSelected(session: Session) {
+-                showBrowserScreenForCurrentSession()
+-            }
+-
+-            override fun onAllSessionsRemoved() {
+-                showUrlInputScreen()
+-            }
+-
+-            override fun onSessionRemoved(session: Session) {
+-                previousSessionCount = components.sessionManager.sessions.count()
+-                if (!isCustomTabMode && components.sessionManager.sessions.isEmpty()) {
+-                    showUrlInputScreen()
+-                }
+-            }
+-        }, owner = this)
+-
+-        if (!isCustomTabMode && components.sessionManager.sessions.isEmpty()) {
+-            showUrlInputScreen()
+-        } else {
+-            showBrowserScreenForCurrentSession()
+-        }
+-
+-        // If needed show the first run tour on top of the browser or url input fragment.
+-        if (Settings.getInstance(this@MainActivity).shouldShowFirstrun() && !isCustomTabMode) {
+-            showFirstrun(components.store.state.selectedTabId)
+-        }
+-    }
+-
+     override fun applyLocale() {
+         // We don't care here: all our fragments update themselves as appropriate
+     }
+@@ -149,7 +119,15 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+         TelemetryWrapper.stopSession()
+     }
+ 
++    override fun onStart() {
++        super.onStart()
++
++        navigation.start()
++    }
++
+     override fun onStop() {
++        navigation.stop()
++
+         super.onStop()
+ 
+         TelemetryWrapper.stopMainActivity()
+@@ -206,7 +184,7 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+         }
+     }
+ 
+-    private fun showUrlInputScreen() {
++    internal fun showUrlInputScreen() {
+         val fragmentManager = supportFragmentManager
+         val browserFragment = fragmentManager.findFragmentByTag(BrowserFragment.FRAGMENT_TAG) as BrowserFragment?
+ 
+@@ -244,14 +222,14 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+                 .commitAllowingStateLoss()
+     }
+ 
+-    private fun showFirstrun(tabId: String? = null) {
++    internal fun showFirstrun(tabId: String? = null) {
+         supportFragmentManager
+                 .beginTransaction()
+                 .add(R.id.container, FirstrunFragment.create(tabId), FirstrunFragment.FRAGMENT_TAG)
+                 .commit()
+     }
+ 
+-    protected fun showBrowserScreenForCurrentSession() {
++    internal fun showBrowserScreenForCurrentSession() {
+         val fragmentManager = supportFragmentManager
+         val tab = currentTabForActivity ?: return
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/browser/binding/NavigationBinding.kt b/focus-android/app/src/main/java/org/mozilla/focus/browser/binding/NavigationBinding.kt
+new file mode 100644
+index 000000000000..9e0500c75f7f
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/browser/binding/NavigationBinding.kt
+@@ -0,0 +1,87 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.browser.binding
++
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.MainScope
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.collect
++import kotlinx.coroutines.flow.filter
++import kotlinx.coroutines.flow.filterNotNull
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.launch
++import mozilla.components.browser.state.selector.privateTabs
++import mozilla.components.browser.state.state.BrowserState
++import mozilla.components.browser.state.store.BrowserStore
++import mozilla.components.lib.state.ext.flow
++import mozilla.components.support.base.feature.LifecycleAwareFeature
++import mozilla.components.support.ktx.kotlinx.coroutines.flow.ifChanged
++import org.mozilla.focus.activity.MainActivity
++import org.mozilla.focus.utils.Settings
++
++// This is more or less a translation of the SessionManager.Observer that existed in MainActivity.
++// This is still not a great way to deal with navigation. But this was the most minimal change for
++// now.
++class NavigationBinding(
++    private val store: BrowserStore,
++    private val activity: MainActivity
++) : LifecycleAwareFeature {
++    private var shouldShowFirstRun =
++        Settings.getInstance(activity).shouldShowFirstrun() && !activity.isCustomTabMode
++    private var scope: CoroutineScope? = null
++
++    override fun start() {
++        scope = MainScope().also { scope ->
++            scope.launch { observeSelectionChanges(store.flow(activity)) }
++            scope.launch { observeTabsClosed(store.flow(activity)) }
++        }
++    }
++
++    override fun stop() {
++        scope?.cancel()
++    }
++
++    private suspend fun observeSelectionChanges(flow: Flow<BrowserState>) {
++        flow.map { state -> state.selectedTabId }
++            .ifChanged()
++            .filterNotNull()
++            .collect { navigateToBrowser() }
++    }
++
++    private suspend fun observeTabsClosed(flow: Flow<BrowserState>) {
++        flow.map { state -> state.privateTabs.isEmpty() }
++            .ifChanged()
++            .filter { isEmpty -> isEmpty }
++            .collect { navigateToHomeScreen() }
++    }
++
++    private fun navigateToHomeScreen() {
++        if (activity.isCustomTabMode) {
++            return
++        }
++
++        if (!activity.isCustomTabMode) {
++            activity.showUrlInputScreen()
++        }
++
++        if (shouldShowFirstRun) {
++            showFirstRun()
++        }
++    }
++
++    private fun navigateToBrowser() {
++        activity.showBrowserScreenForCurrentSession()
++
++        if (shouldShowFirstRun) {
++            showFirstRun()
++        }
++    }
++
++    private fun showFirstRun() {
++        shouldShowFirstRun = false
++        activity.showFirstrun()
++    }
++}

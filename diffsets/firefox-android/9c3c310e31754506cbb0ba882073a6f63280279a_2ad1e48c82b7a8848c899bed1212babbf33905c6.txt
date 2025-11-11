@@ -1,0 +1,241 @@
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsPreferences.kt b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsPreferences.kt
+index f7e0e5c6e670..8d70cb93b7d2 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsPreferences.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsPreferences.kt
+@@ -1,5 +1,45 @@
+ package org.mozilla.focus.searchsuggestions
+ 
+-interface SearchSuggestionsPreferences {
++import android.arch.lifecycle.LiveData
++import android.arch.lifecycle.MutableLiveData
++import android.arch.lifecycle.Transformations.map
++import android.content.Context
++import android.preference.PreferenceManager
++import mozilla.components.browser.search.SearchEngine
++import org.mozilla.focus.Components
++import org.mozilla.focus.utils.Settings
+ 
+-}
+\ No newline at end of file
++class SearchSuggestionsPreferences(private val context: Context) {
++    private val settings = Settings.getInstance(context)
++    private val preferences = PreferenceManager.getDefaultSharedPreferences(context)
++
++    private val _searchEngineSupportsSuggestions = MutableLiveData<Boolean>()
++
++    private val _userHasRespondedToSearchSuggestionPrompt = MutableLiveData<Boolean>()
++    val userHasRespondedToSearchSuggestionPrompt: LiveData<Boolean>
++        get() = _userHasRespondedToSearchSuggestionPrompt
++
++    private val _shouldShowSearchSuggestions = MutableLiveData<Boolean>()
++    val shouldShowSearchSuggestions: LiveData<Boolean>
++        get() = _shouldShowSearchSuggestions
++
++    private val _searchEngine = MutableLiveData<SearchEngine>()
++    val searchEngine: LiveData<SearchEngine>
++        get() = _searchEngine
++
++    val searchEngineSupportsSuggestions = map(searchEngine) { it.canProvideSearchSuggestions }
++
++    init {
++        _shouldShowSearchSuggestions.value = settings.shouldShowSearchSuggestions()
++        _userHasRespondedToSearchSuggestionPrompt.value = false
++        _searchEngine.value = getSearchEngine()
++    }
++
++
++    private fun getSearchEngine(): SearchEngine {
++        val searchEngine = Components.searchEngineManager.getDefaultSearchEngine(
++                context, settings.defaultSearchEngineName)
++
++        return searchEngine
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsService.kt b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsService.kt
+index 82595fb7497f..e85c53cb7b82 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsService.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsService.kt
+@@ -2,32 +2,25 @@ package org.mozilla.focus.searchsuggestions
+ 
+ import android.arch.lifecycle.LiveData
+ import android.arch.lifecycle.MutableLiveData
+-import android.content.Context
+ import kotlinx.coroutines.experimental.CommonPool
+ import kotlinx.coroutines.experimental.android.UI
+ import mozilla.components.browser.search.suggestions.SearchSuggestionClient
+-import org.mozilla.focus.Components
+-import org.mozilla.focus.utils.Settings
+ import kotlinx.coroutines.experimental.launch
+ import mozilla.components.browser.search.SearchEngine
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+ 
+-class SearchSuggestionsService(private val context: Context) {
+-    private var searchEngine: SearchEngine? = null
+-    private var client: SearchSuggestionClient? = null
++class SearchSuggestionsService(searchEngine: SearchEngine) {
++    private var client: SearchSuggestionClient = SearchSuggestionClient(searchEngine, { fetch(it) })
+     private var httpClient = OkHttpClient()
+ 
+     private val _canProvideSearchSuggestions = MutableLiveData<Boolean>()
+-    val canProvideSearchSuggestions: LiveData<Boolean>
+-        get() = _canProvideSearchSuggestions
++    val canProvideSearchSuggestions: LiveData<Boolean> = _canProvideSearchSuggestions
+ 
+     private fun fetch(url: String): String? {
+-        httpClient.dispatcher().queuedCalls().forEach {
+-            if (it.request().tag() == REQUEST_TAG) {
+-                it.cancel()
+-            }
+-        }
++        httpClient.dispatcher().queuedCalls()
++                .filter { it.request().tag() == REQUEST_TAG }
++                .forEach { it.cancel() }
+ 
+         val request = Request.Builder()
+                 .tag(REQUEST_TAG)
+@@ -40,11 +33,10 @@ class SearchSuggestionsService(private val context: Context) {
+     fun getSuggestions(query: String): LiveData<Pair<String, List<String>>> {
+         val result = MutableLiveData<Pair<String, List<String>>>()
+ 
+-        if (shouldUpdateclient()) { updateClient() }
+         if (query.isBlank()) { result.value = Pair(query, listOf()) }
+ 
+         launch(CommonPool) {
+-            val suggestions = client?.getSuggestions(query) ?: listOf()
++            val suggestions = client.getSuggestions(query) ?: listOf()
+ 
+             launch(UI) {
+                 result.value = Pair(query, suggestions)
+@@ -54,23 +46,11 @@ class SearchSuggestionsService(private val context: Context) {
+         return result
+     }
+ 
+-    private fun shouldUpdateclient(): Boolean {
+-        val defaultSearchEngineName= Settings.getInstance(context).defaultSearchEngineName
+-        return searchEngine?.let { it.name != defaultSearchEngineName } ?: true
+-    }
+-
+-    private fun updateClient() {
+-        val defaultIdentifier = Settings.getInstance(context).defaultSearchEngineName
+-
+-        searchEngine = Components.searchEngineManager
+-                .getDefaultSearchEngine(context, defaultIdentifier)
+-
+-        _canProvideSearchSuggestions.value = searchEngine?.canProvideSearchSuggestions ?: false
+-
+-        client = SearchSuggestionClient(searchEngine!!, { fetch(it) })
++    fun updateSearchEngine(searchEngine: SearchEngine) {
++        client = SearchSuggestionClient(searchEngine, { fetch(it) })
+     }
+ 
+     companion object {
+-        private val REQUEST_TAG = "searchSuggestionFetch"
++        private const val REQUEST_TAG = "searchSuggestionFetch"
+     }
+ }
+\ No newline at end of file
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsViewModel.kt b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsViewModel.kt
+index 2adc1735e235..af1bdac075c2 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsViewModel.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsViewModel.kt
+@@ -13,7 +13,9 @@ import android.text.SpannableStringBuilder
+ import android.text.style.StyleSpan
+ 
+ 
+-class SearchSuggestionsViewModel(private val service: SearchSuggestionsService) : ViewModel() {
++class SearchSuggestionsViewModel(
++        private val service: SearchSuggestionsService,
++        private val searchSuggestionsPreferences: SearchSuggestionsPreferences) : ViewModel() {
+     private val _selectedSearchSuggestion = MutableLiveData<String>()
+     private val _searchQuery = MutableLiveData<String>()
+     private val _promptUserToEnableSearchSuggestions = MutableLiveData<Boolean>()
+@@ -58,10 +60,11 @@ class SearchSuggestionsViewModel(private val service: SearchSuggestionsService)
+ 
+     class Factory(private val context: Context) : ViewModelProvider.NewInstanceFactory() {
+         override fun <T : ViewModel?> create(modelClass: Class<T>): T {
+-            val repository = SearchSuggestionsService(context)
++            val preferences = SearchSuggestionsPreferences(context)
++            val service = SearchSuggestionsService(preferences.searchEngine.value!!)
+ 
+             @Suppress("UNCHECKED_CAST")
+-            return SearchSuggestionsViewModel(repository) as T
++            return SearchSuggestionsViewModel(service, preferences) as T
+         }
+     }
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/ui/SearchSuggestionsFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/ui/SearchSuggestionsFragment.kt
+index 009ddeaf8d09..eca48a1dfe5e 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/ui/SearchSuggestionsFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/ui/SearchSuggestionsFragment.kt
+@@ -16,6 +16,9 @@ import kotlinx.android.synthetic.main.fragment_search_suggestions.*
+ import org.mozilla.focus.R
+ import org.mozilla.focus.searchsuggestions.SearchSuggestionsViewModel
+ 
++
++
++
+ class SearchSuggestionsFragment : Fragment() {
+ 
+     private lateinit var searchSuggestionsViewModel: SearchSuggestionsViewModel
+@@ -44,7 +47,9 @@ class SearchSuggestionsFragment : Fragment() {
+         super.onViewCreated(view, savedInstanceState)
+ 
+         suggestionList.layoutManager = LinearLayoutManager(activity, LinearLayoutManager.VERTICAL, false)
+-        suggestionList.adapter = SuggestionsAdapter()
++        suggestionList.adapter = SuggestionsAdapter {
++            searchSuggestionsViewModel.selectSearchSuggestion(it)
++        }
+ 
+         searchView.setOnClickListener {
+             val textView = it
+@@ -58,7 +63,7 @@ class SearchSuggestionsFragment : Fragment() {
+         fun create() = SearchSuggestionsFragment()
+     }
+ 
+-    inner class SuggestionsAdapter: RecyclerView.Adapter<RecyclerView.ViewHolder>() {
++    inner class SuggestionsAdapter(private val clickListener: (String) -> Unit): RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+         private var suggestions: List<SpannableStringBuilder> = listOf()
+ 
+         fun refresh(suggestions: List<SpannableStringBuilder>) {
+@@ -79,7 +84,7 @@ class SearchSuggestionsFragment : Fragment() {
+         }
+ 
+         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+-            return SuggestionViewHolder(LayoutInflater.from(parent.context).inflate(viewType, parent, false))
++            return SuggestionViewHolder(LayoutInflater.from(parent.context).inflate(viewType, parent, false), clickListener)
+         }
+     }
+ }
+@@ -88,7 +93,7 @@ class SearchSuggestionsFragment : Fragment() {
+ /**
+  * ViewHolder implementation for a suggestion item in the list.
+  */
+-private class SuggestionViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
++private class SuggestionViewHolder(itemView: View, private val clickListener: (String) -> Unit) : RecyclerView.ViewHolder(itemView) {
+     companion object {
+         val LAYOUT_ID = R.layout.item_suggestion
+     }
+@@ -97,5 +102,6 @@ private class SuggestionViewHolder(itemView: View) : RecyclerView.ViewHolder(ite
+ 
+     fun bind(suggestion: SpannableStringBuilder) {
+         suggestionText.text = suggestion
++        itemView.setOnClickListener { clickListener(suggestion.toString()) }
+     }
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/utils/Settings.kt b/focus-android/app/src/main/java/org/mozilla/focus/utils/Settings.kt
+index 115fe4c58f25..982ea22418b0 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/utils/Settings.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/utils/Settings.kt
+@@ -49,6 +49,11 @@ class Settings private constructor(context: Context) {
+                     getPreferenceKey(R.string.pref_key_remote_debugging),
+                     false)
+ 
++    fun shouldShowSearchSuggestions(): Boolean =
++            preferences.getBoolean(
++                    getPreferenceKey(R.string.pref_key_show_search_suggestions),
++                    false)
++
+     fun shouldBlockWebFonts(): Boolean =
+         preferences.getBoolean(
+             getPreferenceKey(R.string.pref_key_performance_block_webfonts),

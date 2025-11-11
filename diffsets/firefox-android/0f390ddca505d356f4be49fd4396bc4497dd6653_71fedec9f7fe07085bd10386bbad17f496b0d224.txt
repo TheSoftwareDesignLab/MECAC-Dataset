@@ -1,0 +1,287 @@
+diff --git a/android-components/taskcluster/ac_taskgraph/__init__.py b/android-components/taskcluster/ac_taskgraph/__init__.py
+index ee09abfe76fe..fde3cf6b4252 100644
+--- a/android-components/taskcluster/ac_taskgraph/__init__.py
++++ b/android-components/taskcluster/ac_taskgraph/__init__.py
+@@ -16,6 +16,7 @@
+ extend_parameters_schema({
+     Required("pull_request_number"): Any(All(int, Range(min=1)), None),
+     Required("base_rev"): Any(basestring, None),
++    Required("version"): basestring,
+ })
+ 
+ def register(graph_config):
+@@ -44,6 +45,8 @@ def get_decision_parameters(graph_config, parameters):
+     pr_number = os.environ.get("MOBILE_PULL_REQUEST_NUMBER", None)
+     parameters["pull_request_number"] = None if pr_number is None else int(pr_number)
+     parameters["base_rev"] = os.environ.get("MOBILE_BASE_REV")
++    version = get_version()
++    parameters["version"] = version
+ 
+     if parameters["tasks_for"] == "github-release":
+         head_tag = parameters["head_tag"].decode("utf-8")
+@@ -53,7 +56,6 @@ def get_decision_parameters(graph_config, parameters):
+                     head_tag
+                 )
+             )
+-        version = get_version()
+         # XXX: tags are in the format of `v<semver>`
+         if head_tag[1:] != version:
+             raise ValueError(
+diff --git a/android-components/taskcluster/ac_taskgraph/loader/__init__.py b/android-components/taskcluster/ac_taskgraph/loader/__init__.py
+index a1c8b0ca50b1..917b033b3859 100644
+--- a/android-components/taskcluster/ac_taskgraph/loader/__init__.py
++++ b/android-components/taskcluster/ac_taskgraph/loader/__init__.py
+@@ -70,6 +70,7 @@ def component_grouping(config, tasks):
+ @group_by('build-type')
+ def build_type_grouping(config, tasks):
+     groups = {}
++    only_build_types = config.get("only-for-build-types")
+     for task in tasks:
+         if task.kind not in config.get('kind-dependencies', []):
+             continue
+@@ -80,6 +81,10 @@ def build_type_grouping(config, tasks):
+             continue
+ 
+         build_type = task.attributes.get('build-type')
++        # Skip only_ and build_types that don't match
++        if only_build_types:
++            if not build_type or build_type not in only_build_types:
++                continue
+ 
+         groups.setdefault(build_type, []).append(task)
+ 
+diff --git a/android-components/taskcluster/ac_taskgraph/transforms/github_release.py b/android-components/taskcluster/ac_taskgraph/transforms/github_release.py
+new file mode 100644
+index 000000000000..195e7850a4c5
+--- /dev/null
++++ b/android-components/taskcluster/ac_taskgraph/transforms/github_release.py
+@@ -0,0 +1,49 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++"""
++Apply some defaults and minor modifications to the jobs defined in the github_release
++kind.
++"""
++
++from __future__ import absolute_import, print_function, unicode_literals
++
++from taskgraph.transforms.base import TransformSequence
++from taskgraph.util.schema import resolve_keyed_by
++
++
++transforms = TransformSequence()
++
++
++@transforms.add
++def resolve_keys(config, tasks):
++    for task in tasks:
++        for key in ("worker.github-project", "worker.is-prerelease", "worker.release-name"):
++            resolve_keyed_by(
++                task,
++                key,
++                item_name=task["name"],
++                **{
++                    'build-type': task["attributes"]["build-type"],
++                    'level': config.params["level"],
++                }
++            )
++        yield task
++
++
++@transforms.add
++def build_worker_definition(config, tasks):
++    for task in tasks:
++        worker_definition = {
++            # We don't want to upload 10gb of artifacts to the release; let's
++            # just create a release as a tag.
++            "artifact-map": [],
++            "git-tag": config.params["head_tag"].decode("utf-8"),
++            "git-revision": config.params["head_rev"].decode("utf-8"),
++            "release-name": task["worker"]["release-name"],
++            "release-name": task["worker"]["release-name"].format(version=config.params["version"]),
++        }
++
++        task["worker"].update(worker_definition)
++
++        yield task
+diff --git a/android-components/taskcluster/ac_taskgraph/transforms/post_signing.py b/android-components/taskcluster/ac_taskgraph/transforms/post_dummy.py
+similarity index 100%
+rename from android-components/taskcluster/ac_taskgraph/transforms/post_signing.py
+rename to android-components/taskcluster/ac_taskgraph/transforms/post_dummy.py
+diff --git a/android-components/taskcluster/ac_taskgraph/transforms/treeherder.py b/android-components/taskcluster/ac_taskgraph/transforms/treeherder.py
+index 9fa3791859a9..2cc1dad5a882 100644
+--- a/android-components/taskcluster/ac_taskgraph/transforms/treeherder.py
++++ b/android-components/taskcluster/ac_taskgraph/transforms/treeherder.py
+@@ -14,7 +14,10 @@
+ @transforms.add
+ def build_treeherder_definition(config, tasks):
+     for task in tasks:
+-        dep = task.pop("primary-dependency")
++        if task.get("primary-dependency"):
++            dep = task.pop("primary-dependency")
++        else:
++            dep = task["dependent-tasks"].values()[0]
+ 
+         task.setdefault("treeherder", {}).update(inherit_treeherder_from_dep(task, dep))
+         job_group = dep.task["extra"]["treeherder"].get("groupSymbol", "?")
+diff --git a/android-components/taskcluster/ac_taskgraph/worker_types.py b/android-components/taskcluster/ac_taskgraph/worker_types.py
+index d6bfb6a19af0..ae240414414b 100644
+--- a/android-components/taskcluster/ac_taskgraph/worker_types.py
++++ b/android-components/taskcluster/ac_taskgraph/worker_types.py
+@@ -106,3 +106,43 @@ def build_scriptworker_beetmover_payload(config, task, task_def):
+         "{}:beetmover:action:{}".format(scope_prefix, worker["action"]),
+         "{}:beetmover:bucket:{}".format(scope_prefix, worker["bucket"]),
+     ])
++
++
++@payload_builder(
++    "scriptworker-github",
++    schema={
++        Optional("upstream-artifacts"): [
++            {
++                Required("taskId"): taskref_or_string,
++                Required("taskType"): text_type,
++                Required("paths"): [text_type],
++            }
++        ],
++        Required("artifact-map"): [object],
++        Required("action"): text_type,
++        Required("git-tag"): text_type,
++        Required("git-revision"): text_type,
++        Required("github-project"): text_type,
++        Required("is-prerelease"): bool,
++        Required("release-name"): text_type,
++    },
++)
++def build_github_release_payload(config, task, task_def):
++    worker = task["worker"]
++
++    task_def["tags"]["worker-implementation"] = "scriptworker"
++
++    task_def["payload"] = {
++        "artifactMap": worker["artifact-map"],
++        "gitTag": worker["git-tag"],
++        "gitRevision": worker["git-revision"],
++        "isPrerelease": worker["is-prerelease"],
++        "releaseName": worker["release-name"],
++        "upstreamArtifacts": worker.get("upstream-artifacts", []),
++    }
++
++    scope_prefix = config.graph_config["scriptworker"]["scope-prefix"]
++    task_def["scopes"].extend([
++        "{}:github:project:{}".format(scope_prefix, worker["github-project"]),
++        "{}:github:action:{}".format(scope_prefix, worker["action"]),
++    ])
+diff --git a/android-components/taskcluster/ci/config.yml b/android-components/taskcluster/ci/config.yml
+index e297a1f63b9c..cf0d6f27a58d 100644
+--- a/android-components/taskcluster/ci/config.yml
++++ b/android-components/taskcluster/ci/config.yml
+@@ -55,6 +55,11 @@ workers:
+             implementation: scriptworker-beetmover
+             os: scriptworker
+             worker-type: 'mobile-{level}-beetmover'
++        github:
++            provisioner: scriptworker-k8s
++            implementation: scriptworker-github
++            os: scriptworker
++            worker-type: 'mobile-{level}-github'
+ 
+ scriptworker:
+     scope-prefix: project:mobile:android-components:releng
+diff --git a/android-components/taskcluster/ci/github-release/kind.yml b/android-components/taskcluster/ci/github-release/kind.yml
+new file mode 100644
+index 000000000000..7c9899b58587
+--- /dev/null
++++ b/android-components/taskcluster/ci/github-release/kind.yml
+@@ -0,0 +1,42 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++---
++loader: ac_taskgraph.loader.all_dep:loader
++
++transforms:
++    - ac_taskgraph.transforms.treeherder:transforms
++    - ac_taskgraph.transforms.all_dep:transforms
++    - ac_taskgraph.transforms.github_release:transforms
++    - taskgraph.transforms.task:transforms
++
++kind-dependencies:
++    - post-beetmover
++
++only-for-build-types:
++    - release
++
++group-by: build-type
++
++job-template:
++    description: Create/Update Github release
++    worker-type: github
++    worker:
++        action: release
++        github-project:
++            by-level:
++                '3': android-components
++                default: staging-android-components
++        is-prerelease:
++            by-build-type:
++                release: false
++                default: true
++        release-name:
++            by-build-type:
++                release: Android-Components {version}
++                default: Android-Components fake release {version}
++    treeherder:
++        kind: build
++        platform: android-all/opt
++        job-symbol: github-release
++        tier: 1
+diff --git a/android-components/taskcluster/ci/post-beetmover/kind.yml b/android-components/taskcluster/ci/post-beetmover/kind.yml
+new file mode 100644
+index 000000000000..66157f218ca1
+--- /dev/null
++++ b/android-components/taskcluster/ci/post-beetmover/kind.yml
+@@ -0,0 +1,29 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++---
++loader: ac_taskgraph.loader.all_dep:loader
++
++transforms:
++    - ac_taskgraph.transforms.all_dep:transforms
++    - ac_taskgraph.transforms.post_dummy:transforms
++    - ac_taskgraph.transforms.chunk:transforms
++    - taskgraph.transforms.task:transforms
++
++kind-dependencies:
++    - beetmover
++
++group-by: build-type
++
++job-template:
++    description: Dummy task to wait on all builds before publishing them
++    worker-type: succeed
++    treeherder:
++        kind: build
++        platform: android-all/opt
++        symbol:
++            by-build-type:
++                release: post-beetmover-release
++                nightly: post-beetmover-nightly
++                default: post-beetmover
++        tier: 1
+diff --git a/android-components/taskcluster/ci/post-signing/kind.yml b/android-components/taskcluster/ci/post-signing/kind.yml
+index 5b7716f3f3e1..bfdecffe73f1 100644
+--- a/android-components/taskcluster/ci/post-signing/kind.yml
++++ b/android-components/taskcluster/ci/post-signing/kind.yml
+@@ -6,7 +6,7 @@ loader: ac_taskgraph.loader.all_dep:loader
+ 
+ transforms:
+     - ac_taskgraph.transforms.all_dep:transforms
+-    - ac_taskgraph.transforms.post_signing:transforms
++    - ac_taskgraph.transforms.post_dummy:transforms
+     - ac_taskgraph.transforms.chunk:transforms
+     - taskgraph.transforms.task:transforms
+ 

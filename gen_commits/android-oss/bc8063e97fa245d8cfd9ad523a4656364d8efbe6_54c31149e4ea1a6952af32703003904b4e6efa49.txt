@@ -1,0 +1,631 @@
+diff --git a/app/src/main/java/com/kickstarter/ui/activities/ThreadActivity.kt b/app/src/main/java/com/kickstarter/ui/activities/ThreadActivity.kt
+index 930c721234..99c9b4e162 100644
+--- a/app/src/main/java/com/kickstarter/ui/activities/ThreadActivity.kt
++++ b/app/src/main/java/com/kickstarter/ui/activities/ThreadActivity.kt
+@@ -3,6 +3,7 @@ package com.kickstarter.ui.activities
+ import android.os.Bundle
+ import android.util.Pair
+ import androidx.core.view.isVisible
++import androidx.recyclerview.widget.ConcatAdapter
+ import androidx.recyclerview.widget.LinearLayoutManager
+ import com.kickstarter.R
+ import com.kickstarter.databinding.ActivityThreadLayoutBinding
+@@ -12,8 +13,9 @@ import com.kickstarter.libs.RecyclerViewPaginator
+ import com.kickstarter.libs.qualifiers.RequiresActivityViewModel
+ import com.kickstarter.models.Comment
+ import com.kickstarter.ui.adapters.RepliesAdapter
++import com.kickstarter.ui.adapters.RepliesStatusAdapter
++import com.kickstarter.ui.adapters.RootCommentAdapter
+ import com.kickstarter.ui.extensions.hideKeyboard
+-import com.kickstarter.ui.viewholders.PaginationErrorViewHolder
+ import com.kickstarter.ui.views.OnCommentComposerViewClickedListener
+ import com.kickstarter.viewmodels.ThreadViewModel
+ import org.joda.time.DateTime
+@@ -23,15 +25,23 @@ import java.util.concurrent.TimeUnit
+ @RequiresActivityViewModel(ThreadViewModel.ViewModel::class)
+ class ThreadActivity :
+     BaseActivity<ThreadViewModel.ViewModel>(),
+-    PaginationErrorViewHolder.ViewListener,
++    RepliesStatusAdapter.Delegate,
+     RepliesAdapter.Delegate {
+ 
+     private lateinit var binding: ActivityThreadLayoutBinding
+     private lateinit var ksString: KSString
+ 
+-    private val adapter = RepliesAdapter(this)
++    /** Replies list adapter **/
++    private val repliesAdapter = RepliesAdapter(this)
++    /**  Replies cell status viewMore or Error  **/
++    private val repliesStatusAdapter = RepliesStatusAdapter(this)
++    /** Replies Root comment cell adapter **/
++    private val rootCommentAdapter = RootCommentAdapter()
++    /** reverse Layout to bind the replies from bottom **/
+     private val linearLayoutManager = LinearLayoutManager(this, LinearLayoutManager.VERTICAL, true)
++
+     private lateinit var recyclerViewPaginator: RecyclerViewPaginator
++    var isPaginated = false
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+@@ -41,29 +51,38 @@ class ThreadActivity :
+         ksString = environment().ksString()
+         recyclerViewPaginator = RecyclerViewPaginator(binding.commentRepliesRecyclerView, { viewModel.inputs.nextPage() }, viewModel.outputs.isFetchingReplies(), false)
+ 
+-        binding.commentRepliesRecyclerView.adapter = adapter
++        /** use ConcatAdapter to bind adapters to recycler view and replace the section issue **/
++        binding.commentRepliesRecyclerView.adapter = ConcatAdapter(repliesAdapter, repliesStatusAdapter, rootCommentAdapter)
+         binding.commentRepliesRecyclerView.layoutManager = linearLayoutManager
+ 
+         this.viewModel.outputs.getRootComment()
+             .compose(bindToLifecycle())
+             .observeOn(AndroidSchedulers.mainThread())
+             .subscribe { comment ->
+-                adapter.updateRootCommentCell(comment)
++                /** bind root comment by updating the adapter list**/
++                rootCommentAdapter.updateRootCommentCell(comment)
+             }
+ 
+         this.viewModel.outputs
+             .onCommentReplies()
+             .compose(bindToLifecycle())
+             .observeOn(AndroidSchedulers.mainThread())
++            .filter { it.first.isNotEmpty() }
++            .doOnNext { linearLayoutManager.stackFromEnd = false }
+             .subscribe {
+-                this.adapter.takeData(it.first.reversed(), it.second)
++                /** bind View more cell if the replies more than 7 **/
++                this.repliesStatusAdapter.addViewMoreCell(it.second)
++                /** bind replies list to adapter as reversed as the layout is reversed **/
++                this.repliesAdapter.takeData(it.first.reversed())
+             }
+ 
+         viewModel.outputs.shouldShowPaginationErrorUI()
+             .compose(bindToLifecycle())
+             .observeOn(AndroidSchedulers.mainThread())
++            .filter { it }
+             .subscribe {
+-                adapter.addErrorPaginationCell(it)
++                /** bind Error Pagination cell **/
++                repliesStatusAdapter.addErrorPaginationCell(it)
+             }
+ 
+         viewModel.outputs.isFetchingReplies()
+@@ -97,9 +116,11 @@ class ThreadActivity :
+ 
+         viewModel.outputs.scrollToBottom()
+             .compose(bindToLifecycle())
+-            .delay(200, TimeUnit.MILLISECONDS)
++            .delay(500, TimeUnit.MILLISECONDS)
+             .observeOn(AndroidSchedulers.mainThread())
+-            .doOnNext { reBindLayoutManager(true) }
++            .doOnNext {
++                linearLayoutManager.stackFromEnd = true
++            }
+             .subscribe {
+                 binding.commentRepliesRecyclerView.smoothScrollToPosition(0)
+             }
+@@ -165,24 +186,13 @@ class ThreadActivity :
+     }
+ 
+     override fun loadMoreCallback() {
+-        reBindLayoutManager(false)
+         viewModel.inputs.onViewMoreClicked()
+     }
+ 
+     override fun retryCallback() {
+-        reBindLayoutManager(false)
+         viewModel.inputs.onViewMoreClicked()
+     }
+ 
+-    // we want to change stackFromEnd to be able to scroll after adding new comment
+-    private fun reBindLayoutManager(stackFromEnd: Boolean) {
+-        if (linearLayoutManager.stackFromEnd == stackFromEnd) {
+-            return
+-        }
+-        linearLayoutManager.stackFromEnd = stackFromEnd
+-        binding.commentRepliesRecyclerView.layoutManager = linearLayoutManager
+-    }
+-
+     override fun onDestroy() {
+         super.onDestroy()
+         recyclerViewPaginator.stop()
+diff --git a/app/src/main/java/com/kickstarter/ui/adapters/RepliesAdapter.kt b/app/src/main/java/com/kickstarter/ui/adapters/RepliesAdapter.kt
+index 9cb4061a37..413a480230 100644
+--- a/app/src/main/java/com/kickstarter/ui/adapters/RepliesAdapter.kt
++++ b/app/src/main/java/com/kickstarter/ui/adapters/RepliesAdapter.kt
+@@ -5,72 +5,36 @@ import android.view.ViewGroup
+ import androidx.annotation.LayoutRes
+ import com.kickstarter.R
+ import com.kickstarter.databinding.ItemCommentCardBinding
+-import com.kickstarter.databinding.ItemErrorPaginationBinding
+-import com.kickstarter.databinding.ItemShowMoreRepliesBinding
+-import com.kickstarter.models.Comment
+ import com.kickstarter.ui.data.CommentCardData
+ import com.kickstarter.ui.viewholders.CommentCardViewHolder
+ import com.kickstarter.ui.viewholders.KSViewHolder
+-import com.kickstarter.ui.viewholders.PaginationErrorViewHolder
+-import com.kickstarter.ui.viewholders.PaginationViewMoreRepliesViewHolder
+-import com.kickstarter.ui.viewholders.RootCommentViewHolder
+ 
++/** Replies list adapter to show replies list **/
+ class RepliesAdapter(private val delegate: Delegate) : KSListAdapter() {
+     interface Delegate :
+-        CommentCardViewHolder.Delegate,
+-        PaginationViewMoreRepliesViewHolder.ViewListener,
+-        PaginationErrorViewHolder.ViewListener
++        CommentCardViewHolder.Delegate
+ 
+     init {
+         insertSection(SECTION_COMMENTS, emptyList<CommentCardData>())
+-        insertSection(SECTION_SHOW_MORE_REPLIES_PAGINATING, emptyList<Boolean>())
+-        insertSection(SECTION_ERROR_PAGINATING, emptyList<Boolean>())
+-        insertSection(SECTION_ROOT_COMMENT, emptyList<Comment>())
+     }
+ 
+-    fun takeData(replies: List<CommentCardData>, shouldViewMoreRepliesCell: Boolean) {
++    fun takeData(replies: List<CommentCardData>) {
+         if (replies.isNotEmpty()) {
+             setSection(SECTION_COMMENTS, replies)
+-            setSection(SECTION_SHOW_MORE_REPLIES_PAGINATING, listOf(shouldViewMoreRepliesCell))
++        } else {
++            setSection(SECTION_COMMENTS, emptyList<CommentCardData>())
+         }
+-        setSection(SECTION_ERROR_PAGINATING, listOf(false))
+-        submitList(items())
+-    }
+ 
+-    fun updateRootCommentCell(rootComment: Comment) {
+-        setSection(SECTION_ROOT_COMMENT, listOf(rootComment))
+         submitList(items())
+     }
+ 
+-    fun addErrorPaginationCell(shouldShowErrorCell: Boolean) {
+-        setSection(SECTION_SHOW_MORE_REPLIES_PAGINATING, listOf(false))
+-        // - we want to display SECTION_COMMENTS & SECTION_ERROR_PAGINATING at the same time so we should not clean SECTION_COMMENTS
+-        setSection(SECTION_ERROR_PAGINATING, listOf(shouldShowErrorCell))
+-        submitList(items())
+-    }
+-
+-    override fun layout(sectionRow: SectionRow): Int = when (sectionRow.section()) {
+-        SECTION_COMMENTS -> R.layout.item_comment_card
+-        SECTION_SHOW_MORE_REPLIES_PAGINATING -> R.layout.item_show_more_replies
+-        SECTION_ERROR_PAGINATING -> R.layout.item_error_pagination
+-        else -> 0
+-    }
++    override fun layout(sectionRow: SectionRow): Int = R.layout.item_comment_card
+ 
+     override fun viewHolder(@LayoutRes layout: Int, viewGroup: ViewGroup): KSViewHolder {
+-        return when (layout) {
+-            R.layout.item_comment_card -> CommentCardViewHolder(ItemCommentCardBinding.inflate(LayoutInflater.from(viewGroup.context), viewGroup, false), delegate, true)
+-            R.layout.item_show_more_replies -> PaginationViewMoreRepliesViewHolder(
+-                ItemShowMoreRepliesBinding.inflate(LayoutInflater.from(viewGroup.context), viewGroup, false), delegate
+-            )
+-            R.layout.item_error_pagination -> PaginationErrorViewHolder(ItemErrorPaginationBinding.inflate(LayoutInflater.from(viewGroup.context), viewGroup, false), delegate, true)
+-            else -> RootCommentViewHolder(ItemCommentCardBinding.inflate(LayoutInflater.from(viewGroup.context), viewGroup, false))
+-        }
++        return CommentCardViewHolder(ItemCommentCardBinding.inflate(LayoutInflater.from(viewGroup.context), viewGroup, false), delegate, true)
+     }
+ 
+     companion object {
+         private const val SECTION_COMMENTS = 0
+-        private const val SECTION_SHOW_MORE_REPLIES_PAGINATING = 1
+-        private const val SECTION_ERROR_PAGINATING = 2
+-        private const val SECTION_ROOT_COMMENT = 3
+     }
+ }
+diff --git a/app/src/main/java/com/kickstarter/ui/adapters/RepliesStatusAdapter.kt b/app/src/main/java/com/kickstarter/ui/adapters/RepliesStatusAdapter.kt
+new file mode 100644
+index 0000000000..d2c75de67a
+--- /dev/null
++++ b/app/src/main/java/com/kickstarter/ui/adapters/RepliesStatusAdapter.kt
+@@ -0,0 +1,48 @@
++package com.kickstarter.ui.adapters
++
++import android.view.LayoutInflater
++import android.view.ViewGroup
++import androidx.annotation.LayoutRes
++import com.kickstarter.R
++import com.kickstarter.databinding.ItemShowMoreRepliesBinding
++import com.kickstarter.ui.viewholders.KSViewHolder
++import com.kickstarter.ui.viewholders.RepliesStatusCellType
++import com.kickstarter.ui.viewholders.RepliesStatusCellViewHolder
++
++/**  Replies cell status viewMore or Error  **/
++class RepliesStatusAdapter(private val delegate: Delegate) : KSListAdapter() {
++    interface Delegate :
++        RepliesStatusCellViewHolder.ViewListener
++    init {
++        insertSection(SECTION_SHOW_MORE_REPLIES_PAGINATING, emptyList<RepliesStatusCellType>())
++    }
++
++    fun addViewMoreCell(shouldViewMoreRepliesCell: Boolean) {
++
++        if (shouldViewMoreRepliesCell)
++            setSection(SECTION_SHOW_MORE_REPLIES_PAGINATING, listOf(RepliesStatusCellType.VIEW_MORE))
++        else
++            setSection(SECTION_SHOW_MORE_REPLIES_PAGINATING, emptyList<RepliesStatusCellType>())
++        submitList(items())
++    }
++
++    fun addErrorPaginationCell(shouldShowErrorCell: Boolean) {
++        if (shouldShowErrorCell)
++            setSection(SECTION_SHOW_MORE_REPLIES_PAGINATING, listOf(RepliesStatusCellType.PAGINATION_ERROR))
++        else
++            setSection(SECTION_SHOW_MORE_REPLIES_PAGINATING, emptyList<RepliesStatusCellType>())
++        submitList(items())
++    }
++
++    override fun layout(sectionRow: SectionRow): Int = R.layout.item_show_more_replies
++
++    override fun viewHolder(@LayoutRes layout: Int, viewGroup: ViewGroup): KSViewHolder {
++        return RepliesStatusCellViewHolder(
++            ItemShowMoreRepliesBinding.inflate(LayoutInflater.from(viewGroup.context), viewGroup, false), delegate
++        )
++    }
++
++    companion object {
++        private const val SECTION_SHOW_MORE_REPLIES_PAGINATING = 0
++    }
++}
+diff --git a/app/src/main/java/com/kickstarter/ui/adapters/RootCommentAdapter.kt b/app/src/main/java/com/kickstarter/ui/adapters/RootCommentAdapter.kt
+new file mode 100644
+index 0000000000..1ec8b428bb
+--- /dev/null
++++ b/app/src/main/java/com/kickstarter/ui/adapters/RootCommentAdapter.kt
+@@ -0,0 +1,29 @@
++package com.kickstarter.ui.adapters
++
++import android.view.LayoutInflater
++import android.view.ViewGroup
++import androidx.annotation.LayoutRes
++import com.kickstarter.R
++import com.kickstarter.databinding.ItemRootCommentCardBinding
++import com.kickstarter.models.Comment
++import com.kickstarter.ui.viewholders.KSViewHolder
++import com.kickstarter.ui.viewholders.RootCommentViewHolder
++
++/** Replies Root comment cell adapter **/
++class RootCommentAdapter : KSListAdapter() {
++
++    fun updateRootCommentCell(rootComment: Comment) {
++        addSection(listOf(rootComment))
++        submitList(items())
++    }
++
++    override fun layout(sectionRow: SectionRow): Int = R.layout.item_root_comment_card
++
++    override fun viewHolder(@LayoutRes layout: Int, viewGroup: ViewGroup): KSViewHolder {
++        return RootCommentViewHolder(
++            ItemRootCommentCardBinding.inflate(
++                LayoutInflater.from(viewGroup.context), viewGroup, false
++            )
++        )
++    }
++}
+diff --git a/app/src/main/java/com/kickstarter/ui/viewholders/PaginationViewMoreRepliesViewHolder.kt b/app/src/main/java/com/kickstarter/ui/viewholders/RepliesStatusCellViewHolder.kt
+similarity index 55%
+rename from app/src/main/java/com/kickstarter/ui/viewholders/PaginationViewMoreRepliesViewHolder.kt
+rename to app/src/main/java/com/kickstarter/ui/viewholders/RepliesStatusCellViewHolder.kt
+index de057a1d78..3fef27ab92 100644
+--- a/app/src/main/java/com/kickstarter/ui/viewholders/PaginationViewMoreRepliesViewHolder.kt
++++ b/app/src/main/java/com/kickstarter/ui/viewholders/RepliesStatusCellViewHolder.kt
+@@ -3,19 +3,20 @@ package com.kickstarter.ui.viewholders
+ import com.kickstarter.databinding.ItemShowMoreRepliesBinding
+ import com.kickstarter.libs.rx.transformers.Transformers
+ import com.kickstarter.libs.utils.extensions.toVisibility
+-import com.kickstarter.viewmodels.PaginationViewMoreViewHolderViewModel
++import com.kickstarter.viewmodels.RepliesStatusCellViewHolderViewModel
+ 
+ @Suppress("UNCHECKED_CAST")
+-class PaginationViewMoreRepliesViewHolder(
++class RepliesStatusCellViewHolder(
+     val binding: ItemShowMoreRepliesBinding,
+     private val viewListener: ViewListener
+ ) : KSViewHolder(binding.root) {
+ 
+     interface ViewListener {
+         fun loadMoreCallback()
++        fun retryCallback()
+     }
+ 
+-    private val vm: PaginationViewMoreViewHolderViewModel.ViewModel = PaginationViewMoreViewHolderViewModel.ViewModel(environment())
++    private val vm: RepliesStatusCellViewHolderViewModel.ViewModel = RepliesStatusCellViewHolderViewModel.ViewModel(environment())
+ 
+     init {
+         this.vm.outputs.isViewMoreRepliesPaginationVisible()
+@@ -28,11 +29,27 @@ class PaginationViewMoreRepliesViewHolder(
+         binding.viewMorePaginationButton.setOnClickListener {
+             viewListener.loadMoreCallback()
+         }
++
++        this.vm.outputs.isErrorPaginationVisible()
++            .compose(bindToLifecycle())
++            .compose(Transformers.observeForUI())
++            .subscribe {
++                binding.errorPaginationRetryButton.visibility = it.toVisibility()
++            }
++
++        binding.errorPaginationRetryButton.setOnClickListener {
++            viewListener.retryCallback()
++        }
+     }
+ 
+     override fun bindData(data: Any?) {
+-        if (data is Boolean) {
++        if (data is RepliesStatusCellType) {
+             this.vm.inputs.configureWith(data)
+         }
+     }
+ }
++
++enum class RepliesStatusCellType {
++    PAGINATION_ERROR,
++    VIEW_MORE
++}
+diff --git a/app/src/main/java/com/kickstarter/ui/viewholders/RootCommentViewHolder.kt b/app/src/main/java/com/kickstarter/ui/viewholders/RootCommentViewHolder.kt
+index 00ee273035..e410112215 100644
+--- a/app/src/main/java/com/kickstarter/ui/viewholders/RootCommentViewHolder.kt
++++ b/app/src/main/java/com/kickstarter/ui/viewholders/RootCommentViewHolder.kt
+@@ -1,6 +1,6 @@
+ package com.kickstarter.ui.viewholders
+ 
+-import com.kickstarter.databinding.ItemCommentCardBinding
++import com.kickstarter.databinding.ItemRootCommentCardBinding
+ import com.kickstarter.libs.rx.transformers.Transformers
+ import com.kickstarter.libs.utils.DateTimeUtils
+ import com.kickstarter.models.Comment
+@@ -8,7 +8,7 @@ import com.kickstarter.viewmodels.RootCommentViewHolderViewModel
+ 
+ @Suppress("UNCHECKED_CAST")
+ class RootCommentViewHolder(
+-    val binding: ItemCommentCardBinding
++    val binding: ItemRootCommentCardBinding
+ ) : KSViewHolder(binding.root) {
+ 
+     private val vm: RootCommentViewHolderViewModel.ViewModel = RootCommentViewHolderViewModel.ViewModel(environment())
+diff --git a/app/src/main/java/com/kickstarter/viewmodels/PaginationViewMoreViewHolderViewModel.kt b/app/src/main/java/com/kickstarter/viewmodels/PaginationViewMoreViewHolderViewModel.kt
+deleted file mode 100644
+index e4036a24aa..0000000000
+--- a/app/src/main/java/com/kickstarter/viewmodels/PaginationViewMoreViewHolderViewModel.kt
++++ /dev/null
+@@ -1,39 +0,0 @@
+-package com.kickstarter.viewmodels
+-
+-import com.kickstarter.libs.ActivityViewModel
+-import com.kickstarter.libs.Environment
+-import com.kickstarter.ui.viewholders.PaginationViewMoreRepliesViewHolder
+-import rx.Observable
+-import rx.subjects.BehaviorSubject
+-
+-interface PaginationViewMoreViewHolderViewModel {
+-    interface Inputs {
+-        fun configureWith(configureCellWith: Boolean)
+-    }
+-
+-    interface Outputs {
+-        fun isViewMoreRepliesPaginationVisible(): Observable<Boolean>
+-    }
+-
+-    class ViewModel(environment: Environment) : ActivityViewModel<PaginationViewMoreRepliesViewHolder>(environment), Inputs, Outputs {
+-        private val isViewMoreRepliesPaginationVisible = BehaviorSubject.create<Boolean>()
+-        private val initCellConfig = BehaviorSubject.create<Boolean>()
+-
+-        val inputs = this
+-        val outputs = this
+-
+-        init {
+-            this.initCellConfig
+-                .compose(bindToLifecycle())
+-                .subscribe {
+-                    this.isViewMoreRepliesPaginationVisible.onNext(it)
+-                }
+-        }
+-
+-        // - Inputs
+-        override fun configureWith(shouldShowErrorCell: Boolean) = this.initCellConfig.onNext(shouldShowErrorCell)
+-
+-        // - Outputs
+-        override fun isViewMoreRepliesPaginationVisible(): Observable<Boolean> = this.isViewMoreRepliesPaginationVisible
+-    }
+-}
+diff --git a/app/src/main/java/com/kickstarter/viewmodels/RepliesStatusCellViewHolderViewModel.kt b/app/src/main/java/com/kickstarter/viewmodels/RepliesStatusCellViewHolderViewModel.kt
+new file mode 100644
+index 0000000000..05444627e7
+--- /dev/null
++++ b/app/src/main/java/com/kickstarter/viewmodels/RepliesStatusCellViewHolderViewModel.kt
+@@ -0,0 +1,52 @@
++package com.kickstarter.viewmodels
++
++import com.kickstarter.libs.ActivityViewModel
++import com.kickstarter.libs.Environment
++import com.kickstarter.ui.viewholders.RepliesStatusCellType
++import com.kickstarter.ui.viewholders.RepliesStatusCellViewHolder
++import rx.Observable
++import rx.subjects.BehaviorSubject
++
++interface RepliesStatusCellViewHolderViewModel {
++    interface Inputs {
++        fun configureWith(configureCellWith: RepliesStatusCellType)
++    }
++
++    interface Outputs {
++        fun isViewMoreRepliesPaginationVisible(): Observable<Boolean>
++        fun isErrorPaginationVisible(): Observable<Boolean>
++    }
++
++    class ViewModel(environment: Environment) : ActivityViewModel<RepliesStatusCellViewHolder>(environment), Inputs, Outputs {
++        private val isViewMoreRepliesPaginationVisible = BehaviorSubject.create<Boolean>()
++        private val isErrorPaginationVisible = BehaviorSubject.create<Boolean>()
++        private val initCellConfig = BehaviorSubject.create<RepliesStatusCellType>()
++
++        val inputs = this
++        val outputs = this
++
++        init {
++            this.initCellConfig
++                .compose(bindToLifecycle())
++                .subscribe {
++                    when (it) {
++                        RepliesStatusCellType.VIEW_MORE -> {
++                            this.isErrorPaginationVisible.onNext(false)
++                            this.isViewMoreRepliesPaginationVisible.onNext(true)
++                        }
++                        RepliesStatusCellType.PAGINATION_ERROR -> {
++                            this.isErrorPaginationVisible.onNext(true)
++                            this.isViewMoreRepliesPaginationVisible.onNext(false)
++                        }
++                    }
++                }
++        }
++
++        // - Inputs
++        override fun configureWith(cellType: RepliesStatusCellType) = this.initCellConfig.onNext(cellType)
++
++        // - Outputs
++        override fun isViewMoreRepliesPaginationVisible(): Observable<Boolean> = this.isViewMoreRepliesPaginationVisible
++        override fun isErrorPaginationVisible(): Observable<Boolean> = this.isErrorPaginationVisible
++    }
++}
+diff --git a/app/src/main/java/com/kickstarter/viewmodels/ThreadViewModel.kt b/app/src/main/java/com/kickstarter/viewmodels/ThreadViewModel.kt
+index d6a309816e..54bcbf0cac 100644
+--- a/app/src/main/java/com/kickstarter/viewmodels/ThreadViewModel.kt
++++ b/app/src/main/java/com/kickstarter/viewmodels/ThreadViewModel.kt
+@@ -231,7 +231,6 @@ interface ThreadViewModel {
+                 ?.distinctUntilChanged()
+                 ?.share()
+                 ?.subscribe {
+-                    this.displayPaginationError.onNext(false)
+                     this.onCommentReplies.onNext(it)
+                 }
+ 
+diff --git a/app/src/main/res/layout/item_root_comment_card.xml b/app/src/main/res/layout/item_root_comment_card.xml
+new file mode 100644
+index 0000000000..fd0467aaa5
+--- /dev/null
++++ b/app/src/main/res/layout/item_root_comment_card.xml
+@@ -0,0 +1,18 @@
++<?xml version="1.0" encoding="utf-8"?>
++<androidx.constraintlayout.widget.ConstraintLayout
++    android:id="@+id/card_cl"
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:focusable="true"
++    android:orientation="vertical">
++
++    <com.kickstarter.ui.views.CommentCard
++        android:id="@+id/comments_card_view"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toTopOf="parent" />
++
++</androidx.constraintlayout.widget.ConstraintLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/item_show_more_replies.xml b/app/src/main/res/layout/item_show_more_replies.xml
+index a4518a733b..1b027551a5 100644
+--- a/app/src/main/res/layout/item_show_more_replies.xml
++++ b/app/src/main/res/layout/item_show_more_replies.xml
+@@ -22,4 +22,19 @@
+         app:layout_constraintStart_toStartOf="parent"
+         tools:visibility="visible" />
+ 
++    <androidx.appcompat.widget.AppCompatButton
++        android:layout_width="match_parent"
++        android:id="@+id/error_pagination_retry_button"
++        style="@style/CommentsRetryButton"
++        android:layout_height="@dimen/grid_9"
++        android:layout_marginStart="@dimen/grid_3"
++        android:layout_marginTop="@dimen/grid_2"
++        android:drawableStart="@drawable/ic_retry_send_comment"
++        android:text="@string/Couldnt_load_more_comments_Tap_to_retry"
++        android:gravity="center_vertical"
++        android:visibility="gone"
++        app:layout_constraintTop_toTopOf="parent"
++        app:layout_constraintBottom_toBottomOf="parent"
++        app:layout_constraintStart_toStartOf="parent"
++        tools:visibility="visible" />
+ </androidx.constraintlayout.widget.ConstraintLayout>
+\ No newline at end of file
+diff --git a/app/src/test/java/com/kickstarter/viewmodels/PaginationViewMoreViewHolderViewModelTest.kt b/app/src/test/java/com/kickstarter/viewmodels/PaginationViewMoreViewHolderViewModelTest.kt
+deleted file mode 100644
+index 660fd3442a..0000000000
+--- a/app/src/test/java/com/kickstarter/viewmodels/PaginationViewMoreViewHolderViewModelTest.kt
++++ /dev/null
+@@ -1,32 +0,0 @@
+-package com.kickstarter.viewmodels
+-
+-import com.kickstarter.KSRobolectricTestCase
+-import org.junit.Test
+-import rx.observers.TestSubscriber
+-
+-class PaginationViewMoreViewHolderViewModelTest : KSRobolectricTestCase() {
+-    private lateinit var vm: PaginationViewMoreViewHolderViewModel.ViewModel
+-
+-    private val isViewMoreRepliesPaginationVisible = TestSubscriber<Boolean>()
+-
+-    private fun setupEnvironment() {
+-        this.vm = PaginationViewMoreViewHolderViewModel.ViewModel(environment())
+-        this.vm.outputs.isViewMoreRepliesPaginationVisible().subscribe(isViewMoreRepliesPaginationVisible)
+-    }
+-
+-    @Test
+-    fun isViewMoreUIVisible() {
+-        setupEnvironment()
+-
+-        this.vm.inputs.configureWith(true)
+-        this.isViewMoreRepliesPaginationVisible.assertValue(true)
+-    }
+-
+-    @Test
+-    fun isEViewMoreUINotVisible() {
+-        setupEnvironment()
+-
+-        this.vm.inputs.configureWith(false)
+-        this.isViewMoreRepliesPaginationVisible.assertValue(false)
+-    }
+-}
+diff --git a/app/src/test/java/com/kickstarter/viewmodels/RepliesStatusCellViewHolderViewModelTest.kt b/app/src/test/java/com/kickstarter/viewmodels/RepliesStatusCellViewHolderViewModelTest.kt
+new file mode 100644
+index 0000000000..6686010bb0
+--- /dev/null
++++ b/app/src/test/java/com/kickstarter/viewmodels/RepliesStatusCellViewHolderViewModelTest.kt
+@@ -0,0 +1,37 @@
++package com.kickstarter.viewmodels
++
++import com.kickstarter.KSRobolectricTestCase
++import com.kickstarter.ui.viewholders.RepliesStatusCellType
++import org.junit.Test
++import rx.observers.TestSubscriber
++
++class RepliesStatusCellViewHolderViewModelTest : KSRobolectricTestCase() {
++    private lateinit var vm: RepliesStatusCellViewHolderViewModel.ViewModel
++
++    private val isViewMoreRepliesPaginationVisible = TestSubscriber<Boolean>()
++    private val isErrorPaginationVisible = TestSubscriber<Boolean>()
++
++    private fun setupEnvironment() {
++        this.vm = RepliesStatusCellViewHolderViewModel.ViewModel(environment())
++        this.vm.outputs.isViewMoreRepliesPaginationVisible().subscribe(isViewMoreRepliesPaginationVisible)
++        this.vm.outputs.isErrorPaginationVisible().subscribe(isErrorPaginationVisible)
++    }
++
++    @Test
++    fun isViewMoreUIVisible() {
++        setupEnvironment()
++
++        this.vm.inputs.configureWith(RepliesStatusCellType.VIEW_MORE)
++        this.isViewMoreRepliesPaginationVisible.assertValue(true)
++        this.isErrorPaginationVisible.assertValue(false)
++    }
++
++    @Test
++    fun isErrorPaginationVisible() {
++        setupEnvironment()
++
++        this.vm.inputs.configureWith(RepliesStatusCellType.PAGINATION_ERROR)
++        this.isViewMoreRepliesPaginationVisible.assertValue(false)
++        this.isErrorPaginationVisible.assertValue(true)
++    }
++}

@@ -1,0 +1,1017 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/BrowsingModeManager.kt b/fenix/app/src/main/java/org/mozilla/fenix/BrowsingModeManager.kt
+index 0b13da4d7b4b..2d5ff3afe48a 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/BrowsingModeManager.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/BrowsingModeManager.kt
+@@ -10,40 +10,44 @@ interface BrowsingModeManager {
+     enum class Mode {
+         Normal, Private
+     }
+-}
+ 
+-var temporaryModeStorage: BrowsingModeManager.Mode? = null
+-class DefaultBrowsingModeManager(private val homeActivity: HomeActivity) : BrowsingModeManager {
+     val isPrivate: Boolean
+-        get() = mode == BrowsingModeManager.Mode.Private
+-    var mode: BrowsingModeManager.Mode
+-        get() = temporaryModeStorage!!
+-        set(value) {
+-            temporaryModeStorage = value
+-            setPreference()
+-            updateTheme(value)
+-        }
++    var mode: Mode
++
++}
++
++interface BrowserModeStorage {
++    fun setMode(mode: BrowsingModeManager.Mode)
++    fun currentMode(): BrowsingModeManager.Mode
++}
+ 
+-    private fun updateTheme(mode: BrowsingModeManager.Mode) {
+-        homeActivity.themeManager.apply {
+-            val newTheme = when (mode) {
+-                BrowsingModeManager.Mode.Normal -> ThemeManager.Theme.Normal
+-                BrowsingModeManager.Mode.Private -> ThemeManager.Theme.Private
+-            }
+-            setTheme(newTheme)
++fun Settings.createBrowserModeStorage(): BrowserModeStorage = object : BrowserModeStorage {
++    override fun currentMode(): BrowsingModeManager.Mode {
++        return if (this@createBrowserModeStorage.usePrivateMode) {
++            BrowsingModeManager.Mode.Private
++        } else {
++            BrowsingModeManager.Mode.Normal
+         }
+     }
+ 
+-    private fun setPreference() {
+-        Settings.getInstance(homeActivity).setPrivateMode(isPrivate)
++    override fun setMode(mode: BrowsingModeManager.Mode) {
++        this@createBrowserModeStorage.setPrivateMode(mode == BrowsingModeManager.Mode.Private)
+     }
+ 
+-    init {
+-        if (temporaryModeStorage == null) {
+-            mode = when (Settings.getInstance(homeActivity).usePrivateMode) {
+-                true -> BrowsingModeManager.Mode.Private
+-                false -> BrowsingModeManager.Mode.Normal
+-            }
+-        }
+-    }
+ }
++
++class DefaultBrowsingModeManager(private val storage: BrowserModeStorage) : BrowsingModeManager {
++    override val isPrivate: Boolean
++        get() = mode == BrowsingModeManager.Mode.Private
++
++    override var mode: BrowsingModeManager.Mode
++        get() = storage.currentMode()
++        set(value) = storage.setMode(value)
++}
++
++class CustomTabBrowsingModeManager : BrowsingModeManager {
++    override val isPrivate = false
++    override var mode: BrowsingModeManager.Mode
++        get() = BrowsingModeManager.Mode.Normal
++        set(_) { return }
++}
+\ No newline at end of file
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt b/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt
+index 75e107d6610d..bd5438d6141c 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt
+@@ -45,30 +45,25 @@ open class HomeActivity : AppCompatActivity() {
+     open val isCustomTab = false
+     private var sessionObserver: SessionManager.Observer? = null
+ 
+-    val themeManager = DefaultThemeManager().also {
+-        it.onThemeChange = { theme ->
+-            setTheme(theme)
+-            recreate()
+-        }
+-    }
++    lateinit var themeManager: ThemeManager
++
+ 
+     private val navHost by lazy {
+         supportFragmentManager.findFragmentById(R.id.container) as NavHostFragment
+     }
+ 
+-    lateinit var browsingModeManager: DefaultBrowsingModeManager
++    lateinit var browsingModeManager: BrowsingModeManager
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
++        browsingModeManager = createBrowsingModeManager()
++        themeManager = createThemeManager(when (browsingModeManager.isPrivate) {
++            true -> ThemeManager.Theme.Private
++            false -> ThemeManager.Theme.Normal
++        })
+ 
+-        themeManager.temporaryThemeManagerStorage =
+-            when (Settings.getInstance(this).usePrivateMode) {
+-                true -> ThemeManager.Theme.Private
+-                false -> ThemeManager.Theme.Normal
+-            }
+         setTheme(themeManager.currentTheme)
+-        DefaultThemeManager.applyStatusBarTheme(window, themeManager, this)
+-        browsingModeManager = DefaultBrowsingModeManager(this)
++        ThemeManager.applyStatusBarTheme(window, themeManager, this)
+ 
+         setContentView(R.layout.activity_home)
+ 
+@@ -95,7 +90,6 @@ open class HomeActivity : AppCompatActivity() {
+     }
+ 
+     override fun onDestroy() {
+-        themeManager.onThemeChange = null
+         sessionObserver?.let { components.core.sessionManager.unregister(it) }
+         super.onDestroy()
+     }
+@@ -263,6 +257,16 @@ open class HomeActivity : AppCompatActivity() {
+         }
+     }
+ 
++    private fun createBrowsingModeManager(): BrowsingModeManager {
++        return if (isCustomTab) CustomTabBrowsingModeManager()
++               else DefaultBrowsingModeManager(Settings.getInstance(this).createBrowserModeStorage())
++    }
++
++    private fun createThemeManager(currentTheme: ThemeManager.Theme): ThemeManager {
++        return if (isCustomTab) CustomTabThemeManager()
++               else DefaultThemeManager(currentTheme)
++    }
++
+     private fun subscribeToSessions(): SessionManager.Observer {
+ 
+         return object : SessionManager.Observer {
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/ThemeManager.kt b/fenix/app/src/main/java/org/mozilla/fenix/ThemeManager.kt
+index f1688dd84a26..58d7be05531a 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/ThemeManager.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/ThemeManager.kt
+@@ -15,44 +15,13 @@ import androidx.core.content.ContextCompat
+ 
+ interface ThemeManager {
+     enum class Theme {
+-        Normal, Private
++        Normal, Private;
++
++        fun isPrivate(): Boolean = this == Private
+     }
+ 
+     val currentTheme: Theme
+     fun setTheme(theme: Theme)
+-}
+-
+-fun Activity.setTheme(theme: ThemeManager.Theme) {
+-    val themeCode = when (theme) {
+-        ThemeManager.Theme.Normal -> R.style.NormalTheme
+-        ThemeManager.Theme.Private -> R.style.PrivateTheme
+-    }
+-
+-    setTheme(themeCode)
+-}
+-
+-fun ThemeManager.Theme.isPrivate(): Boolean = this == ThemeManager.Theme.Private
+-
+-class DefaultThemeManager : ThemeManager {
+-    var temporaryThemeManagerStorage = ThemeManager.Theme.Normal
+-
+-    var onThemeChange: ((ThemeManager.Theme) -> Unit)? = null
+-
+-    override val currentTheme: ThemeManager.Theme
+-        get() = temporaryThemeManagerStorage
+-
+-    val currentThemeResource: Int = when (currentTheme) {
+-        ThemeManager.Theme.Normal -> R.style.NormalTheme
+-        ThemeManager.Theme.Private -> R.style.PrivateTheme
+-    }
+-
+-    override fun setTheme(theme: ThemeManager.Theme) {
+-        if (temporaryThemeManagerStorage != theme) {
+-            temporaryThemeManagerStorage = theme
+-
+-            onThemeChange?.invoke(currentTheme)
+-        }
+-    }
+ 
+     companion object {
+         fun resolveAttribute(attribute: Int, context: Context): Int {
+@@ -134,3 +103,33 @@ class DefaultThemeManager : ThemeManager {
+         }
+     }
+ }
++
++val ThemeManager.currentThemeResource: Int
++    get() = when (currentTheme) {
++        ThemeManager.Theme.Normal -> R.style.NormalTheme
++        ThemeManager.Theme.Private -> R.style.PrivateTheme
++    }
++
++fun Activity.setTheme(theme: ThemeManager.Theme) {
++    val themeCode = when (theme) {
++        ThemeManager.Theme.Normal -> R.style.NormalTheme
++        ThemeManager.Theme.Private -> R.style.PrivateTheme
++    }
++
++    setTheme(themeCode)
++}
++
++class DefaultThemeManager(private var _currentTheme: ThemeManager.Theme) : ThemeManager {
++    override val currentTheme: ThemeManager.Theme
++        get() = _currentTheme
++
++    override fun setTheme(theme: ThemeManager.Theme) {
++        if (theme == _currentTheme) return
++        _currentTheme = theme
++    }
++}
++
++class CustomTabThemeManager : ThemeManager {
++    override val currentTheme = ThemeManager.Theme.Normal
++    override fun setTheme(theme: ThemeManager.Theme) { /* noop */ }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt
+index 70db8d0cf8fc..712c1dcca768 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt
+@@ -44,7 +44,6 @@ import mozilla.components.feature.readerview.ReaderViewFeature
+ import mozilla.components.feature.session.FullScreenFeature
+ import mozilla.components.feature.session.SessionFeature
+ import mozilla.components.feature.session.SessionUseCases
+-import mozilla.components.feature.session.SwipeRefreshFeature
+ import mozilla.components.feature.session.ThumbnailsFeature
+ import mozilla.components.feature.sitepermissions.SitePermissions
+ import mozilla.components.feature.sitepermissions.SitePermissionsFeature
+@@ -55,11 +54,11 @@ import mozilla.components.support.ktx.android.view.enterToImmersiveMode
+ import mozilla.components.support.ktx.android.view.exitImmersiveModeIfNeeded
+ import mozilla.components.support.ktx.kotlin.toUri
+ import org.mozilla.fenix.BrowsingModeManager
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.FenixViewModelProvider
+ import org.mozilla.fenix.HomeActivity
+ import org.mozilla.fenix.IntentReceiverActivity
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.collections.CreateCollectionViewModel
+ import org.mozilla.fenix.collections.SaveCollectionStep
+ import org.mozilla.fenix.components.FenixSnackbar
+@@ -205,7 +204,7 @@ class BrowserFragment : Fragment(), BackHandler, CoroutineScope {
+         )
+ 
+         val activity = activity as HomeActivity
+-        DefaultThemeManager.applyStatusBarTheme(activity.window, activity.themeManager, activity)
++        ThemeManager.applyStatusBarTheme(activity.window, activity.themeManager, activity)
+ 
+         return view
+     }
+@@ -290,7 +289,7 @@ class BrowserFragment : Fragment(), BackHandler, CoroutineScope {
+             view = view
+         )
+ 
+-        val accentHighContrastColor = DefaultThemeManager.resolveAttribute(R.attr.accentHighContrast, requireContext())
++        val accentHighContrastColor = ThemeManager.resolveAttribute(R.attr.accentHighContrast, requireContext())
+ 
+         sitePermissionsFeature.set(
+             feature = SitePermissionsFeature(
+@@ -327,7 +326,7 @@ class BrowserFragment : Fragment(), BackHandler, CoroutineScope {
+                 } else {
+                     activity?.exitImmersiveModeIfNeeded()
+                     (activity as HomeActivity).let { activity: HomeActivity ->
+-                        DefaultThemeManager.applyStatusBarTheme(
++                        ThemeManager.applyStatusBarTheme(
+                             activity.window,
+                             activity.themeManager,
+                             activity
+@@ -351,7 +350,7 @@ class BrowserFragment : Fragment(), BackHandler, CoroutineScope {
+             view = view
+         )
+ 
+-        val primaryTextColor = DefaultThemeManager.resolveAttribute(R.attr.primaryText, requireContext())
++        val primaryTextColor = ThemeManager.resolveAttribute(R.attr.primaryText, requireContext())
+         view.swipeRefresh.setColorSchemeColors(primaryTextColor)
+         swipeRefreshFeature.set(
+             feature = SwipeRefreshFeature(
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/DefaultToolbarMenu.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/DefaultToolbarMenu.kt
+index e18c4943ba83..0d057d50805e 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/DefaultToolbarMenu.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/DefaultToolbarMenu.kt
+@@ -11,9 +11,9 @@ import mozilla.components.browser.menu.item.BrowserMenuHighlightableItem
+ import mozilla.components.browser.menu.item.BrowserMenuImageText
+ import mozilla.components.browser.menu.item.BrowserMenuItemToolbar
+ import mozilla.components.browser.menu.item.BrowserMenuSwitch
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.HomeActivity
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.ext.asActivity
+ import org.mozilla.fenix.ext.components
+ 
+@@ -30,14 +30,14 @@ class DefaultToolbarMenu(
+         val back = BrowserMenuItemToolbar.TwoStateButton(
+             primaryImageResource = mozilla.components.ui.icons.R.drawable.mozac_ic_back,
+             primaryContentDescription = context.getString(R.string.browser_menu_back),
+-            primaryImageTintResource = DefaultThemeManager.resolveAttribute(
++            primaryImageTintResource = ThemeManager.resolveAttribute(
+                 R.attr.primaryText,
+                 context
+             ),
+             isInPrimaryState = {
+                 context.components.core.sessionManager.selectedSession?.canGoBack ?: true
+             },
+-            secondaryImageTintResource = DefaultThemeManager.resolveAttribute(
++            secondaryImageTintResource = ThemeManager.resolveAttribute(
+                 R.attr.neutral,
+                 context
+             ),
+@@ -49,14 +49,14 @@ class DefaultToolbarMenu(
+         val forward = BrowserMenuItemToolbar.TwoStateButton(
+             primaryImageResource = mozilla.components.ui.icons.R.drawable.mozac_ic_forward,
+             primaryContentDescription = context.getString(R.string.browser_menu_forward),
+-            primaryImageTintResource = DefaultThemeManager.resolveAttribute(
++            primaryImageTintResource = ThemeManager.resolveAttribute(
+                 R.attr.primaryText,
+                 context
+             ),
+             isInPrimaryState = {
+                 context.components.core.sessionManager.selectedSession?.canGoForward ?: true
+             },
+-            secondaryImageTintResource = DefaultThemeManager.resolveAttribute(
++            secondaryImageTintResource = ThemeManager.resolveAttribute(
+                 R.attr.neutral,
+                 context
+             ),
+@@ -68,7 +68,7 @@ class DefaultToolbarMenu(
+         val refresh = BrowserMenuItemToolbar.TwoStateButton(
+             primaryImageResource = mozilla.components.ui.icons.R.drawable.mozac_ic_refresh,
+             primaryContentDescription = context.getString(R.string.browser_menu_refresh),
+-            primaryImageTintResource = DefaultThemeManager.resolveAttribute(
++            primaryImageTintResource = ThemeManager.resolveAttribute(
+                 R.attr.primaryText,
+                 context
+             ),
+@@ -78,7 +78,7 @@ class DefaultToolbarMenu(
+             },
+             secondaryImageResource = mozilla.components.ui.icons.R.drawable.mozac_ic_stop,
+             secondaryContentDescription = context.getString(R.string.browser_menu_stop),
+-            secondaryImageTintResource = DefaultThemeManager.resolveAttribute(
++            secondaryImageTintResource = ThemeManager.resolveAttribute(
+                 R.attr.primaryText,
+                 context
+             ),
+@@ -99,7 +99,7 @@ class DefaultToolbarMenu(
+             BrowserMenuImageText(
+                 context.getString(R.string.browser_menu_help),
+                 R.drawable.ic_help,
+-                DefaultThemeManager.resolveAttribute(R.attr.primaryText, context)
++                ThemeManager.resolveAttribute(R.attr.primaryText, context)
+             ) {
+                 onItemTapped.invoke(ToolbarMenu.Item.Help)
+             },
+@@ -109,10 +109,10 @@ class DefaultToolbarMenu(
+                 imageResource = R.drawable.ic_settings,
+                 iconTintColorResource = if (hasAccountProblem)
+                     R.color.sync_error_text_color else
+-                    DefaultThemeManager.resolveAttribute(R.attr.primaryText, context),
++                    ThemeManager.resolveAttribute(R.attr.primaryText, context),
+                 textColorResource = if (hasAccountProblem)
+                     R.color.sync_error_text_color else
+-                    DefaultThemeManager.resolveAttribute(R.attr.primaryText, context),
++                    ThemeManager.resolveAttribute(R.attr.primaryText, context),
+                 highlight = if (hasAccountProblem) {
+                     BrowserMenuHighlightableItem.Highlight(
+                         imageResource = R.drawable.ic_alert,
+@@ -126,7 +126,7 @@ class DefaultToolbarMenu(
+             BrowserMenuImageText(
+                 context.getString(R.string.browser_menu_your_library),
+                 R.drawable.ic_library,
+-                DefaultThemeManager.resolveAttribute(R.attr.primaryText, context)
++                ThemeManager.resolveAttribute(R.attr.primaryText, context)
+             ) {
+                 onItemTapped.invoke(ToolbarMenu.Item.Library)
+             },
+@@ -139,7 +139,7 @@ class DefaultToolbarMenu(
+             BrowserMenuImageText(
+                 context.getString(R.string.browser_menu_find_in_page),
+                 R.drawable.mozac_ic_search,
+-                DefaultThemeManager.resolveAttribute(R.attr.primaryText, context)
++                ThemeManager.resolveAttribute(R.attr.primaryText, context)
+             ) {
+                 onItemTapped.invoke(ToolbarMenu.Item.FindInPage)
+             },
+@@ -147,7 +147,7 @@ class DefaultToolbarMenu(
+             BrowserMenuImageText(
+                 context.getString(R.string.browser_menu_private_tab),
+                 R.drawable.ic_private_browsing,
+-                DefaultThemeManager.resolveAttribute(R.attr.primaryText, context)
++                ThemeManager.resolveAttribute(R.attr.primaryText, context)
+             ) {
+                 onItemTapped.invoke(ToolbarMenu.Item.NewPrivateTab)
+             },
+@@ -155,7 +155,7 @@ class DefaultToolbarMenu(
+             BrowserMenuImageText(
+                 context.getString(R.string.browser_menu_new_tab),
+                 R.drawable.ic_new,
+-                DefaultThemeManager.resolveAttribute(R.attr.primaryText, context)
++                ThemeManager.resolveAttribute(R.attr.primaryText, context)
+             ) {
+                 onItemTapped.invoke(ToolbarMenu.Item.NewTab)
+             },
+@@ -163,7 +163,7 @@ class DefaultToolbarMenu(
+             BrowserMenuImageText(
+                 context.getString(R.string.browser_menu_share),
+                 R.drawable.mozac_ic_share,
+-                DefaultThemeManager.resolveAttribute(R.attr.primaryText, context)
++                ThemeManager.resolveAttribute(R.attr.primaryText, context)
+             ) {
+                 onItemTapped.invoke(ToolbarMenu.Item.Share)
+             },
+@@ -171,7 +171,7 @@ class DefaultToolbarMenu(
+             BrowserMenuImageText(
+                 context.getString(R.string.browser_menu_report_issue),
+                 R.drawable.ic_report_issues,
+-                DefaultThemeManager.resolveAttribute(R.attr.primaryText, context)
++                ThemeManager.resolveAttribute(R.attr.primaryText, context)
+             ) {
+                 onItemTapped.invoke(ToolbarMenu.Item.ReportIssue)
+             }
+@@ -182,7 +182,7 @@ class DefaultToolbarMenu(
+                 BrowserMenuImageText(
+                     context.getString(R.string.browser_menu_save_to_collection),
+                     R.drawable.ic_tab_collection,
+-                    DefaultThemeManager.resolveAttribute(R.attr.primaryText, context)
++                    ThemeManager.resolveAttribute(R.attr.primaryText, context)
+                 ) {
+                     onItemTapped.invoke(ToolbarMenu.Item.SaveToCollection)
+                 }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/ToolbarComponent.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/ToolbarComponent.kt
+index 117601a9008d..8f5e1722af79 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/ToolbarComponent.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/ToolbarComponent.kt
+@@ -10,8 +10,8 @@ import androidx.core.content.ContextCompat
+ import kotlinx.android.synthetic.main.component_search.*
+ import mozilla.components.browser.search.SearchEngine
+ import mozilla.components.browser.toolbar.BrowserToolbar
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.mvi.ViewState
+ import org.mozilla.fenix.mvi.Change
+ import org.mozilla.fenix.mvi.Action
+@@ -60,11 +60,11 @@ class ToolbarComponent(
+         )
+         getView().textColor = ContextCompat.getColor(
+             container.context,
+-            DefaultThemeManager.resolveAttribute(R.attr.primaryText, container.context)
++            ThemeManager.resolveAttribute(R.attr.primaryText, container.context)
+         )
+         getView().hintColor = ContextCompat.getColor(
+             container.context,
+-            DefaultThemeManager.resolveAttribute(R.attr.secondaryText, container.context)
++            ThemeManager.resolveAttribute(R.attr.secondaryText, container.context)
+         )
+     }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/ToolbarIntegration.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/ToolbarIntegration.kt
+index fc432aa3ecd6..e4e224dd7d6c 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/ToolbarIntegration.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/ToolbarIntegration.kt
+@@ -20,8 +20,8 @@ import mozilla.components.feature.toolbar.ToolbarPresenter
+ import mozilla.components.lib.publicsuffixlist.PublicSuffixList
+ import mozilla.components.support.base.feature.LifecycleAwareFeature
+ import mozilla.components.support.ktx.android.view.hideKeyboard
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.ext.components
+ import org.mozilla.fenix.utils.Settings
+ 
+@@ -91,7 +91,7 @@ class ToolbarIntegration(
+         sessionId,
+         ToolbarFeature.UrlRenderConfiguration(
+             PublicSuffixList(context),
+-            DefaultThemeManager.resolveAttribute(R.attr.primaryText, context), renderStyle = renderStyle
++            ThemeManager.resolveAttribute(R.attr.primaryText, context), renderStyle = renderStyle
+         )
+     )
+     private var menuPresenter = MenuPresenter(toolbar, context.components.core.sessionManager, sessionId)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/customtabs/CustomTabToolbarMenu.kt b/fenix/app/src/main/java/org/mozilla/fenix/customtabs/CustomTabToolbarMenu.kt
+index 1bc7ce7a1e4a..da2260bd8905 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/customtabs/CustomTabToolbarMenu.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/customtabs/CustomTabToolbarMenu.kt
+@@ -12,10 +12,9 @@ import mozilla.components.browser.menu.item.BrowserMenuItemToolbar
+ import mozilla.components.browser.menu.item.SimpleBrowserMenuItem
+ import mozilla.components.browser.session.Session
+ import mozilla.components.browser.session.SessionManager
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.components.toolbar.ToolbarMenu
+-import org.mozilla.fenix.ext.components
+ 
+ class CustomTabToolbarMenu(
+     private val context: Context,
+@@ -32,14 +31,14 @@ class CustomTabToolbarMenu(
+         val back = BrowserMenuItemToolbar.TwoStateButton(
+             primaryImageResource = mozilla.components.ui.icons.R.drawable.mozac_ic_back,
+             primaryContentDescription = context.getString(R.string.browser_menu_back),
+-            primaryImageTintResource = DefaultThemeManager.resolveAttribute(
++            primaryImageTintResource = ThemeManager.resolveAttribute(
+                 R.attr.primaryText,
+                 context
+             ),
+             isInPrimaryState = {
+                 session?.canGoBack ?: true
+             },
+-            secondaryImageTintResource = DefaultThemeManager.resolveAttribute(
++            secondaryImageTintResource = ThemeManager.resolveAttribute(
+                 R.attr.neutral,
+                 context
+             ),
+@@ -51,14 +50,14 @@ class CustomTabToolbarMenu(
+         val forward = BrowserMenuItemToolbar.TwoStateButton(
+             primaryImageResource = mozilla.components.ui.icons.R.drawable.mozac_ic_forward,
+             primaryContentDescription = context.getString(R.string.browser_menu_forward),
+-            primaryImageTintResource = DefaultThemeManager.resolveAttribute(
++            primaryImageTintResource = ThemeManager.resolveAttribute(
+                 R.attr.primaryText,
+                 context
+             ),
+             isInPrimaryState = {
+                 session?.canGoForward ?: true
+             },
+-            secondaryImageTintResource = DefaultThemeManager.resolveAttribute(
++            secondaryImageTintResource = ThemeManager.resolveAttribute(
+                 R.attr.neutral,
+                 context
+             ),
+@@ -70,7 +69,7 @@ class CustomTabToolbarMenu(
+         val refresh = BrowserMenuItemToolbar.TwoStateButton(
+             primaryImageResource = mozilla.components.ui.icons.R.drawable.mozac_ic_refresh,
+             primaryContentDescription = context.getString(R.string.browser_menu_refresh),
+-            primaryImageTintResource = DefaultThemeManager.resolveAttribute(
++            primaryImageTintResource = ThemeManager.resolveAttribute(
+                 R.attr.primaryText,
+                 context
+             ),
+@@ -80,7 +79,7 @@ class CustomTabToolbarMenu(
+             },
+             secondaryImageResource = mozilla.components.ui.icons.R.drawable.mozac_ic_stop,
+             secondaryContentDescription = context.getString(R.string.browser_menu_stop),
+-            secondaryImageTintResource = DefaultThemeManager.resolveAttribute(
++            secondaryImageTintResource = ThemeManager.resolveAttribute(
+                 R.attr.primaryText,
+                 context
+             ),
+@@ -105,11 +104,11 @@ class CustomTabToolbarMenu(
+             BrowserMenuImageText(
+                 context.getString(R.string.browser_menu_share),
+                 R.drawable.mozac_ic_share,
+-                textColorResource = DefaultThemeManager.resolveAttribute(
++                textColorResource = ThemeManager.resolveAttribute(
+                     R.attr.primaryText,
+                     context
+                 ),
+-                iconTintColorResource = DefaultThemeManager.resolveAttribute(
++                iconTintColorResource = ThemeManager.resolveAttribute(
+                     R.attr.primaryText,
+                     context
+                 )
+@@ -122,7 +121,7 @@ class CustomTabToolbarMenu(
+                     val appName = context.getString(R.string.app_name)
+                     context.getString(R.string.browser_menu_open_in_fenix, appName)
+                 }(),
+-                textColorResource = DefaultThemeManager.resolveAttribute(
++                textColorResource = ThemeManager.resolveAttribute(
+                     R.attr.primaryText,
+                     context
+                 )
+@@ -138,7 +137,7 @@ class CustomTabToolbarMenu(
+                     context.getString(R.string.browser_menu_powered_by, appName).toUpperCase()
+                 }(),
+                 ToolbarMenu.CAPTION_TEXT_SIZE,
+-                DefaultThemeManager.resolveAttribute(R.attr.primaryText, context)
++                ThemeManager.resolveAttribute(R.attr.primaryText, context)
+             )
+         )
+     }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/ext/Int.kt b/fenix/app/src/main/java/org/mozilla/fenix/ext/Int.kt
+index dd0804fb71ce..a8730969aec4 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/ext/Int.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/ext/Int.kt
+@@ -6,7 +6,7 @@ package org.mozilla.fenix.ext
+ 
+ import android.content.Context
+ import androidx.core.content.ContextCompat
+-import org.mozilla.fenix.DefaultThemeManager
++import org.mozilla.fenix.ThemeManager
+ 
+-fun Int.getColorIntFromAttr(context: Context): Int = DefaultThemeManager.resolveAttribute(this, context)
++fun Int.getColorIntFromAttr(context: Context): Int = ThemeManager.resolveAttribute(this, context)
+ fun Int.getColorFromAttr(context: Context): Int = ContextCompat.getColor(context, this.getColorIntFromAttr(context))
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
+index 4f735025aac1..c03aa6e055af 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
+@@ -43,10 +43,10 @@ import org.jetbrains.anko.constraint.layout.ConstraintSetBuilder.Side.TOP
+ import org.jetbrains.anko.constraint.layout.applyConstraintSet
+ import org.mozilla.fenix.BrowserDirection
+ import org.mozilla.fenix.BrowsingModeManager
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.FenixViewModelProvider
+ import org.mozilla.fenix.HomeActivity
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.collections.CreateCollectionViewModel
+ import org.mozilla.fenix.collections.SaveCollectionStep
+ import org.mozilla.fenix.components.metrics.Event
+@@ -155,7 +155,7 @@ class HomeFragment : Fragment(), CoroutineScope, AccountObserver {
+ 
+         ActionBusFactory.get(this).logMergedObservables()
+         val activity = activity as HomeActivity
+-        DefaultThemeManager.applyStatusBarTheme(activity.window, activity.themeManager, activity)
++        ThemeManager.applyStatusBarTheme(activity.window, activity.themeManager, activity)
+ 
+         return view
+     }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeMenu.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeMenu.kt
+index 4b24d3275ff0..fd4f4207d58f 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeMenu.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeMenu.kt
+@@ -8,8 +8,8 @@ import android.content.Context
+ import mozilla.components.browser.menu.BrowserMenuBuilder
+ import mozilla.components.browser.menu.item.BrowserMenuDivider
+ import mozilla.components.browser.menu.item.BrowserMenuImageText
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ 
+ class HomeMenu(
+     private val context: Context,
+@@ -28,7 +28,7 @@ class HomeMenu(
+             BrowserMenuImageText(
+                 context.getString(R.string.browser_menu_settings),
+                 R.drawable.ic_settings,
+-                DefaultThemeManager.resolveAttribute(R.attr.primaryText, context)
++                ThemeManager.resolveAttribute(R.attr.primaryText, context)
+             ) {
+                 onItemTapped.invoke(HomeMenu.Item.Settings)
+             },
+@@ -36,7 +36,7 @@ class HomeMenu(
+             BrowserMenuImageText(
+                 context.getString(R.string.browser_menu_your_library),
+                 R.drawable.ic_library,
+-                DefaultThemeManager.resolveAttribute(R.attr.primaryText, context)
++                ThemeManager.resolveAttribute(R.attr.primaryText, context)
+             ) {
+                 onItemTapped.invoke(HomeMenu.Item.Library)
+             },
+@@ -45,7 +45,7 @@ class HomeMenu(
+             BrowserMenuImageText(
+                 context.getString(R.string.browser_menu_help),
+                 R.drawable.ic_help,
+-                DefaultThemeManager.resolveAttribute(R.attr.primaryText, context)
++                ThemeManager.resolveAttribute(R.attr.primaryText, context)
+             ) {
+                 onItemTapped.invoke(HomeMenu.Item.Help)
+             })
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/SessionBottomSheetFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/SessionBottomSheetFragment.kt
+index 56979381017f..defc989aa469 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/SessionBottomSheetFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/SessionBottomSheetFragment.kt
+@@ -13,9 +13,9 @@ import androidx.core.content.ContextCompat
+ import com.google.android.material.bottomsheet.BottomSheetDialogFragment
+ import kotlinx.android.extensions.LayoutContainer
+ import kotlinx.android.synthetic.main.session_bottom_sheet.view.*
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.utils.ItsNotBrokenSnack
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.ext.getColorFromAttr
+ 
+ class SessionBottomSheetFragment : BottomSheetDialogFragment(), LayoutContainer {
+@@ -47,7 +47,7 @@ class SessionBottomSheetFragment : BottomSheetDialogFragment(), LayoutContainer
+             drawable?.setColorFilter(
+                 ContextCompat.getColor(
+                     context!!,
+-                    DefaultThemeManager.resolveAttribute(R.attr.accent, context!!)
++                    ThemeManager.resolveAttribute(R.attr.accent, context!!)
+                 ), PorterDuff.Mode.SRC_IN
+             )
+             setCompoundDrawablesWithIntrinsicBounds(drawable, null, null, null)
+@@ -69,7 +69,7 @@ class SessionBottomSheetFragment : BottomSheetDialogFragment(), LayoutContainer
+             drawable?.setColorFilter(
+                 ContextCompat.getColor(
+                     context!!,
+-                    DefaultThemeManager.resolveAttribute(R.attr.primaryText, context!!)
++                    ThemeManager.resolveAttribute(R.attr.primaryText, context!!)
+                 ), PorterDuff.Mode.SRC_IN
+             )
+             setCompoundDrawablesWithIntrinsicBounds(drawable, null, null, null)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/viewholders/CollectionViewHolder.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/viewholders/CollectionViewHolder.kt
+index 4fc9cba99046..b7fa8abde6a5 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/viewholders/CollectionViewHolder.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/viewholders/CollectionViewHolder.kt
+@@ -19,8 +19,8 @@ import kotlinx.coroutines.Job
+ import mozilla.components.browser.menu.BrowserMenu
+ import mozilla.components.browser.menu.BrowserMenuBuilder
+ import mozilla.components.browser.menu.item.SimpleBrowserMenuItem
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.ext.increaseTapArea
+ import org.mozilla.fenix.ext.urlToTrimmedHost
+ import org.mozilla.fenix.home.sessioncontrol.CollectionAction
+@@ -175,7 +175,7 @@ class CollectionItemMenu(
+         listOf(
+             SimpleBrowserMenuItem(
+                 context.getString(R.string.collection_delete),
+-                textColorResource = DefaultThemeManager.resolveAttribute(R.attr.destructive, context)
++                textColorResource = ThemeManager.resolveAttribute(R.attr.destructive, context)
+             ) {
+                 onItemTapped.invoke(Item.DeleteCollection)
+             },
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkAdapter.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkAdapter.kt
+index 563e47bb5c37..3628319f33a5 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkAdapter.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkAdapter.kt
+@@ -23,8 +23,8 @@ import mozilla.components.browser.icons.IconRequest
+ import mozilla.components.browser.menu.BrowserMenu
+ import mozilla.components.concept.storage.BookmarkNode
+ import mozilla.components.concept.storage.BookmarkNodeType
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.ext.components
+ import org.mozilla.fenix.ext.increaseTapArea
+ import kotlin.coroutines.CoroutineContext
+@@ -195,9 +195,9 @@ class BookmarkAdapter(val emptyView: View, val actionEmitter: Observer<BookmarkA
+         private fun setColorsAndIcons(selected: Boolean, item: BookmarkNode) {
+             val backgroundTint =
+                 if (selected) {
+-                    DefaultThemeManager.resolveAttribute(R.attr.accentHighContrast, containerView!!.context)
++                    ThemeManager.resolveAttribute(R.attr.accentHighContrast, containerView!!.context)
+                 } else {
+-                    DefaultThemeManager.resolveAttribute(R.attr.neutral, containerView!!.context)
++                    ThemeManager.resolveAttribute(R.attr.neutral, containerView!!.context)
+                 }
+ 
+             val backgroundTintList = ContextCompat.getColorStateList(containerView.context, backgroundTint)
+@@ -277,9 +277,9 @@ class BookmarkAdapter(val emptyView: View, val actionEmitter: Observer<BookmarkA
+             setMenu(item, containerView!!)
+ 
+             val backgroundTint = if (selected) {
+-                DefaultThemeManager.resolveAttribute(R.attr.accentHighContrast, containerView.context)
++                ThemeManager.resolveAttribute(R.attr.accentHighContrast, containerView.context)
+             } else {
+-                DefaultThemeManager.resolveAttribute(R.attr.neutral, containerView.context)
++                ThemeManager.resolveAttribute(R.attr.neutral, containerView.context)
+             }
+ 
+             val backgroundTintList = ContextCompat.getColorStateList(containerView.context, backgroundTint)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkItemMenu.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkItemMenu.kt
+index 84d0644f80c4..727d6c9cff85 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkItemMenu.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/bookmarks/BookmarkItemMenu.kt
+@@ -9,8 +9,8 @@ import mozilla.components.browser.menu.BrowserMenuBuilder
+ import mozilla.components.browser.menu.item.SimpleBrowserMenuItem
+ import mozilla.components.concept.storage.BookmarkNode
+ import mozilla.components.concept.storage.BookmarkNodeType
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ 
+ class BookmarkItemMenu(
+     private val context: Context,
+@@ -59,7 +59,7 @@ class BookmarkItemMenu(
+             } else null,
+             SimpleBrowserMenuItem(
+                 context.getString(R.string.bookmark_menu_delete_button),
+-                textColorResource = DefaultThemeManager.resolveAttribute(R.attr.destructive, context)
++                textColorResource = ThemeManager.resolveAttribute(R.attr.destructive, context)
+             ) {
+                 onItemTapped.invoke(BookmarkItemMenu.Item.Delete)
+             }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryItemMenu.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryItemMenu.kt
+index a1dc94302a3c..0f471a705bd2 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryItemMenu.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryItemMenu.kt
+@@ -7,8 +7,8 @@ package org.mozilla.fenix.library.history
+ import android.content.Context
+ import mozilla.components.browser.menu.BrowserMenuBuilder
+ import mozilla.components.browser.menu.item.SimpleBrowserMenuItem
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ 
+ class HistoryItemMenu(
+     private val context: Context,
+@@ -24,7 +24,7 @@ class HistoryItemMenu(
+         listOf(
+             SimpleBrowserMenuItem(
+                 context.getString(R.string.history_delete_item),
+-                textColorResource = DefaultThemeManager.resolveAttribute(R.attr.destructive, context)
++                textColorResource = ThemeManager.resolveAttribute(R.attr.destructive, context)
+             ) {
+                 onItemTapped.invoke(Item.Delete)
+             }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/history/viewholders/HistoryListItemViewHolder.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/history/viewholders/HistoryListItemViewHolder.kt
+index 868990ead543..2ff5371755ea 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/history/viewholders/HistoryListItemViewHolder.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/history/viewholders/HistoryListItemViewHolder.kt
+@@ -16,8 +16,8 @@ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.launch
+ import mozilla.components.browser.icons.IconRequest
+ import mozilla.components.browser.menu.BrowserMenu
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.ext.components
+ import org.mozilla.fenix.library.history.HistoryAction
+ import org.mozilla.fenix.library.history.HistoryItem
+@@ -93,9 +93,9 @@ class HistoryListItemViewHolder(
+         if (mode is HistoryState.Mode.Editing) {
+             val backgroundTint =
+                 if (selected) {
+-                    DefaultThemeManager.resolveAttribute(R.attr.accentHighContrast, itemView.context)
++                    ThemeManager.resolveAttribute(R.attr.accentHighContrast, itemView.context)
+                 } else {
+-                    DefaultThemeManager.resolveAttribute(R.attr.neutral, itemView.context)
++                    ThemeManager.resolveAttribute(R.attr.neutral, itemView.context)
+                 }
+             val backgroundTintList = ContextCompat.getColorStateList(itemView.context, backgroundTint)
+             favicon.backgroundTintList = backgroundTintList
+@@ -106,7 +106,7 @@ class HistoryListItemViewHolder(
+                 favicon.setImageResource(0)
+             }
+         } else {
+-            val backgroundTint = DefaultThemeManager.resolveAttribute(R.attr.neutral, itemView.context)
++            val backgroundTint = ThemeManager.resolveAttribute(R.attr.neutral, itemView.context)
+             val backgroundTintList = ContextCompat.getColorStateList(itemView.context, backgroundTint)
+             favicon.backgroundTintList = backgroundTintList
+             updateFavIcon(item.url)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/search/awesomebar/AwesomeBarUIView.kt b/fenix/app/src/main/java/org/mozilla/fenix/search/awesomebar/AwesomeBarUIView.kt
+index 021c04bee431..efa91d868691 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/search/awesomebar/AwesomeBarUIView.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/search/awesomebar/AwesomeBarUIView.kt
+@@ -21,8 +21,8 @@ import mozilla.components.feature.awesomebar.provider.SessionSuggestionProvider
+ import mozilla.components.feature.search.SearchUseCases
+ import mozilla.components.feature.session.SessionUseCases
+ import mozilla.components.support.ktx.android.graphics.drawable.toBitmap
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.ext.components
+ import org.mozilla.fenix.mvi.UIView
+ import org.mozilla.fenix.utils.Settings
+@@ -95,7 +95,7 @@ class AwesomeBarUIView(
+             draw?.setColorFilter(
+                 ContextCompat.getColor(
+                     this,
+-                    DefaultThemeManager.resolveAttribute(R.attr.primaryText, this)
++                    ThemeManager.resolveAttribute(R.attr.primaryText, this)
+                 ), PorterDuff.Mode.SRC_IN
+             )
+             clipboardSuggestionProvider = ClipboardSuggestionProvider(
+@@ -131,7 +131,7 @@ class AwesomeBarUIView(
+                 searchDrawable?.setColorFilter(
+                     ContextCompat.getColor(
+                         this,
+-                        DefaultThemeManager.resolveAttribute(R.attr.primaryText, this)
++                        ThemeManager.resolveAttribute(R.attr.primaryText, this)
+                     ), PorterDuff.Mode.SRC_IN
+                 )
+                 defaultSearchSuggestionProvider =
+@@ -187,7 +187,7 @@ class AwesomeBarUIView(
+             draw?.setColorFilter(
+                 ContextCompat.getColor(
+                     this,
+-                    DefaultThemeManager.resolveAttribute(R.attr.primaryText, this)
++                    ThemeManager.resolveAttribute(R.attr.primaryText, this)
+                 ), PorterDuff.Mode.SRC_IN
+             )
+ 
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/search/awesomebar/ShortcutEngineManager.kt b/fenix/app/src/main/java/org/mozilla/fenix/search/awesomebar/ShortcutEngineManager.kt
+index 802fada43eac..e6dda1698114 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/search/awesomebar/ShortcutEngineManager.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/search/awesomebar/ShortcutEngineManager.kt
+@@ -10,8 +10,8 @@ import androidx.navigation.Navigation
+ import io.reactivex.Observer
+ import kotlinx.android.synthetic.main.fragment_search.*
+ import mozilla.components.browser.search.SearchEngine
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.search.SearchFragmentDirections
+ 
+ class ShortcutEngineManager(
+@@ -70,7 +70,7 @@ class ShortcutEngineManager(
+             awesomeBarUIView.search_shortcuts_button.compoundDrawables[0]?.setTint(
+                 ContextCompat.getColor(
+                     this,
+-                    DefaultThemeManager.resolveAttribute(R.attr.foundation, this)
++                    ThemeManager.resolveAttribute(R.attr.foundation, this)
+                 )
+             )
+ 
+@@ -85,7 +85,7 @@ class ShortcutEngineManager(
+             awesomeBarUIView.search_shortcuts_button.compoundDrawables[0]?.setTint(
+                 ContextCompat.getColor(
+                     this,
+-                    DefaultThemeManager.resolveAttribute(R.attr.primaryText, this)
++                    ThemeManager.resolveAttribute(R.attr.primaryText, this)
+                 )
+             )
+ 
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/Extensions.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/Extensions.kt
+index cf9fe3b2ae81..4c93f2a49d67 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/Extensions.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/Extensions.kt
+@@ -12,8 +12,8 @@ import androidx.core.content.ContextCompat
+ import androidx.core.text.HtmlCompat
+ import mozilla.components.feature.sitepermissions.SitePermissions
+ import mozilla.components.feature.sitepermissions.SitePermissionsRules
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ 
+ internal fun SitePermissionsRules.Action.toString(context: Context): String {
+     return when (this) {
+@@ -103,7 +103,7 @@ fun PhoneFeature.getPreferenceKey(context: Context): String {
+ */
+ fun RadioButton.setStartCheckedIndicator() {
+     val attr =
+-        DefaultThemeManager.resolveAttribute(android.R.attr.listChoiceIndicatorSingle, context)
++        ThemeManager.resolveAttribute(android.R.attr.listChoiceIndicatorSingle, context)
+     val buttonDrawable = ContextCompat.getDrawable(context, attr)
+     buttonDrawable.apply {
+         this?.setBounds(0, 0, this.intrinsicWidth, this.intrinsicHeight)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/RadioButtonPreference.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/RadioButtonPreference.kt
+index 9910a5fea91b..5906788e5497 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/RadioButtonPreference.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/RadioButtonPreference.kt
+@@ -16,8 +16,8 @@ import androidx.core.content.res.TypedArrayUtils
+ import androidx.core.text.HtmlCompat
+ import androidx.preference.Preference
+ import androidx.preference.PreferenceViewHolder
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.utils.Settings
+ 
+ class RadioButtonPreference : Preference {
+@@ -37,7 +37,7 @@ class RadioButtonPreference : Preference {
+     */
+     fun RadioButton.setStartCheckedIndicator() {
+         val attr =
+-            DefaultThemeManager.resolveAttribute(android.R.attr.listChoiceIndicatorSingle, context)
++            ThemeManager.resolveAttribute(android.R.attr.listChoiceIndicatorSingle, context)
+         val buttonDrawable = ContextCompat.getDrawable(context, attr)
+         buttonDrawable.apply {
+             this?.setBounds(0, 0, this.intrinsicWidth, this.intrinsicHeight)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/SearchEngineListPreference.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/SearchEngineListPreference.kt
+index 937d5f557b82..00cfc516486f 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/SearchEngineListPreference.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/SearchEngineListPreference.kt
+@@ -19,8 +19,8 @@ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+ import mozilla.components.browser.search.SearchEngine
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ import org.mozilla.fenix.ext.components
+ import org.mozilla.fenix.utils.Settings
+ import kotlin.coroutines.CoroutineContext
+@@ -110,7 +110,7 @@ abstract class SearchEngineListPreference : Preference, CoroutineScope {
+         val engineIcon = BitmapDrawable(res, engine.icon)
+         engineIcon.setBounds(0, 0, iconSize, iconSize)
+         val attr =
+-            DefaultThemeManager.resolveAttribute(android.R.attr.listChoiceIndicatorSingle, context)
++            ThemeManager.resolveAttribute(android.R.attr.listChoiceIndicatorSingle, context)
+         val buttonDrawable = ContextCompat.getDrawable(context, attr)
+         buttonDrawable.apply {
+             this?.setBounds(0, 0, this.intrinsicWidth, this.intrinsicHeight)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/utils/ClearableEditText.kt b/fenix/app/src/main/java/org/mozilla/fenix/utils/ClearableEditText.kt
+index acc6975f3aae..9fb5aa5b46b8 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/utils/ClearableEditText.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/utils/ClearableEditText.kt
+@@ -13,8 +13,8 @@ import android.util.AttributeSet
+ import android.view.MotionEvent
+ import androidx.appcompat.widget.AppCompatEditText
+ import androidx.core.content.ContextCompat.getColor
+-import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ThemeManager
+ 
+ class ClearableEditText @JvmOverloads
+ constructor(
+@@ -40,7 +40,7 @@ constructor(
+         if (lengthAfter != 0 && error == null) {
+             setCompoundDrawablesWithIntrinsicBounds(0, 0, R.drawable.ic_clear, 0)
+             for (drawable: Drawable in compoundDrawables.filterNotNull()) {
+-                val color = DefaultThemeManager.resolveAttribute(R.attr.primaryText, context!!)
++                val color = ThemeManager.resolveAttribute(R.attr.primaryText, context!!)
+                 drawable.colorFilter = PorterDuffColorFilter(getColor(context, color), PorterDuff.Mode.SRC_IN)
+             }
+         } else {

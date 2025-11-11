@@ -1,0 +1,846 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 290c07d9e60..5a3882148de 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -114,6 +114,7 @@ dependencies {
+     implementation(project(":common"))
+ 
+     implementation(Config.Dependency.Misc.blurView)
++    implementation(Config.Dependency.Misc.altBeacon)
+     implementation(Config.Dependency.Misc.iconDialog)
+     implementation(Config.Dependency.Misc.iconDialogMaterial)
+     implementation(Config.Dependency.Misc.emoji) {
+@@ -161,6 +162,7 @@ dependencies {
+     testImplementation(Config.Dependency.Testing.assertJ)
+     testImplementation(Config.Dependency.Testing.mockk)
+     testImplementation(Config.Dependency.Kotlin.coroutinesTest)
++    testImplementation(Config.Dependency.Misc.altBeacon)
+ 
+     implementation(Config.Dependency.Misc.exoCore)
+     implementation(Config.Dependency.Misc.exoHls)
+diff --git a/app/src/full/java/io/homeassistant/companion/android/notifications/MessagingService.kt b/app/src/full/java/io/homeassistant/companion/android/notifications/MessagingService.kt
+index 69d3301b96e..3478196b11c 100644
+--- a/app/src/full/java/io/homeassistant/companion/android/notifications/MessagingService.kt
++++ b/app/src/full/java/io/homeassistant/companion/android/notifications/MessagingService.kt
+@@ -44,6 +44,7 @@ import io.homeassistant.companion.android.common.data.url.UrlRepository
+ import io.homeassistant.companion.android.database.AppDatabase
+ import io.homeassistant.companion.android.database.notification.NotificationItem
+ import io.homeassistant.companion.android.location.HighAccuracyLocationService
++import io.homeassistant.companion.android.sensors.BluetoothSensorManager
+ import io.homeassistant.companion.android.sensors.LocationSensorManager
+ import io.homeassistant.companion.android.util.UrlHandler
+ import io.homeassistant.companion.android.util.cancel
+@@ -87,6 +88,8 @@ class MessagingService : FirebaseMessagingService() {
+         const val COMMAND_BROADCAST_INTENT = "command_broadcast_intent"
+         const val COMMAND_VOLUME_LEVEL = "command_volume_level"
+         const val COMMAND_BLUETOOTH = "command_bluetooth"
++        const val COMMAND_BLE_TRANSMITTER = "command_ble_transmitter"
++
+         const val COMMAND_HIGH_ACCURACY_MODE = "command_high_accuracy_mode"
+         const val COMMAND_ACTIVITY = "command_activity"
+         const val COMMAND_WEBVIEW = "command_webview"
+@@ -115,7 +118,7 @@ class MessagingService : FirebaseMessagingService() {
+ 
+         // Command groups
+         val DEVICE_COMMANDS = listOf(COMMAND_DND, COMMAND_RINGER_MODE, COMMAND_BROADCAST_INTENT,
+-            COMMAND_VOLUME_LEVEL, COMMAND_BLUETOOTH, COMMAND_HIGH_ACCURACY_MODE, COMMAND_ACTIVITY,
++            COMMAND_VOLUME_LEVEL, COMMAND_BLUETOOTH, COMMAND_BLE_TRANSMITTER, COMMAND_HIGH_ACCURACY_MODE, COMMAND_ACTIVITY,
+             COMMAND_WEBVIEW)
+         val DND_COMMANDS = listOf(DND_ALARMS_ONLY, DND_ALL, DND_NONE, DND_PRIORITY_ONLY)
+         val RM_COMMANDS = listOf(RM_NORMAL, RM_SILENT, RM_VIBRATE)
+@@ -231,6 +234,16 @@ class MessagingService : FirebaseMessagingService() {
+                                 }
+                             }
+                         }
++                        COMMAND_BLE_TRANSMITTER -> {
++                            if (!it[TITLE].isNullOrEmpty() && it[TITLE] in ENABLE_COMMANDS)
++                                handleDeviceCommands(it)
++                            else {
++                                mainScope.launch {
++                                    Log.d(TAG, "Invalid ble transmitter command received, posting notification to device")
++                                    sendNotification(it)
++                                }
++                            }
++                        }
+                         COMMAND_HIGH_ACCURACY_MODE -> {
+                             if (!it[TITLE].isNullOrEmpty() && it[TITLE] in ENABLE_COMMANDS)
+                                 handleDeviceCommands(it)
+@@ -451,6 +464,12 @@ class MessagingService : FirebaseMessagingService() {
+                 if (title == TURN_ON)
+                     bluetoothAdapter.enable()
+             }
++            COMMAND_BLE_TRANSMITTER -> {
++                if (title == TURN_OFF)
++                    BluetoothSensorManager.enableDisableBLETransmitter(applicationContext, false)
++                if (title == TURN_ON)
++                    BluetoothSensorManager.enableDisableBLETransmitter(applicationContext, true)
++            }
+             COMMAND_HIGH_ACCURACY_MODE -> {
+                 if (title == TURN_OFF) {
+                     HighAccuracyLocationService.stopService(applicationContext)
+diff --git a/app/src/main/java/io/homeassistant/companion/android/bluetooth/ble/IBeaconTransmitter.kt b/app/src/main/java/io/homeassistant/companion/android/bluetooth/ble/IBeaconTransmitter.kt
+new file mode 100644
+index 00000000000..de41dbe07b2
+--- /dev/null
++++ b/app/src/main/java/io/homeassistant/companion/android/bluetooth/ble/IBeaconTransmitter.kt
+@@ -0,0 +1,12 @@
++package io.homeassistant.companion.android.bluetooth.ble
++
++data class IBeaconTransmitter(
++    var uuid: String,
++    var major: String,
++    var minor: String,
++    var transmitting: Boolean = false,
++    var state: String,
++    var transmitPower: String,
++    val manufacturer: Int = 0x004c,
++    val beaconLayout: String = "m:2-3=0215,i:4-19,i:20-21,i:22-23,p:24-24"
++)
+diff --git a/app/src/main/java/io/homeassistant/companion/android/bluetooth/ble/TransmitterManager.kt b/app/src/main/java/io/homeassistant/companion/android/bluetooth/ble/TransmitterManager.kt
+new file mode 100644
+index 00000000000..811e58690a3
+--- /dev/null
++++ b/app/src/main/java/io/homeassistant/companion/android/bluetooth/ble/TransmitterManager.kt
+@@ -0,0 +1,117 @@
++package io.homeassistant.companion.android.bluetooth.ble
++
++import android.bluetooth.BluetoothAdapter
++import android.bluetooth.le.AdvertiseCallback
++import android.bluetooth.le.AdvertiseSettings
++import android.content.Context
++import java.util.UUID
++import org.altbeacon.beacon.Beacon
++import org.altbeacon.beacon.BeaconParser
++import org.altbeacon.beacon.BeaconTransmitter
++
++object TransmitterManager {
++    private lateinit var physicalTransmitter: BeaconTransmitter
++    private lateinit var beacon: Beacon
++
++    private fun buildBeacon(haTransmitterI: io.homeassistant.companion.android.bluetooth.ble.IBeaconTransmitter): Beacon {
++        val builder = Beacon.Builder()
++        builder.setTxPower(-59)
++        builder.setId1(haTransmitterI.uuid)
++        builder.setId2(haTransmitterI.major)
++        builder.setId3(haTransmitterI.minor)
++        builder.setManufacturer(haTransmitterI.manufacturer)
++        beacon = builder.build()
++        return beacon
++    }
++
++    private fun trasnmissionDetailsChanged(haTransmitter: IBeaconTransmitter): Boolean {
++        return this::beacon.isInitialized && (haTransmitter.uuid != beacon.id1.toString() ||
++                haTransmitter.major != beacon.id2.toString() ||
++                haTransmitter.minor != beacon.id3.toString() ||
++                transmitPowerHasChanged(haTransmitter))
++    }
++
++    private fun transmitPowerHasChanged(haTransmitter: IBeaconTransmitter): Boolean {
++        return (haTransmitter.transmitPower == "ultraLow" && physicalTransmitter.advertiseTxPowerLevel != AdvertiseSettings.ADVERTISE_TX_POWER_ULTRA_LOW) ||
++                (haTransmitter.transmitPower == "low" && physicalTransmitter.advertiseTxPowerLevel != AdvertiseSettings.ADVERTISE_TX_POWER_LOW) ||
++                (haTransmitter.transmitPower == "medium" && physicalTransmitter.advertiseTxPowerLevel != AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM) ||
++                (haTransmitter.transmitPower == "high" && physicalTransmitter.advertiseTxPowerLevel != AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
++    }
++
++    private fun shouldStartTransmitting(haTransmitter: IBeaconTransmitter): Boolean {
++        return validateInputs(haTransmitter) && (!this::physicalTransmitter.isInitialized || !physicalTransmitter.isStarted || trasnmissionDetailsChanged(haTransmitter))
++    }
++
++    private fun validateInputs(haTransmitter: IBeaconTransmitter): Boolean {
++        try {
++            UUID.fromString(haTransmitter.uuid)
++            if (haTransmitter.major.toInt() < 0 || haTransmitter.major.toInt() > 65535 || haTransmitter.minor.toInt() < 0 || haTransmitter.minor.toInt() > 65535)
++                throw IllegalArgumentException("Invalid Major or Minor")
++        } catch (e: IllegalArgumentException) {
++            stopTransmitting(haTransmitter)
++            haTransmitter.state = "Invalid parameters, check UUID, Major and Minor"
++            return false
++        }
++        return true
++    }
++
++    @Synchronized
++    fun startTransmitting(context: Context, haTransmitter: io.homeassistant.companion.android.bluetooth.ble.IBeaconTransmitter) {
++        if (!shouldStartTransmitting(haTransmitter)) {
++            return
++        }
++        if (trasnmissionDetailsChanged(haTransmitter) && this::physicalTransmitter.isInitialized) {
++            stopTransmitting(haTransmitter)
++        }
++        if (!this::physicalTransmitter.isInitialized) {
++            val parser = BeaconParser().setBeaconLayout(haTransmitter.beaconLayout)
++            physicalTransmitter = BeaconTransmitter(context, parser)
++            physicalTransmitter.advertiseMode = AdvertiseSettings.ADVERTISE_MODE_LOW_POWER
++        }
++        physicalTransmitter.advertiseTxPowerLevel = getPowerLevel(haTransmitter)
++        val bluetoothOn = BluetoothAdapter.getDefaultAdapter().isEnabled
++        if (bluetoothOn) {
++            val beacon = buildBeacon(haTransmitter)
++            if (!physicalTransmitter.isStarted) {
++                physicalTransmitter.advertiseTxPowerLevel
++                physicalTransmitter.startAdvertising(beacon, object : AdvertiseCallback() {
++                    override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
++                        haTransmitter.transmitting = true
++                        haTransmitter.state = "Transmitting"
++                    }
++
++                    override fun onStartFailure(errorCode: Int) {
++                        if (errorCode != ADVERTISE_FAILED_ALREADY_STARTED) {
++                            haTransmitter.uuid = ""
++                            haTransmitter.major = ""
++                            haTransmitter.minor = ""
++                            haTransmitter.state = "Unable to transmit"
++                            haTransmitter.transmitting = false
++                        } else {
++                            haTransmitter.transmitting = true
++                            haTransmitter.state = "Transmitting"
++                        }
++                    }
++                })
++            }
++        } else {
++            stopTransmitting(haTransmitter)
++        }
++    }
++
++    private fun getPowerLevel(haTransmitter: IBeaconTransmitter): Int {
++        if (haTransmitter.transmitPower == "high") return AdvertiseSettings.ADVERTISE_TX_POWER_HIGH
++        if (haTransmitter.transmitPower == "medium") return AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM
++        if (haTransmitter.transmitPower == "low") return AdvertiseSettings.ADVERTISE_TX_POWER_LOW
++        return AdvertiseSettings.ADVERTISE_TX_POWER_ULTRA_LOW
++    }
++
++    fun stopTransmitting(haTransmitterI: io.homeassistant.companion.android.bluetooth.ble.IBeaconTransmitter) {
++        if (haTransmitterI.transmitting && this::physicalTransmitter.isInitialized) {
++            if (physicalTransmitter.isStarted)
++                physicalTransmitter.stopAdvertising()
++        }
++        haTransmitterI.transmitting = false
++        haTransmitterI.state = "Stopped"
++    }
++}
+diff --git a/app/src/main/java/io/homeassistant/companion/android/sensors/BluetoothSensorManager.kt b/app/src/main/java/io/homeassistant/companion/android/sensors/BluetoothSensorManager.kt
+index be80043b852..f9bab0607c2 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/sensors/BluetoothSensorManager.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/sensors/BluetoothSensorManager.kt
+@@ -4,23 +4,62 @@ import android.Manifest
+ import android.content.Context
+ import io.homeassistant.companion.android.R
+ import io.homeassistant.companion.android.bluetooth.BluetoothUtils
++import io.homeassistant.companion.android.bluetooth.ble.IBeaconTransmitter
++import io.homeassistant.companion.android.bluetooth.ble.TransmitterManager
++import io.homeassistant.companion.android.database.AppDatabase
++import io.homeassistant.companion.android.database.sensor.Sensor
++import java.util.UUID
++import kotlin.collections.ArrayList
+ 
+ class BluetoothSensorManager : SensorManager {
+     companion object {
+-        private const val TAG = "BluetoothSM"
++
++        private const val BLE_ID1 = "UUID"
++        private const val BLE_ID2 = "Major"
++        private const val BLE_ID3 = "Minor"
++        private const val BLE_TRANSMIT_POWER = "transmit_power"
++        private const val ENABLE_TOGGLE_ALL = "Include when enabling all sensors"
++        private const val DEFAULT_BLE_TRANSMIT_POWER = "ultraLow"
++        private const val DEFAULT_BLE_ID2 = "100"
++        private const val DEFAULT_BLE_ID3 = "1"
++        // private const val TAG = "BluetoothSM"
++        private var bleTransmitterDevice = IBeaconTransmitter("", "", "", transmitPower = "", transmitting = false, state = "")
+         val bluetoothConnection = SensorManager.BasicSensor(
+-            "bluetooth_connection",
+-            "sensor",
+-            R.string.basic_sensor_name_bluetooth,
+-            R.string.sensor_description_bluetooth_connection,
+-            unitOfMeasurement = "connection(s)"
++                "bluetooth_connection",
++                "sensor",
++                R.string.basic_sensor_name_bluetooth,
++                R.string.sensor_description_bluetooth_connection,
++                unitOfMeasurement = "connection(s)"
+         )
+         val bluetoothState = SensorManager.BasicSensor(
+-            "bluetooth_state",
+-            "binary_sensor",
+-            R.string.basic_sensor_name_bluetooth_state,
+-            R.string.sensor_description_bluetooth_state
++                "bluetooth_state",
++                "binary_sensor",
++                R.string.basic_sensor_name_bluetooth_state,
++                R.string.sensor_description_bluetooth_state
++        )
++        val bleTransmitter = SensorManager.BasicSensor(
++                "ble_emitter",
++                "sensor",
++                R.string.basic_sensor_name_bluetooth_ble_emitter,
++                R.string.sensor_description_bluetooth_ble_emitter
+         )
++
++        fun enableDisableBLETransmitter(context: Context, enabled: Boolean) {
++            val sensorDao = AppDatabase.getInstance(context).sensorDao()
++            var sensorEntity = sensorDao.get(bleTransmitter.id)
++            if (sensorEntity != null) {
++                sensorEntity.enabled = enabled
++                sensorDao.update(sensorEntity)
++            } else {
++                sensorEntity = Sensor(bleTransmitter.id, enabled, false, "")
++                sensorDao.add(sensorEntity)
++            }
++            TransmitterManager.stopTransmitting(bleTransmitterDevice) // stop in all instances, clean up state if start required
++            if (enabled) {
++                TransmitterManager.startTransmitting(context, bleTransmitterDevice)
++                TransmitterManager.startTransmitting(context, bleTransmitterDevice)
++            }
++        }
+     }
+ 
+     override val enabledByDefault: Boolean
+@@ -28,7 +67,7 @@ class BluetoothSensorManager : SensorManager {
+     override val name: Int
+         get() = R.string.sensor_name_bluetooth
+     override val availableSensors: List<SensorManager.BasicSensor>
+-        get() = listOf(bluetoothConnection, bluetoothState)
++        get() = listOf(bluetoothConnection, bluetoothState, bleTransmitter)
+ 
+     override fun requiredPermissions(sensorId: String): Array<String> {
+         return arrayOf(Manifest.permission.BLUETOOTH)
+@@ -39,6 +78,7 @@ class BluetoothSensorManager : SensorManager {
+     ) {
+         updateBluetoothConnectionSensor(context)
+         updateBluetoothState(context)
++        updateBLEtransmitter(context)
+     }
+ 
+     private fun updateBluetoothConnectionSensor(context: Context) {
+@@ -60,35 +100,88 @@ class BluetoothSensorManager : SensorManager {
+             totalConnectedDevices = bluetoothDevices.filter { b -> b.connected }.count()
+         }
+         onSensorUpdated(
+-            context,
+-            bluetoothConnection,
+-            totalConnectedDevices,
+-            icon,
+-            mapOf(
+-                "connected_paired_devices" to connectedPairedDevices,
+-                "connected_not_paired_devices" to connectedNotPairedDevices,
+-                "paired_devices" to bondedString
+-            )
++                context,
++                bluetoothConnection,
++                totalConnectedDevices,
++                icon,
++                mapOf(
++                        "connected_paired_devices" to connectedPairedDevices,
++                        "connected_not_paired_devices" to connectedNotPairedDevices,
++                        "paired_devices" to bondedString
++                )
+         )
+     }
+ 
++    private fun isBtOn(context: Context): Boolean {
++        var btOn = false
++        if (checkPermission(context, bluetoothState.id)) {
++            btOn = BluetoothUtils.isOn(context)
++        }
++        return btOn
++    }
++
+     private fun updateBluetoothState(context: Context) {
+         if (!isEnabled(context, bluetoothState.id))
+             return
++        val icon = if (isBtOn(context)) "mdi:bluetooth" else "mdi:bluetooth-off"
++        onSensorUpdated(
++                context,
++                bluetoothState,
++                isBtOn(context),
++                icon,
++                mapOf()
++        )
++    }
+ 
+-        var isBtOn = false
++    override fun enableToggleAll(context: Context, sensorId: String): Boolean {
++        if (sensorId == bleTransmitter.id) {
++            return getSetting(context, bleTransmitter, ENABLE_TOGGLE_ALL, "toggle", "false").toBoolean()
++        }
++        return super.enableToggleAll(context, sensorId)
++    }
+ 
+-        if (checkPermission(context, bluetoothState.id)) {
+-            isBtOn = BluetoothUtils.isOn(context)
++    private fun updatedBLEDevice(context: Context): Boolean {
++        addSettingIfNotPresent(context, bleTransmitter, ENABLE_TOGGLE_ALL, "toggle", "false")
++        var result = false
++        var id1 = getSetting(context, bleTransmitter, BLE_ID1, "string", UUID.randomUUID().toString())
++        var id2 = getSetting(context, bleTransmitter, BLE_ID2, "string", DEFAULT_BLE_ID2)
++        var id3 = getSetting(context, bleTransmitter, BLE_ID3, "string", DEFAULT_BLE_ID3)
++        var transmitPower = getSetting(context, bleTransmitter, BLE_TRANSMIT_POWER, "list", DEFAULT_BLE_TRANSMIT_POWER)
++        if (bleTransmitterDevice.uuid != id1 || bleTransmitterDevice.major != id2 || bleTransmitterDevice.minor != id3 || bleTransmitterDevice.transmitPower != transmitPower)
++            result = true
++
++        bleTransmitterDevice.uuid = id1
++        bleTransmitterDevice.major = id2
++        bleTransmitterDevice.minor = id3
++        bleTransmitterDevice.transmitPower = transmitPower
++
++        return result
++    }
++
++    private fun updateBLEtransmitter(context: Context) {
++        if (!isEnabled(context, bleTransmitter.id)) {
++            if (bleTransmitterDevice.transmitting) // sensor has been turned off, stop transmitting
++                TransmitterManager.stopTransmitting(bleTransmitterDevice)
++            return
++        }
++        // transmit when BT is on, if we are not already transmitting, or details have changed
++        val updatedDeviceDetails = updatedBLEDevice(context)
++        if (isBtOn(context) &&
++                ((isEnabled(context, bleTransmitter.id) && !bleTransmitterDevice.transmitting) || isEnabled(context, bleTransmitter.id) && updatedDeviceDetails)) {
++                TransmitterManager.startTransmitting(context, bleTransmitterDevice)
+         }
+-        val icon = if (isBtOn) "mdi:bluetooth" else "mdi:bluetooth-off"
+ 
++        val state = if (isBtOn(context)) bleTransmitterDevice.state else "Bluetooth is turned off"
++        val icon = if (bleTransmitterDevice.transmitting) "mdi:bluetooth" else "mdi:bluetooth-off"
+         onSensorUpdated(
+-            context,
+-            bluetoothState,
+-            isBtOn,
+-            icon,
+-            mapOf()
++                context,
++                bleTransmitter,
++                state,
++                icon,
++                mapOf(
++                        "id" to bleTransmitterDevice.uuid + "-" + bleTransmitterDevice.major + "-" + bleTransmitterDevice.minor,
++                        "Transmitting power" to bleTransmitterDevice.transmitPower
++                )
+         )
+     }
+ }
+diff --git a/app/src/main/java/io/homeassistant/companion/android/sensors/SensorDetailFragment.kt b/app/src/main/java/io/homeassistant/companion/android/sensors/SensorDetailFragment.kt
+index ef2cd8195d7..cd08a5c02b0 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/sensors/SensorDetailFragment.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/sensors/SensorDetailFragment.kt
+@@ -9,6 +9,7 @@ import android.os.Looper
+ import android.provider.Settings
+ import android.text.InputType
+ import androidx.preference.EditTextPreference
++import androidx.preference.ListPreference
+ import androidx.preference.MultiSelectListPreference
+ import androidx.preference.Preference
+ import androidx.preference.PreferenceCategory
+@@ -29,7 +30,7 @@ class SensorDetailFragment(
+     private val sensorManager: SensorManager,
+     private val basicSensor: SensorManager.BasicSensor
+ ) :
+-    PreferenceFragmentCompat() {
++        PreferenceFragmentCompat() {
+ 
+     companion object {
+         fun newInstance(
+@@ -51,10 +52,10 @@ class SensorDetailFragment(
+ 
+     override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+         DaggerSensorComponent
+-            .builder()
+-            .appComponent((activity?.application as GraphComponentAccessor).appComponent)
+-            .build()
+-            .inject(this)
++                .builder()
++                .appComponent((activity?.application as GraphComponentAccessor).appComponent)
++                .build()
++                .inject(this)
+         sensorDao = AppDatabase.getInstance(requireContext()).sensorDao()
+ 
+         addPreferencesFromResource(R.xml.sensor_detail)
+@@ -80,7 +81,7 @@ class SensorDetailFragment(
+                     val coarseLocation = DisabledLocationHandler.containsLocationPermission(permissions, false)
+ 
+                     if ((fineLocation || coarseLocation) &&
+-                        !DisabledLocationHandler.isLocationEnabled(context, fineLocation)) {
++                            !DisabledLocationHandler.isLocationEnabled(context, fineLocation)) {
+                         DisabledLocationHandler.showLocationDisabledWarnDialog(requireActivity(), arrayOf(getString(basicSensor.name)))
+                         return@setOnPreferenceChangeListener false
+                     } else {
+@@ -200,6 +201,27 @@ class SensorDetailFragment(
+                         }
+                         if (!it.contains(pref))
+                             it.addPreference(pref)
++                    } else if (setting.valueType == "list") {
++                        val pref = findPreference(key) ?: ListPreference(requireContext())
++                        pref.key = key
++                        val titleId = resources.getIdentifier(key + "_title", "string", requireContext().packageName)
++                        pref.title = resources.getString(titleId)
++                        pref.dialogTitle = resources.getString(titleId)
++                        val entriesResourceId = resources.getIdentifier(key + "_labels", "array", requireContext().packageName)
++                        pref.entries = requireContext().resources.getStringArray(entriesResourceId)
++                        val entryValuesResourceId = resources.getIdentifier(key + "_values", "array", requireContext().packageName)
++                        pref.entryValues = requireContext().resources.getStringArray(entryValuesResourceId)
++                        pref.value = setting.value
++                        pref.summary = setting.value
++                        pref.isIconSpaceReserved = false
++                        pref.isSingleLineTitle = false
++                        pref.setOnPreferenceChangeListener { _, newState ->
++                            sensorDao.add(Setting(basicSensor.id, setting.name, newState as String, "list"))
++                            sensorManager.requestSensorUpdate(requireContext())
++                            return@setOnPreferenceChangeListener true
++                        }
++                        if (!it.contains(pref))
++                            it.addPreference(pref)
+                     } else if (setting.valueType == "string" || setting.valueType == "number") {
+                         val pref = findPreference(key) ?: EditTextPreference(requireContext())
+                         pref.key = key
+@@ -223,18 +245,18 @@ class SensorDetailFragment(
+ 
+                         pref.setOnPreferenceChangeListener { _, newValue ->
+                             sensorDao.add(
+-                                Setting(
+-                                    basicSensor.id,
+-                                    setting.name,
+-                                    newValue as String,
+-                                    setting.valueType
+-                                )
++                                    Setting(
++                                            basicSensor.id,
++                                            setting.name,
++                                            newValue as String,
++                                            setting.valueType
++                                    )
+                             )
+                             sensorManager.requestSensorUpdate(requireContext())
+                             return@setOnPreferenceChangeListener true
+                         }
+-                    if (!it.contains(pref))
+-                        it.addPreference(pref)
++                        if (!it.contains(pref))
++                            it.addPreference(pref)
+                     } else if (setting.valueType == "list-apps") {
+                         val packageManager: PackageManager? = context?.packageManager
+                         val packages = packageManager?.getInstalledApplications(PackageManager.GET_META_DATA)
+@@ -245,7 +267,8 @@ class SensorDetailFragment(
+                             }
+                             packageName.sort()
+                         }
+-                        val pref = findPreference(key) ?: MultiSelectListPreference(requireContext())
++                        val pref = findPreference(key)
++                                ?: MultiSelectListPreference(requireContext())
+                         pref.key = key
+                         pref.title = setting.name
+                         pref.entries = packageName.toTypedArray()
+@@ -255,12 +278,12 @@ class SensorDetailFragment(
+                         pref.isSingleLineTitle = false
+                         pref.setOnPreferenceChangeListener { _, newValue ->
+                             sensorDao.add(
+-                                Setting(
+-                                    basicSensor.id,
+-                                    setting.name,
+-                                    newValue.toString().replace("[", "").replace("]", ""),
+-                                    "list-apps"
+-                                )
++                                    Setting(
++                                            basicSensor.id,
++                                            setting.name,
++                                            newValue.toString().replace("[", "").replace("]", ""),
++                                            "list-apps"
++                                    )
+                             )
+                             sensorManager.requestSensorUpdate(requireContext())
+                             return@setOnPreferenceChangeListener true
+@@ -274,7 +297,8 @@ class SensorDetailFragment(
+                     } else if (setting.valueType == "list-bluetooth") {
+                         val btDevices = BluetoothUtils.getBluetoothDevices(requireContext()).map { b -> b.name }
+ 
+-                        val pref = findPreference(key) ?: MultiSelectListPreference(requireContext())
++                        val pref = findPreference(key)
++                                ?: MultiSelectListPreference(requireContext())
+                         pref.key = key
+                         pref.title = setting.name
+                         pref.entries = btDevices.toTypedArray()
+@@ -284,12 +308,12 @@ class SensorDetailFragment(
+                         pref.isSingleLineTitle = false
+                         pref.setOnPreferenceChangeListener { _, newValue ->
+                             sensorDao.add(
+-                                Setting(
+-                                    basicSensor.id,
+-                                    setting.name,
+-                                    newValue.toString().replace("[", "").replace("]", ""),
+-                                    "list-bluetooth"
+-                                )
++                                    Setting(
++                                            basicSensor.id,
++                                            setting.name,
++                                            newValue.toString().replace("[", "").replace("]", ""),
++                                            "list-bluetooth"
++                                    )
+                             )
+                             sensorManager.requestSensorUpdate(requireContext())
+                             return@setOnPreferenceChangeListener true
+@@ -329,8 +353,8 @@ class SensorDetailFragment(
+                 startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+             android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R ->
+                 requestPermissions(
+-                    permissions.toSet()
+-                        .minus(Manifest.permission.ACCESS_BACKGROUND_LOCATION).toTypedArray(), 0
++                        permissions.toSet()
++                                .minus(Manifest.permission.ACCESS_BACKGROUND_LOCATION).toTypedArray(), 0
+                 )
+             else -> requestPermissions(permissions, 0)
+         }
+@@ -344,7 +368,7 @@ class SensorDetailFragment(
+         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+ 
+         if (permissions.contains(Manifest.permission.ACCESS_FINE_LOCATION) &&
+-            android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
++                android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+             requestPermissions(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), 0)
+         }
+ 
+diff --git a/app/src/main/java/io/homeassistant/companion/android/sensors/SensorManager.kt b/app/src/main/java/io/homeassistant/companion/android/sensors/SensorManager.kt
+index 6950281a28d..fefd04e231f 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/sensors/SensorManager.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/sensors/SensorManager.kt
+@@ -45,10 +45,10 @@ interface SensorManager {
+         }
+ 
+         // If we don't have permission but we are still enabled then we aren't really enabled.
+-            if (sensor.enabled && !permission) {
+-                sensor.enabled = false
+-                sensorDao.update(sensor)
+-            }
++        if (sensor.enabled && !permission) {
++            sensor.enabled = false
++            sensorDao.update(sensor)
++        }
+ 
+         return sensor.enabled
+     }
+@@ -59,6 +59,20 @@ interface SensorManager {
+         return true
+     }
+ 
++    fun enableToggleAll(context: Context, sensorId: String): Boolean {
++        return true
++    }
++
++    fun addSettingIfNotPresent(
++        context: Context,
++        sensor: BasicSensor,
++        settingName: String,
++        settingType: String,
++        default: String
++    ) {
++        getSetting(context, sensor, settingName, settingType, default)
++    }
++
+     fun getSetting(
+         context: Context,
+         sensor: BasicSensor,
+@@ -68,9 +82,9 @@ interface SensorManager {
+     ): String {
+         val sensorDao = AppDatabase.getInstance(context).sensorDao()
+         val setting = sensorDao
+-            .getSettings(sensor.id)
+-            .firstOrNull { it.name == settingName }
+-            ?.value
++                .getSettings(sensor.id)
++                .firstOrNull { it.name == settingName }
++                ?.value
+         if (setting == null)
+             sensorDao.add(Setting(sensor.id, settingName, default, settingType))
+ 
+@@ -114,12 +128,12 @@ interface SensorManager {
+             }
+ 
+             sensorDao.add(
+-                Attribute(
+-                    basicSensor.id,
+-                    item.key,
+-                    item.value.toString(),
+-                    valueType
+-                )
++                    Attribute(
++                            basicSensor.id,
++                            item.key,
++                            item.value.toString(),
++                            valueType
++                    )
+             )
+         }
+     }
+diff --git a/app/src/main/java/io/homeassistant/companion/android/sensors/SensorsSettingsFragment.kt b/app/src/main/java/io/homeassistant/companion/android/sensors/SensorsSettingsFragment.kt
+index d6445e0384a..45f3415895c 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/sensors/SensorsSettingsFragment.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/sensors/SensorsSettingsFragment.kt
+@@ -265,8 +265,12 @@ class SensorsSettingsFragment : PreferenceFragmentCompat() {
+ 
+         SensorReceiver.MANAGERS.forEach { managers ->
+             managers.availableSensors.forEach { basicSensor ->
++                val sensorTurnsOnWithGroupToggle = managers.enableToggleAll(requireContext(), basicSensor.id)
++                if (!sensorTurnsOnWithGroupToggle) {
++                    return@forEach
++                }
+                 var enableSensor = false
+-                if (enableAllSensors) {
++                if (enableAllSensors && sensorTurnsOnWithGroupToggle) {
+                     enableSensor = managers.checkPermission(requireContext(), basicSensor.id)
+                 }
+                 var sensorEntity = sensorDao.get(basicSensor.id)
+diff --git a/app/src/main/res/values/arrays.xml b/app/src/main/res/values/arrays.xml
+index b601ffdd28a..8ac2253764c 100644
+--- a/app/src/main/res/values/arrays.xml
++++ b/app/src/main/res/values/arrays.xml
+@@ -10,4 +10,16 @@
+         <item>last50</item>
+         <item>last100</item>
+     </string-array>
++    <string-array name="setting_ble_emitter_transmit_power_labels">
++        <item>@string/ble_transmit_power_label_high</item>
++        <item>@string/ble_transmit_power_label_medium</item>
++        <item>@string/ble_transmit_power_label_low</item>
++        <item>@string/ble_transmit_power_label_ultra_low</item>
++    </string-array>
++    <string-array name="setting_ble_emitter_transmit_power_values">
++        <item>@string/ble_transmit_power_value_high</item>
++        <item>@string/ble_transmit_power_value_medium</item>
++        <item>@string/ble_transmit_power_value_low</item>
++        <item>@string/ble_transmit_power_value_ultra_low</item>
++    </string-array>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 91cb868069b..6e0578efdf6 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -40,6 +40,7 @@
+   <string name="basic_sensor_name_battery_level">Battery Level</string>
+   <string name="basic_sensor_name_battery_state">Battery State</string>
+   <string name="basic_sensor_name_bluetooth">Bluetooth Connection</string>
++  <string name="basic_sensor_name_bluetooth_ble_emitter">Ble Transmitter</string>
+   <string name="basic_sensor_name_bluetooth_state">Bluetooth State</string>
+   <string name="basic_sensor_name_call_number">Call Number</string>
+   <string name="basic_sensor_name_charger_type">Charger Type</string>
+@@ -303,6 +304,7 @@ like to connect to:</string>
+   <string name="sensor_description_battery_level">The current battery level of the device</string>
+   <string name="sensor_description_battery_state">The current charging state of the battery</string>
+   <string name="sensor_description_bluetooth_connection">Information about currently connected bluetooth devices</string>
++  <string name="sensor_description_bluetooth_ble_emitter">Send BLE iBeacon message every second, used to track presence  around house, e.g. together with roomassistant or esp32-mqtt-home projects. Warning, this can affect battery life, particularly if the Transmit Power setting is set to High. Settings allow specifying UUID (standard UUID format), Major and Minor (should be 0 - 65535), to tailor identifiers and groups. By default this sensor is not turned on with the Enable all toggle, to avoid battery drain, there is a setting to enable this.  There is also a Transmitter Power setting to help preserve battery life, use the minimum as required. </string>
+   <string name="sensor_description_bluetooth_state">Whether or not bluetooth is enabled on the device</string>
+   <string name="sensor_description_call_number">The cell number of the incoming or outgoing call</string>
+   <string name="sensor_description_charger_type">The type of charger plugged into the device currently</string>
+@@ -496,4 +498,13 @@ like to connect to:</string>
+   <string name="widget_text_size_label">Widget text size:</string>
+   <string name="widgets">Widgets</string>
+   <string name="zone_event_failure">Unable to send zone event to Home Assistant</string>
++  <string name="ble_transmit_power_label_high">High</string>
++  <string name="ble_transmit_power_label_medium">Medium</string>
++  <string name="ble_transmit_power_label_low">Low</string>
++  <string name="ble_transmit_power_label_ultra_low">Ultra Low</string>
++  <string name="ble_transmit_power_value_high">high</string>
++  <string name="ble_transmit_power_value_medium">medium</string>
++  <string name="ble_transmit_power_value_low">low</string>
++  <string name="ble_transmit_power_value_ultra_low">ultraLow</string>
++  <string name="setting_ble_emitter_transmit_power_title">Transmitter power</string>
+ </resources>
+diff --git a/app/src/main/res/xml/sensor_detail.xml b/app/src/main/res/xml/sensor_detail.xml
+index eb179b64bd7..68d719aec36 100644
+--- a/app/src/main/res/xml/sensor_detail.xml
++++ b/app/src/main/res/xml/sensor_detail.xml
+@@ -1,44 +1,49 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<androidx.preference.PreferenceScreen
++<androidx.preference.PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:app="http://schemas.android.com/apk/res-auto"
+     app:iconSpaceReserved="false">
+ 
++
+     <androidx.preference.SwitchPreference
++        app:iconSpaceReserved="false"
+         app:key="enabled"
+-        app:title="@string/enabled_title"
+         app:summary="@string/enabled_summary"
+-        app:iconSpaceReserved="false"/>
++        app:title="@string/enabled_title" />
+     <Preference
+-        app:key="description"
+-        app:title="@string/sensor_description"
++        app:enableCopying="true"
+         app:iconSpaceReserved="false"
+-        app:enableCopying="true"/>
++        app:key="description"
++        app:title="@string/sensor_description" />
+     <Preference
++        app:iconSpaceReserved="false"
+         app:key="unique_id"
+-        app:title="@string/unique_id"
+-        app:iconSpaceReserved="false"/>
++        app:title="@string/unique_id" />
+     <Preference
++        app:iconSpaceReserved="false"
+         app:key="state"
+-        app:title="@string/state"
+-        app:iconSpaceReserved="false"/>
++        app:title="@string/state" />
+     <Preference
+-        app:key="device_class"
+-        app:title="@string/device_class"
++        app:enableCopying="true"
+         app:iconSpaceReserved="false"
+-        app:enableCopying="true"/>
++        app:key="device_class"
++        app:title="@string/device_class" />
+     <Preference
+-        app:key="icon"
+-        app:title="@string/icon"
++        app:enableCopying="true"
+         app:iconSpaceReserved="false"
+-        app:enableCopying="true"/>
++        app:key="icon"
++        app:title="@string/icon" />
+ 
+     <androidx.preference.PreferenceCategory
++        app:iconSpaceReserved="false"
+         app:key="attributes"
+-        app:title="@string/attributes"
+-        app:iconSpaceReserved="false"/>
++        app:title="@string/attributes" />
+ 
+     <androidx.preference.PreferenceCategory
++        app:iconSpaceReserved="false"
+         app:key="sensor_settings"
+-        app:title="@string/sensor_settings"
+-        app:iconSpaceReserved="false"/>
++        app:title="@string/sensor_settings">
++
++    </androidx.preference.PreferenceCategory>
++
++
+ </androidx.preference.PreferenceScreen>
+\ No newline at end of file
+diff --git a/buildSrc/src/main/kotlin/Config.kt b/buildSrc/src/main/kotlin/Config.kt
+index 787d68fcc9c..4df0a462947 100644
+--- a/buildSrc/src/main/kotlin/Config.kt
++++ b/buildSrc/src/main/kotlin/Config.kt
+@@ -109,6 +109,7 @@ object Config {
+             const val exoCore = "com.google.android.exoplayer:exoplayer-core:2.11.7"
+             const val exoHls = "com.google.android.exoplayer:exoplayer-hls:2.11.7"
+             const val exoUi = "com.google.android.exoplayer:exoplayer-ui:2.11.7"
++            const val altBeacon =  "org.altbeacon:android-beacon-library:2+"
+         }
+     }
+ 
+diff --git a/common/build.gradle.kts b/common/build.gradle.kts
+index 9b0e63c1e13..c8893e3541e 100644
+--- a/common/build.gradle.kts
++++ b/common/build.gradle.kts
+@@ -30,7 +30,7 @@ dependencies {
+     implementation(Config.Dependency.Square.okhttp)
+     implementation(Config.Dependency.Square.okhttpInterceptor)
+     implementation(Config.Dependency.Misc.jackson)
+-
++    implementation(Config.Dependency.Misc.altBeacon)
+     testImplementation(Config.Dependency.Square.okhttpMockServer)
+     testImplementation(Config.Dependency.Testing.spek2Jvm)
+     testRuntimeOnly(Config.Dependency.Testing.spek2JUnit)

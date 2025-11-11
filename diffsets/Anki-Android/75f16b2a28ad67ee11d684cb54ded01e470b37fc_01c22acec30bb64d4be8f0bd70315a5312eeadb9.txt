@@ -1,0 +1,867 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/CoroutineHelpers.kt b/AnkiDroid/src/main/java/com/ichi2/anki/CoroutineHelpers.kt
+index afa22555916b..733c5efc8dd6 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/CoroutineHelpers.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/CoroutineHelpers.kt
+@@ -245,6 +245,7 @@ suspend fun <T> Fragment.withProgress(@StringRes messageId: Int, block: suspend
+ suspend fun <T> withProgressDialog(
+     context: Activity,
+     onCancel: (() -> Unit)?,
++    delayMillis: Long = 600,
+     op: suspend (android.app.ProgressDialog) -> T
+ ): T = coroutineScope {
+     val dialog = android.app.ProgressDialog(context).apply {
+@@ -257,7 +258,7 @@ suspend fun <T> withProgressDialog(
+     context.window.setFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE, WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
+     // reveal the dialog after 600ms
+     val dialogJob = launch {
+-        delay(600)
++        delay(delayMillis)
+         dialog.show()
+     }
+     try {
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt b/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt
+index 35ecfdd3d9de..5acd9246cc34 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt
+@@ -26,6 +26,7 @@
+ package com.ichi2.anki
+ 
+ import android.Manifest
++import android.app.Activity
+ import android.content.*
+ import android.database.SQLException
+ import android.graphics.PixelFormat
+@@ -36,6 +37,7 @@ import android.util.TypedValue
+ import android.view.*
+ import android.view.View.OnLongClickListener
+ import android.widget.*
++import androidx.annotation.StringRes
+ import androidx.annotation.VisibleForTesting
+ import androidx.appcompat.app.AlertDialog
+ import androidx.appcompat.widget.SearchView
+@@ -93,12 +95,9 @@ import com.ichi2.anki.servicelayer.*
+ import com.ichi2.anki.servicelayer.SchedulerService.NextCard
+ import com.ichi2.anki.servicelayer.ScopedStorageService.isLegacyStorage
+ import com.ichi2.anki.servicelayer.ScopedStorageService.mediaMigrationIsInProgress
+-import com.ichi2.anki.servicelayer.ScopedStorageService.prepareAndValidateSourceAndDestinationFolders
+ import com.ichi2.anki.services.MediaMigrationState
+ import com.ichi2.anki.services.MigrationService
+-import com.ichi2.anki.services.PREF_MIGRATION_ERROR_TEXT
+ import com.ichi2.anki.services.getMediaMigrationState
+-import com.ichi2.anki.services.withBoundTo
+ import com.ichi2.anki.snackbar.showSnackbar
+ import com.ichi2.anki.stats.AnkiStatsTaskHandler
+ import com.ichi2.anki.web.HostNumFactory
+@@ -125,6 +124,8 @@ import com.ichi2.utils.NetworkUtils.isActiveNetworkMetered
+ import com.ichi2.utils.Permissions.hasStorageAccessPermission
+ import com.ichi2.widget.WidgetStatus
+ import kotlinx.coroutines.*
++import kotlinx.coroutines.flow.filterNotNull
++import kotlinx.coroutines.flow.first
+ import makeLinksClickable
+ import net.ankiweb.rsdroid.BackendFactory
+ import net.ankiweb.rsdroid.RustCleanup
+@@ -134,7 +135,9 @@ import java.io.File
+ import java.lang.Runnable
+ import java.lang.ref.WeakReference
+ import kotlin.math.roundToLong
+-import kotlin.system.measureTimeMillis
++import kotlin.time.Duration.Companion.milliseconds
++import kotlin.time.ExperimentalTime
++import kotlin.time.measureTimedValue
+ 
+ const val MIGRATION_WAS_LAST_POSTPONED_AT_SECONDS = "secondWhenMigrationWasPostponedLast"
+ const val TIMES_STORAGE_MIGRATION_POSTPONED_KEY = "timesStorageMigrationPostponed"
+@@ -418,6 +421,8 @@ open class DeckPicker :
+         mShortAnimDuration = resources.getInteger(android.R.integer.config_shortAnimTime)
+ 
+         Onboarding.DeckPicker(this, mRecyclerViewLayoutManager).onCreate()
++
++        launchShowingHidingEssentialFileMigrationProgressDialog()
+     }
+ 
+     private fun hasShownAppIntro(): Boolean {
+@@ -471,7 +476,7 @@ open class DeckPicker :
+                 return false
+             }
+             is MediaMigrationState.Ongoing.NotPaused -> {
+-                startMigrateUserDataService()
++                MigrationService.start(baseContext)
+                 return false
+             }
+             // App is already using Scoped Storage Directory for user data, no need to migrate & can proceed with startup
+@@ -631,22 +636,16 @@ open class DeckPicker :
+         val migrationProgressMenuItem = menu.findItem(R.id.action_migration_progress)
+             .apply { isVisible = mediaMigrationState is MediaMigrationState.Ongoing.NotPaused }
+ 
+-        suspend fun CircularProgressIndicator.publishProgress(progress: MigrationService.Progress) {
++        fun CircularProgressIndicator.publishProgress(progress: MigrationService.Progress.MovingMediaFiles) {
+             when (progress) {
+-                is MigrationService.Progress.CalculatingTransferSize -> {
++                is MigrationService.Progress.MovingMediaFiles.CalculatingNumberOfBytesToMove -> {
+                     this.isIndeterminate = true
+                 }
+ 
+-                is MigrationService.Progress.Transferring -> {
++                is MigrationService.Progress.MovingMediaFiles.MovingFiles -> {
+                     this.isIndeterminate = false
+                     this.progress = (progress.ratio * Int.MAX_VALUE).toInt()
+                 }
+-
+-                // TODO BEFORE-RELEASE Perhaps handle the cases of success & failure differently?
+-                is MigrationService.Progress.Done -> {
+-                    updateMenuState()
+-                    updateMenuFromState(menu)
+-                }
+             }
+         }
+ 
+@@ -665,11 +664,25 @@ open class DeckPicker :
+                 }
+ 
+                 migrationProgressPublishingJob = lifecycleScope.launch {
+-                    withBoundTo<MigrationService> { service ->
+-                        service.flowOfProgress
+-                            .flowWithLifecycle(lifecycle, Lifecycle.State.STARTED)
+-                            .collect { progress -> progressIndicator.publishProgress(progress) }
+-                    }
++                    MigrationService.flowOfProgress
++                        .flowWithLifecycle(lifecycle, Lifecycle.State.STARTED)
++                        .filterNotNull()
++                        .collect { progress ->
++                            when (progress) {
++                                is MigrationService.Progress.CopyingEssentialFiles -> {
++                                    // Button is not shown when transferring essential files
++                                }
++
++                                is MigrationService.Progress.MovingMediaFiles -> {
++                                    progressIndicator.publishProgress(progress)
++                                }
++
++                                is MigrationService.Progress.Done -> {
++                                    updateMenuState()
++                                    updateMenuFromState(menu)
++                                }
++                            }
++                        }
+                 }
+             } else {
+                 migrationProgressMenuItem.actionView = cachedMigrationProgressMenuItemActionView
+@@ -789,12 +802,15 @@ open class DeckPicker :
+ 
+     // TODO BEFORE-RELEASE This doesn't offer to migrate data if not logged in.
+     //   This should be changed so that we offer to migrate regardless.
++    // TODO BEFORE-RELEASE Stop offering to migrate on every activity recreation.
++    //   Currently the dialog re-appears if you dismiss it and then e.g. toggle device dark theme.
+     private fun shouldOfferToMigrate(): Boolean {
+         // ALLOW_UNSAFE_MIGRATION skips ensuring that the user is backed up to AnkiWeb
+         if (!BuildConfig.ALLOW_UNSAFE_MIGRATION && !isLoggedIn()) {
+             return false
+         }
+-        return getMediaMigrationState() is MediaMigrationState.NotOngoing.Needed
++        return getMediaMigrationState() is MediaMigrationState.NotOngoing.Needed &&
++            MigrationService.flowOfProgress.value !is MigrationService.Progress.Running
+     }
+ 
+     private fun fetchSyncStatus(col: Collection): SyncIconState {
+@@ -2531,31 +2547,31 @@ open class DeckPicker :
+             return
+         }
+ 
+-        launchCatchingTask {
+-            val elapsedMillisDuringEssentialFilesMigration = measureTimeMillis {
+-                withProgress(getString(R.string.start_migration_progress_message)) {
+-                    loadDeckCounts?.cancel()
+-                    val folders = prepareAndValidateSourceAndDestinationFolders(baseContext)
+-                    CollectionManager.migrateEssentialFiles(baseContext, folders)
+-                    updateDeckList()
+-                    handleStartup()
+-                    startMigrateUserDataService()
++        loadDeckCounts?.cancel()
++
++        MigrationService.start(baseContext)
++    }
++
++    @OptIn(ExperimentalTime::class)
++    private fun launchShowingHidingEssentialFileMigrationProgressDialog() = lifecycleScope.launch {
++        while (true) {
++            MigrationService.flowOfProgress
++                .first { it is MigrationService.Progress.CopyingEssentialFiles }
++
++            val (progress, duration) = measureTimedValue {
++                withImmediatelyShownProgress(R.string.start_migration_progress_message) {
++                    MigrationService.flowOfProgress
++                        .first { it !is MigrationService.Progress.CopyingEssentialFiles }
+                 }
+             }
+-            if (elapsedMillisDuringEssentialFilesMigration > 800) {
++
++            if (progress is MigrationService.Progress.MovingMediaFiles && duration > 800.milliseconds) {
+                 showSnackbar(R.string.migration_part_1_done_resume)
+-                refreshState()
+             }
+-        }
+-    }
+ 
+-    /**
+-     * Start migrating the user data. Assumes that
+-     */
+-    private fun startMigrateUserDataService() {
+-        // TODO: Handle lack of disk space - most common error
+-        Timber.i("Starting Migrate User Data Service")
+-        ContextCompat.startForegroundService(this, Intent(this, MigrationService::class.java))
++            refreshState()
++            updateDeckList()
++        }
+     }
+ 
+     /**
+@@ -2657,8 +2673,7 @@ open class DeckPicker :
+             .setMessage(message)
+             .setNegativeButton(R.string.dialog_cancel) { _, _ -> }
+             .setPositiveButton(R.string.migration__resume_after_failed_dialog__button_positive) { _, _ ->
+-                getSharedPrefs(this@DeckPicker).edit { remove(PREF_MIGRATION_ERROR_TEXT) }
+-                startMigrateUserDataService()
++                MigrationService.start(baseContext)
+                 invalidateOptionsMenu()
+             }
+             .create()
+@@ -2789,3 +2804,11 @@ class ForceFullSyncDialog(val message: String?) : DialogHandlerMessage(
+             ForceFullSyncDialog(message.data.getString("message"))
+     }
+ }
++
++// This is used to re-show the dialog immediately on activity recreation
++private suspend fun <T> Activity.withImmediatelyShownProgress(@StringRes messageId: Int, block: suspend () -> T) =
++    withProgressDialog(context = this, onCancel = null, delayMillis = 0L) { dialog ->
++        @Suppress("DEPRECATION") // ProgressDialog
++        dialog.setMessage(getString(messageId))
++        block()
++    }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/MigrationProgressDialogFragment.kt b/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/MigrationProgressDialogFragment.kt
+index 7adaf9de1e30..d1f107510df6 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/MigrationProgressDialogFragment.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/MigrationProgressDialogFragment.kt
+@@ -29,7 +29,7 @@ import com.google.android.material.progressindicator.CircularProgressIndicator
+ import com.ichi2.anki.AnkiActivity
+ import com.ichi2.anki.R
+ import com.ichi2.anki.services.MigrationService
+-import com.ichi2.anki.services.withBoundTo
++import kotlinx.coroutines.flow.filterNotNull
+ import kotlinx.coroutines.launch
+ 
+ /**
+@@ -49,34 +49,40 @@ class MigrationProgressDialogFragment : DialogFragment() {
+ 
+         progressBar.max = Int.MAX_VALUE
+ 
+-        fun publishProgress(progress: MigrationService.Progress) {
++        fun publishProgress(progress: MigrationService.Progress.MovingMediaFiles) {
+             when (progress) {
+-                is MigrationService.Progress.CalculatingTransferSize -> {
++                is MigrationService.Progress.MovingMediaFiles.CalculatingNumberOfBytesToMove -> {
+                     progressBar.isIndeterminate = true
+                     textView.text = getString(R.string.migration__calculating_transfer_size)
+                 }
+ 
+-                is MigrationService.Progress.Transferring -> {
+-                    val transferredSizeText = formatShortFileSize(requireContext(), progress.transferredBytes)
++                is MigrationService.Progress.MovingMediaFiles.MovingFiles -> {
++                    val movedSizeText = formatShortFileSize(requireContext(), progress.movedBytes)
+                     val totalSizeText = formatShortFileSize(requireContext(), progress.totalBytes)
+ 
+                     progressBar.isIndeterminate = false
+                     progressBar.progress = (progress.ratio * Int.MAX_VALUE).toInt()
+-                    textView.text = getString(R.string.migration__transferred_x_of_y, transferredSizeText, totalSizeText)
++                    textView.text = getString(R.string.migration__moved_x_of_y, movedSizeText, totalSizeText)
+                 }
+-
+-                // MigrationSucceededDialogFragment or MigrationFailedDialogFragment
+-                // is going to be shown instead.
+-                is MigrationService.Progress.Done -> dismiss()
+             }
+         }
+ 
+         lifecycleScope.launch {
+-            requireContext().withBoundTo<MigrationService> { service ->
+-                service.flowOfProgress
+-                    .flowWithLifecycle(lifecycle, Lifecycle.State.STARTED)
+-                    .collect { progress -> publishProgress(progress) }
+-            }
++            MigrationService.flowOfProgress
++                .flowWithLifecycle(lifecycle, Lifecycle.State.STARTED)
++                .filterNotNull()
++                .collect { progress ->
++                    when (progress) {
++                        // The dialog should not be accessible when copying essential files
++                        is MigrationService.Progress.CopyingEssentialFiles -> {}
++
++                        is MigrationService.Progress.MovingMediaFiles -> publishProgress(progress)
++
++                        // MigrationSucceededDialogFragment or MigrationFailedDialogFragment
++                        // is going to be shown instead.
++                        is MigrationService.Progress.Done -> dismiss()
++                    }
++                }
+         }
+ 
+         return AlertDialog.Builder(activity)
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/services/MigrationService.kt b/AnkiDroid/src/main/java/com/ichi2/anki/services/MigrationService.kt
+index 409319c25978..be0127950a62 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/services/MigrationService.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/services/MigrationService.kt
+@@ -23,6 +23,7 @@ import android.net.Uri
+ import android.os.Build
+ import android.text.format.Formatter
+ import androidx.core.app.NotificationCompat
++import androidx.core.content.ContextCompat
+ import androidx.core.content.edit
+ import androidx.lifecycle.Lifecycle
+ import androidx.lifecycle.LifecycleOwner
+@@ -32,6 +33,7 @@ import com.ichi2.anki.*
+ import com.ichi2.anki.servicelayer.ScopedStorageService
+ import com.ichi2.anki.servicelayer.ScopedStorageService.PREF_MIGRATION_DESTINATION
+ import com.ichi2.anki.servicelayer.ScopedStorageService.PREF_MIGRATION_SOURCE
++import com.ichi2.anki.servicelayer.ScopedStorageService.prepareAndValidateSourceAndDestinationFolders
+ import com.ichi2.anki.servicelayer.scopedstorage.MigrateEssentialFiles
+ import com.ichi2.anki.servicelayer.scopedstorage.MoveConflictedFile
+ import com.ichi2.anki.servicelayer.scopedstorage.migrateuserdata.MigrateUserData
+@@ -41,6 +43,7 @@ import com.ichi2.preferences.getOrSetLong
+ import com.ichi2.utils.FileUtil
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.filterNotNull
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.suspendCancellableCoroutine
+ import timber.log.Timber
+@@ -50,7 +53,11 @@ import kotlin.properties.ReadOnlyProperty
+ 
+ // Shared preferences key for user-readable text representing migration error.
+ // If it is set, it means that media migration is ongoing, but currently paused due to an error.
+-const val PREF_MIGRATION_ERROR_TEXT = "migrationErrorText"
++private const val PREF_MIGRATION_ERROR_TEXT = "migrationErrorText"
++
++// Shared preferences key for the initial total size of media files to be moved.
++// It is used to correctly show progress if the app is killed and restarted.
++private const val PREF_INITIAL_TOTAL_MEDIA_BYTES_TO_MOVE = "migrationServiceTotalBytes"
+ 
+ /**
+  * A foreground service responsible for migrating the collection
+@@ -58,7 +65,15 @@ const val PREF_MIGRATION_ERROR_TEXT = "migrationErrorText"
+  *
+  * Notes on behavior:
+  *
+- *   * To show a progress bar, we first calculate the total size of the data to be transferred,
++ *   * Data is moved in two stages, first essential database files are copied,
++ *     and then the media files are moved. When the first step is started,
++ *     the app *does not* update any persistent settings until it is complete.
++ *     If at some point the first step fails, the newly created files are removed,
++ *     however, if the app is killed, they may remain on disk.
++ *     This does not affect the state of the app; upon restart it will behave as if nothing happened.
++ *
++ *   * When moving media files, to show a progress bar,
++ *     we first calculate the total size of the data to be transferred,
+  *     and then, as the files are transferred by recursing into the directories,
+  *     we add the size of each transferred file to a sum of transferred files.
+  *     As the number of files and file sizes can change after the initial calculation,
+@@ -87,126 +102,143 @@ const val PREF_MIGRATION_ERROR_TEXT = "migrationErrorText"
+  */
+ class MigrationService : ServiceWithALifecycleScope(), ServiceWithASimpleBinder<MigrationService> {
+     companion object {
+-        /**
+-         * Preference listing the total number of bytes that [MigrationService] expects to transfer.
+-         *
+-         * @see [MigrationService.getOrSetTotalTransferSize]
+-         */
+-        private const val TOTAL_BYTES_TO_TRANSFER_KEY: String = "migrationServiceTotalBytes"
+-    }
++        private var serviceIsRunning = false
+ 
+-    sealed interface Progress {
+-        object CalculatingTransferSize : Progress
++        fun start(context: Context) {
++            if (serviceIsRunning) return
++            serviceIsRunning = true
++
++            AnkiDroidApp.getSharedPrefs(context).edit { remove(PREF_MIGRATION_ERROR_TEXT) }
++            flowOfProgress.tryEmit(null)
+ 
+-        data class Transferring(val transferredBytes: Long, val totalBytes: Long) : Progress {
+-            val ratio get() = if (totalBytes == 0L) 1f else transferredBytes.toFloat() / totalBytes
++            ContextCompat.startForegroundService(context, Intent(context, MigrationService::class.java))
+         }
+ 
+-        sealed interface Done : Progress
+-        object Success : Done
+-        data class Failure(val e: Exception) : Done
++        val flowOfProgress: MutableStateFlow<Progress?> = MutableStateFlow(null)
+     }
+ 
+-    var flowOfProgress: MutableStateFlow<Progress> = MutableStateFlow(Progress.CalculatingTransferSize)
+-
+-    private val preferences get() = AnkiDroidApp.getSharedPrefs(this)
++    sealed interface Progress {
++        sealed interface Running : Progress
++        sealed interface Done : Progress
+ 
+-    private lateinit var migrateUserDataTask: MigrateUserData
++        object CopyingEssentialFiles : Running
+ 
+-    private var serviceHasBeenStarted = false
++        sealed interface MovingMediaFiles : Running {
++            object CalculatingNumberOfBytesToMove : MovingMediaFiles
+ 
+-    // To simplify things by allowing binding to the service at any time,
+-    // make sure the service has the correct progress emitted even if it is not going to be started.
+-    override fun onCreate() {
+-        if (getMediaMigrationState() is MediaMigrationState.NotOngoing.NotNeeded) {
+-            flowOfProgress.tryEmit(Progress.Success)
++            data class MovingFiles(val movedBytes: Long, val totalBytes: Long) : MovingMediaFiles {
++                val ratio get() = if (totalBytes == 0L) 1f else movedBytes.toFloat() / totalBytes
++            }
+         }
++
++        object Succeeded : Done
++
++        data class Failed(val exception: Exception, val changesRolledBack: Boolean) : Done
+     }
+ 
+-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+-        Timber.w("onStartCommand(%s, ...)", intent)
++    private val preferences get() = AnkiDroidApp.getSharedPrefs(this)
+ 
+-        if (serviceHasBeenStarted) {
+-            Timber.w("MigrationService.onStartCommand has been called twice")
+-            return START_STICKY
+-        }
++    private lateinit var migrateUserDataTask: MigrateUserData
+ 
+-        serviceHasBeenStarted = true
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        Timber.w("onStartCommand(%s, ...)", intent)
+ 
+         lifecycleScope.launch(Dispatchers.IO) {
+-            flowOfProgress.emit(Progress.CalculatingTransferSize)
++            if (getMediaMigrationState() is MediaMigrationState.NotOngoing.Needed) {
++                flowOfProgress.emit(Progress.CopyingEssentialFiles)
+ 
+-            try {
+-                migrateUserDataTask = MigrateUserData.createInstance(preferences)
++                try {
++                    val folders = prepareAndValidateSourceAndDestinationFolders(baseContext)
++                    CollectionManager.migrateEssentialFiles(baseContext, folders)
++                } catch (e: Exception) {
++                    Timber.w(e, "Essential file migration failed")
++                    CrashReportService.sendExceptionReport(e, "Essential file migration failed")
++                    flowOfProgress.emit(Progress.Failed(exception = e, changesRolledBack = true))
++                }
++            }
+ 
+-                val remainingTransferSize = getRemainingTransferSize(migrateUserDataTask)
+-                val totalBytesToTransfer = getOrSetTotalTransferSize(valueToPersistIfNotCalculated = remainingTransferSize)
+-                var transferredBytes = max(totalBytesToTransfer - remainingTransferSize, 0)
++            if (getMediaMigrationState() is MediaMigrationState.Ongoing) {
++                flowOfProgress.emit(Progress.MovingMediaFiles.CalculatingNumberOfBytesToMove)
+ 
+-                migrateUserDataTask.migrateFiles(progressListener = { deltaTransferredBytes ->
+-                    transferredBytes += deltaTransferredBytes
+-                    flowOfProgress.tryEmit(
+-                        Progress.Transferring(
+-                            transferredBytes = transferredBytes.coerceIn(0, totalBytesToTransfer),
+-                            totalBytes = totalBytesToTransfer
++                try {
++                    migrateUserDataTask = MigrateUserData.createInstance(preferences)
++
++                    val remainingBytesToMove = getRemainingMediaBytesToMove(migrateUserDataTask)
++                    val totalBytesToMove = preferences
++                        .getOrSetLong(PREF_INITIAL_TOTAL_MEDIA_BYTES_TO_MOVE) { remainingBytesToMove }
++                    var movedBytes = max(totalBytesToMove - remainingBytesToMove, 0)
++
++                    migrateUserDataTask.migrateFiles(progressListener = { deltaMovedBytes ->
++                        movedBytes += deltaMovedBytes
++                        flowOfProgress.tryEmit(
++                            Progress.MovingMediaFiles.MovingFiles(
++                                movedBytes = movedBytes.coerceIn(0, totalBytesToMove),
++                                totalBytes = totalBytesToMove
++                            )
+                         )
+-                    )
+-                })
+-
+-                // TODO BEFORE-RELEASE Consolidate setting/removing migration-related preferences.
+-                //   The existence of these determine if the *media* migration is taking place.
+-                //   These are currently set in MigrateEssentialFiles.updatePreferences
+-                //   on *background* thread, and removed here in another *background* thread.
+-                //   These are read from other threads, mostly via userMigrationIsInProgress,
+-                //   which might be a race condition and lead to subtle bugs.
+-                preferences.edit {
+-                    remove(PREF_MIGRATION_DESTINATION)
+-                    remove(PREF_MIGRATION_SOURCE)
+-                    remove(TOTAL_BYTES_TO_TRANSFER_KEY)
+-                }
++                    })
++
++                    // TODO BEFORE-RELEASE Consolidate setting/removing migration-related preferences.
++                    //   The existence of these determine if the *media* migration is taking place.
++                    //   These are currently set in MigrateEssentialFiles.updatePreferences
++                    //   on *background* thread, and removed here in another *background* thread.
++                    //   These are read from other threads, mostly via userMigrationIsInProgress,
++                    //   which might be a race condition and lead to subtle bugs.
++                    preferences.edit {
++                        remove(PREF_MIGRATION_DESTINATION)
++                        remove(PREF_MIGRATION_SOURCE)
++                        remove(PREF_INITIAL_TOTAL_MEDIA_BYTES_TO_MOVE)
++                    }
+ 
+-                flowOfProgress.emit(Progress.Success)
+-            } catch (e: Exception) {
+-                CrashReportService.sendExceptionReport(e, "Storage migration failed")
++                    flowOfProgress.emit(Progress.Succeeded)
++                } catch (e: Exception) {
++                    Timber.w(e, "Media migration failed")
++                    CrashReportService.sendExceptionReport(e, "Media migration failed")
+ 
+-                preferences.edit {
+-                    putString(PREF_MIGRATION_ERROR_TEXT, getUserFriendlyErrorText(e).toString())
+-                }
++                    preferences.edit {
++                        putString(PREF_MIGRATION_ERROR_TEXT, getUserFriendlyErrorText(e))
++                    }
+ 
+-                flowOfProgress.emit(Progress.Failure(e))
++                    flowOfProgress.emit(Progress.Failed(exception = e, changesRolledBack = false))
++                }
+             }
+         }
+ 
+         lifecycleScope.launch {
+-            flowOfProgress.collect { progress ->
+-                startForeground(2, makeMigrationProgressNotification(progress))
+-
+-                if (progress is Progress.Done) {
+-                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+-                        @Suppress("DEPRECATION")
+-                        stopForeground(false)
+-                    } else {
+-                        stopForeground(STOP_FOREGROUND_DETACH)
+-                    }
+-
+-                    stopSelf()
+-
+-                    when (progress) {
+-                        is Progress.Success ->
+-                            AnkiDroidApp.instance.activityAgnosticDialogs
+-                                .showOrScheduleStorageMigrationSucceededDialog()
+-                        is Progress.Failure ->
+-                            AnkiDroidApp.instance.activityAgnosticDialogs
+-                                .showOrScheduleStorageMigrationFailedDialog(progress.e)
++            flowOfProgress
++                .filterNotNull()
++                .collect { progress ->
++                    startForeground(2, makeMigrationProgressNotification(progress))
++
++                    if (progress is Progress.Done) {
++                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
++                            @Suppress("DEPRECATION")
++                            stopForeground(false)
++                        } else {
++                            stopForeground(STOP_FOREGROUND_DETACH)
++                        }
++
++                        stopSelf()
++
++                        when (progress) {
++                            is Progress.Succeeded ->
++                                AnkiDroidApp.instance.activityAgnosticDialogs
++                                    .showOrScheduleStorageMigrationSucceededDialog()
++                            is Progress.Failed ->
++                                AnkiDroidApp.instance.activityAgnosticDialogs
++                                    .showOrScheduleStorageMigrationFailedDialog(
++                                        exception = progress.exception,
++                                        changesRolledBack = progress.changesRolledBack
++                                    )
++                        }
+                     }
+                 }
+-            }
+         }
+ 
+         return START_STICKY
+     }
+ 
+-    private fun getRemainingTransferSize(task: MigrateUserData): Long {
++    private fun getRemainingMediaBytesToMove(task: MigrateUserData): Long {
+         val ignoredFiles = MigrateEssentialFiles.iterateEssentialFiles(task.source) +
+             File(task.source.directory, MoveConflictedFile.CONFLICT_DIRECTORY)
+         val ignoredSpace = ignoredFiles.sumOf { FileUtil.getSize(it) }
+@@ -216,19 +248,13 @@ class MigrationService : ServiceWithALifecycleScope(), ServiceWithASimpleBinder<
+         return remainingSpaceToMigrate
+     }
+ 
+-    /**
+-     * Returns the total number of bytes which the MigrationService expects to transfer
+-     * @param valueToPersistIfNotCalculated The value to save to storage if the transfer size has not previously been calculated
+-     */
+-    private fun getOrSetTotalTransferSize(valueToPersistIfNotCalculated: Long): Long {
+-        // The first time that this is accessed will be on the first run of the service, so calculate the remaining transfer size.
+-        // On subsequent runs, return the value we stored in Shared Preferences
+-        return AnkiDroidApp.getSharedPrefs(this)
+-            .getOrSetLong(TOTAL_BYTES_TO_TRANSFER_KEY) { valueToPersistIfNotCalculated }
+-    }
+-
+     override fun onBind(intent: Intent) = SimpleBinder(this)
+ 
++    override fun onDestroy() {
++        super.onDestroy()
++        serviceIsRunning = false
++    }
++
+     /**
+      * A file was expected at the provided location, but wasn't found
+      * If it exists in the old location, attempt to migrate it.
+@@ -249,31 +275,43 @@ class MigrationService : ServiceWithALifecycleScope(), ServiceWithASimpleBinder<
+ private fun Context.makeMigrationProgressNotification(progress: MigrationService.Progress): Notification {
+     val builder = NotificationCompat.Builder(this, Channel.SCOPED_STORAGE_MIGRATION.id)
+         .setSmallIcon(R.drawable.ic_star_notify)
+-        .setContentTitle(getString(R.string.migration__migrating_data))
+         .setPriority(NotificationCompat.PRIORITY_LOW)
+         .setSilent(true)
+ 
+     when (progress) {
+-        is MigrationService.Progress.CalculatingTransferSize -> {
++        is MigrationService.Progress.CopyingEssentialFiles -> {
+             builder.setOngoing(true)
+             builder.setProgress(0, 0, true)
++            builder.setContentTitle(getString(R.string.migration__migrating_database_files))
++            builder.setContentText(getString(R.string.migration__copying))
++        }
++
++        is MigrationService.Progress.MovingMediaFiles.CalculatingNumberOfBytesToMove -> {
++            builder.setOngoing(true)
++            builder.setProgress(0, 0, true)
++            builder.setContentTitle(getString(R.string.migration__migrating_media))
+             builder.setContentText(getString(R.string.migration__calculating_transfer_size))
+         }
+ 
+-        is MigrationService.Progress.Transferring -> {
+-            val transferredSizeText = Formatter.formatShortFileSize(this, progress.transferredBytes)
++        is MigrationService.Progress.MovingMediaFiles.MovingFiles -> {
++            val movedSizeText = Formatter.formatShortFileSize(this, progress.movedBytes)
+             val totalSizeText = Formatter.formatShortFileSize(this, progress.totalBytes)
+ 
+             builder.setOngoing(true)
+             builder.setProgress(Int.MAX_VALUE, (progress.ratio * Int.MAX_VALUE).toInt(), false)
+-            builder.setContentText(getString(R.string.migration__transferred_x_of_y, transferredSizeText, totalSizeText))
++            builder.setContentTitle(getString(R.string.migration__migrating_media))
++            builder.setContentText(getString(R.string.migration__moved_x_of_y, movedSizeText, totalSizeText))
+         }
+ 
+-        is MigrationService.Progress.Success -> {
++        is MigrationService.Progress.Succeeded -> {
+             builder.setProgress(100, 100, false)
++            builder.setContentTitle(getString(R.string.migration__migrating_media))
+             builder.setContentText(getString(R.string.migration_successful_message))
+         }
+ 
++        // Note that this currently does not differentiate between failures
++        // with rolled-back changes and without them.
++        //
+         // A note on behavior of BigTextStyle.
+         // When the notification is collapsed, big text style is completely ignored,
+         // and the notification builder's title and text is shown, single-line each:
+@@ -287,11 +325,11 @@ private fun Context.makeMigrationProgressNotification(progress: MigrationService
+         //   Big content title or notification's content title, bold
+         //   Big text, spanning several lines
+         //   if it is sufficiently long
+-        is MigrationService.Progress.Failure -> {
+-            val errorText = getUserFriendlyErrorText(progress.e)
++        is MigrationService.Progress.Failed -> {
++            val errorText = getUserFriendlyErrorText(progress.exception)
+ 
+             val copyDebugInfoIntent = IntentHandler
+-                .copyStringToClipboardIntent(this, progress.e.stackTraceToString())
++                .copyStringToClipboardIntent(this, progress.exception.stackTraceToString())
+             val copyDebugInfoPendingIntent = CompatHelper.compat
+                 .getImmutableActivityIntent(this, 1, copyDebugInfoIntent, 0)
+ 
+@@ -313,7 +351,7 @@ private fun Context.makeMigrationProgressNotification(progress: MigrationService
+ 
+ /**
+  * A delegate for a property that yields:
+- *   * the [MigrationService] if media migration is currently ongoing and not paused,
++ *   * the [MigrationService] if **media** migration is currently ongoing and not paused,
+  *     and when the owner is started,
+  *   * or `null` otherwise.
+  *
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/ui/dialogs/ActivityAgnosticDialogs.kt b/AnkiDroid/src/main/java/com/ichi2/anki/ui/dialogs/ActivityAgnosticDialogs.kt
+index 9f90c8cc0434..0017e6d6ffb2 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/ui/dialogs/ActivityAgnosticDialogs.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/ui/dialogs/ActivityAgnosticDialogs.kt
+@@ -60,12 +60,18 @@ class MigrationSucceededDialogFragment : DialogFragment() {
+ //   and also add instructions to fix the issue in case of easily fixable problems,
+ //   such as running out of disk space.
+ class MigrationFailedDialogFragment : DialogFragment() {
++    @Suppress("MoveVariableDeclarationIntoWhen") // changesRolledBack
+     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
+         val errorText = arguments?.getString(ERROR_TEXT_KEY) ?: ""
+         val stacktrace = arguments?.getString(STACKTRACE_KEY) ?: ""
++        val changesRolledBack = arguments?.getBoolean(CHANGES_ROLLED_BACK_KEY) ?: false
+ 
++        val messageTemplateId = when (changesRolledBack) {
++            true -> R.string.migration__failed__changes_rolled_back__message
++            false -> R.string.migration__failed__changes_not_rolled_back__message
++        }
+         val helpUrl = getString(R.string.link_migration_failed_dialog_learn_more_en)
+-        val message = getString(R.string.migration__failed__message, errorText, helpUrl).parseAsHtml()
++        val message = getString(messageTemplateId, errorText, helpUrl).parseAsHtml()
+ 
+         return AlertDialog.Builder(requireContext())
+             .setTitle(R.string.migration__failed__title)
+@@ -88,10 +94,17 @@ class MigrationFailedDialogFragment : DialogFragment() {
+     companion object {
+         private const val ERROR_TEXT_KEY = "error text"
+         private const val STACKTRACE_KEY = "stacktrace"
++        private const val CHANGES_ROLLED_BACK_KEY = "changes rolled back"
+ 
+-        fun show(activity: FragmentActivity, errorText: CharSequence, stacktrace: String) {
++        fun show(activity: FragmentActivity, errorText: CharSequence, stacktrace: String, changesRolledBack: Boolean) {
+             MigrationFailedDialogFragment()
+-                .apply { arguments = bundleOf(ERROR_TEXT_KEY to errorText, STACKTRACE_KEY to stacktrace) }
++                .apply {
++                    arguments = bundleOf(
++                        ERROR_TEXT_KEY to errorText,
++                        STACKTRACE_KEY to stacktrace,
++                        CHANGES_ROLLED_BACK_KEY to changesRolledBack
++                    )
++                }
+                 .show(activity.supportFragmentManager, "MigrationFailedDialogFragment")
+         }
+     }
+@@ -112,18 +125,20 @@ class ActivityAgnosticDialogs private constructor(private val application: Appli
+         }
+     }
+ 
+-    fun showOrScheduleStorageMigrationFailedDialog(e: Exception) {
++    fun showOrScheduleStorageMigrationFailedDialog(exception: Exception, changesRolledBack: Boolean) {
+         val currentlyStartedFragmentActivity = this.currentlyStartedFragmentActivity
+         val context = currentlyStartedFragmentActivity ?: application
+-        val errorText = context.getUserFriendlyErrorText(e)
+-        val stacktrace = e.stackTraceToString()
++        val errorText = context.getUserFriendlyErrorText(exception)
++        val stacktrace = exception.stackTraceToString()
+ 
+         if (currentlyStartedFragmentActivity != null) {
+-            MigrationFailedDialogFragment.show(currentlyStartedFragmentActivity, errorText, stacktrace)
++            MigrationFailedDialogFragment
++                .show(currentlyStartedFragmentActivity, errorText, stacktrace, changesRolledBack)
+         } else {
+             preferences.edit {
+-                putString(MIGRATION_FAILED_DIALOG_ERROR_TEXT_KEY, errorText.toString())
+-                putString(MIGRATION_FAILED_STACKTRACE_KEY, stacktrace)
++                putString(MIGRATION_FAILED_DIALOG_ERROR_TEXT_KEY, errorText)
++                putString(MIGRATION_FAILED_DIALOG_STACKTRACE_KEY, stacktrace)
++                putBoolean(MIGRATION_FAILED_DIALOG_CHANGES_ROLLED_BACK_KEY, changesRolledBack)
+             }
+         }
+     }
+@@ -152,12 +167,14 @@ class ActivityAgnosticDialogs private constructor(private val application: Appli
+                 }
+ 
+                 val errorText = preferences.getString(MIGRATION_FAILED_DIALOG_ERROR_TEXT_KEY, null)
+-                val stacktrace = preferences.getString(MIGRATION_FAILED_STACKTRACE_KEY, null)
++                val stacktrace = preferences.getString(MIGRATION_FAILED_DIALOG_STACKTRACE_KEY, null)
++                val changesRolledBack = preferences.getBoolean(MIGRATION_FAILED_DIALOG_CHANGES_ROLLED_BACK_KEY, false)
+                 if (errorText != null && stacktrace != null) {
+-                    MigrationFailedDialogFragment.show(activity, errorText, stacktrace)
++                    MigrationFailedDialogFragment.show(activity, errorText, stacktrace, changesRolledBack)
+                     preferences.edit {
+                         remove(MIGRATION_FAILED_DIALOG_ERROR_TEXT_KEY)
+-                        remove(MIGRATION_FAILED_STACKTRACE_KEY)
++                        remove(MIGRATION_FAILED_DIALOG_STACKTRACE_KEY)
++                        remove(MIGRATION_FAILED_DIALOG_CHANGES_ROLLED_BACK_KEY)
+                     }
+                 }
+             }
+@@ -168,7 +185,8 @@ class ActivityAgnosticDialogs private constructor(private val application: Appli
+         private const val MIGRATION_SUCCEEDED_DIALOG_PENDING_KEY = "migration succeeded dialog pending"
+ 
+         private const val MIGRATION_FAILED_DIALOG_ERROR_TEXT_KEY = "migration failed dialog error text"
+-        private const val MIGRATION_FAILED_STACKTRACE_KEY = "migration failed dialog stacktrace"
++        private const val MIGRATION_FAILED_DIALOG_STACKTRACE_KEY = "migration failed dialog stacktrace"
++        private const val MIGRATION_FAILED_DIALOG_CHANGES_ROLLED_BACK_KEY = "migration failed dialog changes rolled back"
+ 
+         fun register(application: Application) = ActivityAgnosticDialogs(application)
+             .apply { registerCallbacks() }
+diff --git a/AnkiDroid/src/main/res/values/01-core.xml b/AnkiDroid/src/main/res/values/01-core.xml
+index c209cef0c799..40db186a8d03 100644
+--- a/AnkiDroid/src/main/res/values/01-core.xml
++++ b/AnkiDroid/src/main/res/values/01-core.xml
+@@ -246,11 +246,29 @@
+         >Multiple consecutive errors without progress, most recent: %s</string>
+ 
+     <!-- Scoped storage migration -->
+-    <string name="migration__migrating_data">Migrating data</string>
+-    <string name="migration__calculating_transfer_size">Calculating transfer size…</string>
+-    <string name="migration__transferred_x_of_y"
+-        comment="The placeholders will be replaced with short localized byte amounts,
+-        e.g. Transferred 10 kB of 5.2 MB">Transferred %1$s of %2$s</string>
++    <string name="migration__migrating_database_files"
++        comment="Notification title that is shown when copying essential database files.
++        As this is shown on the same line as the notification message, prefer shorter text."
++        >Migrating database files</string>
++    <string name="migration__copying"
++        comment="Notification message that is shown when copying essential database files.
++        As this is shown on the same line as the notification title, prefer shorter text."
++        >Copying…</string>
++
++    <string name="migration__migrating_media"
++        comment="Notification title that is shown when migrating media files.
++        As this is shown on the same line as the notification message, prefer shorter text."
++        >Migrating media</string>
++    <string name="migration__calculating_transfer_size"
++        comment="Notification message that is shown when calculating the total size of media files to move.
++        As this is shown on the same line as the notification title, prefer shorter text."
++        >Calculating transfer size…</string>
++    <string name="migration__moved_x_of_y"
++        comment="Notification message that is shown when moving media files.
++        As this is shown on the same line as the notification title, prefer shorter text.
++        The placeholders will be replaced with short localized byte amounts,
++        e.g. Moved 10 kB of 5.2 MB"
++        >Moved %1$s of %2$s</string>
+ 
+     <string name="migration_successful_message"
+         comment="A title for a dialog, or a short message shown in a notification,
+@@ -267,12 +285,29 @@
+     <string name="migration__failed__title"
+         comment="A title for a dialog, or a short message shown in a notification,
+         when storage migration fails">Migration failed</string>
+-    <string name="migration__failed__message"
+-        comment="A more detailed message shown when storage migration fails"><![CDATA[
+-        Storage migration is paused after failing with the error: %1$s.
++    <string name="migration__failed__changes_rolled_back__message"
++        comment="A more detailed message shown when storage migration fails, with the changes rolled back"><![CDATA[
++        Copying database files failed with the error: %1$s.
++        <br><br>
++        The changes were reverted.
++        <br><br>
++        Please try re-running the migration.
++        To resolve the problem, you may need to free up some disk space,
++        or reconnect the removable storage that holds your collection.
++        <br><br>
++        <a href="%2$s">Learn more and get help</a>
++    ]]></string>
++    <string name="migration__failed__changes_not_rolled_back__message"
++        comment="A more detailed message shown when storage migration fails, with the changes not rolled back"><![CDATA[
++        Moving media files is paused after having failed with the error: %1$s.
++        <br><br>
++        The changes were <i>not</i> reverted.
++        While no data should’ve been lost,
++        the media files might be split between the old and the new folder.
+         <br><br>
+         Please try re-running the migration.
+-        To resolve the problem, you may need to free up some disk space, or-reconnect the missing media.
++        To resolve the problem, you may need to free up some disk space,
++        or reconnect the removable storage that holds your collection.
+         <br><br>
+         <a href="%2$s">Learn more and get help</a>
+     ]]></string>

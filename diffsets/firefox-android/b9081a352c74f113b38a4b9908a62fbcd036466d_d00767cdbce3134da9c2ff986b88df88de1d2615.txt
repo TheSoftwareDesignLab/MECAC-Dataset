@@ -1,0 +1,220 @@
+diff --git a/fenix/app/build.gradle b/fenix/app/build.gradle
+index b4591a0b35ba..202e1e8e680c 100644
+--- a/fenix/app/build.gradle
++++ b/fenix/app/build.gradle
+@@ -45,6 +45,10 @@ android {
+         sourceCompatibility JavaVersion.VERSION_1_8
+         targetCompatibility JavaVersion.VERSION_1_8
+     }
++
++    lintOptions {
++        lintConfig file("lint.xml")
++    }
+ }
+ 
+ android.applicationVariants.all { variant ->
+@@ -93,6 +97,8 @@ dependencies {
+     implementation Deps.anko_appcompat
+     implementation Deps.anko_constraintlayout
+ 
++    implementation Deps.sentry
++
+     implementation Deps.mozilla_concept_engine
+     implementation Deps.mozilla_concept_storage
+     implementation Deps.mozilla_concept_toolbar
+@@ -110,8 +116,11 @@ dependencies {
+     implementation Deps.mozilla_feature_session
+     implementation Deps.mozilla_feature_toolbar
+     implementation Deps.mozilla_feature_tabs
++
+     implementation Deps.mozilla_support_ktx
+ 
++    implementation Deps.mozilla_lib_crash
++
+     testImplementation Deps.junit
+     androidTestImplementation Deps.tools_test_runner
+     androidTestImplementation Deps.tools_espresso_core
+@@ -121,3 +130,21 @@ dependencies {
+     implementation Deps.androidx_legacy
+     implementation Deps.android_arch_navigation
+ }
++
++
++android.applicationVariants.all { variant ->
++    // Reading sentry token from local file (if it exists). In a release task on taskcluster it will be available.
++    try {
++        def token = new File("${rootDir}/.sentry_token").text.trim()
++        buildConfigField 'String', 'SENTRY_TOKEN', '"' + token + '"'
++    } catch (FileNotFoundException ignored) {
++        buildConfigField 'String', 'SENTRY_TOKEN', 'null'
++    }
++
++    // Activating crash reporting only if command line parameter was provided (in automation)
++    if (project.hasProperty("crashReports") && project.property("crashReports") == "true") {
++        buildConfigField 'boolean', 'CRASH_REPORTING', 'true'
++    } else {
++        buildConfigField 'boolean', 'CRASH_REPORTING', 'false'
++    }
++}
+diff --git a/fenix/app/lint.xml b/fenix/app/lint.xml
+new file mode 100644
+index 000000000000..96f5a1786920
+--- /dev/null
++++ b/fenix/app/lint.xml
+@@ -0,0 +1,12 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<lint>
++    <issue id="InvalidPackage">
++        <!-- The Sentry SDK is compiled against parts of the Java SDK that are not available in the Android SDK.
++             Let's just ignore issues in the Sentry code since that is a third-party dependency anyways. -->
++        <ignore path="**/sentry*.jar" />
++    </issue>
++</lint>
++
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/FenixApplication.kt b/fenix/app/src/main/java/org/mozilla/fenix/FenixApplication.kt
+index c250a563e469..e665281041ee 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/FenixApplication.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/FenixApplication.kt
+@@ -9,4 +9,24 @@ import org.mozilla.fenix.components.Components
+ 
+ class FenixApplication : Application() {
+     val components by lazy { Components(this) }
++
++    override fun onCreate() {
++        super.onCreate()
++
++        setupCrashReporting()
++    }
++
++    private fun setupCrashReporting() {
++        @Suppress("ConstantConditionIf")
++        if (!BuildConfig.CRASH_REPORTING || BuildConfig.BUILD_TYPE != "release") {
++            // Only enable crash reporting if this is a release build and if crash reporting was explicitly enabled
++            // via a Gradle command line flag.
++            return
++        }
++
++        components
++            .analytics
++            .crashReporter
++            .install(this)
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/Analytics.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/Analytics.kt
+new file mode 100644
+index 000000000000..6357169b08db
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/Analytics.kt
+@@ -0,0 +1,42 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.components
++
++import android.content.Context
++import mozilla.components.lib.crash.CrashReporter
++import mozilla.components.lib.crash.service.MozillaSocorroService
++import mozilla.components.lib.crash.service.SentryService
++import org.mozilla.fenix.BuildConfig
++import org.mozilla.fenix.R
++import org.mozilla.geckoview.BuildConfig.MOZ_APP_BUILDID
++import org.mozilla.geckoview.BuildConfig.MOZ_APP_VERSION
++
++/**
++ * Component group for all functionality related to analytics e.g. crash reporting and telemetry.
++ */
++class Analytics(
++    private val context: Context
++) {
++    val crashReporter: CrashReporter by lazy {
++        val sentryService = SentryService(
++            context,
++            BuildConfig.SENTRY_TOKEN,
++            tags = mapOf("geckoview" to "$MOZ_APP_VERSION-$MOZ_APP_BUILDID"),
++            sendEventForNativeCrashes = true
++        )
++
++        val socorroService = MozillaSocorroService(context, "Fenix")
++
++        CrashReporter(
++            services = listOf(sentryService, socorroService),
++            shouldPrompt = CrashReporter.Prompt.ALWAYS,
++            promptConfiguration = CrashReporter.PromptConfiguration(
++                appName = context.getString(R.string.app_name),
++                organizationName = "Mozilla"
++            ),
++            enabled = true
++        )
++    }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/Components.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/Components.kt
+index bcc6d04b6eaa..53a44537f773 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/Components.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/Components.kt
+@@ -22,4 +22,5 @@ class Components(private val context: Context) {
+         )
+     }
+     val utils by lazy { Utilities(context, core.sessionManager, useCases.sessionUseCases, useCases.searchUseCases) }
+-}
+\ No newline at end of file
++    val analytics by lazy { Analytics(context) }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/Core.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/Core.kt
+index 5ae0c27cd879..fe08500ae00e 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/Core.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/Core.kt
+@@ -16,6 +16,9 @@ import mozilla.components.concept.engine.DefaultSettings
+ import mozilla.components.concept.engine.Engine
+ import mozilla.components.concept.engine.EngineSession.TrackingProtectionPolicy
+ import mozilla.components.feature.session.HistoryDelegate
++import mozilla.components.lib.crash.handler.CrashHandlerService
++import org.mozilla.geckoview.GeckoRuntime
++import org.mozilla.geckoview.GeckoRuntimeSettings
+ import java.util.concurrent.TimeUnit
+ 
+ /**
+@@ -36,7 +39,14 @@ class Core(private val context: Context) {
+             trackingProtectionPolicy = createTrackingProtectionPolicy(prefs),
+             historyTrackingDelegate = HistoryDelegate(historyStorage)
+         )
+-        GeckoEngine(context, defaultSettings)
++
++        val runtimeSettings = GeckoRuntimeSettings.Builder()
++            .crashHandler(CrashHandlerService::class.java)
++            .build()
++
++        val runtime = GeckoRuntime.create(context, runtimeSettings)
++
++        GeckoEngine(context, defaultSettings, runtime)
+     }
+ 
+     /**
+diff --git a/fenix/buildSrc/src/main/java/Dependencies.kt b/fenix/buildSrc/src/main/java/Dependencies.kt
+index 934d6b97edec..9f1257e21a31 100644
+--- a/fenix/buildSrc/src/main/java/Dependencies.kt
++++ b/fenix/buildSrc/src/main/java/Dependencies.kt
+@@ -9,6 +9,7 @@ private object Versions {
+     const val rxAndroid = "2.1.0"
+     const val rxKotlin = "2.3.0"
+     const val anko = "0.10.8"
++    const val sentry = "1.7.10"
+ 
+     const val androidx_appcompat = "1.0.2"
+     const val androidx_constraint_layout = "2.0.0-alpha3"
+@@ -72,8 +73,12 @@ object Deps {
+     const val mozilla_feature_prompts = "org.mozilla.components:feature-prompts:${Versions.mozilla_android_components}"
+     const val mozilla_feature_toolbar = "org.mozilla.components:feature-toolbar:${Versions.mozilla_android_components}"
+ 
++    const val mozilla_lib_crash = "org.mozilla.components:lib-crash:${Versions.mozilla_android_components}"
++
+     const val mozilla_support_ktx = "org.mozilla.components:support-ktx:${Versions.mozilla_android_components}"
+ 
++    const val sentry = "io.sentry:sentry-android:${Versions.sentry}"
++
+     const val junit = "junit:junit:${Versions.junit}"
+     const val tools_test_runner = "com.android.support.test:runner:${Versions.test_tools}"
+     const val tools_espresso_core = "com.android.support.test.espresso:espresso-core:${Versions.espresso_core}"

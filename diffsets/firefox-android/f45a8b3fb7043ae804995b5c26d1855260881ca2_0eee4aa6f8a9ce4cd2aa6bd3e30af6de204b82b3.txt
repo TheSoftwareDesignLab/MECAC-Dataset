@@ -1,0 +1,149 @@
+diff --git a/fenix/app/build.gradle b/fenix/app/build.gradle
+index 295b804b4d33..71f61a463ee4 100644
+--- a/fenix/app/build.gradle
++++ b/fenix/app/build.gradle
+@@ -384,6 +384,7 @@ dependencies {
+     implementation Deps.mozilla_feature_site_permissions
+     implementation Deps.mozilla_feature_readerview
+     implementation Deps.mozilla_feature_tab_collections
++    implementation Deps.mozilla_feature_sendtab
+ 
+     implementation Deps.mozilla_service_firefox_accounts
+     implementation Deps.mozilla_service_fretboard
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
+index 073d6453ec1a..44073cc4f425 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
+@@ -388,7 +388,7 @@ class HomeFragment : Fragment(), AccountObserver {
+                 invokePendingDeleteJobs()
+                 val shareTabs = sessionManager
+                     .sessionsOfType(private = (activity as HomeActivity).browsingModeManager.mode.isPrivate)
+-                    .map { ShareTab(it.url, it.title, it.id) }
++                    .map { ShareTab(it.url, it.title) }
+                     .toList()
+                 share(tabs = shareTabs)
+             }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/share/ShareController.kt b/fenix/app/src/main/java/org/mozilla/fenix/share/ShareController.kt
+index f794eee9971a..6ccf439214c5 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/share/ShareController.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/share/ShareController.kt
+@@ -13,8 +13,8 @@ import androidx.appcompat.app.AlertDialog
+ import androidx.fragment.app.Fragment
+ import androidx.navigation.NavController
+ import mozilla.components.concept.sync.Device
+-import mozilla.components.concept.sync.DeviceEventOutgoing
+-import mozilla.components.concept.sync.OAuthAccount
++import mozilla.components.concept.sync.TabData
++import mozilla.components.feature.sendtab.SendTabUseCases
+ import org.mozilla.fenix.R
+ import org.mozilla.fenix.ext.nav
+ import org.mozilla.fenix.share.listadapters.AppShareOption
+@@ -37,15 +37,15 @@ interface ShareController {
+  * Default behavior of [ShareController]. Other implementations are possible.
+  *
+  * @param fragment the [ShareFragment] instance this controller handles business logic for.
+- * @param tabs the list of [ShareTab]s that can be shared.
+- * @param account the [OAuthAccount] to which tabs can be shared.
++ * @param sharedTabs the list of [ShareTab]s that can be shared.
++ * @param sendTabUseCases instance of [SendTabUseCases] which allows sending tabs to account devices.
+  * @param navController - [NavController] used for navigation.
+  * @param dismiss - callback signalling sharing can be closed.
+  */
+ class DefaultShareController(
+     private val fragment: Fragment,
+-    private val tabs: List<ShareTab>,
+-    private val account: OAuthAccount?,
++    private val sharedTabs: List<ShareTab>,
++    private val sendTabUseCases: SendTabUseCases,
+     private val navController: NavController,
+     private val dismiss: () -> Unit
+ ) : ShareController {
+@@ -73,14 +73,14 @@ class DefaultShareController(
+     }
+ 
+     override fun handleShareToDevice(device: Device) {
+-        sendTab(device.id)
+-        (fragment.activity as ShareFragment.TabsSharedCallback).onTabsShared(tabs.size)
++        sendTabUseCases.sendToDeviceAsync(device.id, sharedTabs.toTabData())
++        (fragment.activity as ShareFragment.TabsSharedCallback).onTabsShared(sharedTabs.size)
+         dismiss()
+     }
+ 
+     override fun handleShareToAllDevices(devices: List<Device>) {
+-        devices.forEach { device -> sendTab(device.id) }
+-        (fragment.activity as ShareFragment.TabsSharedCallback).onTabsShared(tabs.size)
++        sendTabUseCases.sendToAllAsync(sharedTabs.toTabData())
++        (fragment.activity as ShareFragment.TabsSharedCallback).onTabsShared(sharedTabs.size)
+         dismiss()
+     }
+ 
+@@ -91,17 +91,9 @@ class DefaultShareController(
+     }
+ 
+     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+-    fun sendTab(deviceId: String) {
+-        account?.run {
+-            tabs.forEach { tab ->
+-                deviceConstellation().sendEventToDeviceAsync(
+-                    deviceId,
+-                    DeviceEventOutgoing.SendTab(tab.title, tab.url)
+-                )
+-            }
+-        }
+-    }
++    fun getShareText() = sharedTabs.joinToString("\n") { tab -> tab.url }
+ 
+-    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+-    fun getShareText() = tabs.joinToString("\n") { tab -> tab.url }
++    // Navigation between app fragments uses ShareTab as arguments. SendTabUseCases uses TabData.
++    private fun ShareTab.toTabData() = TabData(title, url)
++    private fun List<ShareTab>.toTabData() = map { it.toTabData() }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/share/ShareFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/share/ShareFragment.kt
+index ce3efbfcc87a..83b716e1450f 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/share/ShareFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/share/ShareFragment.kt
+@@ -25,6 +25,7 @@ import kotlinx.coroutines.async
+ import kotlinx.coroutines.launch
+ import mozilla.components.concept.sync.DeviceCapability
+ import mozilla.components.concept.sync.DeviceType
++import mozilla.components.feature.sendtab.SendTabUseCases
+ import mozilla.components.service.fxa.manager.FxaAccountManager
+ import org.mozilla.fenix.R
+ import org.mozilla.fenix.ext.components
+@@ -81,14 +82,14 @@ class ShareFragment : AppCompatDialogFragment() {
+         }
+ 
+         val tabs = args.tabs?.toList() ?: listOf(ShareTab(args.url!!, args.title ?: ""))
+-        val account = requireComponents.backgroundServices.accountManager.authenticatedAccount()
++        val accountManager = requireComponents.backgroundServices.accountManager
+ 
+         shareInteractor = ShareInteractor(
+             DefaultShareController(
+                 fragment = this,
+-                tabs = tabs,
++                sharedTabs = tabs,
+                 navController = findNavController(),
+-                account = account,
++                sendTabUseCases = SendTabUseCases(accountManager),
+                 dismiss = ::dismiss
+             )
+         )
+@@ -165,4 +166,4 @@ class ShareFragment : AppCompatDialogFragment() {
+ }
+ 
+ @Parcelize
+-data class ShareTab(val url: String, val title: String, val sessionId: String? = null) : Parcelable
++data class ShareTab(val url: String, val title: String) : Parcelable
+diff --git a/fenix/buildSrc/src/main/java/Dependencies.kt b/fenix/buildSrc/src/main/java/Dependencies.kt
+index 4013c4d70b47..3c8ff4ad409d 100644
+--- a/fenix/buildSrc/src/main/java/Dependencies.kt
++++ b/fenix/buildSrc/src/main/java/Dependencies.kt
+@@ -129,6 +129,7 @@ object Deps {
+     const val mozilla_feature_site_permissions = "org.mozilla.components:feature-sitepermissions:${Versions.mozilla_android_components}"
+     const val mozilla_feature_readerview = "org.mozilla.components:feature-readerview:${Versions.mozilla_android_components}"
+     const val mozilla_feature_tab_collections = "org.mozilla.components:feature-tab-collections:${Versions.mozilla_android_components}"
++    const val mozilla_feature_sendtab = "org.mozilla.components:feature-sendtab:${Versions.mozilla_android_components}"
+ 
+     const val mozilla_service_firefox_accounts = "org.mozilla.components:service-firefox-accounts:${Versions.mozilla_android_components}"
+     const val mozilla_service_fretboard = "org.mozilla.components:service-fretboard:${Versions.mozilla_android_components}"

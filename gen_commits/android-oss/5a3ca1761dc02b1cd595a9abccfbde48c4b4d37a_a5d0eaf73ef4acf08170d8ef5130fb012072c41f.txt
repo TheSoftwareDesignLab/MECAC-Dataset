@@ -1,0 +1,171 @@
+diff --git a/app/src/main/java/com/kickstarter/libs/utils/ListUtils.java b/app/src/main/java/com/kickstarter/libs/utils/ListUtils.java
+index 4732a94f9a..78f2e28005 100644
+--- a/app/src/main/java/com/kickstarter/libs/utils/ListUtils.java
++++ b/app/src/main/java/com/kickstarter/libs/utils/ListUtils.java
+@@ -154,7 +154,7 @@ public static <T> List<T> prepend(@NonNull final List<T> xs, @NonNull final T x)
+     return ys;
+   }
+ 
+-  public static @NonNull <T> List<T> replace(final @NonNull List<T> xs, final @NonNull T x, final @NonNull T newx) {
++  public static @NonNull <T> List<T> allReplaced(final @NonNull List<T> xs, final @NonNull T x, final @NonNull T newx) {
+     final List<T> ys = new ArrayList<>(xs);
+ 
+     for (int idx = 0; idx < xs.size(); idx++) {
+@@ -166,6 +166,16 @@ public static <T> List<T> prepend(@NonNull final List<T> xs, @NonNull final T x)
+     return ys;
+   }
+ 
++  /**
++   * Replaces the element at index `idx` with the element `x`. Does so by return a whole new list without
++   * mutating the original.
++   */
++  public static @NonNull <T> List<T> replaced(final @NonNull List<T> xs, final int idx, final @Nullable T x) {
++    final List<T> ys = new ArrayList<>(xs);
++    ys.set(idx, x);
++    return ys;
++  }
++
+   /**
+    * Uses Fisher-Yates algorithm to shuffle an array without mutating input arg.
+    * http://www.dotnetperls.com/shuffle-java
+diff --git a/app/src/main/java/com/kickstarter/ui/viewholders/ProjectCardViewHolder.java b/app/src/main/java/com/kickstarter/ui/viewholders/ProjectCardViewHolder.java
+index 2bf45b4b54..58456327c2 100644
+--- a/app/src/main/java/com/kickstarter/ui/viewholders/ProjectCardViewHolder.java
++++ b/app/src/main/java/com/kickstarter/ui/viewholders/ProjectCardViewHolder.java
+@@ -239,12 +239,12 @@ else if (project.isPotdToday()) {
+     }
+ 
+     else if (project.isFeaturedToday() && project.category() != null) {
++      final Category rootCategory = project.category().root();
++
+       projectMetadataViewGroup.setVisibility(View.VISIBLE);
+       featuredViewGroup.setVisibility(View.VISIBLE);
+-      // TODO: Mini serialized category does not have access to root category name. This is a bug right now,
+-      // it's using the subcategory instead of the root category.
+       featuredTextView.setText(ksString.format(featuredInString,
+-        "category_name", project.category().name()));
++        "category_name", rootCategory.name()));
+       adjustCardViewTopMargin(grid1Dimen);
+ 
+       backingViewGroup.setVisibility(View.GONE);
+diff --git a/app/src/main/java/com/kickstarter/viewmodels/DiscoveryViewModel.java b/app/src/main/java/com/kickstarter/viewmodels/DiscoveryViewModel.java
+index 37c3b00f59..10be3b4e1c 100644
+--- a/app/src/main/java/com/kickstarter/viewmodels/DiscoveryViewModel.java
++++ b/app/src/main/java/com/kickstarter/viewmodels/DiscoveryViewModel.java
+@@ -178,6 +178,17 @@ protected void onCreate(@NonNull final Context context, @Nullable final Bundle s
+ 
+     buildCheck.bind(this, webClient);
+ 
++    final Observable<List<Category>> categories = apiClient.fetchCategories()
++      .compose(Transformers.neverError())
++      .flatMap(Observable::from)
++      .toSortedList()
++      .share();
++
++    final Observable<List<Category>> rootCategories = categories
++      .flatMap(Observable::from)
++      .filter(Category::isRoot)
++      .toList();
++
+     final ApiPaginator<Project, DiscoverEnvelope, DiscoveryParams> paginator =
+       ApiPaginator.<Project, DiscoverEnvelope, DiscoveryParams>builder()
+         .nextPage(nextPage)
+@@ -186,7 +197,6 @@ protected void onCreate(@NonNull final Context context, @Nullable final Bundle s
+         .envelopeToMoreUrl(env -> env.urls().api().moreProjects())
+         .loadWithParams(apiClient::fetchProjects)
+         .loadWithPaginationPath(apiClient::fetchProjects)
+-        .pageTransformation(this::bringPotdToFront)
+         .clearWhenStartingOver(true)
+         .concater(ListUtils::concatDistinct)
+         .build();
+@@ -197,7 +207,12 @@ protected void onCreate(@NonNull final Context context, @Nullable final Bundle s
+         .subscribe(p -> koala.trackDiscovery(p, !hasSeenOnboarding))
+     );
+ 
+-    addSubscription(paginator.paginatedData.subscribe(projects));
++    addSubscription(
++      paginator.paginatedData
++        .compose(Transformers.combineLatestPair(rootCategories))
++        .map(pc -> this.fillRootCategoryForFeaturedProjects(pc.first, pc.second))
++        .subscribe(projects)
++    );
+ 
+     addSubscription(
+       selectedParams
+@@ -210,13 +225,7 @@ protected void onCreate(@NonNull final Context context, @Nullable final Bundle s
+     initializer.subscribe(this.selectedParams::onNext);
+     initializer.onNext(DiscoveryParams.builder().staffPicks(true).build());
+ 
+-
+     // NAVIGATION DRAWER ONCREATE
+-    final Observable<List<Category>> categories = apiClient.fetchCategories()
+-      .compose(Transformers.neverError())
+-      .flatMap(Observable::from)
+-      .toSortedList()
+-      .share();
+ 
+     PublishSubject<Category> expandedParams = PublishSubject.create();
+ 
+@@ -279,22 +288,53 @@ protected void onCreate(@NonNull final Context context, @Nullable final Bundle s
+   }
+ 
+   /**
+-   * Given a list of projects, finds if it contains the POTD and if so
+-   * bumps it to the front of the list.
++   * Given a list of projects and root categories this will determine if the first project is featured
++   * and is in need of its root category. If that is the case we will find its root and fill in that
++   * data and return a new list of projects.
+    */
+-  private List<Project> bringPotdToFront(final @NonNull List<Project> projects) {
++  private List<Project> fillRootCategoryForFeaturedProjects(final @NonNull List<Project> projects,
++    final @NonNull List<Category> rootCategories) {
+ 
+-    return Observable.from(projects)
+-      .reduce(new ArrayList<>(), this::prependPotdElseAppend)
++    // Guard against no projects
++    if (projects.size() == 0) {
++      return ListUtils.empty();
++    }
++
++    final Project firstProject = projects.get(0);
++
++    // Guard against bad category data on first project
++    final Category category = firstProject.category();
++    if (category == null) {
++      return projects;
++    }
++    final Long categoryParentId = category.parentId();
++    if (categoryParentId == null) {
++      return projects;
++    }
++
++    // Guard against not needing to find the root category
++    if (!projectNeedsRootCategory(firstProject, category)) {
++      return projects;
++    }
++
++    // Find the root category for the featured project's category
++    final Category projectRootCategory = Observable.from(rootCategories)
++      .filter(rootCategory -> rootCategory.id() == categoryParentId)
++      .take(1)
+       .toBlocking().single();
++
++    // Sub in the found root category in our featured project.
++    final Category newCategory = category.toBuilder().parent(projectRootCategory).build();
++    final Project newProject = firstProject.toBuilder().category(newCategory).build();
++
++    return ListUtils.replaced(projects, 0, newProject);
+   }
+ 
+   /**
+-   * Given a list of projects and a particular project, returns the list
+-   * when the project prepended if it's POTD and appends otherwise.
++   * Determines if the project and supplied require us to find the root category.
+    */
+-  @NonNull private List<Project> prependPotdElseAppend(final @NonNull List<Project> projects, final @NonNull Project project) {
+-    return project.isPotdToday() ? ListUtils.prepend(projects, project) : ListUtils.append(projects, project);
++  private boolean projectNeedsRootCategory(final @NonNull Project project, final @NonNull Category category) {
++    return !category.isRoot() && category.parent() == null && project.isFeaturedToday();
+   }
+ 
+   private boolean isOnboardingVisible(final @NonNull DiscoveryParams currentParams, final boolean isLoggedIn) {

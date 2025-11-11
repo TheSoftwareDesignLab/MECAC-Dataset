@@ -1,0 +1,786 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/BindableConversationItem.java b/app/src/main/java/org/thoughtcrime/securesms/BindableConversationItem.java
+index 17b2e835549..4569c5ec00a 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/BindableConversationItem.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/BindableConversationItem.java
+@@ -67,6 +67,7 @@ interface EventListener {
+     void onSafetyNumberLearnMoreClicked(@NonNull Recipient recipient);
+     void onJoinGroupCallClicked();
+     void onInviteFriendsToGroupClicked(@NonNull GroupId.V2 groupId);
++    void onEnableCallNotificationsClicked();
+ 
+     /** @return true if handled, false if you want to let the normal url handling continue */
+     boolean onUrlClicked(@NonNull String url);
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationFragment.java b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationFragment.java
+index c33bdaa8713..a87b1acbf91 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationFragment.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationFragment.java
+@@ -88,6 +88,7 @@
+ import org.thoughtcrime.securesms.conversation.ConversationAdapter.ItemClickListener;
+ import org.thoughtcrime.securesms.conversation.ConversationAdapter.StickyHeaderViewHolder;
+ import org.thoughtcrime.securesms.conversation.ConversationMessage.ConversationMessageFactory;
++import org.thoughtcrime.securesms.conversation.ui.error.EnableCallNotificationSettingsDialog;
+ import org.thoughtcrime.securesms.database.DatabaseFactory;
+ import org.thoughtcrime.securesms.database.MessageDatabase;
+ import org.thoughtcrime.securesms.database.MmsDatabase;
+@@ -1558,6 +1559,23 @@ public void onJoinGroupCallClicked() {
+     public void onInviteFriendsToGroupClicked(@NonNull GroupId.V2 groupId) {
+       GroupLinkInviteFriendsBottomSheetDialogFragment.show(requireActivity().getSupportFragmentManager(), groupId);
+     }
++
++    @Override
++    public void onEnableCallNotificationsClicked() {
++      EnableCallNotificationSettingsDialog.fixAutomatically(requireContext());
++      if (EnableCallNotificationSettingsDialog.shouldShow(requireContext())) {
++        EnableCallNotificationSettingsDialog.show(getChildFragmentManager());
++      } else {
++        refreshList();
++      }
++    }
++  }
++
++  public void refreshList() {
++    ConversationAdapter listAdapter = getListAdapter();
++    if (listAdapter != null) {
++      listAdapter.notifyDataSetChanged();
++    }
+   }
+ 
+   @Override
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationUpdateItem.java b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationUpdateItem.java
+index e118b18aeb2..d301b34b70a 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationUpdateItem.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationUpdateItem.java
+@@ -23,6 +23,7 @@
+ import org.thoughtcrime.securesms.BindableConversationItem;
+ import org.thoughtcrime.securesms.R;
+ import org.thoughtcrime.securesms.VerifyIdentityActivity;
++import org.thoughtcrime.securesms.conversation.ui.error.EnableCallNotificationSettingsDialog;
+ import org.thoughtcrime.securesms.database.IdentityDatabase.IdentityRecord;
+ import org.thoughtcrime.securesms.database.model.GroupCallUpdateDetailsUtil;
+ import org.thoughtcrime.securesms.database.model.LiveUpdateMessage;
+@@ -302,6 +303,14 @@ private void present(@NonNull ConversationMessage conversationMessage,
+           eventListener.onInviteFriendsToGroupClicked(conversationRecipient.requireGroupId().requireV2());
+         }
+       });
++    } else if ((conversationMessage.getMessageRecord().isMissedAudioCall() || conversationMessage.getMessageRecord().isMissedVideoCall()) && EnableCallNotificationSettingsDialog.shouldShow(getContext())) {
++      actionButton.setVisibility(VISIBLE);
++      actionButton.setText(R.string.ConversationUpdateItem_enable_call_notifications);
++      actionButton.setOnClickListener(v -> {
++        if (eventListener != null) {
++          eventListener.onEnableCallNotificationsClicked();
++        }
++      });
+     } else {
+       actionButton.setVisibility(GONE);
+       actionButton.setOnClickListener(null);
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/ui/error/EnableCallNotificationSettingsDialog.java b/app/src/main/java/org/thoughtcrime/securesms/conversation/ui/error/EnableCallNotificationSettingsDialog.java
+new file mode 100644
+index 00000000000..21c2c788620
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/ui/error/EnableCallNotificationSettingsDialog.java
+@@ -0,0 +1,233 @@
++package org.thoughtcrime.securesms.conversation.ui.error;
++
++import android.annotation.SuppressLint;
++import android.annotation.TargetApi;
++import android.app.Dialog;
++import android.content.Context;
++import android.content.DialogInterface;
++import android.content.Intent;
++import android.net.Uri;
++import android.os.Build;
++import android.os.Bundle;
++import android.provider.Settings;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.annotation.NonNull;
++import androidx.appcompat.app.AlertDialog;
++import androidx.appcompat.widget.AppCompatImageView;
++import androidx.fragment.app.DialogFragment;
++import androidx.fragment.app.FragmentManager;
++
++import com.google.android.material.dialog.MaterialAlertDialogBuilder;
++
++import org.signal.core.util.logging.Log;
++import org.thoughtcrime.securesms.R;
++import org.thoughtcrime.securesms.conversation.ConversationFragment;
++import org.thoughtcrime.securesms.notifications.NotificationChannels;
++import org.thoughtcrime.securesms.util.DeviceProperties;
++import org.thoughtcrime.securesms.util.TextSecurePreferences;
++
++/**
++ * Provide basic steps to fix potential call notification issues based on what we can detect on the system
++ * and app settings.
++ */
++@TargetApi(26)
++public final class EnableCallNotificationSettingsDialog extends DialogFragment {
++
++  private static final String TAG          = Log.tag(EnableCallNotificationSettingsDialog.class);
++  private static final String FRAGMENT_TAG = "MissedCallCheckSettingsDialog";
++
++  private static final int NOTIFICATIONS_DISABLED      = 1 << 1;
++  private static final int CALL_NOTIFICATIONS_DISABLED = 1 << 2;
++  private static final int CALL_CHANNEL_INVALID        = 1 << 4;
++  private static final int BACKGROUND_RESTRICTED       = 1 << 8;
++
++  private View view;
++
++  public static boolean shouldShow(@NonNull Context context) {
++    return getCallNotificationSettingsBitmask(context) != 0;
++  }
++
++  public static void fixAutomatically(@NonNull Context context) {
++    if (areCallNotificationsDisabled(context)) {
++      TextSecurePreferences.setCallNotificationsEnabled(context, true);
++      Toast.makeText(context, R.string.EnableCallNotificationSettingsDialog__call_notifications_enabled, Toast.LENGTH_SHORT).show();
++    }
++  }
++
++  public static void show(@NonNull FragmentManager fragmentManager) {
++    if (fragmentManager.findFragmentByTag(FRAGMENT_TAG) != null) {
++      Log.i(TAG, "Dialog already being shown");
++      return;
++    }
++
++    new EnableCallNotificationSettingsDialog().show(fragmentManager, FRAGMENT_TAG);
++  }
++
++  @Override
++  public Dialog onCreateDialog(Bundle savedInstanceState) {
++    MaterialAlertDialogBuilder dialogBuilder = new MaterialAlertDialogBuilder(requireContext(), R.style.Signal_ThemeOverlay_Dialog_Rounded);
++
++    Runnable action = null;
++    switch (getCallNotificationSettingsBitmask(requireContext())) {
++      case NOTIFICATIONS_DISABLED:
++        dialogBuilder.setTitle(R.string.EnableCallNotificationSettingsDialog__enable_call_notifications)
++                     .setMessage(R.string.EnableCallNotificationSettingsDialog__to_receive_call_notifications_tap_settings_and_turn_on_show_notifications)
++                     .setPositiveButton(R.string.EnableCallNotificationSettingsDialog__settings, null);
++        action = this::showNotificationSettings;
++        break;
++      case CALL_CHANNEL_INVALID:
++        dialogBuilder.setTitle(R.string.EnableCallNotificationSettingsDialog__enable_call_notifications)
++                     .setMessage(R.string.EnableCallNotificationSettingsDialog__to_receive_call_notifications_tap_settings_and_turn_on_notifications)
++                     .setPositiveButton(R.string.EnableCallNotificationSettingsDialog__settings, null);
++        action = this::showNotificationChannelSettings;
++        break;
++      case BACKGROUND_RESTRICTED:
++        dialogBuilder.setTitle(R.string.EnableCallNotificationSettingsDialog__enable_background_activity)
++                     .setMessage(R.string.EnableCallNotificationSettingsDialog__to_receive_call_notifications_tap_settings_and_enable_background_activity_in_battery_settings)
++                     .setPositiveButton(R.string.EnableCallNotificationSettingsDialog__settings, null);
++        action = this::showAppSettings;
++        break;
++      default:
++        dialogBuilder.setTitle(R.string.EnableCallNotificationSettingsDialog__enable_call_notifications)
++                     .setView(createView())
++                     .setPositiveButton(android.R.string.ok, null);
++        break;
++    }
++
++    dialogBuilder.setNegativeButton(android.R.string.cancel, null);
++
++    AlertDialog dialog = dialogBuilder.create();
++
++    if (action != null) {
++      final Runnable localAction = action;
++      dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> localAction.run()));
++    }
++
++    return dialog;
++  }
++
++  @Override
++  public void onResume() {
++    super.onResume();
++    if (getCallNotificationSettingsBitmask(requireContext()) == 0) {
++      dismissAllowingStateLoss();
++    } else if (view != null) {
++      bind(view);
++    }
++  }
++
++  @Override
++  public void onDismiss(@NonNull DialogInterface dialog) {
++    super.onDismiss(dialog);
++    if (getParentFragment() instanceof ConversationFragment) {
++      ((ConversationFragment) getParentFragment()).refreshList();
++    }
++  }
++
++  @SuppressLint("InflateParams")
++  private @NonNull View createView() {
++    view = LayoutInflater.from(getContext()).inflate(R.layout.enable_call_notification_settings_dialog_fragment, null, false);
++    bind(view);
++    return view;
++  }
++
++  private void bind(@NonNull View view) {
++    TextView           allConfigured                 = view.findViewById(R.id.enable_call_notification_settings_dialog_system_all_configured);
++    AppCompatImageView systemSettingIndicator        = view.findViewById(R.id.enable_call_notification_settings_dialog_system_setting_indicator);
++    TextView           systemSettingText             = view.findViewById(R.id.enable_call_notification_settings_dialog_system_setting_text);
++    AppCompatImageView channelSettingIndicator       = view.findViewById(R.id.enable_call_notification_settings_dialog_channel_setting_indicator);
++    TextView           channelSettingText            = view.findViewById(R.id.enable_call_notification_settings_dialog_channel_setting_text);
++    AppCompatImageView backgroundRestrictedIndicator = view.findViewById(R.id.enable_call_notification_settings_dialog_background_restricted_indicator);
++    TextView           backgroundRestrictedText      = view.findViewById(R.id.enable_call_notification_settings_dialog_background_restricted_text);
++
++    if (areNotificationsDisabled(requireContext())) {
++      systemSettingIndicator.setVisibility(View.VISIBLE);
++      systemSettingText.setVisibility(View.VISIBLE);
++      systemSettingText.setOnClickListener(v -> showNotificationSettings());
++    } else {
++      systemSettingIndicator.setVisibility(View.GONE);
++      systemSettingText.setVisibility(View.GONE);
++      systemSettingText.setOnClickListener(null);
++    }
++
++    if (isCallChannelInvalid(requireContext())) {
++      channelSettingIndicator.setVisibility(View.VISIBLE);
++      channelSettingText.setVisibility(View.VISIBLE);
++      channelSettingText.setOnClickListener(v -> showNotificationChannelSettings());
++    } else {
++      channelSettingIndicator.setVisibility(View.GONE);
++      channelSettingText.setVisibility(View.GONE);
++      channelSettingText.setOnClickListener(null);
++    }
++
++    if (isBackgroundRestricted(requireContext())) {
++      backgroundRestrictedIndicator.setVisibility(View.VISIBLE);
++      backgroundRestrictedText.setVisibility(View.VISIBLE);
++      backgroundRestrictedText.setOnClickListener(v -> showAppSettings());
++    } else {
++      backgroundRestrictedIndicator.setVisibility(View.GONE);
++      backgroundRestrictedText.setVisibility(View.GONE);
++      backgroundRestrictedText.setOnClickListener(null);
++    }
++
++    allConfigured.setVisibility(shouldShow(requireContext()) ? View.GONE : View.VISIBLE);
++  }
++
++  private void showNotificationSettings() {
++    Intent intent = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
++    intent.putExtra(Settings.EXTRA_APP_PACKAGE, requireContext().getPackageName());
++    startActivity(intent);
++  }
++
++  private void showNotificationChannelSettings() {
++    NotificationChannels.openChannelSettings(requireContext(), NotificationChannels.CALLS);
++  }
++
++  private void showAppSettings() {
++    Intent intent = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
++                               Uri.fromParts("package", requireContext().getPackageName(), null));
++    startActivity(intent);
++  }
++
++  private static boolean areNotificationsDisabled(@NonNull Context context) {
++    return !NotificationChannels.areNotificationsEnabled(context);
++  }
++
++  private static boolean areCallNotificationsDisabled(Context context) {
++    return !TextSecurePreferences.isCallNotificationsEnabled(context);
++  }
++
++  private static boolean isCallChannelInvalid(Context context) {
++    return !NotificationChannels.isCallsChannelValid(context);
++  }
++
++  private static boolean isBackgroundRestricted(Context context) {
++    return Build.VERSION.SDK_INT >= 28 && DeviceProperties.isBackgroundRestricted(context);
++  }
++
++  private static int getCallNotificationSettingsBitmask(@NonNull Context context) {
++    int bitmask = 0;
++
++    if (areNotificationsDisabled(context)) {
++      bitmask |= NOTIFICATIONS_DISABLED;
++    }
++
++    if (areCallNotificationsDisabled(context)) {
++      bitmask |= CALL_NOTIFICATIONS_DISABLED;
++    }
++
++    if (isCallChannelInvalid(context)) {
++      bitmask |= CALL_CHANNEL_INVALID;
++    }
++
++    if (isBackgroundRestricted(context)) {
++      bitmask |= BACKGROUND_RESTRICTED;
++    }
++
++    return bitmask;
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/notifications/NotificationChannels.java b/app/src/main/java/org/thoughtcrime/securesms/notifications/NotificationChannels.java
+index 1d2cb3597a4..47e04800327 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/notifications/NotificationChannels.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/notifications/NotificationChannels.java
+@@ -4,6 +4,7 @@
+ import android.app.NotificationChannel;
+ import android.app.NotificationChannelGroup;
+ import android.app.NotificationManager;
++import android.content.ActivityNotFoundException;
+ import android.content.Context;
+ import android.content.Intent;
+ import android.graphics.Color;
+@@ -13,6 +14,7 @@
+ import android.os.Build;
+ import android.provider.Settings;
+ import android.text.TextUtils;
++import android.widget.Toast;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+@@ -219,10 +221,15 @@ public static void openChannelSettings(@NonNull Context context, @NonNull String
+       return;
+     }
+ 
+-    Intent intent = new Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS);
+-    intent.putExtra(Settings.EXTRA_CHANNEL_ID, channelId);
+-    intent.putExtra(Settings.EXTRA_APP_PACKAGE, context.getPackageName());
+-    context.startActivity(intent);
++    try {
++      Intent intent = new Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS);
++      intent.putExtra(Settings.EXTRA_CHANNEL_ID, channelId);
++      intent.putExtra(Settings.EXTRA_APP_PACKAGE, context.getPackageName());
++      context.startActivity(intent);
++    } catch (ActivityNotFoundException e) {
++      Log.w(TAG, "Channel settings activity not found", e);
++      Toast.makeText(context, R.string.NotificationChannels__no_activity_available_to_open_notification_channel_settings, Toast.LENGTH_SHORT).show();
++    }
+   }
+ 
+   /**
+@@ -413,6 +420,16 @@ public static synchronized boolean isMessagesChannelGroupEnabled(@NonNull Contex
+     return group != null && !group.isBlocked();
+   }
+ 
++  public static boolean isCallsChannelValid(@NonNull Context context) {
++    if (!supported()) {
++      return true;
++    }
++
++    NotificationManager notificationManager = ServiceUtil.getNotificationManager(context);
++    NotificationChannel channel             = notificationManager.getNotificationChannel(CALLS);
++
++    return channel != null && channel.getImportance() == NotificationManager.IMPORTANCE_HIGH;
++  }
+ 
+   /**
+    * Whether or not notifications for the entire app are enabled.
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/WebRtcCallService.java b/app/src/main/java/org/thoughtcrime/securesms/service/WebRtcCallService.java
+index fba10f50c34..f709ad932a8 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/service/WebRtcCallService.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/WebRtcCallService.java
+@@ -31,10 +31,8 @@
+ import org.signal.ringrtc.Remote;
+ import org.signal.storageservice.protos.groups.GroupExternalCredential;
+ import org.signal.zkgroup.VerificationFailedException;
+-import org.thoughtcrime.securesms.ApplicationContext;
+ import org.thoughtcrime.securesms.BuildConfig;
+ import org.thoughtcrime.securesms.WebRtcCallActivity;
+-import org.thoughtcrime.securesms.components.sensors.DeviceOrientationMonitor;
+ import org.thoughtcrime.securesms.crypto.IdentityKeyParcelable;
+ import org.thoughtcrime.securesms.crypto.UnidentifiedAccessUtil;
+ import org.thoughtcrime.securesms.database.DatabaseFactory;
+@@ -57,6 +55,7 @@
+ import org.thoughtcrime.securesms.service.webrtc.WebRtcInteractor;
+ import org.thoughtcrime.securesms.service.webrtc.WebRtcUtil;
+ import org.thoughtcrime.securesms.service.webrtc.state.WebRtcServiceState;
++import org.thoughtcrime.securesms.util.AppForegroundObserver;
+ import org.thoughtcrime.securesms.util.BubbleUtil;
+ import org.thoughtcrime.securesms.util.FutureTaskListener;
+ import org.thoughtcrime.securesms.util.ListenableFutureTask;
+@@ -90,10 +89,14 @@
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.TimeUnit;
+ 
++import static org.thoughtcrime.securesms.events.WebRtcViewModel.GroupCallState.IDLE;
++import static org.thoughtcrime.securesms.events.WebRtcViewModel.State.CALL_INCOMING;
++
+ public class WebRtcCallService extends Service implements CallManager.Observer,
+-        BluetoothStateManager.BluetoothStateListener,
+-        CameraEventListener,
+-        GroupCall.Observer
++                                                          BluetoothStateManager.BluetoothStateListener,
++                                                          CameraEventListener,
++                                                          GroupCall.Observer,
++                                                          AppForegroundObserver.Listener
+ {
+ 
+   private static final String TAG = Log.tag(WebRtcCallService.class);
+@@ -276,6 +279,7 @@ private boolean initializeResources() {
+                                             new SignalAudioManager(this),
+                                             bluetoothStateManager,
+                                             this,
++                                            this,
+                                             this);
+     return true;
+   }
+@@ -479,15 +483,16 @@ public void sendMessage(@NonNull WebRtcServiceState state) {
+     return listenableFutureTask;
+   }
+ 
+-  public void startCallCardActivityIfPossible() {
++  public boolean startCallCardActivityIfPossible() {
+     if (Build.VERSION.SDK_INT >= 29 && !ApplicationDependencies.getAppForegroundObserver().isForegrounded()) {
+-      return;
++      return false;
+     }
+ 
+     Intent activityIntent = new Intent();
+     activityIntent.setClass(this, WebRtcCallActivity.class);
+     activityIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+     startActivity(activityIntent);
++    return true;
+   }
+ 
+   private static @NonNull OfferMessage.Type getOfferTypeFromCallMediaType(@NonNull CallManager.CallMediaType mediaType) {
+@@ -516,6 +521,18 @@ public void startCallCardActivityIfPossible() {
+     return null;
+   }
+ 
++  @Override
++  public void onForeground() {
++    WebRtcViewModel.State callState = serviceState.getCallInfoState().getCallState();
++    if (callState == CALL_INCOMING && serviceState.getCallInfoState().getGroupCallState() == IDLE) {
++      startCallCardActivityIfPossible();
++    }
++    ApplicationDependencies.getAppForegroundObserver().removeListener(this);
++  }
++
++  @Override
++  public void onBackground() { }
++
+   private static class WiredHeadsetStateReceiver extends BroadcastReceiver {
+     @Override
+     public void onReceive(@NonNull Context context, @NonNull Intent intent) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/CallSetupActionProcessorDelegate.java b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/CallSetupActionProcessorDelegate.java
+index 61e00d20dec..cb0a148e984 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/CallSetupActionProcessorDelegate.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/CallSetupActionProcessorDelegate.java
+@@ -5,6 +5,7 @@
+ import org.signal.core.util.logging.Log;
+ import org.signal.ringrtc.CallException;
+ import org.signal.ringrtc.CallManager;
++import org.thoughtcrime.securesms.dependencies.ApplicationDependencies;
+ import org.thoughtcrime.securesms.events.WebRtcViewModel;
+ import org.thoughtcrime.securesms.ringrtc.CallState;
+ import org.thoughtcrime.securesms.ringrtc.Camera;
+@@ -37,6 +38,7 @@ public CallSetupActionProcessorDelegate(@NonNull WebRtcInteractor webRtcInteract
+ 
+     RemotePeer activePeer = currentState.getCallInfoState().requireActivePeer();
+ 
++    ApplicationDependencies.getAppForegroundObserver().removeListener(webRtcInteractor.getForegroundListener());
+     webRtcInteractor.startAudioCommunication(activePeer.getState() == CallState.REMOTE_RINGING);
+     webRtcInteractor.setWantsBluetoothConnection(true);
+ 
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/IncomingCallActionProcessor.java b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/IncomingCallActionProcessor.java
+index 7071469ea5a..59ff052d49c 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/IncomingCallActionProcessor.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/IncomingCallActionProcessor.java
+@@ -12,6 +12,7 @@
+ import org.thoughtcrime.securesms.components.webrtc.OrientationAwareVideoSink;
+ import org.thoughtcrime.securesms.database.DatabaseFactory;
+ import org.thoughtcrime.securesms.database.RecipientDatabase;
++import org.thoughtcrime.securesms.dependencies.ApplicationDependencies;
+ import org.thoughtcrime.securesms.events.CallParticipant;
+ import org.thoughtcrime.securesms.events.WebRtcViewModel;
+ import org.thoughtcrime.securesms.notifications.DoNotDisturbUtil;
+@@ -157,7 +158,11 @@ public IncomingCallActionProcessor(@NonNull WebRtcInteractor webRtcInteractor) {
+ 
+     boolean shouldDisturbUserWithCall = DoNotDisturbUtil.shouldDisturbUserWithCall(context.getApplicationContext(), recipient);
+     if (shouldDisturbUserWithCall) {
+-      webRtcInteractor.startWebRtcCallActivityIfPossible();
++      boolean started = webRtcInteractor.startWebRtcCallActivityIfPossible();
++      if (!started) {
++        Log.i(TAG, "Unable to start call activity due to OS version or not being in the foreground");
++        ApplicationDependencies.getAppForegroundObserver().addListener(webRtcInteractor.getForegroundListener());
++      }
+     }
+ 
+     webRtcInteractor.initializeAudioForCall();
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/WebRtcActionProcessor.java b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/WebRtcActionProcessor.java
+index 92f7ec93e87..9456a428639 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/WebRtcActionProcessor.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/WebRtcActionProcessor.java
+@@ -13,6 +13,7 @@
+ import org.signal.ringrtc.GroupCall;
+ import org.thoughtcrime.securesms.components.sensors.Orientation;
+ import org.thoughtcrime.securesms.crypto.IdentityKeyUtil;
++import org.thoughtcrime.securesms.dependencies.ApplicationDependencies;
+ import org.thoughtcrime.securesms.events.CallParticipant;
+ import org.thoughtcrime.securesms.events.WebRtcViewModel;
+ import org.thoughtcrime.securesms.recipients.RecipientId;
+@@ -723,6 +724,8 @@ public WebRtcActionProcessor(@NonNull WebRtcInteractor webRtcInteractor, @NonNul
+       return currentState;
+     }
+ 
++    ApplicationDependencies.getAppForegroundObserver().removeListener(webRtcInteractor.getForegroundListener());
++
+     webRtcInteractor.updatePhoneState(LockManager.PhoneState.PROCESSING);
+     webRtcInteractor.stopForegroundService();
+     boolean playDisconnectSound = (activePeer.getState() == CallState.DIALING) ||
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/WebRtcInteractor.java b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/WebRtcInteractor.java
+index 465177b98ff..8dd7693a722 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/WebRtcInteractor.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/webrtc/WebRtcInteractor.java
+@@ -13,6 +13,7 @@
+ import org.thoughtcrime.securesms.ringrtc.RemotePeer;
+ import org.thoughtcrime.securesms.service.WebRtcCallService;
+ import org.thoughtcrime.securesms.service.webrtc.state.WebRtcServiceState;
++import org.thoughtcrime.securesms.util.AppForegroundObserver;
+ import org.thoughtcrime.securesms.webrtc.audio.BluetoothStateManager;
+ import org.thoughtcrime.securesms.webrtc.audio.OutgoingRinger;
+ import org.thoughtcrime.securesms.webrtc.audio.SignalAudioManager;
+@@ -29,13 +30,14 @@
+  */
+ public class WebRtcInteractor {
+ 
+-  @NonNull private final WebRtcCallService     webRtcCallService;
+-  @NonNull private final CallManager           callManager;
+-  @NonNull private final LockManager           lockManager;
+-  @NonNull private final SignalAudioManager    audioManager;
+-  @NonNull private final BluetoothStateManager bluetoothStateManager;
+-  @NonNull private final CameraEventListener   cameraEventListener;
+-  @NonNull private final GroupCall.Observer    groupCallObserver;
++  @NonNull private final WebRtcCallService              webRtcCallService;
++  @NonNull private final CallManager                    callManager;
++  @NonNull private final LockManager                    lockManager;
++  @NonNull private final SignalAudioManager             audioManager;
++  @NonNull private final BluetoothStateManager          bluetoothStateManager;
++  @NonNull private final CameraEventListener            cameraEventListener;
++  @NonNull private final GroupCall.Observer             groupCallObserver;
++  @NonNull private final AppForegroundObserver.Listener foregroundListener;
+ 
+   public WebRtcInteractor(@NonNull WebRtcCallService webRtcCallService,
+                           @NonNull CallManager callManager,
+@@ -43,7 +45,8 @@ public WebRtcInteractor(@NonNull WebRtcCallService webRtcCallService,
+                           @NonNull SignalAudioManager audioManager,
+                           @NonNull BluetoothStateManager bluetoothStateManager,
+                           @NonNull CameraEventListener cameraEventListener,
+-                          @NonNull GroupCall.Observer groupCallObserver)
++                          @NonNull GroupCall.Observer groupCallObserver,
++                          @NonNull AppForegroundObserver.Listener foregroundListener)
+   {
+     this.webRtcCallService     = webRtcCallService;
+     this.callManager           = callManager;
+@@ -52,6 +55,7 @@ public WebRtcInteractor(@NonNull WebRtcCallService webRtcCallService,
+     this.bluetoothStateManager = bluetoothStateManager;
+     this.cameraEventListener   = cameraEventListener;
+     this.groupCallObserver     = groupCallObserver;
++    this.foregroundListener    = foregroundListener;
+   }
+ 
+   @NonNull CameraEventListener getCameraEventListener() {
+@@ -70,6 +74,10 @@ public WebRtcInteractor(@NonNull WebRtcCallService webRtcCallService,
+     return groupCallObserver;
+   }
+ 
++  @NonNull AppForegroundObserver.Listener getForegroundListener() {
++    return foregroundListener;
++  }
++
+   void setWantsBluetoothConnection(boolean enabled) {
+     bluetoothStateManager.setWantsConnection(enabled);
+   }
+@@ -118,8 +126,8 @@ void insertMissedCall(@NonNull RemotePeer remotePeer, boolean signal, long times
+     webRtcCallService.insertMissedCall(remotePeer, signal, timestamp, isVideoOffer);
+   }
+ 
+-  void startWebRtcCallActivityIfPossible() {
+-    webRtcCallService.startCallCardActivityIfPossible();
++  boolean startWebRtcCallActivityIfPossible() {
++    return webRtcCallService.startCallCardActivityIfPossible();
+   }
+ 
+   void registerPowerButtonReceiver() {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/util/TextSecurePreferences.java b/app/src/main/java/org/thoughtcrime/securesms/util/TextSecurePreferences.java
+index 4f27cd446d9..168c718ea13 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/util/TextSecurePreferences.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/util/TextSecurePreferences.java
+@@ -987,6 +987,10 @@ public static boolean isNotificationsEnabled(Context context) {
+     return getBooleanPreference(context, NOTIFICATION_PREF, true);
+   }
+ 
++  public static void setCallNotificationsEnabled(Context context, boolean enabled) {
++    setBooleanPreference(context, CALL_NOTIFICATIONS_PREF, enabled);
++  }
++
+   public static boolean isCallNotificationsEnabled(Context context) {
+     return getBooleanPreference(context, CALL_NOTIFICATIONS_PREF, true);
+   }
+diff --git a/app/src/main/res/drawable/ic_check_24.xml b/app/src/main/res/drawable/ic_check_24.xml
+index 3f70fa3fe8f..6554551de06 100644
+--- a/app/src/main/res/drawable/ic_check_24.xml
++++ b/app/src/main/res/drawable/ic_check_24.xml
+@@ -4,6 +4,6 @@
+     android:viewportWidth="24"
+     android:viewportHeight="24">
+   <path
+-      android:fillColor="@color/signal_icon_tint_primary"
++      android:fillColor="#000000"
+       android:pathData="M9.172,18.5l-6.188,-6.187l1.061,-1.061l5.127,5.127l10.783,-10.784l1.061,1.061l-11.844,11.844z"/>
+ </vector>
+diff --git a/app/src/main/res/drawable/ic_info_white_24.xml b/app/src/main/res/drawable/ic_info_white_24.xml
+index e0e1e9d88ae..27437af495f 100644
+--- a/app/src/main/res/drawable/ic_info_white_24.xml
++++ b/app/src/main/res/drawable/ic_info_white_24.xml
+@@ -4,6 +4,6 @@
+     android:viewportWidth="24"
+     android:viewportHeight="24">
+     <path
+-        android:fillColor="@color/core_white"
++        android:fillColor="#ffffff"
+         android:pathData="M12,2.5A9.5,9.5 0,1 1,2.5 12,9.511 9.511,0 0,1 12,2.5M12,1A11,11 0,1 0,23 12,11 11,0 0,0 12,1ZM12,8.5A1.5,1.5 0,0 0,13.5 7a1.5,1.5 0,1 0,-2.56 1.06A1.435,1.435 0,0 0,12 8.5ZM13,16.5L13,10L9.5,10v1.5h2v5L9,16.5L9,18h6L15,16.5Z" />
+ </vector>
+diff --git a/app/src/main/res/layout/enable_call_notification_settings_dialog_fragment.xml b/app/src/main/res/layout/enable_call_notification_settings_dialog_fragment.xml
+new file mode 100644
+index 00000000000..075132a598e
+--- /dev/null
++++ b/app/src/main/res/layout/enable_call_notification_settings_dialog_fragment.xml
+@@ -0,0 +1,84 @@
++<?xml version="1.0" encoding="utf-8"?>
++<androidx.gridlayout.widget.GridLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:padding="?attr/dialogPreferredPadding"
++    app:alignmentMode="alignBounds"
++    app:columnCount="2">
++
++    <TextView
++        android:id="@+id/enable_call_notification_settings_dialog_system_all_configured"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:text="@string/EnableCallNotificationSettingsDialog__everything_looks_good_now"
++        android:textAppearance="@style/TextAppearance.Signal.Body2"
++        android:visibility="gone"
++        app:layout_columnSpan="2" />
++
++    <androidx.appcompat.widget.AppCompatImageView
++        android:id="@+id/enable_call_notification_settings_dialog_system_setting_indicator"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginEnd="8dp"
++        android:layout_marginBottom="8dp"
++        app:layout_gravity="center_vertical"
++        app:srcCompat="@drawable/ic_info_white_24"
++        app:tint="@color/signal_alert_primary" />
++
++    <TextView
++        android:id="@+id/enable_call_notification_settings_dialog_system_setting_text"
++        android:layout_width="0dp"
++        android:layout_height="wrap_content"
++        android:background="?selectableItemBackground"
++        android:text="@string/EnableCallNotificationSettingsDialog__to_receive_call_notifications_tap_here_and_turn_on_show_notifications"
++        android:textAlignment="viewStart"
++        android:textAppearance="@style/TextAppearance.Signal.Body2"
++        app:layout_columnWeight="1"
++        app:layout_gravity="center_vertical" />
++
++    <androidx.appcompat.widget.AppCompatImageView
++        android:id="@+id/enable_call_notification_settings_dialog_channel_setting_indicator"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="8dp"
++        android:layout_marginEnd="8dp"
++        android:layout_marginBottom="8dp"
++        app:layout_gravity="center_vertical"
++        app:srcCompat="@drawable/ic_info_white_24"
++        app:tint="@color/signal_alert_primary" />
++
++    <TextView
++        android:id="@+id/enable_call_notification_settings_dialog_channel_setting_text"
++        android:layout_width="0dp"
++        android:layout_height="wrap_content"
++        android:background="?selectableItemBackground"
++        android:text="@string/EnableCallNotificationSettingsDialog__to_receive_call_notifications_tap_here_and_turn_on_notifications"
++        android:textAlignment="viewStart"
++        android:textAppearance="@style/TextAppearance.Signal.Body2"
++        app:layout_columnWeight="1"
++        app:layout_gravity="center_vertical" />
++
++
++    <androidx.appcompat.widget.AppCompatImageView
++        android:id="@+id/enable_call_notification_settings_dialog_background_restricted_indicator"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="8dp"
++        android:layout_marginEnd="8dp"
++        app:layout_gravity="center_vertical"
++        app:srcCompat="@drawable/ic_info_white_24"
++        app:tint="@color/signal_alert_primary" />
++
++    <TextView
++        android:id="@+id/enable_call_notification_settings_dialog_background_restricted_text"
++        android:layout_width="0dp"
++        android:layout_height="wrap_content"
++        android:background="?selectableItemBackground"
++        android:text="@string/EnableCallNotificationSettingsDialog__to_receive_call_notifications_tap_here_and_enable_background_activity_in_battery_settings"
++        android:textAlignment="viewStart"
++        android:textAppearance="@style/TextAppearance.Signal.Body2"
++        app:layout_columnWeight="1"
++        app:layout_gravity="center_vertical" />
++
++</androidx.gridlayout.widget.GridLayout>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 9020c8e5caa..8386f7c7dee 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -640,7 +640,7 @@
+         <item quantity="one">Error revoking invite</item>
+         <item quantity="other">Error revoking invites</item>
+     </plurals>
+-    
++
+     <!-- RequestingMembersFragment -->
+     <string name="RequestingMembersFragment_pending_member_requests">Pending member requests</string>
+     <string name="RequestingMembersFragment_no_member_requests_to_show">No member requests to show.</string>
+@@ -799,7 +799,7 @@
+     <string name="CustomNotificationsDialogFragment__enabled">Enabled</string>
+     <string name="CustomNotificationsDialogFragment__disabled">Disabled</string>
+     <string name="CustomNotificationsDialogFragment__default">Default</string>
+-    
++
+     <!-- ShareableGroupLinkDialogFragment -->
+     <string name="ShareableGroupLinkDialogFragment__shareable_group_link">Shareable group link</string>
+     <string name="ShareableGroupLinkDialogFragment__manage_and_share">Manage &amp; share</string>
+@@ -1722,7 +1722,7 @@
+     <string name="NotificationChannel_group_messages">Messages</string>
+     <string name="NotificationChannel_missing_display_name">Unknown</string>
+     <string name="NotificationChannel_voice_notes">Voice Notes</string>
+-
++    <string name="NotificationChannels__no_activity_available_to_open_notification_channel_settings">No activity available to open notification channel settings.</string>
+     <!-- ProfileEditNameFragment -->
+ 
+     <!-- QuickResponseService -->
+@@ -1871,6 +1871,7 @@
+     <string name="ConversationUpdateItem_return_to_call">Return to call</string>
+     <string name="ConversationUpdateItem_call_is_full">Call is full</string>
+     <string name="ConversationUpdateItem_invite_friends">Invite friends</string>
++    <string name="ConversationUpdateItem_enable_call_notifications">Enable Call Notifications</string>
+ 
+     <!-- audio_view -->
+     <string name="audio_view__play_pause_accessibility_description">Play … Pause</string>
+@@ -1899,6 +1900,19 @@
+     <string name="safety_number_change_dialog__view">View</string>
+     <string name="safety_number_change_dialog__previous_verified">Previous verified</string>
+ 
++    <!-- EnableCallNotificationSettingsDialog__call_notifications_checklist -->
++    <string name="EnableCallNotificationSettingsDialog__call_notifications_enabled">Call notifications enabled.</string>
++    <string name="EnableCallNotificationSettingsDialog__enable_call_notifications">Enable call notifications</string>
++    <string name="EnableCallNotificationSettingsDialog__enable_background_activity">Enable background activity</string>
++    <string name="EnableCallNotificationSettingsDialog__everything_looks_good_now">Everything looks good now!</string>
++    <string name="EnableCallNotificationSettingsDialog__to_receive_call_notifications_tap_here_and_turn_on_show_notifications">To receive call notifications, tap here and turn on \"Show notifications.\"</string>
++    <string name="EnableCallNotificationSettingsDialog__to_receive_call_notifications_tap_here_and_turn_on_notifications">To receive call notifications, tap here and turn on notifications and make sure Sound and Pop-up are enabled.</string>
++    <string name="EnableCallNotificationSettingsDialog__to_receive_call_notifications_tap_here_and_enable_background_activity_in_battery_settings">To receive call notifications, tap here and enable background activity in \"Battery\" settings. </string>
++    <string name="EnableCallNotificationSettingsDialog__settings">Settings</string>
++    <string name="EnableCallNotificationSettingsDialog__to_receive_call_notifications_tap_settings_and_turn_on_show_notifications">To receive call notifications, tap Settings and turn on \"Show notifications.\"</string>
++    <string name="EnableCallNotificationSettingsDialog__to_receive_call_notifications_tap_settings_and_turn_on_notifications">To receive call notifications, tap Settings and turn on notifications and make sure Sound and Pop-up are enabled.</string>
++    <string name="EnableCallNotificationSettingsDialog__to_receive_call_notifications_tap_settings_and_enable_background_activity_in_battery_settings">To receive call notifications, tap Settings and enable background activity in \"Battery\" settings.</string>
++
+     <!-- country_selection_fragment -->
+     <string name="country_selection_fragment__loading_countries">Loading countries…</string>
+     <string name="country_selection_fragment__search">Search</string>

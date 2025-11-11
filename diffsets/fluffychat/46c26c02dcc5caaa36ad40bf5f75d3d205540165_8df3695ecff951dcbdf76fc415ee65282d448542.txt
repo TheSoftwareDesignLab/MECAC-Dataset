@@ -1,0 +1,564 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 534264b75d..0759a8d970 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,10 @@
+ # Version 0.19.0 - 2020-??-??
+ ### Features
+ - Implemented ignore list
++- Jump to events in timeline: When tapping on a reply and when tapping a matrix.to link
++### Fixes
++- Timeline randomly resorting while more history is being fetched
++- Automatically request history if the "load more" button is on the screen
+ 
+ # Version 0.18.0 - 2020-09-13
+ ### Features
+diff --git a/lib/components/list_items/message.dart b/lib/components/list_items/message.dart
+index 53053411c4..36f5bd90fc 100644
+--- a/lib/components/list_items/message.dart
++++ b/lib/components/list_items/message.dart
+@@ -20,6 +20,7 @@ class Message extends StatelessWidget {
+   final Event nextEvent;
+   final Function(Event) onSelect;
+   final Function(Event) onAvatarTab;
++  final Function(String) scrollToEventId;
+   final bool longPressSelect;
+   final bool selected;
+   final Timeline timeline;
+@@ -29,6 +30,7 @@ class Message extends StatelessWidget {
+       this.longPressSelect,
+       this.onSelect,
+       this.onAvatarTab,
++      this.scrollToEventId,
+       this.selected,
+       this.timeline});
+ 
+@@ -110,10 +112,19 @@ class Message extends StatelessWidget {
+                                   status: 1,
+                                   originServerTs: DateTime.now(),
+                                 );
+-                          return Container(
+-                            margin: EdgeInsets.symmetric(vertical: 4.0),
+-                            child: ReplyContent(replyEvent,
+-                                lightText: ownMessage, timeline: timeline),
++                          return InkWell(
++                            child: AbsorbPointer(
++                              child: Container(
++                                margin: EdgeInsets.symmetric(vertical: 4.0),
++                                child: ReplyContent(replyEvent,
++                                    lightText: ownMessage, timeline: timeline),
++                              ),
++                            ),
++                            onTap: () {
++                              if (scrollToEventId != null) {
++                                scrollToEventId(replyEvent.eventId);
++                              }
++                            },
+                           );
+                         },
+                       ),
+diff --git a/lib/utils/matrix_identifier_string_extension.dart b/lib/utils/matrix_identifier_string_extension.dart
+new file mode 100644
+index 0000000000..140be067d4
+--- /dev/null
++++ b/lib/utils/matrix_identifier_string_extension.dart
+@@ -0,0 +1,24 @@
++extension MatrixIdentifierStringExtension on String {
++  /// Separates room identifiers with an event id and possibly a query parameter into its components.
++  MatrixIdentifierStringExtensionResults parseIdentifierIntoParts() {
++    final match = RegExp(r'^([#!][^:]*:[^\/?]*)(?:\/(\$[^?]*))?(?:\?(.*))?$')
++        .firstMatch(this);
++    if (match == null) {
++      return null;
++    }
++    return MatrixIdentifierStringExtensionResults(
++      roomIdOrAlias: match.group(1),
++      eventId: match.group(2),
++      queryString: match.group(3),
++    );
++  }
++}
++
++class MatrixIdentifierStringExtensionResults {
++  final String roomIdOrAlias;
++  final String eventId;
++  final String queryString;
++
++  MatrixIdentifierStringExtensionResults(
++      {this.roomIdOrAlias, this.eventId, this.queryString});
++}
+diff --git a/lib/utils/url_launcher.dart b/lib/utils/url_launcher.dart
+index 9c6d3140e6..5603772bde 100644
+--- a/lib/utils/url_launcher.dart
++++ b/lib/utils/url_launcher.dart
+@@ -5,6 +5,7 @@ import 'package:fluffychat/utils/app_route.dart';
+ import 'package:fluffychat/views/chat.dart';
+ import 'package:flutter/material.dart';
+ import 'package:url_launcher/url_launcher.dart';
++import 'matrix_identifier_string_extension.dart';
+ 
+ class UrlLauncher {
+   final String url;
+@@ -23,51 +24,79 @@ class UrlLauncher {
+     final matrix = Matrix.of(context);
+     final identifier = url.replaceAll('https://matrix.to/#/', '');
+     if (identifier[0] == '#' || identifier[0] == '!') {
+-      var room = matrix.client.getRoomByAlias(identifier);
+-      room ??= matrix.client.getRoomById(identifier);
++      // sometimes we have identifiers which have an event id and additional query parameters
++      // we want to separate those.
++      final identityParts = identifier.parseIdentifierIntoParts();
++      if (identityParts == null) {
++        return; // no match, nothing to do
++      }
++      final roomIdOrAlias = identityParts.roomIdOrAlias;
++      final event = identityParts.eventId;
++      final query = identityParts.queryString;
++      var room = matrix.client.getRoomByAlias(roomIdOrAlias) ??
++          matrix.client.getRoomById(roomIdOrAlias);
+       var roomId = room?.id;
+-      var servers = <String>[];
+-      if (room == null && identifier == '#') {
++      // we make the servers a set and later on convert to a list, so that we can easily
++      // deduplicate servers added via alias lookup and query parameter
++      var servers = <String>{};
++      if (room == null && roomIdOrAlias == '#') {
+         // we were unable to find the room locally...so resolve it
+         final response =
+             await SimpleDialogs(context).tryRequestWithLoadingDialog(
+-          matrix.client.requestRoomAliasInformations(identifier),
++          matrix.client.requestRoomAliasInformations(roomIdOrAlias),
+         );
+         if (response != false) {
+           roomId = response.roomId;
+-          servers = response.servers;
++          servers.addAll(response.servers);
+           room = matrix.client.getRoomById(roomId);
+         }
+       }
++      if (query != null) {
++        // the query information might hold additional servers to try, so let's try them!
++        // as there might be multiple "via" tags we can't just use Uri.splitQueryString, we need to do our own thing
++        for (final parameter in query.split('&')) {
++          final index = parameter.indexOf('=');
++          if (index == -1) {
++            continue;
++          }
++          if (Uri.decodeQueryComponent(parameter.substring(0, index)) !=
++              'via') {
++            continue;
++          }
++          servers.add(Uri.decodeQueryComponent(parameter.substring(index + 1)));
++        }
++      }
+       if (room != null) {
+         // we have the room, so....just open it!
+         await Navigator.pushAndRemoveUntil(
+           context,
+-          AppRoute.defaultRoute(context, ChatView(room.id)),
++          AppRoute.defaultRoute(
++              context, ChatView(room.id, scrollToEventId: event)),
+           (r) => r.isFirst,
+         );
+         return;
+       }
+-      if (identifier == '!') {
+-        roomId = identifier;
++      if (roomIdOrAlias[0] == '!') {
++        roomId = roomIdOrAlias;
+       }
+       if (roomId == null) {
+         // we haven't found this room....so let's ignore it
+         return;
+       }
+       if (await SimpleDialogs(context)
+-          .askConfirmation(titleText: 'Join room $identifier')) {
++          .askConfirmation(titleText: 'Join room $roomIdOrAlias')) {
+         final response =
+             await SimpleDialogs(context).tryRequestWithLoadingDialog(
+           matrix.client.joinRoomOrAlias(
+-            Uri.encodeComponent(roomId),
+-            servers: servers,
++            Uri.encodeComponent(roomIdOrAlias),
++            servers: servers.toList(),
+           ),
+         );
+         if (response == false) return;
+         await Navigator.pushAndRemoveUntil(
+           context,
+-          AppRoute.defaultRoute(context, ChatView(response['room_id'])),
++          AppRoute.defaultRoute(
++              context, ChatView(response['room_id'], scrollToEventId: event)),
+           (r) => r.isFirst,
+         );
+       }
+diff --git a/lib/views/chat.dart b/lib/views/chat.dart
+index ec65569ae7..c4713364c1 100644
+--- a/lib/views/chat.dart
++++ b/lib/views/chat.dart
+@@ -3,6 +3,7 @@ import 'dart:io';
+ import 'dart:math';
+ 
+ import 'package:famedlysdk/famedlysdk.dart';
++import 'package:flutter/scheduler.dart';
+ import 'package:fluffychat/components/adaptive_page_layout.dart';
+ import 'package:fluffychat/components/avatar.dart';
+ import 'package:fluffychat/components/chat_settings_popup_menu.dart';
+@@ -24,6 +25,7 @@ import 'package:memoryfilepicker/memoryfilepicker.dart';
+ import 'package:pedantic/pedantic.dart';
+ import 'package:image_picker/image_picker.dart';
+ import 'package:file_picker_platform_interface/file_picker_platform_interface.dart';
++import 'package:scroll_to_index/scroll_to_index.dart';
+ 
+ import 'chat_details.dart';
+ import 'chat_list.dart';
+@@ -33,8 +35,9 @@ import '../utils/matrix_file_extension.dart';
+ 
+ class ChatView extends StatelessWidget {
+   final String id;
++  final String scrollToEventId;
+ 
+-  const ChatView(this.id, {Key key}) : super(key: key);
++  const ChatView(this.id, {Key key, this.scrollToEventId}) : super(key: key);
+ 
+   @override
+   Widget build(BuildContext context) {
+@@ -44,15 +47,16 @@ class ChatView extends StatelessWidget {
+       firstScaffold: ChatList(
+         activeChat: id,
+       ),
+-      secondScaffold: _Chat(id),
++      secondScaffold: _Chat(id, scrollToEventId: scrollToEventId),
+     );
+   }
+ }
+ 
+ class _Chat extends StatefulWidget {
+   final String id;
++  final String scrollToEventId;
+ 
+-  const _Chat(this.id, {Key key}) : super(key: key);
++  const _Chat(this.id, {Key key, this.scrollToEventId}) : super(key: key);
+ 
+   @override
+   _ChatState createState() => _ChatState();
+@@ -67,7 +71,7 @@ class _ChatState extends State<_Chat> {
+ 
+   String seenByText = '';
+ 
+-  final ScrollController _scrollController = ScrollController();
++  final AutoScrollController _scrollController = AutoScrollController();
+ 
+   FocusNode inputFocus = FocusNode();
+ 
+@@ -101,28 +105,33 @@ class _ChatState extends State<_Chat> {
+         timeline.requestHistory(historyCount: _loadHistoryCount),
+       );
+ 
+-      if (mounted) setState(() => _loadingHistory = false);
++      // we do NOT setState() here as then the event order will be wrong.
++      // instead, we just set our variable to false, and rely on timeline update to set the
++      // new state, thus triggering a re-render, for us
++      _loadingHistory = false;
++    }
++  }
++
++  void _updateScrollController() {
++    if (_scrollController.position.pixels ==
++            _scrollController.position.maxScrollExtent &&
++        timeline.events.isNotEmpty &&
++        timeline.events[timeline.events.length - 1].type !=
++            EventTypes.RoomCreate) {
++      requestHistory();
++    }
++    if (_scrollController.position.pixels > 0 &&
++        showScrollDownButton == false) {
++      setState(() => showScrollDownButton = true);
++    } else if (_scrollController.position.pixels == 0 &&
++        showScrollDownButton == true) {
++      setState(() => showScrollDownButton = false);
+     }
+   }
+ 
+   @override
+   void initState() {
+-    _scrollController.addListener(() async {
+-      if (_scrollController.position.pixels ==
+-              _scrollController.position.maxScrollExtent &&
+-          timeline.events.isNotEmpty &&
+-          timeline.events[timeline.events.length - 1].type !=
+-              EventTypes.RoomCreate) {
+-        requestHistory();
+-      }
+-      if (_scrollController.position.pixels > 0 &&
+-          showScrollDownButton == false) {
+-        setState(() => showScrollDownButton = true);
+-      } else if (_scrollController.position.pixels == 0 &&
+-          showScrollDownButton == true) {
+-        setState(() => showScrollDownButton = false);
+-      }
+-    });
++    _scrollController.addListener(() => _updateScrollController);
+ 
+     super.initState();
+   }
+@@ -156,12 +165,22 @@ class _ChatState extends State<_Chat> {
+     }
+   }
+ 
+-  Future<bool> getTimeline() async {
++  Future<bool> getTimeline(BuildContext context) async {
+     if (timeline == null) {
+       timeline = await room.getTimeline(onUpdate: updateView);
+       if (timeline.events.isNotEmpty) {
+         unawaited(room.sendReadReceipt(timeline.events.first.eventId));
+       }
++
++      // when the scroll controller is attached we want to scroll to an event id, if specified
++      // and update the scroll controller...which will trigger a request history, if the
++      // "load more" button is visible on the screen
++      SchedulerBinding.instance.addPostFrameCallback((_) async {
++        if (widget.scrollToEventId != null) {
++          _scrollToEventId(widget.scrollToEventId, context: context);
++        }
++        _updateScrollController();
++      });
+     }
+     updateView();
+     return true;
+@@ -316,6 +335,66 @@ class _ChatState extends State<_Chat> {
+     inputFocus.requestFocus();
+   }
+ 
++  void _scrollToEventId(String eventId, {BuildContext context}) async {
++    var eventIndex =
++        getFilteredEvents().indexWhere((e) => e.eventId == eventId);
++    if (eventIndex == -1) {
++      // event id not found...maybe we can fetch it?
++      // the try...finally is here to start and close the loading dialog reliably
++      try {
++        if (context != null) {
++          SimpleDialogs(context).showLoadingDialog(context);
++        }
++        // okay, we first have to fetch if the event is in the room
++        try {
++          final event = await timeline.getEventById(eventId);
++          if (event == null) {
++            // event is null...meaning something is off
++            return;
++          }
++        } catch (err) {
++          if (err is MatrixException && err.errcode == 'M_NOT_FOUND') {
++            // event wasn't found, as the server gave a 404 or something
++            return;
++          }
++          rethrow;
++        }
++        // okay, we know that the event *is* in the room
++        while (eventIndex == -1) {
++          if (!_canLoadMore) {
++            // we can't load any more events but still haven't found ours yet...better stop here
++            return;
++          }
++          try {
++            await timeline.requestHistory(historyCount: _loadHistoryCount);
++          } catch (err) {
++            if (err is TimeoutException) {
++              // loading the history timed out...so let's do nothing
++              return;
++            }
++            rethrow;
++          }
++          eventIndex =
++              getFilteredEvents().indexWhere((e) => e.eventId == eventId);
++        }
++      } finally {
++        if (context != null) {
++          Navigator.of(context)?.pop();
++        }
++      }
++    }
++    await _scrollController.scrollToIndex(eventIndex,
++        preferPosition: AutoScrollPosition.middle);
++    _updateScrollController();
++  }
++
++  List<Event> getFilteredEvents() => timeline.events
++      .where((e) =>
++          ![RelationshipTypes.Edit, RelationshipTypes.Reaction]
++              .contains(e.relationshipType) &&
++          e.type != 'm.reaction')
++      .toList();
++
+   @override
+   Widget build(BuildContext context) {
+     matrix = Matrix.of(context);
+@@ -484,7 +563,7 @@ class _ChatState extends State<_Chat> {
+               ConnectionStatusHeader(),
+               Expanded(
+                 child: FutureBuilder<bool>(
+-                  future: getTimeline(),
++                  future: getTimeline(context),
+                   builder: (BuildContext context, snapshot) {
+                     if (!snapshot.hasData) {
+                       return Center(
+@@ -500,14 +579,7 @@ class _ChatState extends State<_Chat> {
+                       room.sendReadReceipt(timeline.events.first.eventId);
+                     }
+ 
+-                    final filteredEvents = timeline.events
+-                        .where((e) =>
+-                            ![
+-                              RelationshipTypes.Edit,
+-                              RelationshipTypes.Reaction
+-                            ].contains(e.relationshipType) &&
+-                            e.type != 'm.reaction')
+-                        .toList();
++                    final filteredEvents = getFilteredEvents();
+ 
+                     return ListView.builder(
+                         padding: EdgeInsets.symmetric(
+@@ -570,34 +642,48 @@ class _ChatState extends State<_Chat> {
+                                         bottom: 8,
+                                       ),
+                                     )
+-                                  : Message(filteredEvents[i - 1],
+-                                      onAvatarTab: (Event event) {
+-                                      sendController.text +=
+-                                          ' ${event.senderId}';
+-                                    }, onSelect: (Event event) {
+-                                      if (!event.redacted) {
+-                                        if (selectedEvents.contains(event)) {
+-                                          setState(
+-                                            () => selectedEvents.remove(event),
+-                                          );
+-                                        } else {
+-                                          setState(
+-                                            () => selectedEvents.add(event),
+-                                          );
+-                                        }
+-                                        selectedEvents.sort(
+-                                          (a, b) => a.originServerTs
+-                                              .compareTo(b.originServerTs),
+-                                        );
+-                                      }
+-                                    },
+-                                      longPressSelect: selectedEvents.isEmpty,
+-                                      selected: selectedEvents
+-                                          .contains(filteredEvents[i - 1]),
+-                                      timeline: timeline,
+-                                      nextEvent: i >= 2
+-                                          ? filteredEvents[i - 2]
+-                                          : null);
++                                  : AutoScrollTag(
++                                      key: ValueKey(i - 1),
++                                      index: i - 1,
++                                      controller: _scrollController,
++                                      child: Message(filteredEvents[i - 1],
++                                          onAvatarTab: (Event event) {
++                                            sendController.text +=
++                                                ' ${event.senderId}';
++                                          },
++                                          onSelect: (Event event) {
++                                            if (!event.redacted) {
++                                              if (selectedEvents
++                                                  .contains(event)) {
++                                                setState(
++                                                  () => selectedEvents
++                                                      .remove(event),
++                                                );
++                                              } else {
++                                                setState(
++                                                  () =>
++                                                      selectedEvents.add(event),
++                                                );
++                                              }
++                                              selectedEvents.sort(
++                                                (a, b) => a.originServerTs
++                                                    .compareTo(
++                                                        b.originServerTs),
++                                              );
++                                            }
++                                          },
++                                          scrollToEventId: (String eventId) =>
++                                              _scrollToEventId(eventId,
++                                                  context: context),
++                                          longPressSelect:
++                                              selectedEvents.isEmpty,
++                                          selected: selectedEvents
++                                              .contains(filteredEvents[i - 1]),
++                                          timeline: timeline,
++                                          nextEvent: i >= 2
++                                              ? filteredEvents[i - 2]
++                                              : null),
++                                    );
+                         });
+                   },
+                 ),
+diff --git a/pubspec.lock b/pubspec.lock
+index 03294156ad..df82bd71ba 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -739,6 +739,13 @@ packages:
+       url: "https://pub.dartlang.org"
+     source: hosted
+     version: "0.24.1"
++  scroll_to_index:
++    dependency: "direct main"
++    description:
++      name: scroll_to_index
++      url: "https://pub.dartlang.org"
++    source: hosted
++    version: "1.0.6"
+   sentry:
+     dependency: "direct main"
+     description:
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 1d4ae1b512..a00a8c773c 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -68,6 +68,7 @@ dependencies:
+       ref: master
+   flutter_blurhash: ^0.5.0
+   sentry: ">=3.0.0 <4.0.0"
++  scroll_to_index: ^1.0.6
+ 
+ dev_dependencies:
+   flutter_test:
+diff --git a/test/matrix_identifier_string_extension_test.dart b/test/matrix_identifier_string_extension_test.dart
+new file mode 100644
+index 0000000000..06db66d7fc
+--- /dev/null
++++ b/test/matrix_identifier_string_extension_test.dart
+@@ -0,0 +1,31 @@
++import 'package:flutter_test/flutter_test.dart';
++import 'package:fluffychat/utils/matrix_identifier_string_extension.dart';
++
++void main() {
++  group('Matrix Identifier String Extension', () {
++    test('parseIdentifierIntoParts', () {
++      var res = '#alias:beep'.parseIdentifierIntoParts();
++      expect(res.roomIdOrAlias, '#alias:beep');
++      expect(res.eventId, null);
++      expect(res.queryString, null);
++      res = 'blha'.parseIdentifierIntoParts();
++      expect(res, null);
++      res = '#alias:beep/\$event'.parseIdentifierIntoParts();
++      expect(res.roomIdOrAlias, '#alias:beep');
++      expect(res.eventId, '\$event');
++      expect(res.queryString, null);
++      res = '#alias:beep?blubb'.parseIdentifierIntoParts();
++      expect(res.roomIdOrAlias, '#alias:beep');
++      expect(res.eventId, null);
++      expect(res.queryString, 'blubb');
++      res = '#alias:beep/\$event?blubb'.parseIdentifierIntoParts();
++      expect(res.roomIdOrAlias, '#alias:beep');
++      expect(res.eventId, '\$event');
++      expect(res.queryString, 'blubb');
++      res = '#/\$?:beep/\$event?blubb?b'.parseIdentifierIntoParts();
++      expect(res.roomIdOrAlias, '#/\$?:beep');
++      expect(res.eventId, '\$event');
++      expect(res.queryString, 'blubb?b');
++    });
++  });
++}

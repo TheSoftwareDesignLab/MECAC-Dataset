@@ -1,0 +1,587 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/EnumMapper.kt b/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/EnumMapper.kt
+index 610decc09171..37acb01d058b 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/EnumMapper.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/EnumMapper.kt
+@@ -5,8 +5,8 @@
+ package org.mozilla.fenix.shopping.middleware
+ 
+ /**
+- * Converts a string to an enum value, ignoring case. If the string does not match any of the
+- * enum values, the default value is returned.
++ * Converts a string to an enum value, ignoring case and replacing spaces with underscores.
++ * If the string does not match any of the enum values, the default value is returned.
+  */
+ inline fun <reified T : Enum<T>> String.asEnumOrDefault(defaultValue: T? = null): T? =
+-    enumValues<T>().firstOrNull { it.name.equals(this, ignoreCase = true) } ?: defaultValue
++    enumValues<T>().firstOrNull { it.name.equals(this.replace(" ", "_"), ignoreCase = true) } ?: defaultValue
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/ProductAnalysisMapper.kt b/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/ProductAnalysisMapper.kt
+index ccbe306b623e..f9acdd4c9897 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/ProductAnalysisMapper.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/ProductAnalysisMapper.kt
+@@ -27,6 +27,10 @@ private fun ProductAnalysis.toProductReview(): ProductReviewState =
+         } else {
+             ProductReviewState.Error.GenericError
+         }
++    } else if (deletedProductReported) {
++        ProductReviewState.Error.ProductAlreadyReported
++    } else if (deletedProduct) {
++        ProductReviewState.Error.ProductNotAvailable
+     } else if (notEnoughReviews && !needsAnalysis) {
+         ProductReviewState.Error.NotEnoughReviews
+     } else {
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/ReviewQualityCheckNetworkMiddleware.kt b/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/ReviewQualityCheckNetworkMiddleware.kt
+index aeff96d5ea2c..f4d74196775e 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/ReviewQualityCheckNetworkMiddleware.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/ReviewQualityCheckNetworkMiddleware.kt
+@@ -56,24 +56,7 @@ class ReviewQualityCheckNetworkMiddleware(
+         scope.launch {
+             when (action) {
+                 FetchProductAnalysis, RetryProductAnalysis -> {
+-                    val productAnalysis = reviewQualityCheckService.fetchProductReview()
+-                    val productReviewState = productAnalysis.toProductReviewState()
+-
+-                    // Here the ProductReviewState should only updated after the analysis status API
+-                    // returns a result. This makes sure that the UI doesn't show the reanalyse
+-                    // button in case the product analysis is already in progress on the backend.
+-                    if (productReviewState.isAnalysisPresentOrNoAnalysisPresent() &&
+-                        reviewQualityCheckService.analysisStatus()?.status.isPendingOrInProgress()
+-                    ) {
+-                        store.updateProductReviewState(productReviewState, true)
+-                        store.dispatch(ReviewQualityCheckAction.RestoreReanalysis)
+-                    } else {
+-                        store.updateProductReviewState(productReviewState)
+-                    }
+-
+-                    if (productReviewState is ProductReviewState.AnalysisPresent) {
+-                        store.updateRecommendedProductState()
+-                    }
++                    store.onFetch()
+                 }
+ 
+                 ReviewQualityCheckAction.ReanalyzeProduct,
+@@ -83,6 +66,13 @@ class ReviewQualityCheckNetworkMiddleware(
+                     store.onReanalyze()
+                 }
+ 
++                ReviewQualityCheckAction.ReportProductBackInStock -> {
++                    val status = reviewQualityCheckService.reportBackInStock()
++                    if (status == ReportBackInStockStatusDto.NOT_DELETED) {
++                        store.onFetch()
++                    }
++                }
++
+                 ReviewQualityCheckAction.ToggleProductRecommendation -> {
+                     val state = store.state
+                     if (state is ReviewQualityCheckState.OptedIn &&
+@@ -104,6 +94,27 @@ class ReviewQualityCheckNetworkMiddleware(
+         }
+     }
+ 
++    private suspend fun Store<ReviewQualityCheckState, ReviewQualityCheckAction>.onFetch() {
++        val productAnalysis = reviewQualityCheckService.fetchProductReview()
++        val productReviewState = productAnalysis.toProductReviewState()
++
++        // Here the ProductReviewState should only updated after the analysis status API
++        // returns a result. This makes sure that the UI doesn't show the reanalyse
++        // button in case the product analysis is already in progress on the backend.
++        if (productReviewState.isAnalysisPresentOrNoAnalysisPresent() &&
++            reviewQualityCheckService.analysisStatus()?.status.isPendingOrInProgress()
++        ) {
++            updateProductReviewState(productReviewState, true)
++            dispatch(ReviewQualityCheckAction.RestoreReanalysis)
++        } else {
++            updateProductReviewState(productReviewState)
++        }
++
++        if (productReviewState is ProductReviewState.AnalysisPresent) {
++            updateRecommendedProductState()
++        }
++    }
++
+     private suspend fun Store<ReviewQualityCheckState, ReviewQualityCheckAction>.onReanalyze() {
+         val reanalysis = reviewQualityCheckService.reanalyzeProduct()
+ 
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/ReviewQualityCheckService.kt b/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/ReviewQualityCheckService.kt
+index 0ba074702e9b..56dd8d9275bd 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/ReviewQualityCheckService.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/shopping/middleware/ReviewQualityCheckService.kt
+@@ -57,6 +57,13 @@ interface ReviewQualityCheckService {
+      * Sends an impression attribution event for a given product aid.
+      */
+     suspend fun recordRecommendedProductImpression(productAid: String)
++
++    /**
++     * Reports that a product is back in stock.
++     *
++     * @return [ReportBackInStockStatusDto] if the request succeeds, null otherwise.
++     */
++    suspend fun reportBackInStock(): ReportBackInStockStatusDto?
+ }
+ 
+ /**
+@@ -195,6 +202,23 @@ class DefaultReviewQualityCheckService(
+             }
+         }
+     }
++
++    override suspend fun reportBackInStock(): ReportBackInStockStatusDto? = withContext(Dispatchers.Main) {
++        suspendCoroutine { continuation ->
++            browserStore.state.selectedTab?.let { tab ->
++                tab.engineState.engineSession?.reportBackInStock(
++                    url = tab.content.url,
++                    onResult = {
++                        continuation.resume(it.asEnumOrDefault<ReportBackInStockStatusDto>())
++                    },
++                    onException = {
++                        logger.error("Error reporting product back in stock", it)
++                        continuation.resume(null)
++                    },
++                )
++            }
++        }
++    }
+ }
+ 
+ /**
+@@ -232,3 +256,23 @@ data class AnalysisStatusProgressDto(
+     val status: AnalysisStatusDto,
+     val progress: Double,
+ )
++
++/**
++ * Enum that represents the status returned from reporting a product is back in stock.
++ */
++enum class ReportBackInStockStatusDto {
++    /**
++     * Report created.
++     */
++    REPORT_CREATED,
++
++    /**
++     * Product is already reported to be back in stock.
++     */
++    ALREADY_REPORTED,
++
++    /**
++     * Product was not actually marked as deleted.
++     */
++    NOT_DELETED,
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckAction.kt b/fenix/app/src/main/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckAction.kt
+index bf9afe655f2a..8aed790ce2d2 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckAction.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckAction.kt
+@@ -225,5 +225,5 @@ sealed interface ReviewQualityCheckAction : Action {
+     /**
+      * Triggered when the user reports a product is back in stock.
+      */
+-    object ReportProductBackInStock : TelemetryAction
++    object ReportProductBackInStock : NetworkAction, UpdateAction, TelemetryAction
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckState.kt b/fenix/app/src/main/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckState.kt
+index adf6f55184e5..3eefbaff1e98 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckState.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckState.kt
+@@ -90,6 +90,21 @@ sealed interface ReviewQualityCheckState : State {
+                  * Denotes a generic error has occurred.
+                  */
+                 object GenericError : Error
++
++                /**
++                 * Denotes a product is not available.
++                 */
++                object ProductNotAvailable : Error
++
++                /**
++                 * Denotes current user reported a product is back in stock.
++                 */
++                object ThanksForReporting : Error
++
++                /**
++                 * Denotes another user has already reported the product is back in stock.
++                 */
++                object ProductAlreadyReported : Error
+             }
+ 
+             /**
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckStore.kt b/fenix/app/src/main/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckStore.kt
+index e93d8a06d85e..ce760cc9412e 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckStore.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckStore.kt
+@@ -197,5 +197,17 @@ private fun mapStateForUpdateAction(
+                 }
+             }
+         }
++
++        ReviewQualityCheckAction.ReportProductBackInStock -> {
++            state.mapIfOptedIn {
++                if (it.productReviewState is ProductReviewState.Error.ProductNotAvailable) {
++                    it.copy(
++                        productReviewState = ProductReviewState.Error.ThanksForReporting,
++                    )
++                } else {
++                    it
++                }
++            }
++        }
+     }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/shopping/ui/ProductAnalysisError.kt b/fenix/app/src/main/java/org/mozilla/fenix/shopping/ui/ProductAnalysisError.kt
+index 83e950c3e0fc..1a4ca2815bec 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/shopping/ui/ProductAnalysisError.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/shopping/ui/ProductAnalysisError.kt
+@@ -29,6 +29,7 @@ import org.mozilla.fenix.theme.FirefoxTheme
+  * Product analysis error UI
+  *
+  * @param error The error state to display.
++ * @param onReportBackInStockClick Invoked when the user clicks on the report back in stock button.
+  * @param productRecommendationsEnabled The current state of the product recommendations toggle.
+  * @param productVendor The vendor of the product.
+  * @param isSettingsExpanded Whether or not the settings card is expanded.
+@@ -43,9 +44,10 @@ import org.mozilla.fenix.theme.FirefoxTheme
+  * @param modifier Modifier to apply to the layout.
+  */
+ @Composable
+-@Suppress("LongParameterList")
++@Suppress("LongParameterList", "LongMethod")
+ fun ProductAnalysisError(
+     error: ProductReviewState.Error,
++    onReportBackInStockClick: () -> Unit,
+     productRecommendationsEnabled: Boolean?,
+     productVendor: ReviewQualityCheckState.ProductVendor,
+     isSettingsExpanded: Boolean,
+@@ -98,14 +100,51 @@ fun ProductAnalysisError(
+                     ReviewQualityCheckInfoType.Info,
+                 )
+             }
++
++            ProductReviewState.Error.ProductNotAvailable -> {
++                Triple(
++                    R.string.review_quality_check_product_availability_warning_title,
++                    R.string.review_quality_check_product_availability_warning_body,
++                    ReviewQualityCheckInfoType.Info,
++                )
++            }
++
++            ProductReviewState.Error.ProductAlreadyReported -> {
++                Triple(
++                    R.string.review_quality_check_analysis_requested_other_user_info_title,
++                    R.string.review_quality_check_analysis_requested_other_user_info_body,
++                    ReviewQualityCheckInfoType.Info,
++                )
++            }
++
++            ProductReviewState.Error.ThanksForReporting -> {
++                Triple(
++                    R.string.review_quality_check_analysis_requested_info_title,
++                    R.string.review_quality_check_analysis_requested_info_body,
++                    ReviewQualityCheckInfoType.Info,
++                )
++            }
+         }
+ 
+-        ReviewQualityCheckInfoCard(
+-            title = stringResource(id = titleResourceId),
+-            description = stringResource(id = descriptionResourceId),
+-            type = type,
+-            modifier = Modifier.fillMaxWidth(),
+-        )
++        if (error == ProductReviewState.Error.ProductNotAvailable) {
++            ReviewQualityCheckInfoCard(
++                title = stringResource(id = titleResourceId),
++                description = stringResource(id = descriptionResourceId),
++                type = type,
++                modifier = Modifier.fillMaxWidth(),
++                buttonText = InfoCardButtonText(
++                    text = stringResource(R.string.review_quality_check_product_availability_warning_action_2),
++                    onClick = onReportBackInStockClick,
++                ),
++            )
++        } else {
++            ReviewQualityCheckInfoCard(
++                title = stringResource(id = titleResourceId),
++                description = stringResource(id = descriptionResourceId),
++                type = type,
++                modifier = Modifier.fillMaxWidth(),
++            )
++        }
+ 
+         ReviewQualityInfoCard(
+             productVendor = productVendor,
+@@ -145,6 +184,7 @@ private fun ProductAnalysisErrorPreview() {
+ 
+             ProductAnalysisError(
+                 error = ProductReviewState.Error.NetworkError,
++                onReportBackInStockClick = { },
+                 productRecommendationsEnabled = productRecommendationsEnabled,
+                 productVendor = ReviewQualityCheckState.ProductVendor.AMAZON,
+                 isSettingsExpanded = isSettingsExpanded,
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/shopping/ui/ReviewQualityCheckBottomSheet.kt b/fenix/app/src/main/java/org/mozilla/fenix/shopping/ui/ReviewQualityCheckBottomSheet.kt
+index d7f60cc426ce..81d375239a8b 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/shopping/ui/ReviewQualityCheckBottomSheet.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/shopping/ui/ReviewQualityCheckBottomSheet.kt
+@@ -81,6 +81,9 @@ fun ReviewQualityCheckBottomSheet(
+                     onReanalyzeClick = {
+                         store.dispatch(ReviewQualityCheckAction.ReanalyzeProduct)
+                     },
++                    onReportBackInStockClick = {
++                        store.dispatch(ReviewQualityCheckAction.ReportProductBackInStock)
++                    },
+                     onProductRecommendationsEnabledStateChange = {
+                         store.dispatch(ReviewQualityCheckAction.ToggleProductRecommendation)
+                     },
+@@ -141,6 +144,7 @@ private fun ProductReview(
+     onFooterLinkClick: () -> Unit,
+     onRecommendedProductClick: (aid: String, url: String) -> Unit,
+     onProductRecommendationImpression: (aid: String) -> Unit,
++    onReportBackInStockClick: () -> Unit,
+ ) {
+     when (val productReviewState = state.productReviewState) {
+         is AnalysisPresent -> {
+@@ -167,6 +171,7 @@ private fun ProductReview(
+         is ReviewQualityCheckState.OptedIn.ProductReviewState.Error -> {
+             ProductAnalysisError(
+                 error = productReviewState,
++                onReportBackInStockClick = onReportBackInStockClick,
+                 productRecommendationsEnabled = state.productRecommendationsPreference,
+                 productVendor = state.productVendor,
+                 isSettingsExpanded = state.isSettingsExpanded,
+diff --git a/fenix/app/src/main/res/values/strings.xml b/fenix/app/src/main/res/values/strings.xml
+index 0b8eab30b5cb..c0d9015a5d1d 100644
+--- a/fenix/app/src/main/res/values/strings.xml
++++ b/fenix/app/src/main/res/values/strings.xml
+@@ -2180,13 +2180,13 @@
+     <!-- Text for body of warning card informing the user that the current product does not have enough reviews for a review analysis. -->
+     <string name="review_quality_check_no_reviews_warning_body">When this product has more reviews, we’ll be able to check their quality.</string>
+     <!-- Title for warning card informing the user that the current product is currently not available. -->
+-    <string name="review_quality_check_product_availability_warning_title" tools:ignore="UnusedResources">Product is not available</string>
++    <string name="review_quality_check_product_availability_warning_title">Product is not available</string>
+     <!-- Text for the body of warning card informing the user that the current product is currently not available. -->
+-    <string name="review_quality_check_product_availability_warning_body" tools:ignore="UnusedResources">If you see this product is back in stock, report it and we’ll work on checking the reviews.</string>
++    <string name="review_quality_check_product_availability_warning_body">If you see this product is back in stock, report it and we’ll work on checking the reviews.</string>
+     <!-- Clickable text for warning card informing the user that the current product is currently not available. Clicking this should inform the server that the product is available. -->
+     <string name="review_quality_check_product_availability_warning_action" moz:RemovedIn="120" tools:ignore="UnusedResources">Report this product is back in stock</string>
+     <!-- Clickable text for warning card informing the user that the current product is currently not available. Clicking this should inform the server that the product is available. -->
+-    <string name="review_quality_check_product_availability_warning_action_2" tools:ignore="UnusedResources">Report product is in stock</string>
++    <string name="review_quality_check_product_availability_warning_action_2">Report product is in stock</string>
+     <!-- Title for warning card informing the user that the current product's re-analysis is still processing. -->
+     <string name="review_quality_check_reanalysis_in_progress_warning_title" moz:RemovedIn="122">Checking review quality</string>
+     <!-- Title for warning card informing the user that the current product's analysis is still processing. -->
+@@ -2196,9 +2196,9 @@
+     <!-- Text for body of warning card informing the user that the current product's analysis is still processing. -->
+     <string name="review_quality_check_analysis_in_progress_warning_body">This could take about 60 seconds.</string>
+     <!-- Title for info card displayed after the user reports a product is back in stock. -->
+-    <string name="review_quality_check_analysis_requested_info_title" tools:ignore="UnusedResources">Thanks for reporting!</string>
++    <string name="review_quality_check_analysis_requested_info_title">Thanks for reporting!</string>
+     <!-- Text for body of info card displayed after the user reports a product is back in stock. -->
+-    <string name="review_quality_check_analysis_requested_info_body" tools:ignore="UnusedResources">We should have info about this product’s reviews within 24 hours. Please check back.</string>
++    <string name="review_quality_check_analysis_requested_info_body">We should have info about this product’s reviews within 24 hours. Please check back.</string>
+     <!-- Title for info card displayed when the user review checker while on a product that Fakespot does not analyze (e.g. gift cards, music). -->
+     <string name="review_quality_check_not_analyzable_info_title">We can’t check these reviews</string>
+     <!-- Text for body of info card displayed when the user review checker while on a product that Fakespot does not analyze (e.g. gift cards, music). -->
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/shopping/fake/FakeReviewQualityCheckService.kt b/fenix/app/src/test/java/org/mozilla/fenix/shopping/fake/FakeReviewQualityCheckService.kt
+index 83ff286f242a..2965bc435dcc 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/shopping/fake/FakeReviewQualityCheckService.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/shopping/fake/FakeReviewQualityCheckService.kt
+@@ -8,6 +8,7 @@ import mozilla.components.concept.engine.shopping.ProductAnalysis
+ import mozilla.components.concept.engine.shopping.ProductRecommendation
+ import org.mozilla.fenix.shopping.middleware.AnalysisStatusDto
+ import org.mozilla.fenix.shopping.middleware.AnalysisStatusProgressDto
++import org.mozilla.fenix.shopping.middleware.ReportBackInStockStatusDto
+ import org.mozilla.fenix.shopping.middleware.ReviewQualityCheckService
+ 
+ class FakeReviewQualityCheckService(
+@@ -17,6 +18,7 @@ class FakeReviewQualityCheckService(
+     private val productRecommendation: () -> ProductRecommendation? = { null },
+     private val recordClick: (String) -> Unit = {},
+     private val recordImpression: (String) -> Unit = {},
++    private val report: ReportBackInStockStatusDto? = null,
+ ) : ReviewQualityCheckService {
+ 
+     private var analysisCount = 0
+@@ -44,4 +46,6 @@ class FakeReviewQualityCheckService(
+     override suspend fun recordRecommendedProductImpression(productAid: String) {
+         recordImpression(productAid)
+     }
++
++    override suspend fun reportBackInStock(): ReportBackInStockStatusDto? = report
+ }
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/shopping/middleware/EnumMapperTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/shopping/middleware/EnumMapperTest.kt
+index 64101cf20065..df8dc930022c 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/shopping/middleware/EnumMapperTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/shopping/middleware/EnumMapperTest.kt
+@@ -23,11 +23,13 @@ class EnumMapperTest {
+         val tablet = "TABLET"
+         val wearable = "WEARABLE"
+         val other = "other_type"
++        val otherWithSpace = "other type"
+ 
+         assertEquals(DeviceType.PHONE, phone.asEnumOrDefault<DeviceType>())
+         assertEquals(DeviceType.TABLET, tablet.asEnumOrDefault<DeviceType>())
+         assertEquals(DeviceType.WEARABLE, wearable.asEnumOrDefault<DeviceType>())
+         assertEquals(DeviceType.OTHER_TYPE, other.asEnumOrDefault<DeviceType>())
++        assertEquals(DeviceType.OTHER_TYPE, otherWithSpace.asEnumOrDefault<DeviceType>())
+     }
+ 
+     @Test
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/shopping/middleware/ProductAnalysisMapperTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/shopping/middleware/ProductAnalysisMapperTest.kt
+index 4e1174eee42e..4c33bd9f7bdf 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/shopping/middleware/ProductAnalysisMapperTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/shopping/middleware/ProductAnalysisMapperTest.kt
+@@ -334,4 +334,28 @@ class ProductAnalysisMapperTest {
+ 
+         assertEquals(expected, actual)
+     }
++
++    @Test
++    fun `WHEN product deleted is true and has not been reported THEN it is mapped to not available and not back in stock`() {
++        val actual = ProductAnalysisTestData.productAnalysis(
++            deletedProduct = true,
++            deletedProductReported = false,
++        ).toProductReviewState()
++
++        val expected =
++            ReviewQualityCheckState.OptedIn.ProductReviewState.Error.ProductNotAvailable
++        assertEquals(expected, actual)
++    }
++
++    @Test
++    fun `WHEN product deleted is true and has been reported THEN it is mapped to not available and back in stock`() {
++        val actual = ProductAnalysisTestData.productAnalysis(
++            deletedProduct = true,
++            deletedProductReported = true,
++        ).toProductReviewState()
++
++        val expected =
++            ReviewQualityCheckState.OptedIn.ProductReviewState.Error.ProductAlreadyReported
++        assertEquals(expected, actual)
++    }
+ }
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckStoreTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckStoreTest.kt
+index 5c182c210ce0..07534d205724 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckStoreTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/shopping/store/ReviewQualityCheckStoreTest.kt
+@@ -33,6 +33,7 @@ import org.mozilla.fenix.shopping.fake.FakeShoppingExperienceFeature
+ import org.mozilla.fenix.shopping.middleware.AnalysisStatusDto
+ import org.mozilla.fenix.shopping.middleware.AnalysisStatusProgressDto
+ import org.mozilla.fenix.shopping.middleware.NetworkChecker
++import org.mozilla.fenix.shopping.middleware.ReportBackInStockStatusDto
+ import org.mozilla.fenix.shopping.middleware.ReviewQualityCheckNetworkMiddleware
+ import org.mozilla.fenix.shopping.middleware.ReviewQualityCheckPreferences
+ import org.mozilla.fenix.shopping.middleware.ReviewQualityCheckPreferencesMiddleware
+@@ -1283,6 +1284,115 @@ class ReviewQualityCheckStoreTest {
+             assertTrue(observedState.contains(expectedProgressState3))
+         }
+ 
++    @Test
++    fun `GIVEN deletedProduct is true and deletedProductReported is false WHEN report back in stock is clicked THEN thanks for reporting card is shown`() =
++        runTest {
++            val tested = ReviewQualityCheckStore(
++                middleware = provideReviewQualityCheckMiddleware(
++                    reviewQualityCheckPreferences = FakeReviewQualityCheckPreferences(isEnabled = true),
++                    reviewQualityCheckService = FakeReviewQualityCheckService(
++                        productAnalysis = {
++                            ProductAnalysisTestData.productAnalysis(
++                                deletedProduct = true,
++                                deletedProductReported = false,
++                            )
++                        },
++                        reanalysis = AnalysisStatusDto.PENDING,
++                        statusProgress = { null },
++                        report = ReportBackInStockStatusDto.REPORT_CREATED,
++                    ),
++                    networkChecker = FakeNetworkChecker(isConnected = true),
++                ),
++            )
++            tested.waitUntilIdle()
++            dispatcher.scheduler.advanceUntilIdle()
++            tested.waitUntilIdle()
++            tested.dispatch(ReviewQualityCheckAction.FetchProductAnalysis).joinBlocking()
++            tested.waitUntilIdle()
++            dispatcher.scheduler.advanceUntilIdle()
++
++            val expected = ReviewQualityCheckState.OptedIn(
++                productReviewState = ReviewQualityCheckState.OptedIn.ProductReviewState.Error.ProductNotAvailable,
++                productRecommendationsPreference = false,
++                productRecommendationsExposure = true,
++                productVendor = ProductVendor.BEST_BUY,
++            )
++            assertEquals(expected, tested.state)
++
++            tested.dispatch(ReviewQualityCheckAction.ReportProductBackInStock).joinBlocking()
++            tested.waitUntilIdle()
++            dispatcher.scheduler.advanceUntilIdle()
++
++            val reportExpected = expected.copy(
++                productReviewState = ReviewQualityCheckState.OptedIn.ProductReviewState.Error.ThanksForReporting,
++            )
++            assertEquals(reportExpected, tested.state)
++        }
++
++    @Test
++    fun `GIVEN deletedProduct is true WHEN report back in stock returns not deleted THEN state is updated to no analysis`() =
++        runTest {
++            val tested = ReviewQualityCheckStore(
++                middleware = provideReviewQualityCheckMiddleware(
++                    reviewQualityCheckPreferences = FakeReviewQualityCheckPreferences(isEnabled = true),
++                    reviewQualityCheckService = FakeReviewQualityCheckService(
++                        productAnalysis = {
++                            ProductAnalysisTestData.productAnalysis(
++                                deletedProduct = true,
++                                deletedProductReported = false,
++                            )
++                        },
++                        reanalysis = AnalysisStatusDto.PENDING,
++                        statusProgress = { null },
++                        report = ReportBackInStockStatusDto.NOT_DELETED,
++                    ),
++                    networkChecker = FakeNetworkChecker(isConnected = true),
++                ),
++            )
++            tested.waitUntilIdle()
++            dispatcher.scheduler.advanceUntilIdle()
++            tested.waitUntilIdle()
++            tested.dispatch(ReviewQualityCheckAction.FetchProductAnalysis).joinBlocking()
++            tested.waitUntilIdle()
++            dispatcher.scheduler.advanceUntilIdle()
++
++            val expected = ReviewQualityCheckState.OptedIn(
++                productReviewState = ReviewQualityCheckState.OptedIn.ProductReviewState.Error.ProductNotAvailable,
++                productRecommendationsPreference = false,
++                productRecommendationsExposure = true,
++                productVendor = ProductVendor.BEST_BUY,
++            )
++            assertEquals(expected, tested.state)
++
++            val noAnalysisTested = ReviewQualityCheckStore(
++                middleware = provideReviewQualityCheckMiddleware(
++                    reviewQualityCheckPreferences = FakeReviewQualityCheckPreferences(isEnabled = true),
++                    reviewQualityCheckService = FakeReviewQualityCheckService(
++                        productAnalysis = {
++                            ProductAnalysisTestData.productAnalysis(
++                                grade = null,
++                                adjustedRating = null,
++                                needsAnalysis = true,
++                            )
++                        },
++                        reanalysis = AnalysisStatusDto.PENDING,
++                        statusProgress = { null },
++                        report = ReportBackInStockStatusDto.NOT_DELETED,
++                    ),
++                    networkChecker = FakeNetworkChecker(isConnected = true),
++                ),
++            )
++
++            noAnalysisTested.dispatch(ReviewQualityCheckAction.ReportProductBackInStock).joinBlocking()
++            noAnalysisTested.waitUntilIdle()
++            dispatcher.scheduler.advanceUntilIdle()
++
++            val reportExpected = expected.copy(
++                productReviewState = ProductAnalysisTestData.noAnalysisPresent(progress = -1f),
++            )
++            assertEquals(reportExpected, noAnalysisTested.state)
++        }
++
+     @Test
+     fun `GIVEN product recommendations are enabled WHEN a product analysis is fetched successfully THEN product recommendation should also be fetched and displayed if available`() =
+         runTest {

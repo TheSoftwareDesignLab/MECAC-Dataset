@@ -1,0 +1,150 @@
+diff --git a/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/FxaAccountManager.kt b/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/FxaAccountManager.kt
+index 4ee3b847924e..f3400ba79e87 100644
+--- a/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/FxaAccountManager.kt
++++ b/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/FxaAccountManager.kt
+@@ -18,7 +18,6 @@ import mozilla.components.concept.base.crash.CrashReporting
+ import mozilla.components.concept.sync.AccountEventsObserver
+ import mozilla.components.concept.sync.AccountObserver
+ import mozilla.components.concept.sync.AuthFlowError
+-import mozilla.components.concept.sync.AuthFlowUrl
+ import mozilla.components.concept.sync.AuthType
+ import mozilla.components.concept.sync.DeviceConfig
+ import mozilla.components.concept.sync.FxAEntryPoint
+@@ -111,22 +110,6 @@ open class FxaAccountManager(
+ ) : Closeable, Observable<AccountObserver> by ObserverRegistry() {
+     private val logger = Logger("FirefoxAccountStateMachine")
+ 
+-    /**
+-     * Observer interface which lets its consumers respond to authentication requests.
+-     */
+-    private interface OAuthObserver {
+-        /**
+-         * Account manager is requesting for an OAUTH flow to begin.
+-         * @param authFlowUrl Starting point for the OAUTH flow.
+-         */
+-        fun onBeginOAuthFlow(authFlowUrl: AuthFlowUrl)
+-
+-        /**
+-         * Account manager encountered an error during authentication.
+-         */
+-        fun onError() {}
+-    }
+-
+     @Volatile
+     private var latestAuthState: String? = null
+ 
+@@ -143,8 +126,6 @@ open class FxaAccountManager(
+         authRecoveryScheduled.set(false)
+     }
+ 
+-    private val oauthObservers = object : Observable<OAuthObserver> by ObserverRegistry() {}
+-
+     init {
+         GlobalAccountManager.setInstance(this)
+     }
+@@ -379,23 +360,16 @@ open class FxaAccountManager(
+             Event.Account.BeginEmailFlow(entrypoint)
+         }
+ 
+-        // 'deferredAuthUrl' will be set as the state machine reacts to the 'event'.
+-        var deferredAuthUrl: String? = null
+-        oauthObservers.register(
+-            object : OAuthObserver {
+-                override fun onBeginOAuthFlow(authFlowUrl: AuthFlowUrl) {
+-                    deferredAuthUrl = authFlowUrl.url
+-                }
+-
+-                override fun onError() {
+-                    // No-op for now.
+-                    logger.warn("Got an error during 'beginAuthentication'")
+-                }
+-            },
+-        )
++        // Process the event, then use the new state to check the result of the operation
+         processQueue(event)
+-        oauthObservers.unregisterObservers()
+-        deferredAuthUrl
++        when (val state = state) {
++            is State.Idle -> (state.accountState as? AccountState.Authenticating)?.oAuthUrl
++            else -> null
++        }.also { result ->
++            if (result == null) {
++                logger.warn("beginAuthentication: error processing next state ($state)")
++            }
++        }
+     }
+ 
+     /**
+@@ -408,8 +382,6 @@ open class FxaAccountManager(
+      * Guiding principle behind this is that logging into accounts.firefox.com should not affect
+      * logged-in state of the browser itself, even though the two may have an established communication
+      * channel via [WebChannelFeature].
+-     *
+-     * @return A deferred boolean flag indicating if authentication state was accepted.
+      */
+     suspend fun finishAuthentication(authData: FxaAuthData) = withContext(coroutineContext) {
+         when {
+@@ -612,11 +584,9 @@ open class FxaAccountManager(
+                 when (result) {
+                     is Result.Success -> {
+                         latestAuthState = result.value!!.state
+-                        oauthObservers.notifyObservers { onBeginOAuthFlow(result.value) }
+-                        null
++                        Event.Progress.StartedOAuthFlow(result.value.url)
+                     }
+                     Result.Failure -> {
+-                        oauthObservers.notifyObservers { onError() }
+                         Event.Progress.FailedToBeginAuth
+                     }
+                 }
+diff --git a/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/State.kt b/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/State.kt
+index c09df58523c4..b75d5aa8d831 100644
+--- a/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/State.kt
++++ b/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/State.kt
+@@ -52,10 +52,11 @@ import mozilla.components.service.fxa.FxaAuthData
+  * State transitions are described by a transition matrix, which is described in [State.next].
+  */
+ 
+-internal enum class AccountState {
+-    NotAuthenticated,
+-    Authenticated,
+-    AuthenticationProblem,
++internal sealed class AccountState {
++    object Authenticated : AccountState()
++    data class Authenticating(val oAuthUrl: String) : AccountState()
++    object AuthenticationProblem : AccountState()
++    object NotAuthenticated : AccountState()
+ }
+ 
+ internal enum class ProgressState {
+@@ -98,6 +99,7 @@ internal sealed class Event {
+ 
+         object LoggedOut : Progress()
+ 
++        data class StartedOAuthFlow(val oAuthUrl: String) : Progress()
+         data class CompletedAuthentication(val authType: AuthType) : Progress()
+     }
+ }
+@@ -116,6 +118,11 @@ internal fun State.next(event: Event): State? = when (this) {
+             is Event.Account.BeginPairingFlow -> State.Active(ProgressState.BeginningAuthentication)
+             else -> null
+         }
++        is AccountState.Authenticating -> when (event) {
++            is Event.Progress.AuthData -> State.Active(ProgressState.CompletingAuthentication)
++            Event.Progress.CancelAuth -> State.Idle(AccountState.NotAuthenticated)
++            else -> null
++        }
+         AccountState.Authenticated -> when (event) {
+             is Event.Account.AuthenticationError -> State.Active(ProgressState.RecoveringFromAuthProblem)
+             is Event.Account.AccessTokenKeyError -> State.Idle(AccountState.AuthenticationProblem)
+@@ -136,9 +143,8 @@ internal fun State.next(event: Event): State? = when (this) {
+             else -> null
+         }
+         ProgressState.BeginningAuthentication -> when (event) {
+-            is Event.Progress.AuthData -> State.Active(ProgressState.CompletingAuthentication)
+             Event.Progress.FailedToBeginAuth -> State.Idle(AccountState.NotAuthenticated)
+-            Event.Progress.CancelAuth -> State.Idle(AccountState.NotAuthenticated)
++            is Event.Progress.StartedOAuthFlow -> State.Idle(AccountState.Authenticating(event.oAuthUrl))
+             else -> null
+         }
+         ProgressState.CompletingAuthentication -> when (event) {

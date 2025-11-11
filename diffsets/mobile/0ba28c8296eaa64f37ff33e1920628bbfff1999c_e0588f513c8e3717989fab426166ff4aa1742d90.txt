@@ -1,0 +1,430 @@
+diff --git a/lib/src/model/analysis/analysis_controller.dart b/lib/src/model/analysis/analysis_controller.dart
+index 820e45bfd0..277abcb8d4 100644
+--- a/lib/src/model/analysis/analysis_controller.dart
++++ b/lib/src/model/analysis/analysis_controller.dart
+@@ -823,7 +823,7 @@ class AnalysisCurrentNode with _$AnalysisCurrentNode {
+     required bool isRoot,
+     SanMove? sanMove,
+     Opening? opening,
+-    LocalEval? eval,
++    ClientEval? eval,
+     IList<PgnComment>? lichessAnalysisComments,
+     IList<PgnComment>? startingComments,
+     IList<PgnComment>? comments,
+diff --git a/lib/src/model/broadcast/broadcast_analysis_controller.dart b/lib/src/model/broadcast/broadcast_analysis_controller.dart
+index 1ef13ec003..d0c2f6481d 100644
+--- a/lib/src/model/broadcast/broadcast_analysis_controller.dart
++++ b/lib/src/model/broadcast/broadcast_analysis_controller.dart
+@@ -9,6 +9,7 @@ import 'package:lichess_mobile/src/model/analysis/analysis_controller.dart';
+ import 'package:lichess_mobile/src/model/analysis/analysis_preferences.dart';
+ import 'package:lichess_mobile/src/model/broadcast/broadcast_repository.dart';
+ import 'package:lichess_mobile/src/model/common/chess.dart';
++import 'package:lichess_mobile/src/model/common/eval.dart';
+ import 'package:lichess_mobile/src/model/common/id.dart';
+ import 'package:lichess_mobile/src/model/common/node.dart';
+ import 'package:lichess_mobile/src/model/common/service/move_feedback.dart';
+@@ -181,6 +182,9 @@ class BroadcastAnalysisController extends _$BroadcastAnalysisController implemen
+       // Sent when a pgn tag changes
+       case 'setTags':
+         _handleSetTagsEvent(event);
++      // Sent when a new eval is received
++      case 'evalHit':
++        _handleEvalHitEvent(event);
+     }
+   }
+ 
+@@ -240,6 +244,44 @@ class BroadcastAnalysisController extends _$BroadcastAnalysisController implemen
+     state = AsyncData(state.requireValue.copyWith(pgnHeaders: pgnHeaders));
+   }
+ 
++  void _handleEvalHitEvent(SocketEvent event) {
++    final path = pick(event.data, 'path').asUciPathOrThrow();
++
++    if (state.requireValue.currentPath != path) return;
++
++    final depth = pick(event.data, 'depth').asIntOrThrow();
++    final pvs =
++        pick(event.data, 'pvs')
++            .asListOrThrow(
++              (pv) => PvData(
++                moves: pv('moves').asStringOrThrow().split(' ').toIList(),
++                cp: pv('cp').asIntOrNull(),
++                mate: pv('mate').asIntOrNull(),
++              ),
++            )
++            .toIList();
++
++    state = AsyncData(
++      state.requireValue.copyWith(
++        currentNode: state.requireValue.currentNode.copyWith(
++          eval: CloudEval(depth: depth, position: state.requireValue.position, pvs: pvs),
++        ),
++      ),
++    );
++  }
++
++  // ignore: unused_element
++  void _sendEvalGetEvent() {
++    final numEvalLines = ref.read(analysisPreferencesProvider).numEvalLines;
++
++    _socketClient.send('evalGet', {
++      'fen': state.requireValue.currentNode.position.fen,
++      'path': state.requireValue.currentPath.value,
++      'mpv': numEvalLines,
++      'up': true,
++    });
++  }
++
+   EvaluationContext get _evaluationContext =>
+       EvaluationContext(variant: Variant.standard, initialPosition: _root.position);
+ 
+diff --git a/lib/src/model/common/eval.dart b/lib/src/model/common/eval.dart
+index de004b7abe..6686a183e7 100644
+--- a/lib/src/model/common/eval.dart
++++ b/lib/src/model/common/eval.dart
+@@ -14,6 +14,7 @@ part 'eval.g.dart';
+ 
+ /// Base class for evals.
+ sealed class Eval {
++  /// The string to display the eval
+   String get evalString;
+ 
+   /// The winning chances for the given [Side].
+@@ -25,9 +26,17 @@ sealed class Eval {
+ 
+ /// The eval from the client side, either from the cloud or the local engine.
+ sealed class ClientEval extends Eval {
++  /// The position for which the eval is given
+   Position get position;
+ 
++  /// The depth of the eval
++  int get depth;
++
++  /// The principal variations of the eval
+   IList<PvData> get pvs;
++
++  /// The best moves to play with their winning chances
++  IList<MoveWithWinningChances> get bestMoves;
+ }
+ 
+ /// The eval coming from other Lichess clients, served from the network.
+@@ -44,6 +53,16 @@ class CloudEval with _$CloudEval implements ClientEval {
+   @override
+   double winningChances(Side side) => _toPov(side, _toWhiteWinningChances(cp, mate));
+ 
++  @override
++  IList<MoveWithWinningChances> get bestMoves {
++    return pvs
++        .where((e) => e.moves.isNotEmpty)
++        .map((e) => e._firstMoveWithWinningChances(position.turn))
++        .nonNulls
++        .sorted((a, b) => b.winningChances.compareTo(a.winningChances))
++        .toIList();
++  }
++
+   int? get cp => pvs[0].cp;
+ 
+   int? get mate => pvs[0].mate;
+@@ -73,6 +92,7 @@ class LocalEval with _$LocalEval implements ClientEval {
+     return Move.parse(uci);
+   }
+ 
++  @override
+   IList<MoveWithWinningChances> get bestMoves {
+     return pvs
+         .where((e) => e.moves.isNotEmpty)
+diff --git a/lib/src/model/engine/evaluation_service.dart b/lib/src/model/engine/evaluation_service.dart
+index bca17a99a8..cba02183e2 100644
+--- a/lib/src/model/engine/evaluation_service.dart
++++ b/lib/src/model/engine/evaluation_service.dart
+@@ -26,9 +26,7 @@ const engineSupportedVariants = {Variant.standard, Variant.chess960, Variant.fro
+ 
+ /// A service to evaluate chess positions using an engine.
+ class EvaluationService {
+-  EvaluationService(this.ref, {required this.maxMemory});
+-
+-  final Ref ref;
++  EvaluationService({required this.maxMemory});
+ 
+   final int maxMemory;
+ 
+@@ -179,7 +177,7 @@ class EvaluationService {
+ EvaluationService evaluationService(Ref ref) {
+   final maxMemory = ref.read(preloadedDataProvider).requireValue.engineMaxMemoryInMb;
+ 
+-  final service = EvaluationService(ref, maxMemory: maxMemory);
++  final service = EvaluationService(maxMemory: maxMemory);
+   ref.onDispose(() {
+     service.disposeEngine();
+   });
+diff --git a/lib/src/view/analysis/analysis_screen.dart b/lib/src/view/analysis/analysis_screen.dart
+index f0d12a5c94..389ad82282 100644
+--- a/lib/src/view/analysis/analysis_screen.dart
++++ b/lib/src/view/analysis/analysis_screen.dart
+@@ -91,7 +91,7 @@ class _AnalysisScreenState extends ConsumerState<_AnalysisScreen>
+ 
+     final appBarActions = [
+       if (prefs.enableComputerAnalysis)
+-        EngineDepth(defaultEval: asyncState.valueOrNull?.currentNode.eval),
++        EngineDepth(savedEval: asyncState.valueOrNull?.currentNode.eval),
+       AppBarAnalysisTabIndicator(tabs: tabs, controller: _tabController),
+       AppBarIconButton(
+         onPressed: () {
+@@ -214,7 +214,7 @@ class _Body extends ConsumerWidget {
+           isEngineAvailable && numEvalLines > 0
+               ? EngineLines(
+                 onTapMove: ref.read(ctrlProvider.notifier).onUserMove,
+-                localEval: currentNode.eval,
++                savedEval: currentNode.eval,
+                 isGameOver: currentNode.position.isGameOver,
+               )
+               : null,
+diff --git a/lib/src/view/broadcast/broadcast_game_screen.dart b/lib/src/view/broadcast/broadcast_game_screen.dart
+index db831ba48c..f1d912089c 100644
+--- a/lib/src/view/broadcast/broadcast_game_screen.dart
++++ b/lib/src/view/broadcast/broadcast_game_screen.dart
+@@ -214,7 +214,7 @@ class _Body extends ConsumerWidget {
+           engineLines:
+               isLocalEvaluationEnabled && numEvalLines > 0
+                   ? EngineLines(
+-                    localEval: currentNode.eval,
++                    savedEval: currentNode.eval,
+                     isGameOver: currentNode.position.isGameOver,
+                     onTapMove:
+                         ref
+diff --git a/lib/src/view/engine/engine_depth.dart b/lib/src/view/engine/engine_depth.dart
+index ea08eb5959..60fd011460 100644
+--- a/lib/src/view/engine/engine_depth.dart
++++ b/lib/src/view/engine/engine_depth.dart
+@@ -12,61 +12,88 @@ import 'package:lichess_mobile/src/widgets/list.dart';
+ import 'package:popover/popover.dart';
+ 
+ class EngineDepth extends ConsumerWidget {
+-  const EngineDepth({this.defaultEval});
++  const EngineDepth({this.savedEval});
+ 
+-  final LocalEval? defaultEval;
++  final ClientEval? savedEval;
+ 
+   @override
+   Widget build(BuildContext context, WidgetRef ref) {
+-    final depth =
+-        ref.watch(engineEvaluationProvider.select((value) => value.eval?.depth)) ??
+-        defaultEval?.depth;
++    final eval = ref.watch(engineEvaluationProvider).eval ?? savedEval;
+ 
+-    return depth != null
++    return eval != null
+         ? AppBarTextButton(
+           onPressed: () {
+-            showPopover(
+-              context: context,
+-              bodyBuilder: (context) {
+-                return _StockfishInfo(defaultEval);
+-              },
+-              direction: PopoverDirection.top,
+-              width: 240,
+-              backgroundColor:
+-                  Theme.of(context).platform == TargetPlatform.android
+-                      ? DialogTheme.of(context).backgroundColor ??
+-                          ColorScheme.of(context).surfaceContainerHigh
+-                      : CupertinoDynamicColor.resolve(
+-                        CupertinoColors.tertiarySystemBackground,
+-                        context,
+-                      ),
+-              transitionDuration: Duration.zero,
+-              popoverTransitionBuilder: (_, child) => child,
+-            );
++            if (eval is LocalEval) {
++              showPopover(
++                context: context,
++                bodyBuilder: (context) {
++                  return _StockfishInfo(eval);
++                },
++                direction: PopoverDirection.top,
++                width: 240,
++                backgroundColor:
++                    Theme.of(context).platform == TargetPlatform.android
++                        ? DialogTheme.of(context).backgroundColor ??
++                            ColorScheme.of(context).surfaceContainerHigh
++                        : CupertinoDynamicColor.resolve(
++                          CupertinoColors.tertiarySystemBackground,
++                          context,
++                        ),
++                transitionDuration: Duration.zero,
++                popoverTransitionBuilder: (_, child) => child,
++              );
++            }
+           },
+-          child: RepaintBoundary(
+-            child: Container(
+-              width: 20.0,
+-              height: 20.0,
+-              padding: const EdgeInsets.all(2.0),
+-              decoration: BoxDecoration(
+-                color: ColorScheme.of(context).secondary,
+-                borderRadius: BorderRadius.circular(4.0),
+-              ),
+-              child: FittedBox(
+-                fit: BoxFit.contain,
+-                child: Text(
+-                  '${math.min(99, depth)}',
+-                  style: TextStyle(
+-                    color: ColorScheme.of(context).onSecondary,
+-                    fontFeatures: const [FontFeature.tabularFigures()],
+-                  ),
+-                ),
++          child: _AppBarButtonChild(eval),
++        )
++        : const SizedBox.shrink();
++  }
++}
++
++class _AppBarButtonChild extends StatelessWidget {
++  final ClientEval eval;
++
++  const _AppBarButtonChild(this.eval);
++
++  @override
++  Widget build(BuildContext context) {
++    return switch (eval) {
++      LocalEval(:final depth) => RepaintBoundary(
++        child: Container(
++          width: 20.0,
++          height: 20.0,
++          padding: const EdgeInsets.all(2.0),
++          decoration: BoxDecoration(
++            color: ColorScheme.of(context).secondary,
++            borderRadius: BorderRadius.circular(4.0),
++          ),
++          child: FittedBox(
++            fit: BoxFit.contain,
++            child: Text(
++              '${math.min(99, depth)}',
++              style: TextStyle(
++                color: ColorScheme.of(context).onSecondary,
++                fontFeatures: const [FontFeature.tabularFigures()],
+               ),
+             ),
+           ),
+-        )
+-        : const SizedBox.shrink();
++        ),
++      ),
++      CloudEval(:final depth) => Stack(
++        alignment: const AlignmentDirectional(-0.05, 0.15),
++        children: [
++          Icon(Icons.cloud, size: 30, color: ColorScheme.of(context).secondary),
++          Text(
++            '${math.min(99, depth)}',
++            style: TextStyle(
++              color: ColorScheme.of(context).onSecondary,
++              fontFeatures: const [FontFeature.tabularFigures()],
++              fontSize: 12,
++            ),
++          ),
++        ],
++      ),
++    };
+   }
+ }
+ 
+@@ -86,15 +113,10 @@ class _StockfishInfo extends ConsumerWidget {
+     final knps = engineState == EngineState.computing ? ', ${eval?.knps.round()}kn/s' : '';
+     final depth = currentEval?.depth ?? 0;
+ 
+-    return Column(
+-      mainAxisSize: MainAxisSize.min,
+-      children: [
+-        PlatformListTile(
+-          leading: Image.asset('assets/images/stockfish/icon.png', width: 44, height: 44),
+-          title: Text(engineName),
+-          subtitle: Text(context.l10n.depthX('$depth$knps')),
+-        ),
+-      ],
++    return PlatformListTile(
++      leading: Image.asset('assets/images/stockfish/icon.png', width: 44, height: 44),
++      title: Text(engineName),
++      subtitle: Text(context.l10n.depthX('$depth$knps')),
+     );
+   }
+ }
+diff --git a/lib/src/view/engine/engine_gauge.dart b/lib/src/view/engine/engine_gauge.dart
+index 5a15bd2915..623a7e5d39 100644
+--- a/lib/src/view/engine/engine_gauge.dart
++++ b/lib/src/view/engine/engine_gauge.dart
+@@ -45,28 +45,15 @@ class EngineGauge extends ConsumerWidget {
+ 
+   @override
+   Widget build(BuildContext context, WidgetRef ref) {
+-    final localEval =
+-        params.isLocalEngineAvailable ? ref.watch(engineEvaluationProvider).eval : null;
+-
+-    return localEval != null
+-        ? _EvalGauge(
+-          displayMode: displayMode,
+-          position: params.position,
+-          orientation: params.orientation,
+-          eval: localEval,
+-        )
+-        : params.savedEval != null
+-        ? _EvalGauge(
+-          displayMode: displayMode,
+-          position: params.position,
+-          orientation: params.orientation,
+-          eval: params.savedEval,
+-        )
+-        : _EvalGauge(
+-          displayMode: displayMode,
+-          position: params.position,
+-          orientation: params.orientation,
+-        );
++    final eval =
++        params.isLocalEngineAvailable ? ref.watch(engineEvaluationProvider).eval : params.savedEval;
++
++    return _EvalGauge(
++      displayMode: displayMode,
++      position: params.position,
++      orientation: params.orientation,
++      eval: eval,
++    );
+   }
+ }
+ 
+diff --git a/lib/src/view/engine/engine_lines.dart b/lib/src/view/engine/engine_lines.dart
+index 595684c1fa..fae43fee84 100644
+--- a/lib/src/view/engine/engine_lines.dart
++++ b/lib/src/view/engine/engine_lines.dart
+@@ -11,16 +11,16 @@ import 'package:lichess_mobile/src/view/engine/engine_gauge.dart';
+ import 'package:lichess_mobile/src/widgets/buttons.dart';
+ 
+ class EngineLines extends ConsumerWidget {
+-  const EngineLines({required this.onTapMove, required this.localEval, required this.isGameOver});
++  const EngineLines({required this.onTapMove, required this.savedEval, required this.isGameOver});
+   final void Function(NormalMove move) onTapMove;
+-  final LocalEval? localEval;
++  final ClientEval? savedEval;
+   final bool isGameOver;
+ 
+   @override
+   Widget build(BuildContext context, WidgetRef ref) {
+     final numEvalLines = ref.watch(analysisPreferencesProvider.select((p) => p.numEvalLines));
+     final engineEval = ref.watch(engineEvaluationProvider).eval;
+-    final eval = engineEval ?? localEval;
++    final eval = engineEval ?? savedEval;
+ 
+     final emptyLines = List.filled(numEvalLines, const Engineline.empty());
+ 
+diff --git a/lib/src/view/study/study_screen.dart b/lib/src/view/study/study_screen.dart
+index c0f95d5c05..f062c42944 100644
+--- a/lib/src/view/study/study_screen.dart
++++ b/lib/src/view/study/study_screen.dart
+@@ -428,7 +428,7 @@ class _Body extends ConsumerWidget {
+       engineLines:
+           isComputerAnalysisAllowed && isLocalEvaluationEnabled && numEvalLines > 0
+               ? EngineLines(
+-                localEval: currentNode.eval,
++                savedEval: currentNode.eval,
+                 isGameOver: currentNode.position?.isGameOver ?? false,
+                 onTapMove: ref.read(studyControllerProvider(id).notifier).onUserMove,
+               )

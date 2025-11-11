@@ -1,0 +1,1562 @@
+diff --git a/.eslintignore b/.eslintignore
+index 2569aef9fec..2c1e5c7a43a 100644
+--- a/.eslintignore
++++ b/.eslintignore
+@@ -10,6 +10,7 @@ dist/
+ dist-client/
+ apidoc_build/
+ content_cache/
++i18n_cache/
+ node_modules/
+ 
+ # Old migrations, disabled
+diff --git a/test/client/.babelrc b/test/client/.babelrc
+deleted file mode 100644
+index 5fd9045a154..00000000000
+--- a/test/client/.babelrc
++++ /dev/null
+@@ -1,16 +0,0 @@
+-{
+-  "env": {
+-    "test": {
+-      plugins: [
+-        ["istanbul"],
+-      ],
+-    },
+-  },
+-  "presets": [
+-    ["es2015", { modules: false }],
+-  ],
+-  "plugins": [
+-    "transform-object-rest-spread",
+-  ],
+-  "comments": false,
+-}
+\ No newline at end of file
+diff --git a/test/client/unit/index.js b/test/client/unit/index.js
+deleted file mode 100644
+index 9a3f4b6f9a6..00000000000
+--- a/test/client/unit/index.js
++++ /dev/null
+@@ -1,21 +0,0 @@
+-/* eslint-disable */
+-// TODO verify if it's needed, added because Axios require Promise in the global scope
+-// and babel-runtime doesn't affect external libraries
+-require('babel-polyfill');
+-
+-// Automatically setup SinonJS' sandbox for each test
+-beforeEach(() => {
+-  global.sandbox = sinon.createSandbox();
+-});
+-
+-afterEach(() => {
+-  global.sandbox.restore();
+-});
+-
+-// require all test files
+-const testsContext = require.context('./specs', true, /\.js$/);
+-testsContext.keys().forEach(testsContext);
+-
+-// require all .vue and .js files except main.js for coverage.
+-const srcContext = require.context('../../../website/client', true, /^\.\/(?=(?!main(\.js)?$))(?=(.*\.(vue|js)$))/);
+-srcContext.keys().forEach(srcContext);
+diff --git a/test/client/unit/karma.conf.js b/test/client/unit/karma.conf.js
+deleted file mode 100644
+index b12c5aac67c..00000000000
+--- a/test/client/unit/karma.conf.js
++++ /dev/null
+@@ -1,40 +0,0 @@
+-/* eslint-disable */
+-// This is a karma config file. For more details see
+-//   http://karma-runner.github.io/0.13/config/configuration-file.html
+-// we are also using it with karma-webpack
+-//   https://github.com/webpack/karma-webpack
+-
+-// Necessary for babel to respect the env version of .babelrc which is necessary
+-// Because inject-loader does not work with ["es2015", { modules: false }] that we use
+-// in order to let webpack2 handle the imports
+-process.env.CHROME_BIN = require('puppeteer').executablePath();
+-// eslint-disable-line no-process-env
+-process.env.BABEL_ENV = process.env.NODE_ENV; // eslint-disable-line no-process-env
+-const webpackConfig = require('../../../webpack/webpack.test.conf');
+-
+-module.exports = function (config) {
+-  config.set({
+-    // to run in additional browsers:
+-    // 1. install corresponding karma launcher
+-    //    http://karma-runner.github.io/0.13/config/browsers.html
+-    // 2. add it to the `browsers` array below.
+-    browsers: ['ChromeHeadless'],
+-    frameworks: ['mocha', 'sinon-stub-promise', 'sinon-chai', 'chai-as-promised', 'chai'],
+-    reporters: ['spec', 'coverage'],
+-    files: ['./index.js'],
+-    preprocessors: {
+-      './index.js': ['webpack', 'sourcemap'],
+-    },
+-    webpack: webpackConfig,
+-    webpackMiddleware: {
+-      noInfo: true,
+-    },
+-    coverageReporter: {
+-      dir: '../../../coverage/client-unit',
+-      reporters: [
+-        { type: 'lcov', subdir: '.' },
+-        { type: 'text-summary' },
+-      ],
+-    },
+-  });
+-};
+diff --git a/website/client/src/app.vue b/website/client/src/app.vue
+index 0f9fb260814..6b5f7db865c 100644
+--- a/website/client/src/app.vue
++++ b/website/client/src/app.vue
+@@ -297,7 +297,7 @@ export default {
+     };
+   },
+   computed: {
+-    ...mapState(['isUserLoggedIn', 'browserTimezoneOffset', 'isUserLoaded']),
++    ...mapState(['isUserLoggedIn', 'browserTimezoneOffset', 'isUserLoaded', 'notificationsRemoved']),
+     ...mapState({ user: 'user.data' }),
+     isStaticPage () {
+       return this.$route.meta.requiresLogin === false;
+@@ -361,13 +361,55 @@ export default {
+       showSpinner: false,
+     });
+ 
+-    // Set up Error interceptors
+-    axios.interceptors.response.use(response => {
++    axios.interceptors.response.use(response => { // Set up Response interceptors
++      // Verify that the user was not updated from another browser/app/client
++      // If it was, sync
++      const { url } = response.config;
++      const { method } = response.config;
++
++      const isApiCall = url.indexOf('api/v4') !== -1;
++      const userV = response.data && response.data.userV;
++      const isCron = url.indexOf('/api/v4/cron') === 0 && method === 'post';
++
++      if (this.isUserLoaded && isApiCall && userV) {
++        const oldUserV = this.user._v;
++        this.user._v = userV;
++
++        // Do not sync again if already syncing
++        const isUserSync = url.indexOf('/api/v4/user') === 0 && method === 'get';
++        const isTasksSync = url.indexOf('/api/v4/tasks/user') === 0 && method === 'get';
++        // exclude chat seen requests because with real time chat they would be too many
++        const isChatSeen = url.indexOf('/chat/seen') !== -1 && method === 'post';
++        // exclude POST /api/v4/cron because the user is synced automatically after cron runs
++
++        // Something has changed on the user object that was not tracked here, sync the user
++        if (userV - oldUserV > 1 && !isCron && !isChatSeen && !isUserSync && !isTasksSync) {
++          Promise.all([
++            this.$store.dispatch('user:fetch', { forceLoad: true }),
++            this.$store.dispatch('tasks:fetchUserTasks', { forceLoad: true }),
++          ]);
++        }
++      }
++
++      // Store the app version from the server
++      const serverAppVersion = response.data && response.data.appVersion;
++
++      if (serverAppVersion && this.$store.state.serverAppVersion !== response.data.appVersion) {
++        this.$store.state.serverAppVersion = serverAppVersion;
++      }
++
++      // Store the notifications, filtering those that have already been read
++      // See store/index.js on why this is necessary
+       if (this.user && response.data && response.data.notifications) {
+-        this.$set(this.user, 'notifications', response.data.notifications);
++        const filteredNotifications = response.data.notifications.filter(serverNotification => {
++          if (this.notificationsRemoved.includes(serverNotification.id)) return false;
++          return true;
++        });
++        this.$set(this.user, 'notifications', filteredNotifications);
+       }
++
+       return response;
+-    }, error => {
++    }, error => { // Set up Error interceptors
+       if (error.response.status >= 400) {
+         const isBanned = this.checkForBannedUser(error);
+         if (isBanned === true) return null; // eslint-disable-line consistent-return
+@@ -425,51 +467,6 @@ export default {
+       return Promise.reject(error);
+     });
+ 
+-    axios.interceptors.response.use(response => {
+-      // Verify that the user was not updated from another browser/app/client
+-      // If it was, sync
+-      const { url } = response.config;
+-      const { method } = response.config;
+-
+-      const isApiCall = url.indexOf('api/v4') !== -1;
+-      const userV = response.data && response.data.userV;
+-      const isCron = url.indexOf('/api/v4/cron') === 0 && method === 'post';
+-
+-      if (this.isUserLoaded && isApiCall && userV) {
+-        const oldUserV = this.user._v;
+-        this.user._v = userV;
+-
+-        // Do not sync again if already syncing
+-        const isUserSync = url.indexOf('/api/v4/user') === 0 && method === 'get';
+-        const isTasksSync = url.indexOf('/api/v4/tasks/user') === 0 && method === 'get';
+-        // exclude chat seen requests because with real time chat they would be too many
+-        const isChatSeen = url.indexOf('/chat/seen') !== -1 && method === 'post';
+-        // exclude POST /api/v4/cron because the user is synced automatically after cron runs
+-
+-        // Something has changed on the user object that was not tracked here, sync the user
+-        if (userV - oldUserV > 1 && !isCron && !isChatSeen && !isUserSync && !isTasksSync) {
+-          Promise.all([
+-            this.$store.dispatch('user:fetch', { forceLoad: true }),
+-            this.$store.dispatch('tasks:fetchUserTasks', { forceLoad: true }),
+-          ]);
+-        }
+-      }
+-
+-      // Verify the client is updated
+-      // const serverAppVersion = response.data.appVersion;
+-      // let serverAppVersionState = this.$store.state.serverAppVersion;
+-      // if (isApiCall && !serverAppVersionState) {
+-      //   this.$store.state.serverAppVersion = serverAppVersion;
+-      // } else if (isApiCall && serverAppVersionState !== serverAppVersion) {
+-      //   if (document.activeElement.tagName !== 'INPUT'
+-      // || confirm(this.$t('habiticaHasUpdated'))) {
+-      //     location.reload(true);
+-      //   }
+-      // }
+-
+-      return response;
+-    });
+-
+     // Setup listener for title
+     this.$store.watch(state => state.title, title => {
+       document.title = title;
+diff --git a/website/client/src/components/achievements/chooseClass.vue b/website/client/src/components/achievements/chooseClass.vue
+index 913abb1b1d4..5597f4328f8 100644
+--- a/website/client/src/components/achievements/chooseClass.vue
++++ b/website/client/src/components/achievements/chooseClass.vue
+@@ -16,7 +16,7 @@
+         <div class="row">
+           <div
+             v-for="heroClass in classes"
+-            :key="heroClass"
++            :key="`${heroClass}-avatar`"
+             class="col-md-3"
+           >
+             <div @click="selectedClass = heroClass">
+@@ -60,7 +60,7 @@
+         </div>
+         <div
+           v-for="heroClass in classes"
+-          :key="heroClass"
++          :key="`${heroClass}-explanation`"
+         >
+           <div
+             v-if="selectedClass === heroClass"
+diff --git a/website/client/src/components/achievements/newStuff.vue b/website/client/src/components/achievements/newStuff.vue
+index 50772d37b49..e59592ee2ad 100644
+--- a/website/client/src/components/achievements/newStuff.vue
++++ b/website/client/src/components/achievements/newStuff.vue
+@@ -64,7 +64,7 @@ export default {
+       this.html = response.data.html;
+     });
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('bv::show::modal');
+   },
+   methods: {
+diff --git a/website/client/src/components/challenges/challengeDetail.vue b/website/client/src/components/challenges/challengeDetail.vue
+index b4ccb4fdc9e..00ff4eb30bc 100644
+--- a/website/client/src/components/challenges/challengeDetail.vue
++++ b/website/client/src/components/challenges/challengeDetail.vue
+@@ -55,7 +55,7 @@
+         </div>
+         <div class="col-12 col-md-6 text-right">
+           <div
+-            class="box"
++            class="box member-count"
+             @click="showMemberModal()"
+           >
+             <div
+@@ -93,6 +93,7 @@
+             :members="members"
+             :challenge-id="challengeId"
+             @member-selected="openMemberProgressModal"
++            @opened="initialMembersLoad()"
+           />
+         </div>
+         <div class="col-12 col-md-6 text-right">
+@@ -279,6 +280,10 @@
+     font-size: 20px;
+     vertical-align: bottom;
+ 
++    &.member-count:hover {
++      cursor: pointer;
++    }
++
+     .svg-icon {
+       width: 30px;
+       display: inline-block;
+@@ -364,6 +369,7 @@ export default {
+       }),
+       challenge: {},
+       members: [],
++      membersLoaded: false,
+       tasksByType: {
+         habit: [],
+         daily: [],
+@@ -427,8 +433,6 @@ export default {
+         this.$router.push('/challenges/findChallenges');
+         return;
+       }
+-      this.members = await this
+-        .loadMembers({ challengeId: this.searchId, includeAllPublicFields: true });
+       const tasks = await this.$store.dispatch('tasks:getChallengeTasks', { challengeId: this.searchId });
+       this.tasksByType = {
+         habit: [],
+@@ -454,7 +458,22 @@ export default {
+       }
+       return this.$store.dispatch('members:getChallengeMembers', payload);
+     },
++    initialMembersLoad () {
++      this.$store.state.memberModalOptions.loading = true;
++      if (!this.membersLoaded) {
++        this.membersLoaded = true;
+ 
++        this.loadMembers({
++          challengeId: this.searchId,
++          includeAllPublicFields: true,
++        }).then(m => {
++          this.members.push(...m);
++          this.$store.state.memberModalOptions.loading = false;
++        });
++      } else {
++        this.$store.state.memberModalOptions.loading = false;
++      }
++    },
+     editTask (task) {
+       this.taskFormPurpose = 'edit';
+       this.editingTask = cloneDeep(task);
+@@ -489,6 +508,8 @@ export default {
+       this.tasksByType[task.type].splice(index, 1);
+     },
+     showMemberModal () {
++      this.initialMembersLoad();
++
+       this.$root.$emit('habitica:show-member-modal', {
+         challengeId: this.challenge._id,
+         groupId: 'challenge', // @TODO: change these terrible settings
+@@ -501,8 +522,8 @@ export default {
+     async joinChallenge () {
+       this.user.challenges.push(this.searchId);
+       this.challenge = await this.$store.dispatch('challenges:joinChallenge', { challengeId: this.searchId });
+-      this.members = await this
+-        .loadMembers({ challengeId: this.searchId, includeAllPublicFields: true });
++      this.membersLoaded = false;
++      this.members = [];
+ 
+       await this.$store.dispatch('tasks:fetchUserTasks', { forceLoad: true });
+     },
+@@ -511,10 +532,11 @@ export default {
+     },
+     async updateChallenge () {
+       this.challenge = await this.$store.dispatch('challenges:getChallenge', { challengeId: this.searchId });
+-      this.members = await this
+-        .loadMembers({ challengeId: this.searchId, includeAllPublicFields: true });
++      this.membersLoaded = false;
++      this.members = [];
+     },
+     closeChallenge () {
++      this.initialMembersLoad();
+       this.$root.$emit('bv::show::modal', 'close-challenge-modal');
+     },
+     edit () {
+diff --git a/website/client/src/components/chat/chatMessages.vue b/website/client/src/components/chat/chatMessages.vue
+index a1fe82ef725..5b7ee3b8e0e 100644
+--- a/website/client/src/components/chat/chatMessages.vue
++++ b/website/client/src/components/chat/chatMessages.vue
+@@ -223,7 +223,7 @@ export default {
+   created () {
+     window.addEventListener('scroll', this.handleScroll);
+   },
+-  destroyed () {
++  beforeDestroy () {
+     window.removeEventListener('scroll', this.handleScroll);
+   },
+   methods: {
+diff --git a/website/client/src/components/chat/copyAsTodoModal.vue b/website/client/src/components/chat/copyAsTodoModal.vue
+index 42a7f2d1af3..89ba5e1699d 100644
+--- a/website/client/src/components/chat/copyAsTodoModal.vue
++++ b/website/client/src/components/chat/copyAsTodoModal.vue
+@@ -81,7 +81,7 @@ export default {
+       this.$root.$emit('bv::show::modal', 'copyAsTodo');
+     });
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('habitica::copy-as-todo');
+   },
+   methods: {
+diff --git a/website/client/src/components/chat/reportFlagModal.vue b/website/client/src/components/chat/reportFlagModal.vue
+index e59c769e4d0..eac5ea738b4 100644
+--- a/website/client/src/components/chat/reportFlagModal.vue
++++ b/website/client/src/components/chat/reportFlagModal.vue
+@@ -122,10 +122,10 @@ export default {
+       };
+     },
+   },
+-  created () {
++  mounted () {
+     this.$root.$on('habitica::report-chat', this.handleReport);
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('habitica::report-chat', this.handleReport);
+   },
+   methods: {
+diff --git a/website/client/src/components/groups/group.vue b/website/client/src/components/groups/group.vue
+index 503b1206296..6f58e1f4b18 100644
+--- a/website/client/src/components/groups/group.vue
++++ b/website/client/src/components/groups/group.vue
+@@ -385,7 +385,7 @@
+ import extend from 'lodash/extend';
+ import groupUtilities from '@/mixins/groupsUtilities';
+ import styleHelper from '@/mixins/styleHelper';
+-import { mapState } from '@/libs/store';
++import { mapState, mapGetters } from '@/libs/store';
+ import * as Analytics from '@/libs/analytics';
+ import startQuestModal from './startQuestModal';
+ import questDetailsModal from './questDetailsModal';
+@@ -447,6 +447,7 @@ export default {
+         bronzeGuildBadgeIcon,
+       }),
+       members: [],
++      membersLoaded: false,
+       selectedQuest: {},
+       chat: {
+         submitDisable: false,
+@@ -455,7 +456,12 @@ export default {
+     };
+   },
+   computed: {
+-    ...mapState({ user: 'user.data' }),
++    ...mapState({
++      user: 'user.data',
++    }),
++    ...mapGetters({
++      partyMembers: 'party:members',
++    }),
+     partyStore () {
+       return this.$store.state.party;
+     },
+@@ -487,10 +493,15 @@ export default {
+       }
+     },
+   },
+-  mounted () {
++  async mounted () {
+     if (this.isParty) this.searchId = 'party';
+     if (!this.searchId) this.searchId = this.groupId;
+-    this.load();
++    await this.fetchGuild();
++
++    this.$root.$on('updatedGroup', this.onGroupUpdate);
++  },
++  beforeDestroy () {
++    this.$root.$off('updatedGroup', this.onGroupUpdate);
+   },
+   beforeRouteUpdate (to, from, next) {
+     this.$set(this, 'searchId', to.params.groupId);
+@@ -501,19 +512,9 @@ export default {
+     acceptCommunityGuidelines () {
+       this.$store.dispatch('user:set', { 'flags.communityGuidelinesAccepted': true });
+     },
+-    async load () {
+-      if (this.isParty) {
+-        this.searchId = 'party';
+-        // @TODO: Set up from old client. Decide what we need and what we don't
+-        // Check Desktop notifs
+-        // Load invites
+-      }
+-      await this.fetchGuild();
+-
+-      this.$root.$on('updatedGroup', group => {
+-        const updatedGroup = extend(this.group, group);
+-        this.$set(this.group, updatedGroup);
+-      });
++    onGroupUpdate (group) {
++      const updatedGroup = extend(this.group, group);
++      this.$set(this.group, updatedGroup);
+     },
+ 
+     /**
+@@ -531,6 +532,26 @@ export default {
+       return this.$store.dispatch('members:getGroupMembers', payload);
+     },
+     showMemberModal () {
++      this.$store.state.memberModalOptions.loading = true;
++
++      if (this.isParty) {
++        this.membersLoaded = true;
++        this.members = this.partyMembers;
++        this.$store.state.memberModalOptions.loading = false;
++      } else if (!this.membersLoaded) {
++        this.membersLoaded = true;
++
++        this.loadMembers({
++          groupId: this.group._id,
++          includeAllPublicFields: true,
++        }).then(m => {
++          this.members.push(...m);
++          this.$store.state.memberModalOptions.loading = false;
++        });
++      } else {
++        this.$store.state.memberModalOptions.loading = false;
++      }
++
+       this.$root.$emit('habitica:show-member-modal', {
+         groupId: this.group._id,
+         group: this.group,
+@@ -565,19 +586,13 @@ export default {
+ 
+       const groupId = this.searchId === 'party' ? this.user.party._id : this.searchId;
+       if (this.hasUnreadMessages(groupId)) {
+-        // Delay by 1sec to make sure it returns after
+-        // other requests that don't have the notification marked as read
+-        setTimeout(() => {
+-          this.$store.dispatch('chat:markChatSeen', { groupId });
+-          this.$delete(this.user.newMessages, groupId);
+-        }, 1000);
++        const notification = this.user
++          .notifications.find(n => n.type === 'NEW_CHAT_MESSAGE' && n.data.group.id === groupId);
++        const notificationId = notification && notification.id;
++        this.$store.dispatch('chat:markChatSeen', { groupId, notificationId });
+       }
+-
+-      this.members = await this.loadMembers({
+-        groupId: this.group._id,
+-        includeAllPublicFields: true,
+-      });
+     },
++    // returns the notification id or false
+     hasUnreadMessages (groupId) {
+       if (this.user.newMessages[groupId]) return true;
+ 
+diff --git a/website/client/src/components/groups/membersModal.vue b/website/client/src/components/groups/membersModal.vue
+index f02e9494c05..e6be50bf553 100644
+--- a/website/client/src/components/groups/membersModal.vue
++++ b/website/client/src/components/groups/membersModal.vue
+@@ -99,14 +99,21 @@
+           </div>
+         </div>
+       </div>
+-      <div v-if="selectedPage === 'members'">
++      <loading-gryphon v-if="loading" />
++      <div
++        v-if="selectedPage === 'members' && !loading"
++        :class="{'mt-1': invites.length === 0}"
++      >
+         <div
+           v-for="(member, index) in sortedMembers"
+           :key="member._id"
+           class="row"
+         >
+           <div class="col-11 no-padding-left">
+-            <member-details :member="member" />
++            <member-details
++              :member="member"
++              :class-badge-position="'next-to-name'"
++            />
+           </div>
+           <div class="col-1 actions">
+             <b-dropdown right="right">
+@@ -201,7 +208,7 @@
+           class="row gradient"
+         ></div>
+       </div>
+-      <div v-if="selectedPage === 'invites'">
++      <div v-if="selectedPage === 'invites' && !loading">
+         <div
+           v-for="(member, index) in invites"
+           :key="member._id"
+@@ -270,6 +277,8 @@
+     .modal-body {
+       padding-left: 0;
+       padding-right: 0;
++      padding-bottom: 0;
++      padding-top: 0;
+     }
+ 
+     .member-details {
+@@ -378,6 +387,7 @@ import isEmpty from 'lodash/isEmpty';
+ import { mapState } from '@/libs/store';
+ 
+ import removeMemberModal from '@/components/members/removeMemberModal';
++import loadingGryphon from '@/components/ui/loadingGryphon';
+ import MemberDetails from '../memberDetails';
+ import removeIcon from '@/assets/members/remove.svg';
+ import messageIcon from '@/assets/members/message.svg';
+@@ -388,6 +398,7 @@ export default {
+   components: {
+     MemberDetails,
+     removeMemberModal,
++    loadingGryphon,
+   },
+   props: ['hideBadge'],
+   data () {
+@@ -474,6 +485,9 @@ export default {
+     challengeId () {
+       return this.$store.state.memberModalOptions.challengeId;
+     },
++    loading () {
++      return this.$store.state.memberModalOptions.loading;
++    },
+     sortedMembers () {
+       let sortedMembers = this.members.slice(); // shallow clone to avoid infinite loop
+ 
+@@ -504,16 +518,6 @@ export default {
+     },
+   },
+   watch: {
+-    groupId () {
+-      // @TODO: We might not need this since groupId is computed now
+-      this.getMembers();
+-    },
+-    challengeId () {
+-      this.getMembers();
+-    },
+-    group () {
+-      this.getMembers();
+-    },
+     // Watches `searchTerm` and if present, performs a `searchMembers` action
+     // and usual `getMembers` otherwise
+     searchTerm () {
+@@ -537,7 +541,7 @@ export default {
+       this.getMembers();
+     });
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('habitica:show-member-modal');
+   },
+   methods: {
+@@ -558,8 +562,9 @@ export default {
+       });
+     },
+     async getMembers () {
+-      const { groupId } = this;
++      this.members = this.$store.state.memberModalOptions.viewingMembers;
+ 
++      const { groupId } = this;
+       if (groupId && groupId !== 'challenge') {
+         const invites = await this.$store.dispatch('members:getGroupInvites', {
+           groupId,
+@@ -567,8 +572,6 @@ export default {
+         });
+         this.invites = invites;
+       }
+-
+-      this.members = this.$store.state.memberModalOptions.viewingMembers;
+     },
+     async clickMember (uid, forceShow) {
+       const user = this.$store.state.user.data;
+diff --git a/website/client/src/components/groups/startQuestModal.vue b/website/client/src/components/groups/startQuestModal.vue
+index 340cac2aa38..ac1a98e786f 100644
+--- a/website/client/src/components/groups/startQuestModal.vue
++++ b/website/client/src/components/groups/startQuestModal.vue
+@@ -209,7 +209,7 @@ export default {
+ 
+     this.$root.$on('selectQuest', this.selectQuest);
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('selectQuest', this.selectQuest);
+   },
+   methods: {
+diff --git a/website/client/src/components/header/index.vue b/website/client/src/components/header/index.vue
+index 740c12a05e6..85317373959 100644
+--- a/website/client/src/components/header/index.vue
++++ b/website/client/src/components/header/index.vue
+@@ -222,8 +222,8 @@ export default {
+       this.$root.$emit('bv::show::modal', 'invite-modal');
+     });
+   },
+-  destroyed () {
+-    this.$root.off('inviteModal::inviteToGroup');
++  beforeDestroy () {
++    this.$root.$off('inviteModal::inviteToGroup');
+   },
+   methods: {
+     ...mapActions({
+@@ -250,6 +250,7 @@ export default {
+         groupId: party.data._id,
+         viewingMembers: this.partyMembers,
+         group: party.data,
++        fetchMoreMembers: p => this.$store.dispatch('members:getGroupMembers', p),
+       });
+     },
+     setPartyMembersWidth ($event) {
+diff --git a/website/client/src/components/header/notifications/base.vue b/website/client/src/components/header/notifications/base.vue
+index 40af37b2ee3..e1e79896c7b 100644
+--- a/website/client/src/components/header/notifications/base.vue
++++ b/website/client/src/components/header/notifications/base.vue
+@@ -182,10 +182,10 @@ export default {
+     remove () {
+       if (this.notification.type === 'NEW_CHAT_MESSAGE') {
+         const groupId = this.notification.data.group.id;
+-        this.$store.dispatch('chat:markChatSeen', { groupId });
+-        if (this.user.newMessages[groupId]) {
+-          this.$delete(this.user.newMessages, groupId);
+-        }
++        this.$store.dispatch('chat:markChatSeen', {
++          groupId,
++          notificationId: this.notification.id,
++        });
+       } else {
+         this.readNotification({ notificationId: this.notification.id });
+       }
+diff --git a/website/client/src/components/header/notifications/worldBoss.vue b/website/client/src/components/header/notifications/worldBoss.vue
+index 48e3876173e..f3be771fbd9 100644
+--- a/website/client/src/components/header/notifications/worldBoss.vue
++++ b/website/client/src/components/header/notifications/worldBoss.vue
+@@ -1,6 +1,6 @@
+ <template>
+   <base-notification
+-    v-if="worldBoss.active"
++    v-if="worldBoss && worldBoss.active"
+     :can-remove="false"
+     :notification="{}"
+     :read-after-click="false"
+@@ -11,10 +11,16 @@
+       class="background"
+     >
+       <div class="text">
+-        <div class="title">
++        <div
++          v-once
++          class="title"
++        >
+           {{ $t('worldBoss') }}
+         </div>
+-        <div class="sub-title">
++        <div
++          v-once
++          class="sub-title"
++        >
+           {{ $t('questDysheartenerText') }}
+         </div>
+       </div>
+@@ -40,6 +46,7 @@
+         </div>
+         <div class="pending-damage">
+           <div
++            v-once
+             class="svg-icon"
+             v-html="icons.sword"
+           ></div>
+@@ -182,11 +189,13 @@ export default {
+         sword,
+       }),
+       questData,
+-      worldBoss: {},
+     };
+   },
+   computed: {
+-    ...mapState({ user: 'user.data' }),
++    ...mapState({
++      user: 'user.data',
++      worldBoss: 'worldState.data.worldBoss',
++    }),
+     bossHp () {
+       if (this.worldBoss && this.worldBoss.progress) {
+         return this.worldBoss.progress.hp;
+@@ -195,8 +204,7 @@ export default {
+     },
+   },
+   async mounted () {
+-    const result = await this.$store.dispatch('worldState:getWorldState');
+-    this.worldBoss = result.worldBoss;
++    await this.$store.dispatch('worldState:getWorldState');
+   },
+   methods: {
+     action () {
+diff --git a/website/client/src/components/inventory/stable/hatchedPetDialog.vue b/website/client/src/components/inventory/stable/hatchedPetDialog.vue
+index 5ca052cd0dd..c1e065da5b0 100644
+--- a/website/client/src/components/inventory/stable/hatchedPetDialog.vue
++++ b/website/client/src/components/inventory/stable/hatchedPetDialog.vue
+@@ -124,7 +124,7 @@ export default {
+   mounted () {
+     this.$root.$on('hatchedPet::open', this.openDialog);
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('hatchedPet::open', this.openDialog);
+   },
+   methods: {
+diff --git a/website/client/src/components/inventory/stable/mountRaisedModal.vue b/website/client/src/components/inventory/stable/mountRaisedModal.vue
+index 719830ba12c..d5c9b07f7df 100644
+--- a/website/client/src/components/inventory/stable/mountRaisedModal.vue
++++ b/website/client/src/components/inventory/stable/mountRaisedModal.vue
+@@ -102,7 +102,7 @@ export default {
+   mounted () {
+     this.$root.$on('habitica::mount-raised', this.openDialog);
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('habitica::mount-raised', this.openDialog);
+   },
+   methods: {
+diff --git a/website/client/src/components/members/memberSearchDropdown.vue b/website/client/src/components/members/memberSearchDropdown.vue
+index f9d877a37f1..7f495926cc7 100644
+--- a/website/client/src/components/members/memberSearchDropdown.vue
++++ b/website/client/src/components/members/memberSearchDropdown.vue
+@@ -3,6 +3,7 @@
+     class="create-dropdown"
+     :text="text"
+     no-flip="no-flip"
++    @show="$emit('opened')"
+   >
+     <b-dropdown-form
+       :disabled="false"
+@@ -14,6 +15,7 @@
+         type="text"
+       >
+     </b-dropdown-form>
++    <loading-gryphon v-if="loading" />
+     <b-dropdown-item
+       v-for="member in memberResults"
+       :key="member._id"
+@@ -30,8 +32,12 @@
+ <script>
+ // @TODO: how do we subclass this rather than type checking?
+ import challengeMemberSearchMixin from '@/mixins/challengeMemberSearch';
++import loadingGryphon from '@/components/ui/loadingGryphon';
+ 
+ export default {
++  components: {
++    loadingGryphon,
++  },
+   mixins: [challengeMemberSearchMixin],
+   props: {
+     text: {
+@@ -52,6 +58,11 @@ export default {
+       memberResults: [],
+     };
+   },
++  computed: {
++    loading () {
++      return this.$store.state.memberModalOptions.loading;
++    },
++  },
+   watch: {
+     memberResults () {
+       if (this.memberResults.length > 10) this.memberResults.length = 10;
+diff --git a/website/client/src/components/messages/messageList.vue b/website/client/src/components/messages/messageList.vue
+index 2dec7de5c64..d0d7cb31495 100644
+--- a/website/client/src/components/messages/messageList.vue
++++ b/website/client/src/components/messages/messageList.vue
+@@ -226,8 +226,6 @@ export default {
+   beforeDestroy () {
+     this.$el.removeEventListener('selectstart', () => this.handleSelectStart());
+     this.$el.removeEventListener('mouseup', () => this.handleSelectChange());
+-  },
+-  destroyed () {
+     window.removeEventListener('scroll', this.handleScroll);
+   },
+   computed: {
+diff --git a/website/client/src/components/notifications.vue b/website/client/src/components/notifications.vue
+index 5c14acdc7fc..54683f0eac4 100644
+--- a/website/client/src/components/notifications.vue
++++ b/website/client/src/components/notifications.vue
+@@ -817,10 +817,8 @@ export default {
+             break;
+           }
+           case 'CRON':
+-            if (notification.data) {
+-              if (notification.data.hp) this.hp(notification.data.hp, 'hp');
+-              if (notification.data.mp && this.userHasClass) this.mp(notification.data.mp);
+-            }
++            // Not needed because it's shown already by the userHp and userMp watchers
++            // Keeping an empty block so that it gets read
+             break;
+           case 'SCORED_TASK':
+             // Search if it is a read notification
+diff --git a/website/client/src/components/payments/amazonModal.vue b/website/client/src/components/payments/amazonModal.vue
+index bf5b5244158..f9b7e934f49 100644
+--- a/website/client/src/components/payments/amazonModal.vue
++++ b/website/client/src/components/payments/amazonModal.vue
+@@ -125,7 +125,7 @@ export default {
+       });
+     });
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('habitica::pay-with-amazon');
+   },
+   methods: {
+diff --git a/website/client/src/components/payments/cancelModalConfirm.vue b/website/client/src/components/payments/cancelModalConfirm.vue
+index 545820f1a9a..680e8919aad 100644
+--- a/website/client/src/components/payments/cancelModalConfirm.vue
++++ b/website/client/src/components/payments/cancelModalConfirm.vue
+@@ -79,7 +79,7 @@ export default {
+       this.$root.$emit('bv::show::modal', 'subscription-cancel-modal');
+     });
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('habitica:cancel-subscription-confirm');
+   },
+   methods: {
+diff --git a/website/client/src/components/payments/canceledModal.vue b/website/client/src/components/payments/canceledModal.vue
+index cb4be6a1567..84d028ab994 100644
+--- a/website/client/src/components/payments/canceledModal.vue
++++ b/website/client/src/components/payments/canceledModal.vue
+@@ -108,7 +108,7 @@ export default {
+       this.$root.$emit('bv::show::modal', 'subscription-canceled-modal');
+     });
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('habitica:subscription-canceled');
+   },
+   methods: {
+diff --git a/website/client/src/components/payments/successModal.vue b/website/client/src/components/payments/successModal.vue
+index 965eddecb8a..46e6097f7b9 100644
+--- a/website/client/src/components/payments/successModal.vue
++++ b/website/client/src/components/payments/successModal.vue
+@@ -237,7 +237,7 @@ export default {
+       this.$root.$emit('bv::show::modal', 'payments-success-modal');
+     });
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.paymentData = {};
+     this.$root.$off('habitica:payments-success');
+   },
+diff --git a/website/client/src/components/shops/market/index.vue b/website/client/src/components/shops/market/index.vue
+index 1034353616c..33ff46eedf3 100644
+--- a/website/client/src/components/shops/market/index.vue
++++ b/website/client/src/components/shops/market/index.vue
+@@ -161,7 +161,7 @@
+ import _filter from 'lodash/filter';
+ import _map from 'lodash/map';
+ import _throttle from 'lodash/throttle';
+-import { mapState } from '@/libs/store';
++import { mapState, mapGetters } from '@/libs/store';
+ 
+ import KeysToKennel from './keysToKennel';
+ import EquipmentSection from './equipmentSection';
+@@ -221,8 +221,6 @@ export default {
+ 
+       hideLocked: false,
+       hidePinned: false,
+-
+-      broken: false,
+     };
+   },
+   computed: {
+@@ -232,6 +230,9 @@ export default {
+       userStats: 'user.data.stats',
+       userItems: 'user.data.items',
+     }),
++    ...mapGetters({
++      broken: 'worldState.brokenMarket',
++    }),
+     market () {
+       return shops.getMarketShop(this.user);
+     },
+@@ -303,10 +304,7 @@ export default {
+     }, 250),
+   },
+   async mounted () {
+-    const worldState = await this.$store.dispatch('worldState:getWorldState');
+-    this.broken = worldState && worldState.worldBoss
+-      && worldState.worldBoss.extra && worldState.worldBoss.extra.worldDmg
+-      && worldState.worldBoss.extra.worldDmg.market;
++    await this.$store.dispatch('worldState:getWorldState');
+   },
+   methods: {
+     sellItem (itemScope) {
+diff --git a/website/client/src/components/shops/market/sellModal.vue b/website/client/src/components/shops/market/sellModal.vue
+index 8093fae2d77..f8d7c1e08dd 100644
+--- a/website/client/src/components/shops/market/sellModal.vue
++++ b/website/client/src/components/shops/market/sellModal.vue
+@@ -196,7 +196,7 @@ export default {
+       this.$root.$emit('bv::show::modal', 'sell-modal');
+     });
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('sellItem');
+   },
+   methods: {
+diff --git a/website/client/src/components/shops/quests/index.vue b/website/client/src/components/shops/quests/index.vue
+index 2c94f707e13..8a426a83d37 100644
+--- a/website/client/src/components/shops/quests/index.vue
++++ b/website/client/src/components/shops/quests/index.vue
+@@ -456,7 +456,7 @@ import _sortBy from 'lodash/sortBy';
+ import _throttle from 'lodash/throttle';
+ import _groupBy from 'lodash/groupBy';
+ import _map from 'lodash/map';
+-import { mapState } from '@/libs/store';
++import { mapState, mapGetters } from '@/libs/store';
+ 
+ import ShopItem from '../shopItem';
+ import Item from '@/components/inventory/item';
+@@ -503,8 +503,6 @@ export default {
+ 
+       hideLocked: false,
+       hidePinned: false,
+-
+-      broken: false,
+     };
+   },
+   computed: {
+@@ -514,6 +512,9 @@ export default {
+       userStats: 'user.data.stats',
+       userItems: 'user.data.items',
+     }),
++    ...mapGetters({
++      broken: 'worldState.brokenQuests',
++    }),
+     shop () {
+       return shops.getQuestShop(this.user);
+     },
+@@ -540,9 +541,7 @@ export default {
+     }, 250),
+   },
+   async mounted () {
+-    const worldState = await this.$store.dispatch('worldState:getWorldState');
+-    this.broken = worldState && worldState.worldBoss && worldState.worldBoss.extra
+-      && worldState.worldBoss.extra.worldDmg && worldState.worldBoss.extra.worldDmg.quests;
++    await this.$store.dispatch('worldState:getWorldState');
+   },
+   methods: {
+     questItems (category, sortBy, searchBy, hideLocked, hidePinned) {
+diff --git a/website/client/src/components/shops/seasonal/index.vue b/website/client/src/components/shops/seasonal/index.vue
+index a6e5a35e123..948420713d4 100644
+--- a/website/client/src/components/shops/seasonal/index.vue
++++ b/website/client/src/components/shops/seasonal/index.vue
+@@ -373,7 +373,7 @@ import _sortBy from 'lodash/sortBy';
+ import _throttle from 'lodash/throttle';
+ import _groupBy from 'lodash/groupBy';
+ import _reverse from 'lodash/reverse';
+-import { mapState } from '@/libs/store';
++import { mapState, mapGetters } from '@/libs/store';
+ 
+ import Checkbox from '@/components/ui/checkbox';
+ import PinBadge from '@/components/ui/pinBadge';
+@@ -434,8 +434,6 @@ export default {
+       featuredGearBought: false,
+ 
+       backgroundUpdate: new Date(),
+-
+-      broken: false,
+     };
+   },
+   computed: {
+@@ -444,6 +442,9 @@ export default {
+       user: 'user.data',
+       userStats: 'user.data.stats',
+     }),
++    ...mapGetters({
++      broken: 'worldState.brokenSeasonalShop',
++    }),
+ 
+     usersOfficalPinnedItems () {
+       return getOfficialPinnedItems(this.user);
+@@ -516,14 +517,11 @@ export default {
+     }, 250),
+   },
+   async mounted () {
+-    const worldState = await this.$store.dispatch('worldState:getWorldState');
+-    this.broken = worldState && worldState.worldBoss && worldState.worldBoss.extra
+-      && worldState.worldBoss.extra.worldDmg && worldState.worldBoss.extra.worldDmg.seasonalShop;
+-  },
+-  created () {
+     this.$root.$on('buyModal::boughtItem', () => {
+       this.backgroundUpdate = new Date();
+     });
++
++    await this.$store.dispatch('worldState:getWorldState');
+   },
+   beforeDestroy () {
+     this.$root.$off('buyModal::boughtItem');
+diff --git a/website/client/src/components/shops/timeTravelers/index.vue b/website/client/src/components/shops/timeTravelers/index.vue
+index 172864a5e26..0704ef689c7 100644
+--- a/website/client/src/components/shops/timeTravelers/index.vue
++++ b/website/client/src/components/shops/timeTravelers/index.vue
+@@ -395,7 +395,7 @@ export default {
+       this.searchTextThrottled = this.searchText.toLowerCase();
+     }, 250),
+   },
+-  created () {
++  mounted () {
+     this.$root.$on('buyModal::boughtItem', () => {
+       this.backgroundUpdate = new Date();
+     });
+diff --git a/website/client/src/components/tasks/brokenTaskModal.vue b/website/client/src/components/tasks/brokenTaskModal.vue
+index c035d272100..cb08a768be8 100644
+--- a/website/client/src/components/tasks/brokenTaskModal.vue
++++ b/website/client/src/components/tasks/brokenTaskModal.vue
+@@ -91,7 +91,7 @@ export default {
+       brokenChallengeTask: {},
+     };
+   },
+-  created () {
++  mounted () {
+     this.$root.$on('handle-broken-task', task => {
+       this.brokenChallengeTask = { ...task };
+       this.$root.$emit('bv::show::modal', 'broken-task-modal');
+diff --git a/website/client/src/components/tasks/column.vue b/website/client/src/components/tasks/column.vue
+index 8f212114a3f..de9c15c2950 100644
+--- a/website/client/src/components/tasks/column.vue
++++ b/website/client/src/components/tasks/column.vue
+@@ -515,7 +515,7 @@ export default {
+       this.loadCompletedTodos();
+     });
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('buyModal::boughtItem');
+     if (this.type !== 'todo') return;
+     this.$root.$off(EVENTS.RESYNC_COMPLETED);
+diff --git a/website/client/src/components/tasks/taskModal.vue b/website/client/src/components/tasks/taskModal.vue
+index deaf783157e..737d937b9f3 100644
+--- a/website/client/src/components/tasks/taskModal.vue
++++ b/website/client/src/components/tasks/taskModal.vue
+@@ -1323,7 +1323,7 @@ export default {
+   created () {
+     document.addEventListener('keyup', this.handleEsc);
+   },
+-  destroyed () {
++  beforeDestroy () {
+     document.removeEventListener('keyup', this.handleEsc);
+   },
+   methods: {
+diff --git a/website/client/src/components/ui/customMenuDropdown.vue b/website/client/src/components/ui/customMenuDropdown.vue
+index 26406178bcd..78ba50f9d03 100644
+--- a/website/client/src/components/ui/customMenuDropdown.vue
++++ b/website/client/src/components/ui/customMenuDropdown.vue
+@@ -91,7 +91,7 @@ export default {
+   mounted () {
+     document.documentElement.addEventListener('click', this._clickOutListener);
+   },
+-  destroyed () {
++  beforeDestroy () {
+     document.removeEventListener('click', this._clickOutListener);
+   },
+   methods: {
+diff --git a/website/client/src/components/ui/loadingGryphon.vue b/website/client/src/components/ui/loadingGryphon.vue
+new file mode 100644
+index 00000000000..6e2d89c513e
+--- /dev/null
++++ b/website/client/src/components/ui/loadingGryphon.vue
+@@ -0,0 +1,45 @@
++<template>
++  <div class="loading-gryphon-wrapper">
++    <div
++      v-once
++      class="svg-icon loading-gryphon"
++      v-html="icons.gryphon"
++    ></div>
++  </div>
++</template>
++
++<style lang='scss' scoped>
++  .loading-gryphon-wrapper {
++    width: 100%;
++    padding-top: 72px;
++    padding-bottom: 72px;
++  }
++
++  .loading-gryphon {
++    color: #6133b4;
++    margin: 0 auto;
++    width: 65px;
++    height: 70px;
++    animation: pulsate 2s linear infinite;
++  }
++
++  @keyframes pulsate {
++    from { opacity: 1; }
++    50% { opacity: 0.5; }
++    to { opacity: 1; }
++  }
++</style>
++
++<script>
++import gryphon from '@/assets/svg/gryphon.svg';
++
++export default {
++  data () {
++    return {
++      icons: Object.freeze({
++        gryphon,
++      }),
++    };
++  },
++};
++</script>
+diff --git a/website/client/src/components/userMenu/profileModal.vue b/website/client/src/components/userMenu/profileModal.vue
+index c1e1e2ade9f..f148af9b704 100644
+--- a/website/client/src/components/userMenu/profileModal.vue
++++ b/website/client/src/components/userMenu/profileModal.vue
+@@ -45,7 +45,7 @@ export default {
+       this.$root.$emit('bv::show::modal', 'profile');
+     });
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off('habitica:show-profile');
+   },
+   methods: {
+diff --git a/website/client/src/libs/asyncResource.js b/website/client/src/libs/asyncResource.js
+index 5d74d99f320..d5125c65c8f 100644
+--- a/website/client/src/libs/asyncResource.js
++++ b/website/client/src/libs/asyncResource.js
+@@ -6,12 +6,14 @@ import axios from 'axios';
+ export function asyncResourceFactory () {
+   return {
+     loadingStatus: 'NOT_LOADED', // NOT_LOADED, LOADING, LOADED
++    appVersionOnLoad: null, // record the server app version the last time the resource was loaded
+     data: null,
+   };
+ }
+ 
+ export function loadAsyncResource ({
+-  store, path, url, deserialize, forceLoad = false,
++  store, path, url, deserialize,
++  forceLoad = false, reloadOnAppVersionChange = false,
+ }) {
+   if (!store) throw new Error('"store" is required and must be the application store.');
+   if (!path) throw new Error('The path to the resource in the application state is required.');
+@@ -22,7 +24,16 @@ export function loadAsyncResource ({
+   if (!resource) throw new Error(`No resouce found at path "${path}".`);
+   const { loadingStatus } = resource;
+ 
+-  if (loadingStatus === 'LOADED' && !forceLoad) {
++  // Has the server been updated since we last loaded this resource?
++  const appVersionHasChanged = loadingStatus === 'LOADED'
++    && store.state.serverAppVersion
++    && store.state.serverAppVersion !== resource.appVersionOnLoad;
++
++  let shouldUpdate = false;
++  if (forceLoad) shouldUpdate = true;
++  if (appVersionHasChanged && reloadOnAppVersionChange) shouldUpdate = true;
++
++  if (loadingStatus === 'LOADED' && !shouldUpdate) {
+     return Promise.resolve(resource);
+   } if (loadingStatus === 'LOADING') {
+     return new Promise((resolve, reject) => {
+@@ -34,15 +45,19 @@ export function loadAsyncResource ({
+         return reject(); // TODO add reason?
+       });
+     });
+-  } if (loadingStatus === 'NOT_LOADED' || forceLoad) {
+-    return axios.get(url).then(response => { // TODO support more params
++  } if (loadingStatus === 'NOT_LOADED' || shouldUpdate) { // @TODO set loadingStatus back to LOADING?
++    return axios.get(url).then(response => { // @TODO support more params
+       resource.loadingStatus = 'LOADED';
+       // deserialize can be a promise
+       return Promise.resolve(deserialize(response)).then(deserializedData => {
+         resource.data = deserializedData;
++        // record the app version when the resource was loaded
++        // allows reloading if the app version has changed
++        resource.appVersionOnLoad = store.state.serverAppVersion;
+         return resource;
+       });
+     });
+   }
++
+   return Promise.reject(new Error(`Invalid loading status "${loadingStatus} for resource at "${path}".`));
+ }
+diff --git a/website/client/src/libs/logging.js b/website/client/src/libs/logging.js
+index f2c442e1018..e2d02b9d8c6 100644
+--- a/website/client/src/libs/logging.js
++++ b/website/client/src/libs/logging.js
+@@ -34,7 +34,6 @@ export function setUpLogging () { // eslint-disable-line import/prefer-default-e
+ 
+     _LTracker.push({
+       err,
+-      vm,
+       info,
+     });
+   };
+diff --git a/website/client/src/pages/private-messages.vue b/website/client/src/pages/private-messages.vue
+index 0e5d0a6f3bd..cc3c4dcd777 100644
+--- a/website/client/src/pages/private-messages.vue
++++ b/website/client/src/pages/private-messages.vue
+@@ -662,8 +662,9 @@ export default {
+       this.selectConversation(this.initiatedConversation.uuid);
+     }
+   },
+-  destroyed () {
++  beforeDestroy () {
+     this.$root.$off(EVENTS.RESYNC_COMPLETED);
++    this.$root.$off(EVENTS.PM_REFRESH);
+   },
+   computed: {
+     ...mapState({ user: 'user.data' }),
+diff --git a/website/client/src/store/actions/chat.js b/website/client/src/store/actions/chat.js
+index 75ef624306b..08e5ec21360 100644
+--- a/website/client/src/store/actions/chat.js
++++ b/website/client/src/store/actions/chat.js
+@@ -1,4 +1,5 @@
+ import axios from 'axios';
++import Vue from 'vue';
+ import * as Analytics from '@/libs/analytics';
+ 
+ export async function getChat (store, payload) {
+@@ -70,8 +71,15 @@ export async function clearFlagCount (store, payload) {
+ }
+ 
+ export async function markChatSeen (store, payload) {
+-  if (store.state.user.newMessages) delete store.state.user.newMessages[payload.groupId];
+   const url = `/api/v4/groups/${payload.groupId}/chat/seen`;
+   const response = await axios.post(url);
++
++  if (store.state.user.data.newMessages[payload.groupId]) {
++    Vue.delete(store.state.user.data.newMessages, payload.groupId);
++  }
++  if (payload.notificationId) {
++    store.state.notificationsRemoved.push(payload.notificationId);
++  }
++
+   return response.data.data;
+ }
+diff --git a/website/client/src/store/actions/guilds.js b/website/client/src/store/actions/guilds.js
+index 02609970fe1..6d1a45703a4 100644
+--- a/website/client/src/store/actions/guilds.js
++++ b/website/client/src/store/actions/guilds.js
+@@ -74,8 +74,9 @@ export async function join (store, payload) {
+     if (invitationI !== -1) invitations.parties.splice(invitationI, 1);
+ 
+     user.party._id = groupId;
+-
+     Analytics.updateUser({ partyID: groupId });
++    // load the party members so that they get shown in the header
++    store.dispatch('party:getMembers');
+   }
+ 
+   return response.data.data;
+diff --git a/website/client/src/store/actions/index.js b/website/client/src/store/actions/index.js
+index 09f744f2025..539f71c1e2d 100644
+--- a/website/client/src/store/actions/index.js
++++ b/website/client/src/store/actions/index.js
+@@ -15,7 +15,7 @@ import * as tags from './tags';
+ import * as hall from './hall';
+ import * as shops from './shops';
+ import * as snackbars from './snackbars';
+-import * as worldState from './world-state';
++import * as worldState from './worldState';
+ 
+ // Actions should be named as 'actionName' and can be accessed as 'namespace:actionName'
+ // Example: fetch in user.js -> 'user:fetch'
+diff --git a/website/client/src/store/actions/notifications.js b/website/client/src/store/actions/notifications.js
+index 981260c6b71..281f60f1fc9 100644
+--- a/website/client/src/store/actions/notifications.js
++++ b/website/client/src/store/actions/notifications.js
+@@ -3,6 +3,7 @@ import axios from 'axios';
+ export async function readNotification (store, payload) {
+   const url = `/api/v4/notifications/${payload.notificationId}/read`;
+   const response = await axios.post(url);
++  store.state.notificationsRemoved.push(payload.notificationId);
+   return response.data.data;
+ }
+ 
+@@ -11,6 +12,7 @@ export async function readNotifications (store, payload) {
+   const response = await axios.post(url, {
+     notificationIds: payload.notificationIds,
+   });
++  store.state.notificationsRemoved.push(...payload.notificationIds);
+   return response.data.data;
+ }
+ 
+diff --git a/website/client/src/store/actions/world-state.js b/website/client/src/store/actions/world-state.js
+deleted file mode 100644
+index 19d0a893f90..00000000000
+--- a/website/client/src/store/actions/world-state.js
++++ /dev/null
+@@ -1,7 +0,0 @@
+-import axios from 'axios';
+-
+-export async function getWorldState () { // eslint-disable-line import/prefer-default-export
+-  const url = '/api/v4/world-state';
+-  const response = await axios.get(url);
+-  return response.data.data;
+-}
+diff --git a/website/client/src/store/actions/worldState.js b/website/client/src/store/actions/worldState.js
+new file mode 100644
+index 00000000000..367b9299a86
+--- /dev/null
++++ b/website/client/src/store/actions/worldState.js
+@@ -0,0 +1,14 @@
++import { loadAsyncResource } from '@/libs/asyncResource';
++
++export async function getWorldState (store, options = {}) {
++  return loadAsyncResource({
++    store,
++    path: 'worldState',
++    url: '/api/v4/world-state',
++    deserialize (response) {
++      return response.data.data;
++    },
++    forceLoad: options.forceLoad,
++    reloadOnAppVersionChange: true, // reload when the server has been updated
++  });
++}
+diff --git a/website/client/src/store/getters/index.js b/website/client/src/store/getters/index.js
+index e4ccdccf361..b068d3a211c 100644
+--- a/website/client/src/store/getters/index.js
++++ b/website/client/src/store/getters/index.js
+@@ -4,6 +4,7 @@ import * as shops from './shops';
+ import * as tasks from './tasks';
+ import * as party from './party';
+ import * as members from './members';
++import * as worldState from './worldState';
+ 
+ // Getters should be named as 'getterName' and can be accessed as 'namespace:getterName'
+ // Example: gems in user.js -> 'user:gems'
+@@ -14,6 +15,7 @@ const getters = flattenAndNamespace({
+   party,
+   members,
+   shops,
++  worldState,
+ });
+ 
+ export default getters;
+diff --git a/website/client/src/store/getters/worldState.js b/website/client/src/store/getters/worldState.js
+new file mode 100644
+index 00000000000..ccb4132b695
+--- /dev/null
++++ b/website/client/src/store/getters/worldState.js
+@@ -0,0 +1,23 @@
++function getWorldDamage (store) {
++  const worldState = store.state.worldState.data;
++
++  return worldState
++    && worldState.worldBoss
++    && worldState.worldBoss.extra
++    && worldState.worldBoss.extra.worldDmg;
++}
++
++export function brokenSeasonalShop (store) {
++  const worldDmg = getWorldDamage(store);
++  return worldDmg && worldDmg.seasonalShop;
++}
++
++export function brokenMarket (store) {
++  const worldDmg = getWorldDamage(store);
++  return worldDmg && worldDmg.market;
++}
++
++export function brokenQuests (store) {
++  const worldDmg = getWorldDamage(store);
++  return worldDmg && worldDmg.quests;
++}
+diff --git a/website/client/src/store/index.js b/website/client/src/store/index.js
+index 340a3c50bfd..94405ae54fd 100644
+--- a/website/client/src/store/index.js
++++ b/website/client/src/store/index.js
+@@ -50,12 +50,20 @@ export default function () {
+     actions,
+     getters,
+     state: {
+-      serverAppVersion: '',
++      serverAppVersion: null,
+       title: 'Habitica',
+       isUserLoggedIn,
+-      isUserLoaded: false, // Means the user and the user's tasks are ready
++      // Means the user and the user's tasks are ready
++      // @TODO use store.user.loaded since it's an async resource?
++      isUserLoaded: false,
+       isAmazonReady: false, // Whether the Amazon Payments lib can be used
+       user: asyncResourceFactory(),
++      // Keep track of the ids of notifications that have been removed
++      // to make sure they don't get shown again. It happened due to concurrent requests
++      // which in some cases could result in a read notification showing up again
++      // see https://github.com/HabitRPG/habitica/issues/9242
++      notificationsRemoved: [],
++      worldState: asyncResourceFactory(),
+       credentials: isUserLoggedIn ? {
+         API_ID: AUTH_SETTINGS.auth.apiId,
+         API_TOKEN: AUTH_SETTINGS.auth.apiToken,
+@@ -65,6 +73,7 @@ export default function () {
+       // in app.vue
+       browserTimezoneOffset,
+       tasks: asyncResourceFactory(), // user tasks
++      // @TODO use asyncresource?
+       completedTodosStatus: 'NOT_LOADED',
+       party: asyncResourceFactory(),
+       partyMembers: asyncResourceFactory(),
+@@ -105,6 +114,7 @@ export default function () {
+         groupId: '',
+         challengeId: '',
+         group: {},
++        loading: false,
+       },
+       openedItemRows: [],
+       spellOptions: {
+diff --git a/website/client/tests/unit/libs/asyncResource.spec.js b/website/client/tests/unit/libs/asyncResource.spec.js
+index 41999f25901..00ed922056c 100644
+--- a/website/client/tests/unit/libs/asyncResource.spec.js
++++ b/website/client/tests/unit/libs/asyncResource.spec.js
+@@ -123,6 +123,56 @@ describe('async resource', () => {
+       expect(axios.get).to.have.been.calledOnce;
+     });
+ 
++    describe('reloadOnAppVersionChange', async () => {
++      let store;
++
++      beforeEach(() => {
++        store = generateStore();
++        store.state.worldState.loadingStatus = 'LOADED';
++        store.state.serverAppVersion = 1;
++        store.state.worldState.appVersionOnLoad = 1;
++      });
++
++      it('load the resource if it is loaded but the appVersion has changed', async () => {
++        store.state.serverAppVersion = 2;
++        sandbox.stub(axios, 'get').withArgs('/api/v4/world-state').returns(Promise.resolve({
++          data: { data: { _id: 1 } },
++        }));
++
++        const resource = await loadAsyncResource({
++          store,
++          path: 'worldState',
++          url: '/api/v4/world-state',
++          reloadOnAppVersionChange: true,
++          deserialize (response) {
++            return response.data.data;
++          },
++        });
++
++        expect(resource).to.equal(store.state.worldState);
++        expect(resource.loadingStatus).to.equal('LOADED');
++        expect(resource.data._id).to.equal(1);
++        expect(axios.get).to.have.been.calledOnce;
++      });
++
++      it('does not load the resource if it is loaded but the appVersion has changed', async () => {
++        sandbox.stub(axios, 'get').returns(Promise.resolve({ data: { data: { _id: 1 } } }));
++
++        const resource = await loadAsyncResource({
++          store,
++          path: 'worldState',
++          url: '/api/v4/world-state',
++          reloadOnAppVersionChange: true,
++          deserialize (response) {
++            return response.data.data;
++          },
++        });
++
++        expect(resource).to.equal(store.state.worldState);
++        expect(axios.get).to.not.have.been.called;
++      });
++    });
++
+     it('does not send multiple requests if the resource is being loaded', async () => {
+       const store = generateStore();
+       store.state.user.loadingStatus = 'LOADING';

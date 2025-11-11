@@ -1,0 +1,1123 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt b/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt
+index 1b68763aa566..7a50685cc057 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt
+@@ -481,7 +481,9 @@ open class HomeActivity : LocaleAwareAppCompatActivity(), NavHostActivity {
+         )
+ 
+         val intentProcessors =
+-            listOf(CrashReporterIntentProcessor()) + externalSourceIntentProcessors
++            listOf(
++                CrashReporterIntentProcessor(components.appStore)
++            ) + externalSourceIntentProcessors
+         val intentHandled =
+             intentProcessors.any { it.process(intent, navHost.navController, this.intent) }
+         browsingModeManager.mode = getModeFromIntentOrLastKnown(intent)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt
+index 4c4e595e886e..3128149c0f0d 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt
+@@ -132,6 +132,7 @@ import mozilla.components.support.ktx.android.view.enterToImmersiveMode
+ import mozilla.components.support.ktx.kotlin.getOrigin
+ import org.mozilla.fenix.components.toolbar.interactor.BrowserToolbarInteractor
+ import org.mozilla.fenix.components.toolbar.interactor.DefaultBrowserToolbarInteractor
++import org.mozilla.fenix.crashes.CrashContentIntegration
+ import org.mozilla.fenix.databinding.FragmentBrowserBinding
+ import org.mozilla.fenix.ext.secure
+ import org.mozilla.fenix.perf.MarkersFragmentLifecycleCallbacks
+@@ -191,6 +192,7 @@ abstract class BaseBrowserFragment :
+     private val searchFeature = ViewBoundFeatureWrapper<SearchFeature>()
+     private val webAuthnFeature = ViewBoundFeatureWrapper<WebAuthnFeature>()
+     private val biometricPromptFeature = ViewBoundFeatureWrapper<BiometricPromptFeature>()
++    private val crashContentIntegration = ViewBoundFeatureWrapper<CrashContentIntegration>()
+     private var pipFeature: PictureInPictureFeature? = null
+ 
+     var customTabSessionId: String? = null
+@@ -637,6 +639,22 @@ abstract class BaseBrowserFragment :
+             view = view
+         )
+ 
++        crashContentIntegration.set(
++            feature = CrashContentIntegration(
++                browserStore = requireComponents.core.store,
++                appStore = requireComponents.appStore,
++                toolbar = browserToolbarView.view,
++                isToolbarPlacedAtTop = !context.settings().shouldUseBottomToolbar,
++                crashReporterView = binding.crashReporterView,
++                components = requireComponents,
++                settings = context.settings(),
++                navController = findNavController(),
++                sessionId = customTabSessionId
++            ),
++            owner = this,
++            view = view
++        )
++
+         searchFeature.set(
+             feature = SearchFeature(store, customTabSessionId) { request, tabId ->
+                 val parentSession = store.state.findTabOrCustomTab(tabId)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/appstate/AppAction.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/appstate/AppAction.kt
+index 2d30dcbf9074..3b0f4564e578 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/appstate/AppAction.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/appstate/AppAction.kt
+@@ -4,6 +4,7 @@
+ 
+ package org.mozilla.fenix.components.appstate
+ 
++import mozilla.components.lib.crash.Crash.NativeCodeCrash
+ import mozilla.components.lib.state.Action
+ import org.mozilla.fenix.components.AppStore
+ 
+@@ -12,4 +13,7 @@ import org.mozilla.fenix.components.AppStore
+  */
+ sealed class AppAction : Action {
+     data class UpdateInactiveExpanded(val expanded: Boolean) : AppAction()
++    data class AddNonFatalCrash(val crash: NativeCodeCrash) : AppAction()
++    data class RemoveNonFatalCrash(val crash: NativeCodeCrash) : AppAction()
++    object RemoveAllNonFatalCrashes : AppAction()
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/appstate/AppState.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/appstate/AppState.kt
+index 281b13bb7a69..41699e17c30e 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/appstate/AppState.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/appstate/AppState.kt
+@@ -4,6 +4,7 @@
+ 
+ package org.mozilla.fenix.components.appstate
+ 
++import mozilla.components.lib.crash.Crash.NativeCodeCrash
+ import mozilla.components.lib.state.State
+ 
+ /**
+@@ -11,7 +12,9 @@ import mozilla.components.lib.state.State
+  *
+  * @property inactiveTabsExpanded A flag to know if the Inactive Tabs section of the Tabs Tray
+  * should be expanded when the tray is opened.
++ * @property nonFatalCrashes List of non-fatal crashes that allow the app to continue being used.
+  */
+ data class AppState(
+-    val inactiveTabsExpanded: Boolean = false
++    val inactiveTabsExpanded: Boolean = false,
++    val nonFatalCrashes: List<NativeCodeCrash> = emptyList()
+ ) : State
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/appstate/AppStoreReducer.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/appstate/AppStoreReducer.kt
+index f61421c28c59..698ab4f5f2d6 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/appstate/AppStoreReducer.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/appstate/AppStoreReducer.kt
+@@ -13,5 +13,11 @@ internal object AppStoreReducer {
+     fun reduce(state: AppState, action: AppAction): AppState = when (action) {
+         is AppAction.UpdateInactiveExpanded ->
+             state.copy(inactiveTabsExpanded = action.expanded)
++        is AppAction.AddNonFatalCrash ->
++            state.copy(nonFatalCrashes = state.nonFatalCrashes + action.crash)
++        is AppAction.RemoveNonFatalCrash ->
++            state.copy(nonFatalCrashes = state.nonFatalCrashes - action.crash)
++        is AppAction.RemoveAllNonFatalCrashes ->
++            state.copy(nonFatalCrashes = emptyList())
+     }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/crashes/CrashContentIntegration.kt b/fenix/app/src/main/java/org/mozilla/fenix/crashes/CrashContentIntegration.kt
+new file mode 100644
+index 000000000000..4522733f8335
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/crashes/CrashContentIntegration.kt
+@@ -0,0 +1,88 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.crashes
++
++import android.view.ViewGroup.MarginLayoutParams
++import androidx.navigation.NavController
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.collect
++import kotlinx.coroutines.flow.mapNotNull
++import mozilla.components.browser.state.selector.findTabOrCustomTabOrSelectedTab
++import mozilla.components.browser.state.selector.normalTabs
++import mozilla.components.browser.state.selector.privateTabs
++import mozilla.components.browser.state.state.BrowserState
++import mozilla.components.browser.state.state.EngineState
++import mozilla.components.browser.state.store.BrowserStore
++import mozilla.components.browser.toolbar.BrowserToolbar
++import mozilla.components.lib.state.helpers.AbstractBinding
++import mozilla.components.support.ktx.kotlinx.coroutines.flow.ifChanged
++import org.mozilla.fenix.components.AppStore
++import org.mozilla.fenix.components.Components
++import org.mozilla.fenix.utils.Settings
++
++/**
++ * Helper for observing [BrowserStore] and show an in-app crash reporter for tabs with content crashes.
++ *
++ * @param browserStore [BrowserStore] observed for any changes related to [EngineState.crashed].
++ * @param appStore [AppStore] that tracks all content crashes in the current app session until the user
++ * decides to either send or dismiss all crash reports.
++ * @param toolbar [BrowserToolbar] that will be expanded when showing the in-app crash reporter.
++ * @param isToolbarPlacedAtTop [Boolean] based allowing the in-app crash reporter to be shown as
++ * immediately below or above the toolbar.
++ * @param crashReporterView [CrashReporterFragment] which will be shown if the current tab is marked as crashed.
++ * @param components [Components] allowing interactions with other app features.
++ * @param settings [Settings] allowing to check whether crash reporting is enabled or not.
++ * @param navController [NavController] used to navigate to other parts of the app.
++ * @param sessionId [String] Id of the tab or custom tab which should be observed for [EngineState.crashed]
++ * depending on which [crashReporterView] will be shown or hidden.
++ */
++class CrashContentIntegration(
++    private val browserStore: BrowserStore,
++    private val appStore: AppStore,
++    private val toolbar: BrowserToolbar,
++    private val isToolbarPlacedAtTop: Boolean,
++    private val crashReporterView: CrashReporterFragment,
++    private val components: Components,
++    private val settings: Settings,
++    private val navController: NavController,
++    private val sessionId: String?
++) : AbstractBinding<BrowserState>(browserStore) {
++    override suspend fun onState(flow: Flow<BrowserState>) {
++        flow.mapNotNull { state -> state.findTabOrCustomTabOrSelectedTab(sessionId) }
++            .ifChanged { tab -> tab.engineState.crashed }
++            .collect { tab ->
++                if (tab.engineState.crashed) {
++                    toolbar.expand()
++
++                    crashReporterView.apply {
++                        val controller = CrashReporterController(
++                            sessionId = tab.id,
++                            currentNumberOfTabs = if (tab.content.private) {
++                                browserStore.state.privateTabs.size
++                            } else {
++                                browserStore.state.normalTabs.size
++                            },
++                            components = components,
++                            settings = settings,
++                            navController = navController,
++                            appStore = appStore
++                        )
++
++                        show(controller)
++
++                        with(layoutParams as MarginLayoutParams) {
++                            if (isToolbarPlacedAtTop) {
++                                topMargin = toolbar.height
++                            } else {
++                                bottomMargin = toolbar.height
++                            }
++                        }
++                    }
++                } else {
++                    crashReporterView.hide()
++                }
++            }
++    }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/crashes/CrashReporterController.kt b/fenix/app/src/main/java/org/mozilla/fenix/crashes/CrashReporterController.kt
+index 40dd9baeee3c..eaf83590d459 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/crashes/CrashReporterController.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/crashes/CrashReporterController.kt
+@@ -4,81 +4,89 @@
+ 
+ package org.mozilla.fenix.crashes
+ 
+-import android.util.Log
++import androidx.annotation.VisibleForTesting
+ import androidx.navigation.NavController
+ import kotlinx.coroutines.DelicateCoroutinesApi
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.GlobalScope
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.launch
+-import mozilla.components.lib.crash.Crash
+-import org.mozilla.fenix.R
++import org.mozilla.fenix.browser.BrowserFragmentDirections
++import org.mozilla.fenix.components.AppStore
+ import org.mozilla.fenix.components.Components
+-import org.mozilla.fenix.ext.nav
++import org.mozilla.fenix.components.appstate.AppAction
+ import org.mozilla.fenix.utils.Settings
+ 
+ class CrashReporterController(
+-    private val crash: Crash,
+-    private val sessionId: String?,
+-    private val navController: NavController,
+-    private val components: Components,
+-    private val settings: Settings
++    @get:VisibleForTesting internal val sessionId: String,
++    @get:VisibleForTesting internal val currentNumberOfTabs: Int,
++    @get:VisibleForTesting internal val components: Components,
++    @get:VisibleForTesting internal val settings: Settings,
++    @get:VisibleForTesting internal val navController: NavController,
++    @get:VisibleForTesting internal val appStore: AppStore
+ ) {
+ 
+     /**
+-     * Closes the crash reporter fragment and tries to recover the session.
++     * Restore all sessions and optionally report pending non-fatal crashes.
+      *
+-     * @param sendCrash If true, submit a crash report.
+-     * @return Job if report is submitted through an IO thread, null otherwise
++     * @param sendCrashes If true, submit crash reports for all current non-fatal crashes.
++     * @return [Job] allowing to check status / cancel the reporting operation or null if reporting is disabled.
+      */
+-    fun handleCloseAndRestore(sendCrash: Boolean): Job? {
+-        val job = submitReportIfNecessary(sendCrash)
++    fun handleCloseAndRestore(sendCrashes: Boolean): Job? {
++        val job = submitPendingNonFatalCrashesIfNecessary(sendCrashes)
+ 
+         components.useCases.sessionUseCases.crashRecovery.invoke()
+-        navController.popBackStack()
++
+         return job
+     }
+ 
+     /**
+-     * Closes the crash reporter fragment and the tab.
++     * Closes the current tab, restore all sessions and optionally report pending non-fatal crashes.
+      *
+-     * @param sendCrash If true, submit a crash report.
+-     * @return Job if report is submitted through an IO thread, null otherwise
++     * @param reportCrashes If true, submit crash reports for all current non-fatal crashes.
++     * @return [Job] allowing to check status / cancel the reporting operation or null if reporting is disabled.
+      */
+-    fun handleCloseAndRemove(sendCrash: Boolean): Job? {
+-        sessionId ?: return null
+-        val job = submitReportIfNecessary(sendCrash)
++    fun handleCloseAndRemove(reportCrashes: Boolean): Job? {
++        val job = submitPendingNonFatalCrashesIfNecessary(reportCrashes)
+ 
+         components.useCases.tabsUseCases.removeTab(sessionId)
+         components.useCases.sessionUseCases.crashRecovery.invoke()
+ 
+-        navController.nav(
+-            R.id.crashReporterFragment,
+-            CrashReporterFragmentDirections.actionGlobalHome()
+-        )
++        // When the only tab crashed and the user chose to close it we'll navigate to Home.
++        if (currentNumberOfTabs == 1) {
++            navController.navigate(
++                BrowserFragmentDirections.actionGlobalHome()
++            )
++        }
+ 
+         return job
+     }
+ 
+     /**
+-     * Submits the crash report if the "Send crash" checkbox was checked and the setting is enabled.
++     * Submits all pending non-fatal crash reports if the "Send crash" checkbox was checked
++     * and the report crashes setting is enabled.
++     * Also clears the current list of non-fatal crashes irrespective of whether they are reported or not.
+      *
+-     * @param sendCrash If true, submit a crash report.
+-     * @return Job if report is submitted through an IO thread, null otherwise
++     * @param reportCrashes A second condition beside crash reporting being enabled in app settings
++     * based on which the current crashes will be reported or immediately disposed off.
++     * @return [Job] allowing to check status / cancel the reporting operation or null if reporting is disabled.
+      */
++    @VisibleForTesting
+     @OptIn(DelicateCoroutinesApi::class) // GlobalScope usage
+-    private fun submitReportIfNecessary(sendCrash: Boolean): Job? {
++    internal fun submitPendingNonFatalCrashesIfNecessary(reportCrashes: Boolean): Job? {
+         var job: Job? = null
+-        val didSubmitReport = if (sendCrash && settings.isCrashReportingEnabled) {
++        if (reportCrashes && settings.isCrashReportingEnabled) {
+             job = GlobalScope.launch(Dispatchers.IO) {
+-                components.analytics.crashReporter.submitReport(crash)
++                val crashes = appStore.state.nonFatalCrashes
++                crashes.forEach {
++                    components.analytics.crashReporter.submitReport(it)
++                    appStore.dispatch(AppAction.RemoveNonFatalCrash(it))
++                }
+             }
+-            true
+         } else {
+-            false
++            appStore.dispatch(AppAction.RemoveAllNonFatalCrashes)
+         }
+ 
+-        Log.i("Crash Reporter", "Report submitted: $didSubmitReport")
+         return job
+     }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/crashes/CrashReporterFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/crashes/CrashReporterFragment.kt
+index 8adfdd3065a5..6a5efe6e935f 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/crashes/CrashReporterFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/crashes/CrashReporterFragment.kt
+@@ -4,41 +4,67 @@
+ 
+ package org.mozilla.fenix.crashes
+ 
+-import android.os.Bundle
+-import android.view.View
+-import androidx.fragment.app.Fragment
+-import androidx.navigation.fragment.findNavController
+-import androidx.navigation.fragment.navArgs
+-import mozilla.components.lib.crash.Crash
++import android.content.Context
++import android.util.AttributeSet
++import android.view.LayoutInflater
++import androidx.annotation.VisibleForTesting
++import androidx.constraintlayout.widget.ConstraintLayout
+ import org.mozilla.fenix.R
+ import org.mozilla.fenix.databinding.FragmentCrashReporterBinding
+-import org.mozilla.fenix.ext.hideToolbar
+ import org.mozilla.fenix.ext.increaseTapArea
+-import org.mozilla.fenix.ext.requireComponents
+-import org.mozilla.fenix.ext.settings
+ 
+ /**
+  * Fragment shown when a tab crashes.
+  */
+-class CrashReporterFragment : Fragment(R.layout.fragment_crash_reporter) {
++class CrashReporterFragment @JvmOverloads constructor(
++    context: Context,
++    attrs: AttributeSet? = null,
++    defStyleAttr: Int = 0
++) : ConstraintLayout(context, attrs, defStyleAttr) {
++    @VisibleForTesting
++    internal lateinit var binding: FragmentCrashReporterBinding
++    @VisibleForTesting val isBindingInitialized
++        get() = ::binding.isInitialized
++    @VisibleForTesting
++    internal lateinit var controller: CrashReporterController
+ 
+-    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+-        super.onViewCreated(view, savedInstanceState)
++    /**
++     * Inflate if necessary and show this `View`.
++     *
++     * @param controller [CrashReporterController] delegated for all user interactions with this `View`.
++     */
++    fun show(controller: CrashReporterController) {
++        this.controller = controller
++        inflateViewIfNecessary()
++        visibility = VISIBLE
++    }
++
++    /**
++     * Remove this View from layout.
++     */
++    fun hide() {
++        visibility = GONE
++    }
+ 
+-        val binding = FragmentCrashReporterBinding.bind(view)
++    @VisibleForTesting
++    internal fun inflateViewIfNecessary() {
++        if (isBindingInitialized) {
++            return
++        }
+ 
+-        val args: CrashReporterFragmentArgs by navArgs()
+-        val crash = Crash.fromIntent(args.crashIntent)
++        inflate()
++        bindViews()
++    }
+ 
+-        binding.title.text = getString(R.string.tab_crash_title_2, getString(R.string.app_name))
++    @VisibleForTesting
++    internal fun inflate() {
++        binding = FragmentCrashReporterBinding.inflate(LayoutInflater.from(context), this, true)
++    }
+ 
+-        val controller = CrashReporterController(
+-            crash,
+-            sessionId = requireComponents.core.store.state.selectedTabId,
+-            navController = findNavController(),
+-            components = requireComponents,
+-            settings = requireContext().settings()
+-        )
++    @VisibleForTesting
++    internal fun bindViews() {
++        binding.title.text =
++            context.getString(R.string.tab_crash_title_2, context.getString(R.string.app_name))
+ 
+         binding.restoreTabButton.apply {
+             increaseTapArea(TAP_INCREASE_DP)
+@@ -55,12 +81,8 @@ class CrashReporterFragment : Fragment(R.layout.fragment_crash_reporter) {
+         }
+     }
+ 
+-    override fun onResume() {
+-        super.onResume()
+-        hideToolbar()
+-    }
+-
+     companion object {
+-        private const val TAP_INCREASE_DP = 12
++        @VisibleForTesting
++        internal const val TAP_INCREASE_DP = 12
+     }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/intent/CrashReporterIntentProcessor.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/intent/CrashReporterIntentProcessor.kt
+index dfc6feac4447..b3002a07cc73 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/intent/CrashReporterIntentProcessor.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/intent/CrashReporterIntentProcessor.kt
+@@ -5,27 +5,43 @@
+ package org.mozilla.fenix.home.intent
+ 
+ import android.content.Intent
++import android.util.Log
+ import androidx.navigation.NavController
+ import mozilla.components.lib.crash.Crash
+-import org.mozilla.fenix.NavGraphDirections
++import mozilla.components.lib.crash.Crash.NativeCodeCrash
++import org.mozilla.fenix.components.AppStore
++import org.mozilla.fenix.components.appstate.AppAction
++import mozilla.components.lib.crash.CrashReporter
+ 
+ /**
+- * When the app crashes, the user has the option to report it.
+- * Reporting fires an intent to the main activity which is handled here.
++ * Process the [Intent] from [CrashReporter] through which the app is informed about
++ * recoverable native crashes.
+  */
+-class CrashReporterIntentProcessor : HomeIntentProcessor {
++class CrashReporterIntentProcessor(private val store: AppStore) : HomeIntentProcessor {
+ 
+     override fun process(intent: Intent, navController: NavController, out: Intent): Boolean {
+         return if (Crash.isCrashIntent(intent)) {
+-            openToCrashReporter(intent, navController)
++            val crash = Crash.fromIntent(intent)
++            // If only a child process crashed we can handle this gracefully.
++            if ((crash as? NativeCodeCrash)?.isFatal == false) {
++                store.dispatch(AppAction.AddNonFatalCrash(crash))
++            } else {
++                // A fatal crash means the app's main process is affected.
++                // An UncaughtExceptionCrash refers to a [Throwable] that would otherwise crash the app
++                // but is intercepted to allow us to gather more info and crash more gracefully.
++                //
++                // In both cases the app is left in a bad state so the main process is killed
++                // but not before gathering more info about the crashes to form and persist a crash report and
++                // not before "CrashHandlerService" is started in a separate process to be able to
++                // show a dialog allowing users to send the crash report and maybe restart the app.
++
++                // Log that an unexpected crash was sent but avoid leaking potential sensitive information.
++                // We expect other types of crashes to be handled by "CrashHandlerService".
++                Log.e("CrashReporterProcessor", "Invalid crash to process: ${crash::class}")
++            }
+             true
+         } else {
+             false
+         }
+     }
+-
+-    private fun openToCrashReporter(intent: Intent, navController: NavController) {
+-        val directions = NavGraphDirections.actionGlobalCrashReporter(intent)
+-        navController.navigate(directions)
+-    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/search/SearchDialogFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/search/SearchDialogFragment.kt
+index 9cbb79682d8e..2ed7e1793576 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/search/SearchDialogFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/search/SearchDialogFragment.kt
+@@ -226,6 +226,7 @@ class SearchDialogFragment : AppCompatDialogFragment(), UserInteractionHandler {
+             binding.searchWrapper.background = ColorDrawable(Color.TRANSPARENT)
+             dialog?.window?.decorView?.setOnTouchListener { _, event ->
+                 requireActivity().dispatchTouchEvent(event)
++                // toolbarView.view.displayMode()
+                 false
+             }
+         }
+diff --git a/fenix/app/src/main/res/layout/fragment_browser.xml b/fenix/app/src/main/res/layout/fragment_browser.xml
+index cd4c91f5b66f..f943f980ad95 100644
+--- a/fenix/app/src/main/res/layout/fragment_browser.xml
++++ b/fenix/app/src/main/res/layout/fragment_browser.xml
+@@ -60,6 +60,12 @@
+                 android:elevation="24dp"
+                 android:visibility="gone" />
+ 
++            <org.mozilla.fenix.crashes.CrashReporterFragment
++                android:id="@+id/crash_reporter_view"
++                android:layout_width="match_parent"
++                android:layout_height="match_parent"
++                android:visibility="gone" />
++
+         </androidx.coordinatorlayout.widget.CoordinatorLayout>
+ 
+         <mozilla.components.feature.prompts.creditcard.CreditCardSelectBar
+diff --git a/fenix/app/src/main/res/navigation/nav_graph.xml b/fenix/app/src/main/res/navigation/nav_graph.xml
+index 6a600257ee61..77dbd32b3e79 100644
+--- a/fenix/app/src/main/res/navigation/nav_graph.xml
++++ b/fenix/app/src/main/res/navigation/nav_graph.xml
+@@ -55,9 +55,6 @@
+     <action
+         android:id="@+id/action_global_shareFragment"
+         app:destination="@id/shareFragment" />
+-    <action
+-        android:id="@+id/action_global_crash_reporter"
+-        app:destination="@id/crashReporterFragment" />
+     <action
+         android:id="@+id/action_global_turn_on_sync"
+         app:destination="@id/turnOnSyncFragment" />
+@@ -742,14 +739,6 @@
+         android:id="@+id/secretInfoSettingsFragment"
+         android:name="org.mozilla.fenix.settings.SecretDebugSettingsFragment"
+         android:label="@string/preferences_debug_info" />
+-    <fragment
+-        android:id="@+id/crashReporterFragment"
+-        android:name="org.mozilla.fenix.crashes.CrashReporterFragment"
+-        tools:layout="@layout/fragment_crash_reporter">
+-        <argument
+-            android:name="crashIntent"
+-            app:argType="android.content.Intent" />
+-    </fragment>
+     <fragment
+         android:id="@+id/aboutLibrariesFragment"
+         android:name="org.mozilla.fenix.settings.about.AboutLibrariesFragment"
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/components/appstate/AppStoreReducerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/components/appstate/AppStoreReducerTest.kt
+new file mode 100644
+index 000000000000..2431dad62ecf
+--- /dev/null
++++ b/fenix/app/src/test/java/org/mozilla/fenix/components/appstate/AppStoreReducerTest.kt
+@@ -0,0 +1,72 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.components.appstate
++
++import io.mockk.mockk
++import mozilla.components.lib.crash.Crash.NativeCodeCrash
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.mozilla.fenix.components.appstate.AppAction.AddNonFatalCrash
++import org.mozilla.fenix.components.appstate.AppAction.RemoveAllNonFatalCrashes
++import org.mozilla.fenix.components.appstate.AppAction.RemoveNonFatalCrash
++import org.mozilla.fenix.components.appstate.AppAction.UpdateInactiveExpanded
++
++class AppStoreReducerTest {
++    @Test
++    fun `GIVEN a new value for inactiveTabsExpanded WHEN UpdateInactiveExpanded is called THEN update the current value`() {
++        val initialState = AppState(
++            inactiveTabsExpanded = true
++        )
++
++        var updatedState = AppStoreReducer.reduce(initialState, UpdateInactiveExpanded(false))
++        assertFalse(updatedState.inactiveTabsExpanded)
++
++        updatedState = AppStoreReducer.reduce(updatedState, UpdateInactiveExpanded(true))
++        assertTrue(updatedState.inactiveTabsExpanded)
++    }
++
++    @Test
++    fun `GIVEN a Crash WHEN AddNonFatalCrash is called THEN add that Crash to the current list`() {
++        val initialState = AppState()
++        val crash1: NativeCodeCrash = mockk()
++        val crash2: NativeCodeCrash = mockk()
++
++        var updatedState = AppStoreReducer.reduce(initialState, AddNonFatalCrash(crash1))
++        assertTrue(listOf(crash1).containsAll(updatedState.nonFatalCrashes))
++
++        updatedState = AppStoreReducer.reduce(updatedState, AddNonFatalCrash(crash2))
++        assertTrue(listOf(crash1, crash2).containsAll(updatedState.nonFatalCrashes))
++    }
++
++    @Test
++    fun `GIVEN a Crash WHEN RemoveNonFatalCrash is called THEN remove that Crash from the current list`() {
++        val crash1: NativeCodeCrash = mockk()
++        val crash2: NativeCodeCrash = mockk()
++        val initialState = AppState(
++            nonFatalCrashes = listOf(crash1, crash2)
++        )
++
++        var updatedState = AppStoreReducer.reduce(initialState, RemoveNonFatalCrash(crash1))
++        assertTrue(listOf(crash2).containsAll(updatedState.nonFatalCrashes))
++
++        updatedState = AppStoreReducer.reduce(updatedState, RemoveNonFatalCrash(mockk()))
++        assertTrue(listOf(crash2).containsAll(updatedState.nonFatalCrashes))
++
++        updatedState = AppStoreReducer.reduce(updatedState, RemoveNonFatalCrash(crash2))
++        assertTrue(updatedState.nonFatalCrashes.isEmpty())
++    }
++
++    @Test
++    fun `GIVEN crashes exist in State WHEN RemoveAllNonFatalCrashes is called THEN clear the current list of crashes`() {
++        val initialState = AppState(
++            nonFatalCrashes = listOf(mockk(), mockk())
++        )
++
++        val updatedState = AppStoreReducer.reduce(initialState, RemoveAllNonFatalCrashes)
++
++        assertTrue(updatedState.nonFatalCrashes.isEmpty())
++    }
++}
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/crashes/CrashContentIntegrationTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/crashes/CrashContentIntegrationTest.kt
+new file mode 100644
+index 000000000000..526844841bab
+--- /dev/null
++++ b/fenix/app/src/test/java/org/mozilla/fenix/crashes/CrashContentIntegrationTest.kt
+@@ -0,0 +1,108 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.crashes
++
++import android.view.ViewGroup.MarginLayoutParams
++import io.mockk.every
++import io.mockk.mockk
++import io.mockk.slot
++import io.mockk.verify
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import mozilla.components.browser.state.action.CrashAction
++import mozilla.components.browser.state.state.BrowserState
++import mozilla.components.browser.state.state.createTab
++import mozilla.components.browser.state.store.BrowserStore
++import mozilla.components.browser.toolbar.BrowserToolbar
++import mozilla.components.support.test.libstate.ext.waitUntilIdle
++import mozilla.components.support.test.rule.MainCoroutineRule
++import org.junit.Assert.assertEquals
++import org.junit.Before
++import org.junit.Rule
++import org.junit.Test
++import org.mozilla.fenix.components.AppStore
++import org.mozilla.fenix.components.Components
++import org.mozilla.fenix.utils.Settings
++
++class CrashContentIntegrationTest {
++    @OptIn(ExperimentalCoroutinesApi::class)
++    @get:Rule
++    val coroutinesTestRule = MainCoroutineRule()
++
++    private val sessionId = "sessionId"
++    private lateinit var browserStore: BrowserStore
++
++    @Before
++    fun setup() {
++        browserStore = BrowserStore(
++            BrowserState(
++                tabs = listOf(
++                    createTab("url", id = sessionId)
++                ),
++                selectedTabId = sessionId
++            )
++        )
++    }
++
++    @Test
++    fun `GIVEN a tab WHEN its content crashes THEN expand the toolbar and show the in-content crash reporter`() {
++        val crashReporterLayoutParams: MarginLayoutParams = mockk(relaxed = true)
++        val crashReporterView: CrashReporterFragment = mockk(relaxed = true) {
++            every { layoutParams } returns crashReporterLayoutParams
++        }
++        val toolbar: BrowserToolbar = mockk(relaxed = true) {
++            every { height } returns 33
++        }
++        val components: Components = mockk()
++        val settings: Settings = mockk()
++        val appStore: AppStore = mockk()
++        val integration = CrashContentIntegration(
++            browserStore = browserStore,
++            appStore = appStore,
++            toolbar = toolbar,
++            isToolbarPlacedAtTop = true,
++            crashReporterView = crashReporterView,
++            components = components,
++            settings = settings,
++            navController = mockk(),
++            sessionId = sessionId
++        )
++        val controllerCaptor = slot<CrashReporterController>()
++        integration.start()
++        browserStore.dispatch(CrashAction.SessionCrashedAction(sessionId))
++        browserStore.waitUntilIdle()
++
++        verify {
++            toolbar.expand()
++            crashReporterLayoutParams.topMargin = 33
++            crashReporterView.show(capture(controllerCaptor))
++        }
++        assertEquals(sessionId, controllerCaptor.captured.sessionId)
++        assertEquals(components, controllerCaptor.captured.components)
++        assertEquals(settings, controllerCaptor.captured.settings)
++        assertEquals(appStore, controllerCaptor.captured.appStore)
++    }
++
++    @Test
++    fun `GIVEN a tab is marked as crashed WHEN the crashed state changes THEN hide the in-content crash reporter`() {
++        val crashReporterView: CrashReporterFragment = mockk(relaxed = true)
++        val integration = CrashContentIntegration(
++            browserStore = browserStore,
++            appStore = mockk(),
++            toolbar = mockk(),
++            isToolbarPlacedAtTop = true,
++            crashReporterView = crashReporterView,
++            components = mockk(),
++            settings = mockk(),
++            navController = mockk(),
++            sessionId = sessionId,
++        )
++
++        integration.start()
++        browserStore.dispatch(CrashAction.RestoreCrashedSessionAction(sessionId))
++        browserStore.waitUntilIdle()
++
++        verify { crashReporterView.hide() }
++    }
++}
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/crashes/CrashReporterControllerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/crashes/CrashReporterControllerTest.kt
+index b75fbf905903..48fa4d91717b 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/crashes/CrashReporterControllerTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/crashes/CrashReporterControllerTest.kt
+@@ -5,82 +5,135 @@
+ package org.mozilla.fenix.crashes
+ 
+ import androidx.navigation.NavController
+-import androidx.navigation.NavDestination
++import io.mockk.Called
+ import io.mockk.every
+ import io.mockk.mockk
++import io.mockk.spyk
+ import io.mockk.verify
+-import mozilla.components.lib.crash.Crash
++import mozilla.components.lib.crash.Crash.NativeCodeCrash
+ import mozilla.components.support.test.ext.joinBlocking
+-import org.junit.Before
+ import org.junit.Test
+-import org.mozilla.fenix.R
++import org.mozilla.fenix.browser.BrowserFragmentDirections
++import org.mozilla.fenix.components.AppStore
+ import org.mozilla.fenix.components.Components
++import org.mozilla.fenix.components.appstate.AppAction
++import org.mozilla.fenix.components.appstate.AppState
+ 
+ import org.mozilla.fenix.utils.Settings
+ 
+ class CrashReporterControllerTest {
+ 
+-    private lateinit var components: Components
+-    private lateinit var crash: Crash
+-    private lateinit var sessionId: String
+-    private lateinit var navContoller: NavController
+-    private lateinit var settings: Settings
+-
+-    @Before
+-    fun setup() {
+-        components = mockk(relaxed = true)
+-        crash = mockk()
+-        sessionId = "testId"
+-        navContoller = mockk(relaxed = true)
+-        settings = mockk()
+-
+-        val currentDest: NavDestination = mockk()
+-        every { navContoller.currentDestination } returns currentDest
+-        every { currentDest.id } returns R.id.crashReporterFragment
++    private val sessionId = "testId"
++    private val components: Components = mockk(relaxed = true)
++    private val settings: Settings = mockk(relaxed = true)
++    private val navController: NavController = mockk(relaxed = true)
++    private val crash: NativeCodeCrash = mockk(relaxed = true)
++    private var appStore = AppStore(
++        AppState(
++            nonFatalCrashes = listOf(crash)
++        )
++    )
++    private var controller = CrashReporterController(sessionId, 2, components, settings, navController, appStore)
++
++    @Test
++    fun `GIVEN reportCrashes true WHEN user restores tab THEN try submitting non-fatal crashes and recover tabs`() {
++        controller = spyk(controller)
++
++        controller.handleCloseAndRestore(true)
++
++        verify { controller.submitPendingNonFatalCrashesIfNecessary(true) }
++        verify { components.useCases.sessionUseCases.crashRecovery.invoke() }
+     }
+ 
+     @Test
+-    fun `handle close and restore tab`() {
+-        val controller = CrashReporterController(crash, sessionId, navContoller, components, settings)
+-        controller.handleCloseAndRestore(sendCrash = false)?.joinBlocking()
++    fun `GIVEN reportCrashes false WHEN user restores tab THEN try submitting non-fatal crashes and recover tabs`() {
++        controller = spyk(controller)
++
++        controller.handleCloseAndRestore(false)
+ 
++        verify { controller.submitPendingNonFatalCrashesIfNecessary(false) }
+         verify { components.useCases.sessionUseCases.crashRecovery.invoke() }
+-        verify { navContoller.popBackStack() }
+     }
+ 
+     @Test
+-    fun `handle close and remove tab`() {
+-        val controller = CrashReporterController(crash, sessionId, navContoller, components, settings)
+-        controller.handleCloseAndRemove(sendCrash = false)?.joinBlocking()
++    fun `GIVEN reportCrashes true WHEN user closes the tab THEN try submitting non-fatal crashes, remove the current tab and recover others`() {
++        controller = spyk(controller)
+ 
++        controller.handleCloseAndRemove(true)
++
++        verify { controller.submitPendingNonFatalCrashesIfNecessary(true) }
+         verify { components.useCases.tabsUseCases.removeTab(sessionId) }
+         verify { components.useCases.sessionUseCases.crashRecovery.invoke() }
+-        verify {
+-            navContoller.navigate(CrashReporterFragmentDirections.actionGlobalHome(), null)
+-        }
+     }
+ 
+     @Test
+-    fun `don't submit report if setting is turned off`() {
+-        every { settings.isCrashReportingEnabled } returns false
++    fun `GIVEN reportCrashes false WHEN user closes the tab THEN try submitting non-fatal crashes, remove the current tab and recover others`() {
++        controller = spyk(controller)
+ 
+-        val controller = CrashReporterController(crash, sessionId, navContoller, components, settings)
+-        controller.handleCloseAndRestore(sendCrash = true)?.joinBlocking()
++        controller.handleCloseAndRemove(false)
+ 
+-        verify(exactly = 0) {
+-            components.analytics.crashReporter.submitReport(crash)
++        verify { controller.submitPendingNonFatalCrashesIfNecessary(false) }
++        verify { components.useCases.tabsUseCases.removeTab(sessionId) }
++        verify { components.useCases.sessionUseCases.crashRecovery.invoke() }
++    }
++
++    @Test
++    fun `GIVEN reportCrashes false WHEN trying to submit crashes THEN no crashes should be submitted and all should be disposed off`() {
++        val enabledCrashReporterSettings: Settings = mockk {
++            every { isCrashReportingEnabled } returns true
+         }
++        appStore = spyk(appStore)
++        controller = CrashReporterController(sessionId, 2, components, enabledCrashReporterSettings, navController, appStore)
++
++        controller.submitPendingNonFatalCrashesIfNecessary(false)?.joinBlocking()
++
++        verify(exactly = 0) { components.analytics.crashReporter.submitReport(crash) }
++        verify { appStore.dispatch(AppAction.RemoveAllNonFatalCrashes) }
+     }
+ 
+     @Test
+-    fun `submit report if setting is turned on`() {
+-        every { settings.isCrashReportingEnabled } returns true
++    fun `GIVEN reportCrashes true but reporting crashes disabled WHEN trying to submit crashes THEN no crashes should be submitted and all should be disposed off`() {
++        val disabledCrashReporterSettings: Settings = mockk {
++            every { isCrashReportingEnabled } returns false
++        }
++        appStore = spyk(appStore)
++        controller = CrashReporterController(sessionId, 2, components, disabledCrashReporterSettings, navController, appStore)
+ 
+-        val controller = CrashReporterController(crash, sessionId, navContoller, components, settings)
+-        controller.handleCloseAndRestore(sendCrash = true)?.joinBlocking()
++        controller.submitPendingNonFatalCrashesIfNecessary(true)?.joinBlocking()
+ 
+-        verify {
+-            components.analytics.crashReporter.submitReport(crash)
++        verify(exactly = 0) { components.analytics.crashReporter.submitReport(crash) }
++        verify { appStore.dispatch(AppAction.RemoveAllNonFatalCrashes) }
++    }
++
++    @Test
++    fun `GIVEN reportCrashes true and reporting crashes enabled WHEN trying to submit crashes THEN all crashes should be submitted and then disposed off`() {
++        val disabledCrashReporterSettings: Settings = mockk {
++            every { isCrashReportingEnabled } returns true
+         }
++        appStore = spyk(appStore)
++        controller = CrashReporterController(sessionId, 2, components, disabledCrashReporterSettings, navController, appStore)
++
++        controller.submitPendingNonFatalCrashesIfNecessary(true)!!.joinBlocking()
++
++        verify { components.analytics.crashReporter.submitReport(crash) }
++        verify { appStore.dispatch(AppAction.RemoveNonFatalCrash(crash)) }
++    }
++
++    @Test
++    fun `GIVEN only one tab opened WHEN user closes the tab THEN navigate to Home`() {
++        controller = CrashReporterController(sessionId, 1, components, settings, navController, appStore)
++
++        controller.handleCloseAndRemove(true)
++
++        verify { navController.navigate(BrowserFragmentDirections.actionGlobalHome()) }
++    }
++
++    @Test
++    fun `GIVEN multiple tabs opened WHEN user closes one tab THEN don't use navigation`() {
++        controller = CrashReporterController(sessionId, 2, components, settings, navController, appStore)
++
++        controller.handleCloseAndRemove(true)
++
++        verify { navController wasNot Called }
+     }
+ }
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/crashes/CrashReporterFragmentTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/crashes/CrashReporterFragmentTest.kt
+new file mode 100644
+index 000000000000..95d38bb65bca
+--- /dev/null
++++ b/fenix/app/src/test/java/org/mozilla/fenix/crashes/CrashReporterFragmentTest.kt
+@@ -0,0 +1,101 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.crashes
++
++import android.view.View.GONE
++import android.view.View.VISIBLE
++import io.mockk.mockk
++import io.mockk.mockkStatic
++import io.mockk.spyk
++import io.mockk.verify
++import mozilla.components.support.test.robolectric.testContext
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.mozilla.fenix.R
++import org.mozilla.fenix.crashes.CrashReporterFragment.Companion.TAP_INCREASE_DP
++import org.mozilla.fenix.ext.increaseTapArea
++import org.mozilla.fenix.helpers.FenixRobolectricTestRunner
++
++@RunWith(FenixRobolectricTestRunner::class)
++class CrashReporterFragmentTest {
++    @Test
++    fun `WHEN show is called THEN remember the controller, inflate and display the View`() {
++        val view = spyk(CrashReporterFragment(testContext))
++        val controller: CrashReporterController = mockk()
++
++        view.show(controller)
++
++        assertTrue(view.controller === controller)
++        verify {
++            view.inflateViewIfNecessary()
++            view.visibility = VISIBLE
++        }
++    }
++
++    @Test
++    fun `WHEN hide is called THEN remove the View from layout`() {
++        val view = spyk(CrashReporterFragment(testContext))
++
++        view.hide()
++
++        verify { view.visibility = GONE }
++    }
++
++    @Test
++    fun `GIVEN the View is not shown WHEN needing to be shown THEN inflate the layout and bind all widgets`() {
++        val controller: CrashReporterController = mockk(relaxed = true)
++        val view = CrashReporterFragment(testContext)
++        view.controller = controller
++        assertFalse(view.isBindingInitialized)
++
++        mockkStatic("org.mozilla.fenix.ext.ViewKt") {
++            view.inflateViewIfNecessary()
++
++            assertTrue(view.isBindingInitialized)
++            assertEquals(
++                testContext.getString(R.string.tab_crash_title_2, testContext.getString(R.string.app_name)),
++                view.binding.title.text
++            )
++            verify {
++                view.binding.restoreTabButton.increaseTapArea(TAP_INCREASE_DP)
++                view.binding.closeTabButton.increaseTapArea(TAP_INCREASE_DP)
++            }
++
++            view.binding.sendCrashCheckbox.isChecked = true
++            view.binding.restoreTabButton.callOnClick()
++            verify { controller.handleCloseAndRestore(true) }
++
++            view.binding.sendCrashCheckbox.isChecked = false
++            view.binding.closeTabButton.callOnClick()
++            verify { controller.handleCloseAndRemove(false) }
++        }
++    }
++
++    @Test
++    fun `GIVEN the View is not shown WHEN needing to be shown THEN delegate the process to helper methods`() {
++        val view = spyk(CrashReporterFragment(testContext))
++
++        view.inflateViewIfNecessary()
++
++        verify {
++            view.inflate()
++            view.bindViews()
++        }
++    }
++
++    @Test
++    fun `GIVEN the View is to already shown WHEN needing to be shown again THEN return early and avoid duplicating the widgets setup`() {
++        val view = spyk(CrashReporterFragment(testContext))
++        view.inflate() // mock that the View is already inflated
++
++        view.inflateViewIfNecessary() // try inflating it again
++
++        verify(exactly = 1) { view.inflate() }
++        verify(exactly = 0) { view.bindViews() }
++    }
++}
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/home/intent/CrashReporterIntentProcessorTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/home/intent/CrashReporterIntentProcessorTest.kt
+index af2f34b91ec0..43854c41ce8f 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/home/intent/CrashReporterIntentProcessorTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/home/intent/CrashReporterIntentProcessorTest.kt
+@@ -5,39 +5,56 @@
+ package org.mozilla.fenix.home.intent
+ 
+ import android.content.Intent
+-import android.os.Bundle
+ import androidx.navigation.NavController
+ import io.mockk.Called
++import io.mockk.every
+ import io.mockk.mockk
++import io.mockk.mockkObject
+ import io.mockk.verify
++import mozilla.components.lib.crash.Crash
++import mozilla.components.lib.crash.Crash.NativeCodeCrash
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
+ import org.junit.Test
+ import org.junit.runner.RunWith
+-import org.mozilla.fenix.NavGraphDirections
++import org.mozilla.fenix.components.AppStore
++import org.mozilla.fenix.components.appstate.AppAction
+ import org.mozilla.fenix.helpers.FenixRobolectricTestRunner
+ 
+ @RunWith(FenixRobolectricTestRunner::class)
+ class CrashReporterIntentProcessorTest {
++    private val store: AppStore = mockk(relaxed = true)
++    private val navController: NavController = mockk()
++    private val out: Intent = mockk()
+ 
+     @Test
+-    fun `do not process blank intents`() {
+-        val navController: NavController = mockk()
+-        val out: Intent = mockk()
+-        CrashReporterIntentProcessor().process(Intent(), navController, out)
++    fun `GIVEN a blank Intent WHEN processing it THEN do nothing and return false`() {
++        val processor = CrashReporterIntentProcessor(store)
+ 
++        val result = processor.process(Intent(), navController, out)
++
++        assertFalse(result)
+         verify { navController wasNot Called }
+         verify { out wasNot Called }
++        verify { store wasNot Called }
+     }
+ 
+     @Test
+-    fun `process crash intents`() {
+-        val navController: NavController = mockk(relaxed = true)
+-        val out: Intent = mockk()
+-        val intent = Intent().apply {
+-            putExtra("mozilla.components.lib.crash.CRASH", mockk<Bundle>())
+-        }
+-        CrashReporterIntentProcessor().process(intent, navController, out)
++    fun `GIVEN a crash Intent WHEN processing it THEN update crash details and return true`() {
++        val processor = CrashReporterIntentProcessor(store)
++        val intent = Intent()
++        val crash = mockk<NativeCodeCrash>(relaxed = true)
+ 
+-        verify { navController.navigate(NavGraphDirections.actionGlobalCrashReporter(intent)) }
+-        verify { out wasNot Called }
++        mockkObject(Crash.Companion) {
++            every { Crash.Companion.isCrashIntent(intent) } returns true
++            every { Crash.Companion.fromIntent(intent) } returns crash
++
++            val result = processor.process(intent, navController, out)
++
++            assertTrue(result)
++            verify { navController wasNot Called }
++            verify { out wasNot Called }
++            verify { store.dispatch(AppAction.AddNonFatalCrash(crash)) }
++        }
+     }
+ }

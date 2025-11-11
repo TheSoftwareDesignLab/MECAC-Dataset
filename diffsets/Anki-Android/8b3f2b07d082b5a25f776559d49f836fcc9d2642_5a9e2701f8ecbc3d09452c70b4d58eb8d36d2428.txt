@@ -1,0 +1,1127 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/AnkiActivity.kt b/AnkiDroid/src/main/java/com/ichi2/anki/AnkiActivity.kt
+index 14117111100b..86d15a6c36e8 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/AnkiActivity.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/AnkiActivity.kt
+@@ -32,6 +32,7 @@ import androidx.browser.customtabs.CustomTabsIntent.*
+ import androidx.core.app.NotificationCompat
+ import androidx.core.app.PendingIntentCompat
+ import androidx.fragment.app.DialogFragment
++import androidx.fragment.app.Fragment
+ import androidx.fragment.app.FragmentManager
+ import com.google.android.material.color.MaterialColors
+ import com.ichi2.anim.ActivityTransitionAnimation
+@@ -590,3 +591,8 @@ open class AnkiActivity : AppCompatActivity, SimpleMessageDialogListener {
+         private const val SIMPLE_NOTIFICATION_ID = 0
+     }
+ }
++
++fun Fragment.requireAnkiActivity(): AnkiActivity {
++    return requireActivity() as? AnkiActivity?
++        ?: throw java.lang.IllegalStateException("Fragment $this not attached to an AnkiActivity.")
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/UIUtils.kt b/AnkiDroid/src/main/java/com/ichi2/anki/UIUtils.kt
+index 2fa4a3c4bf88..0c6c308c28dc 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/UIUtils.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/UIUtils.kt
+@@ -2,10 +2,12 @@
+ 
+ package com.ichi2.anki
+ 
++import android.app.Activity
+ import android.content.Context
+ import android.util.DisplayMetrics
+ import android.widget.Toast
+ import androidx.annotation.StringRes
++import androidx.fragment.app.Fragment
+ import com.ichi2.libanki.utils.Time
+ import java.util.*
+ 
+@@ -21,6 +23,16 @@ fun showThemedToast(context: Context, @StringRes textResource: Int, shortLength:
+     Toast.makeText(context, textResource, if (shortLength) Toast.LENGTH_SHORT else Toast.LENGTH_LONG).show()
+ }
+ 
++context (Fragment)
++fun showThemedToast(@StringRes textResource: Int, shortLength: Boolean) {
++    Toast.makeText(requireContext(), textResource, if (shortLength) Toast.LENGTH_SHORT else Toast.LENGTH_LONG).show()
++}
++
++context (Activity)
++fun showThemedToast(@StringRes textResource: Int, shortLength: Boolean) {
++    Toast.makeText(this@Activity, textResource, if (shortLength) Toast.LENGTH_SHORT else Toast.LENGTH_LONG).show()
++}
++
+ fun getDensityAdjustedValue(context: Context, value: Float): Float {
+     return context.resources.displayMetrics.density * value
+ }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/scheduling/SetDueDateDialog.kt b/AnkiDroid/src/main/java/com/ichi2/anki/scheduling/SetDueDateDialog.kt
+new file mode 100644
+index 000000000000..df122698d2db
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/scheduling/SetDueDateDialog.kt
+@@ -0,0 +1,250 @@
++/*
++ *  Copyright (c) 2024 David Allison <davidallisongithub@gmail.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify it under
++ *  the terms of the GNU General Public License as published by the Free Software
++ *  Foundation; either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++ *  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with
++ *  this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package com.ichi2.anki.scheduling
++
++import android.app.Dialog
++import android.os.Bundle
++import android.view.View
++import android.view.WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM
++import android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
++import android.widget.TextView
++import androidx.annotation.CheckResult
++import androidx.appcompat.app.AlertDialog
++import androidx.core.os.bundleOf
++import androidx.core.widget.doOnTextChanged
++import androidx.fragment.app.DialogFragment
++import androidx.fragment.app.Fragment
++import androidx.fragment.app.activityViewModels
++import androidx.lifecycle.lifecycleScope
++import androidx.viewpager2.adapter.FragmentStateAdapter
++import androidx.viewpager2.widget.ViewPager2
++import com.google.android.material.checkbox.MaterialCheckBox
++import com.google.android.material.snackbar.Snackbar
++import com.google.android.material.tabs.TabLayout
++import com.google.android.material.tabs.TabLayoutMediator
++import com.google.android.material.textfield.TextInputLayout
++import com.ichi2.anki.AnkiActivity
++import com.ichi2.anki.CollectionManager
++import com.ichi2.anki.R
++import com.ichi2.anki.launchCatchingTask
++import com.ichi2.anki.requireAnkiActivity
++import com.ichi2.anki.scheduling.SetDueDateViewModel.Tab
++import com.ichi2.anki.showThemedToast
++import com.ichi2.anki.snackbar.showSnackbar
++import com.ichi2.anki.utils.openUrl
++import com.ichi2.anki.withProgress
++import com.ichi2.libanki.CardId
++import com.ichi2.libanki.sched.Scheduler
++import com.ichi2.utils.create
++import com.ichi2.utils.negativeButton
++import com.ichi2.utils.neutralButton
++import com.ichi2.utils.positiveButton
++import com.ichi2.utils.title
++import kotlinx.coroutines.launch
++import timber.log.Timber
++
++/**
++ * Dialog for [Scheduler.setDueDate], containing two tabs: [Tab.SINGLE_DAY] and [Tab.DATE_RANGE]
++ *
++ *
++ * @see SetDueDateViewModel
++ */
++// We explicitly do not use calendar controls here
++// User feedback:
++// (1) Don't have to think about what today is in order to use it,
++// (2) looking at a calendar makes the future date too concrete
++//  (... easier to consider as a nebulous range than a deadline)
++// (3) If the interval is changed, it will be set to a number of days, not a date.
++// (4) Inconsistent with Anki Desktop
++// TODO: This does not handle configuration changes on some EditTexts [screen rotate/night mode]
++class SetDueDateDialog : DialogFragment() {
++    val viewModel: SetDueDateViewModel by activityViewModels<SetDueDateViewModel>()
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        val cardIds = requireNotNull(requireArguments().getLongArray(ARG_CARD_IDS)) { ARG_CARD_IDS }
++        viewModel.init(cardIds)
++        Timber.d("Set due date dialog: %d card(s)", cardIds.size)
++    }
++
++    override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
++        return AlertDialog.Builder(requireContext()).create {
++            title(text = CollectionManager.TR.actionsSetDueDate()) // TODO: this is uppercase rather than title case
++            positiveButton(R.string.dialog_ok) { launchUpdateDueDate() }
++            negativeButton(R.string.dialog_cancel)
++            neutralButton(R.string.help) {
++                openUrl(R.string.link_set_due_date_help)
++            }
++
++            setView(R.layout.dialog_set_due_date)
++        }.apply {
++            show()
++
++            lifecycleScope.launch {
++                viewModel.isValidFlow.collect { isValid -> positiveButton.isEnabled = isValid }
++            }
++            // setup viewpager + tabs
++            val viewPager = findViewById<ViewPager2>(R.id.pager)!!
++            viewPager.adapter = DueDateStateAdapter(this@SetDueDateDialog)
++            val tabLayout = findViewById<TabLayout>(R.id.tab_layout)!!
++            TabLayoutMediator(tabLayout, viewPager) { tab: TabLayout.Tab, position: Int ->
++                SetDueDateViewModel.Tab.entries.first { it.position == position }
++                    .let { selectedTab ->
++                        tab.setIcon(selectedTab.icon)
++                    }
++            }.attach()
++            tabLayout.selectTab(tabLayout.getTabAt(0))
++
++            viewPager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
++                override fun onPageSelected(position: Int) {
++                    SetDueDateViewModel.Tab.entries.first { it.position == position }.let { selectedTab ->
++                        viewModel.currentTab = selectedTab
++                    }
++                    super.onPageSelected(position)
++                }
++            })
++
++            // setup 'set interval to same value' checkbox
++            findViewById<MaterialCheckBox>(R.id.change_interval)!!.apply {
++                isChecked = viewModel.updateIntervalToMatchDueDate
++                setOnCheckedChangeListener { _, isChecked ->
++                    viewModel.updateIntervalToMatchDueDate = isChecked
++                }
++            }
++        }
++    }
++
++    override fun setupDialog(dialog: Dialog, style: Int) {
++        super.setupDialog(dialog, style)
++        // this is required for the keyboard to appear: https://stackoverflow.com/a/10133603/
++        dialog.window?.clearFlags(FLAG_NOT_FOCUSABLE or FLAG_ALT_FOCUSABLE_IM)
++    }
++
++    private fun launchUpdateDueDate() = requireAnkiActivity().updateDueDate(viewModel)
++
++    companion object {
++        const val ARG_CARD_IDS = "ARGS_CARD_IDS"
++
++        @CheckResult
++        fun newInstance(cardIds: List<CardId>) = SetDueDateDialog().apply {
++            arguments = bundleOf(ARG_CARD_IDS to cardIds.toLongArray())
++            Timber.i("Showing 'set due date' dialog for %d cards", cardIds.size)
++        }
++    }
++
++    class DueDateStateAdapter(fragment: Fragment) : FragmentStateAdapter(fragment) {
++        override fun createFragment(position: Int): Fragment {
++            return when (position) {
++                0 -> SelectSingleDateFragment()
++                1 -> SelectDateRangeFragment()
++                else -> throw IllegalStateException("invalid position: $position")
++            }
++        }
++
++        override fun getItemCount() = 2
++    }
++
++    class SelectSingleDateFragment : Fragment(R.layout.set_due_date_single) {
++
++        private val viewModel: SetDueDateViewModel by activityViewModels<SetDueDateViewModel>()
++
++        override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
++            super.onViewCreated(view, savedInstanceState)
++            view.findViewById<TextInputLayout>(R.id.set_due_date_single_day_text).apply {
++                editText!!.apply {
++                    viewModel.nextSingleDayDueDate?.let { value -> setText(value.toString()) }
++                    doOnTextChanged { text, _, _, _ ->
++                        val currentValue = text?.toString()?.toIntOrNull()
++                        viewModel.nextSingleDayDueDate = currentValue
++                        suffixText = resources.getQuantityString(R.plurals.set_due_date_label_suffix, currentValue ?: 0)
++                    }
++                    suffixText = resources.getQuantityString(R.plurals.set_due_date_label_suffix, 0)
++                }
++            }
++            view.findViewById<TextView>(R.id.date_single_label).text =
++                resources.getQuantityString(R.plurals.set_due_date_single_day_label, viewModel.cardCount)
++        }
++    }
++
++    /**
++     * Allows a user to select a start and end date
++     */
++    class SelectDateRangeFragment : Fragment(R.layout.set_due_date_range) {
++
++        private val viewModel: SetDueDateViewModel by activityViewModels<SetDueDateViewModel>()
++
++        override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
++            super.onViewCreated(view, savedInstanceState)
++            view.findViewById<TextInputLayout>(R.id.date_range_start_layout).apply {
++                editText!!.apply {
++                    viewModel.dateRange.start?.let { start -> setText(start.toString()) }
++                    doOnTextChanged { text, _, _, _ ->
++                        val value = text.toString().toIntOrNull()
++                        viewModel.setNextDateRangeStart(value)
++                        suffixText =
++                            resources.getQuantityString(R.plurals.set_due_date_label_suffix, value ?: 0)
++                    }
++                    suffixText = resources.getQuantityString(R.plurals.set_due_date_label_suffix, 0)
++                }
++            }
++            view.findViewById<TextInputLayout>(R.id.date_range_end_layout).apply {
++                editText!!.apply {
++                    doOnTextChanged { text, _, _, _ ->
++                        val value = text.toString().toIntOrNull()
++                        viewModel.setNextDateRangeEnd(value)
++                        suffixText =
++                            resources.getQuantityString(R.plurals.set_due_date_label_suffix, value ?: 0)
++                    }
++                    suffixText = resources.getQuantityString(R.plurals.set_due_date_label_suffix, 0)
++                    viewModel.dateRange.end?.let { end -> setText(end.toString()) }
++                }
++            }
++            view.findViewById<TextView>(R.id.date_range_label).text =
++                resources.getQuantityString(R.plurals.set_due_date_range_label, viewModel.cardCount)
++        }
++
++        override fun onResume() {
++            super.onResume()
++            this.requireView().requestLayout() // fix the height not being changed
++        }
++    }
++}
++
++// this can outlive the lifetime of the fragment
++private fun AnkiActivity.updateDueDate(viewModel: SetDueDateViewModel) = this@AnkiActivity.launchCatchingTask {
++    // NICE_TO_HAVE: Display a snackbar if the activity is recreated while this executes
++    val cardsUpdated = withProgress(resources.getString(R.string.dialog_processing)) {
++        // this is async as it should be run on the viewModel
++        viewModel.updateDueDateAsync().await()
++    }
++    Timber.d("updated %d cards", cardsUpdated)
++
++    if (cardsUpdated == null) {
++        Timber.w("unable to update due date")
++        showThemedToast(R.string.something_wrong, true)
++        return@launchCatchingTask
++    }
++
++    showSnackbar(
++        resources.getQuantityString(
++            R.plurals.reschedule_cards_dialog_acknowledge,
++            cardsUpdated,
++            cardsUpdated
++        ),
++        Snackbar.LENGTH_SHORT
++    )
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/scheduling/SetDueDateViewModel.kt b/AnkiDroid/src/main/java/com/ichi2/anki/scheduling/SetDueDateViewModel.kt
+new file mode 100644
+index 000000000000..c8ec2f524e27
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/scheduling/SetDueDateViewModel.kt
+@@ -0,0 +1,152 @@
++/*
++ *  Copyright (c) 2024 David Allison <davidallisongithub@gmail.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify it under
++ *  the terms of the GNU General Public License as published by the Free Software
++ *  Foundation; either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++ *  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with
++ *  this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package com.ichi2.anki.scheduling
++
++import androidx.annotation.DrawableRes
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import com.ichi2.anki.R
++import com.ichi2.libanki.CardId
++import com.ichi2.libanki.sched.SetDueDateDays
++import com.ichi2.libanki.undoableOp
++import kotlinx.coroutines.async
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.update
++import timber.log.Timber
++
++/**
++ * 0 = today
++ * @see SetDueDateDays
++ */
++typealias NumberOfDaysInFuture = Int
++
++class SetDueDateViewModel : ViewModel() {
++    /** Whether the value may be submitted */
++    val isValidFlow = MutableStateFlow(false)
++
++    /** The cards to change the due date of */
++    lateinit var cardIds: List<CardId>
++
++    /** The number of cards which will be affected */
++    // primarily used for plurals
++    val cardCount
++        get() = cardIds.size
++
++    /** The number of days in the future if we are on [Tab.SINGLE_DAY] */
++    var nextSingleDayDueDate: NumberOfDaysInFuture? = null
++        set(value) {
++            field = if (value != null && value >= 0) {
++                value
++            } else {
++                null
++            }
++            Timber.d("update SINGLE_DAY to %s", field)
++            refreshIsValid()
++        }
++
++    var dateRange: DateRange = DateRange()
++        private set
++
++    internal var currentTab = Tab.SINGLE_DAY
++        set(value) {
++            Timber.i("selected tab %s", value)
++            field = value
++            refreshIsValid()
++        }
++
++    /** If `true`, the interval of the card is updated to match the calculated due date */
++    var updateIntervalToMatchDueDate: Boolean = false
++        set(value) {
++            Timber.d("updateIntervalToMatchDueDate: %b", value)
++            field = value
++        }
++
++    fun init(cardIds: LongArray) {
++        this.cardIds = cardIds.toList()
++    }
++
++    fun setNextDateRangeStart(value: Int?) {
++        Timber.d("updated date range start to %s", value)
++        dateRange.start = value
++        refreshIsValid()
++    }
++
++    fun setNextDateRangeEnd(value: Int?) {
++        Timber.d("updated date range end to %s", value)
++        dateRange.end = value
++        refreshIsValid()
++    }
++
++    private fun refreshIsValid() {
++        val isValid = when (currentTab) {
++            Tab.SINGLE_DAY -> nextSingleDayDueDate.let { it != null && it >= 0 }
++            Tab.DATE_RANGE -> dateRange.isValid()
++        }
++        isValidFlow.update { isValid }
++    }
++
++    fun calculateDaysParameter(): SetDueDateDays? {
++        val dateRange = when (currentTab) {
++            Tab.SINGLE_DAY -> nextSingleDayDueDate?.let { "$it" }
++            Tab.DATE_RANGE -> dateRange.toDaysParameter()
++        } ?: return null
++
++        // add a "!" suffix if necessary
++        val param = if (this.updateIntervalToMatchDueDate) "$dateRange!" else dateRange
++        return SetDueDateDays(param)
++    }
++
++    /**
++     * Updates the due date of [cardIds] based on the current state.
++     * @return The number of cards affected, or `null` if an error occurred
++     */
++    fun updateDueDateAsync() = viewModelScope.async {
++        val days = calculateDaysParameter() ?: return@async null
++        // TODO: Provide a config parameter - we can use this to set a 'last used value' in the UI
++        // when the screen is opened
++        undoableOp { sched.setDueDate(cardIds, days) }
++        return@async cardIds.size
++    }
++
++    enum class Tab(val position: Int, @DrawableRes val icon: Int) {
++        /** Set the due date to a single day */
++        SINGLE_DAY(0, R.drawable.calendar_single_day),
++
++        /** Sets the due date randomly between a range of days */
++        DATE_RANGE(1, R.drawable.calendar_date_range)
++    }
++
++    class DateRange(
++        var start: NumberOfDaysInFuture? = null,
++        var end: NumberOfDaysInFuture? = null
++    ) {
++        fun isValid(): Boolean {
++            val start = start ?: return false
++            val end = end ?: return false
++            if (start < 0) return false // 0 is valid -> today
++            return start <= end
++        }
++
++        fun toDaysParameter(): String? {
++            if (!isValid()) return null
++            if (start == end) return "$start"
++            return "$start-$end"
++        }
++
++        override fun toString() = "$start – $end"
++    }
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/utils/AndroidUtils.kt b/AnkiDroid/src/main/java/com/ichi2/anki/utils/AndroidUtils.kt
+index 11c528c6ebf7..f89f528e9330 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/utils/AndroidUtils.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/utils/AndroidUtils.kt
+@@ -18,6 +18,7 @@ import android.content.Context
+ import android.content.Intent
+ import android.net.Uri
+ import android.os.PowerManager
++import androidx.annotation.StringRes
+ import androidx.core.content.ContextCompat
+ import androidx.fragment.app.Fragment
+ import androidx.fragment.app.FragmentActivity
+@@ -78,3 +79,6 @@ fun Fragment.openUrl(uri: Uri) {
+     }
+     startActivity(Intent(Intent.ACTION_VIEW, uri))
+ }
++
++fun Fragment.openUrl(@StringRes stringRes: Int) =
++    openUrl(Uri.parse(requireContext().getString(stringRes)))
+diff --git a/AnkiDroid/src/main/res/drawable/calendar_date_range.xml b/AnkiDroid/src/main/res/drawable/calendar_date_range.xml
+new file mode 100644
+index 000000000000..d8f2936ada7d
+--- /dev/null
++++ b/AnkiDroid/src/main/res/drawable/calendar_date_range.xml
+@@ -0,0 +1,36 @@
++<!--
++  ~ Copyright 2xxx, Google Material Design Icons
++  ~
++  ~ Licensed under the Apache License, Version 2.0 (the "License");
++  ~ you may not use this file except in compliance with the License.
++  ~ You may obtain a copy of the License at
++  ~
++  ~    http://www.apache.org/licenses/LICENSE-2.0
++  ~
++  ~ Unless required by applicable law or agreed to in writing, software
++  ~ distributed under the License is distributed on an "AS IS" BASIS,
++  ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  ~ See the License for the specific language governing permissions and
++  ~ limitations under the License.
++  ~
++  ~ Modifications (GitHub: snowtimeglass, 2024):
++  ~  Base icon: baseline_calendar_today
++  ~  Made bar 1px taller
++  ~  added question mark icon
++  -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M6,1L6,3L4,3C3,3 2,4 2,5L2,20C2,20.999 3,21.999 4,22L15,22L15,20L4,20L4,7L20,7L20,11C20.833,11.006 21.518,11.581 22,12L22,11.016 22,5C22,4 21,3 20,3L18,3L18,1L16,1L16,3L8,3L8,1ZM6,9L6,11.5L18,11.5L18,9Z"
++        android:fillColor="#000000"/>
++    <path
++        android:pathData="M19,13L17,13C15,13 14,14 14,16 14,16 14,17 15,17 16.009,17 16,16 16,16 16,14.995 17,15 17,15L19,15C20,15 20,16 20,16 20,17 19,17 19,17L18,17C17,17 17,18 17,18L17,20C17,21 18,21 18,21 18,21 19,21 19,20L19,19C23,19 23,12.998 19,13Z"
++        android:fillColor="#000000"/>
++    <path
++        android:pathData="M19,23C19,23 18.995,22 18,22 17,22 17,23 17,23 17,23 17,24 18,24 18,24 19,24 19,23Z"
++        android:fillColor="#000000"/>
++</vector>
++
+diff --git a/AnkiDroid/src/main/res/drawable/calendar_single_day.xml b/AnkiDroid/src/main/res/drawable/calendar_single_day.xml
+new file mode 100644
+index 000000000000..ec085551b7a2
+--- /dev/null
++++ b/AnkiDroid/src/main/res/drawable/calendar_single_day.xml
+@@ -0,0 +1,28 @@
++<!--
++  ~ Copyright 2xxx, Google Material Design Icons
++  ~
++  ~ Licensed under the Apache License, Version 2.0 (the "License");
++  ~ you may not use this file except in compliance with the License.
++  ~ You may obtain a copy of the License at
++  ~
++  ~    http://www.apache.org/licenses/LICENSE-2.0
++  ~
++  ~ Unless required by applicable law or agreed to in writing, software
++  ~ distributed under the License is distributed on an "AS IS" BASIS,
++  ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  ~ See the License for the specific language governing permissions and
++  ~ limitations under the License.
++  ~
++  ~ Modifications (GitHub: snowtimeglass, 2024):
++  ~ modified style to match calendar_date_range
++  ~ Made dot 1px larger
++  -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:pathData="M6,1L6,3L4,3C3,3 2.005,4 2,5L2,20C2,21 3,21.999 4,21.999L4,20 4,7L20,7L20,20L4,20 4,22L20,22C21,22 22,21 22,20L22,11 22,5C22,4 20.999,3 20,3L18,3L18,1L16,1L16,3L8,3L8,1ZM6,9L6,11.5L8.5,11.5L8.5,9Z"
++        android:fillColor="#000000"/>
++</vector>
+diff --git a/AnkiDroid/src/main/res/layout/dialog_set_due_date.xml b/AnkiDroid/src/main/res/layout/dialog_set_due_date.xml
+new file mode 100644
+index 000000000000..e108e3df5194
+--- /dev/null
++++ b/AnkiDroid/src/main/res/layout/dialog_set_due_date.xml
+@@ -0,0 +1,69 @@
++<?xml version="1.0" encoding="utf-8"?><!--
++  ~  Copyright (c) 2024 David Allison <davidallisongithub@gmail.com>
++  ~
++  ~  This program is free software; you can redistribute it and/or modify it under
++  ~  the terms of the GNU General Public License as published by the Free Software
++  ~  Foundation; either version 3 of the License, or (at your option) any later
++  ~  version.
++  ~
++  ~  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++  ~  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++  ~  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++  ~
++  ~  You should have received a copy of the GNU General Public License along with
++  ~  this program.  If not, see <http://www.gnu.org/licenses/>.
++  -->
++
++<!-- ScrollView is used as in landscape mode, the checkbox may be hidden -->
++<ScrollView
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:fadeScrollbars="false">
++
++    <LinearLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++
++        android:orientation="vertical">
++
++        <com.google.android.material.tabs.TabLayout
++            android:id="@+id/tab_layout"
++            android:orientation="vertical"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            app:tabMaxWidth="0dp"
++            app:tabGravity="fill" >
++
++            <com.google.android.material.tabs.TabItem
++                android:id="@+id/set_single_day"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:icon="@drawable/calendar_single_day"
++                />
++
++            <com.google.android.material.tabs.TabItem
++                android:id="@+id/set_date_range"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:icon="@drawable/calendar_date_range"
++                />
++
++        </com.google.android.material.tabs.TabLayout>
++
++        <androidx.viewpager2.widget.ViewPager2
++            android:id="@+id/pager"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            />
++
++
++        <com.google.android.material.checkbox.MaterialCheckBox
++            android:id="@+id/change_interval"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginStart="16dp"
++            android:text="@string/set_due_date_match_interval"/>
++    </LinearLayout>
++</ScrollView>
+\ No newline at end of file
+diff --git a/AnkiDroid/src/main/res/layout/set_due_date_range.xml b/AnkiDroid/src/main/res/layout/set_due_date_range.xml
+new file mode 100644
+index 000000000000..2d6a434b0262
+--- /dev/null
++++ b/AnkiDroid/src/main/res/layout/set_due_date_range.xml
+@@ -0,0 +1,88 @@
++<?xml version="1.0" encoding="utf-8"?><!--
++  ~  Copyright (c) 2024 David Allison <davidallisongithub@gmail.com>
++  ~
++  ~  This program is free software; you can redistribute it and/or modify it under
++  ~  the terms of the GNU General Public License as published by the Free Software
++  ~  Foundation; either version 3 of the License, or (at your option) any later
++  ~  version.
++  ~
++  ~  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++  ~  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++  ~  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++  ~
++  ~  You should have received a copy of the GNU General Public License along with
++  ~  this program.  If not, see <http://www.gnu.org/licenses/>.
++  -->
++
++<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:paddingHorizontal="16dp"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent">
++
++    <com.google.android.material.textview.MaterialTextView
++        android:id="@+id/date_range_label"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:paddingTop="8dp"
++        android:layout_marginStart="8dp"
++        style="@style/TextAppearance.Material3.LabelLarge"
++        tools:text="Show card in range"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="parent" />
++
++
++    <com.google.android.material.textfield.TextInputLayout
++        android:id="@+id/date_range_start_layout"
++        android:layout_width="wrap_content"
++        android:layout_height="0dp"
++        android:layout_marginTop="8dp"
++        android:paddingBottom="8dp"
++        android:minEms="6"
++        app:expandedHintEnabled="false"
++        app:suffixText="days"
++        app:layout_constraintStart_toStartOf="@+id/date_range_label"
++        app:layout_constraintTop_toBottomOf="@+id/date_range_label">
++
++        <com.google.android.material.textfield.TextInputEditText
++            android:id="@+id/date_range_start"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:inputType="number"
++            android:maxLength="5" />
++    </com.google.android.material.textfield.TextInputLayout>
++
++
++    <com.google.android.material.textview.MaterialTextView
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:text="@string/range_delimiter"
++        android:textSize="24sp"
++        app:layout_constraintBottom_toBottomOf="@+id/date_range_start_layout"
++        app:layout_constraintEnd_toStartOf="@+id/date_range_end_layout"
++        app:layout_constraintStart_toEndOf="@+id/date_range_start_layout"
++        app:layout_constraintTop_toTopOf="@+id/date_range_start_layout"
++        />
++
++    <com.google.android.material.textfield.TextInputLayout
++        android:id="@+id/date_range_end_layout"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="8dp"
++        android:layout_marginEnd="8dp"
++        android:minEms="6"
++        app:expandedHintEnabled="false"
++        app:suffixText="days"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintTop_toBottomOf="@+id/date_range_label">
++
++        <com.google.android.material.textfield.TextInputEditText
++            android:id="@+id/date_range_end"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:inputType="number"
++            android:maxLength="5" />
++    </com.google.android.material.textfield.TextInputLayout>
++
++</androidx.constraintlayout.widget.ConstraintLayout>
+\ No newline at end of file
+diff --git a/AnkiDroid/src/main/res/layout/set_due_date_single.xml b/AnkiDroid/src/main/res/layout/set_due_date_single.xml
+new file mode 100644
+index 000000000000..91647537d174
+--- /dev/null
++++ b/AnkiDroid/src/main/res/layout/set_due_date_single.xml
+@@ -0,0 +1,56 @@
++<?xml version="1.0" encoding="utf-8"?><!--
++  ~  Copyright (c) 2024 David Allison <davidallisongithub@gmail.com>
++  ~
++  ~  This program is free software; you can redistribute it and/or modify it under
++  ~  the terms of the GNU General Public License as published by the Free Software
++  ~  Foundation; either version 3 of the License, or (at your option) any later
++  ~  version.
++  ~
++  ~  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++  ~  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++  ~  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++  ~
++  ~  You should have received a copy of the GNU General Public License along with
++  ~  this program.  If not, see <http://www.gnu.org/licenses/>.
++  -->
++
++<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:paddingHorizontal="16dp"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent">
++
++    <com.google.android.material.textview.MaterialTextView
++        android:id="@+id/date_single_label"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:paddingTop="8dp"
++        android:layout_marginStart="8dp"
++        style="@style/TextAppearance.Material3.LabelLarge"
++        tools:hint="Show card in"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="parent" />
++
++    <com.google.android.material.textfield.TextInputLayout
++        android:id="@+id/set_due_date_single_day_text"
++        android:layout_width="0dp"
++        android:layout_height="wrap_content"
++        android:layout_gravity="center_horizontal"
++        android:layout_marginTop="8dp"
++        android:layout_marginEnd="8dp"
++        android:paddingBottom="8dp"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="@+id/date_single_label"
++        app:layout_constraintTop_toBottomOf="@+id/date_single_label"
++        app:expandedHintEnabled="false"
++        tools:suffixText="days">
++
++        <com.google.android.material.textfield.TextInputEditText
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:inputType="number"
++            tools:text="2" />
++    </com.google.android.material.textfield.TextInputLayout>
++
++</androidx.constraintlayout.widget.ConstraintLayout>
+\ No newline at end of file
+diff --git a/AnkiDroid/src/main/res/values/03-dialogs.xml b/AnkiDroid/src/main/res/values/03-dialogs.xml
+index da1ed5575131..772f20b2a322 100644
+--- a/AnkiDroid/src/main/res/values/03-dialogs.xml
++++ b/AnkiDroid/src/main/res/values/03-dialogs.xml
+@@ -262,4 +262,23 @@
+     <string name="deck_already_exists">Deck already exists</string>
+ 
+     <string name="create_deck_numeric_hint">If you have deck ordering issues (e.g. ‘10’ appears before ‘2’), replace ‘2’ with ‘02’</string>
++
++    <!-- Set Due Date -->
++    <string name="set_due_date_match_interval" comment="when setting a card's due date, this checkbox
++also changes the interval of the card"
++        >Set interval to same value</string>
++    <plurals name="set_due_date_single_day_label" comment="a date control is provided afterwards">
++        <item quantity="one">Show card in</item>
++        <item quantity="other">Show cards in</item>
++    </plurals>
++    <plurals name="set_due_date_range_label" comment="a date control is provided afterwards">
++        <item quantity="one">Show card in range</item>
++        <item quantity="other">Show cards in range</item>
++    </plurals>
++    <plurals name="set_due_date_label_suffix" comment="a suffix on a text field allowing a user to enter a number of days">
++        <item quantity="one">day</item>
++        <item quantity="other">days</item>
++    </plurals>
++    <string name="range_delimiter" comment="Placed between two input boxes to denote a range">–</string>
++
+ </resources>
+diff --git a/AnkiDroid/src/main/res/values/constants.xml b/AnkiDroid/src/main/res/values/constants.xml
+index 99433e8df768..a6406c2d57d1 100644
+--- a/AnkiDroid/src/main/res/values/constants.xml
++++ b/AnkiDroid/src/main/res/values/constants.xml
+@@ -151,6 +151,7 @@
+     <string name="link_install_non_play_store_install">https://github.com/ankidroid/Anki-Android/wiki/Full-Storage-Access</string>
+     <string name="link_custom_sync_server_help_learn_more_en">https://docs.ankidroid.org/#_custom_sync_server</string>
+     <string name="link_migration_failed_dialog_learn_more_en">https://docs.ankidroid.org/storage-migration-error.html</string>
++    <string name="link_set_due_date_help">https://docs.ankiweb.net/browsing.html#cards</string>
+     <string name="migration_failed_help_url">https://docs.ankidroid.org/storage-migration-error.html</string>
+ 
+     <string-array name="cram_deck_conf_order_values">
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/scheduling/SetDueDateDialogTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/scheduling/SetDueDateDialogTest.kt
+new file mode 100644
+index 000000000000..738817cea8c0
+--- /dev/null
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/scheduling/SetDueDateDialogTest.kt
+@@ -0,0 +1,164 @@
++/*
++ *  Copyright (c) 2024 David Allison <davidallisongithub@gmail.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify it under
++ *  the terms of the GNU General Public License as published by the Free Software
++ *  Foundation; either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++ *  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with
++ *  this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package com.ichi2.anki.scheduling
++
++import android.widget.CheckBox
++import android.widget.EditText
++import android.widget.TextView
++import androidx.appcompat.app.AlertDialog
++import androidx.fragment.app.testing.launchFragment
++import androidx.lifecycle.Lifecycle
++import androidx.test.ext.junit.runners.AndroidJUnit4
++import com.google.android.material.tabs.TabLayout
++import com.google.android.material.textfield.TextInputLayout
++import com.ichi2.anki.R
++import com.ichi2.anki.RobolectricTest
++import com.ichi2.anki.scheduling.SetDueDateViewModel.Tab
++import com.ichi2.annotations.NeedsTest
++import com.ichi2.libanki.CardId
++import com.ichi2.utils.positiveButton
++import org.hamcrest.MatcherAssert.assertThat
++import org.hamcrest.Matchers.equalTo
++import org.junit.Ignore
++import org.junit.Test
++import org.junit.runner.RunWith
++
++@Ignore("selectTab(1) does not attach Ids")
++@NeedsTest("get the tests working")
++@RunWith(AndroidJUnit4::class)
++class SetDueDateDialogTest : RobolectricTest() {
++    @Test
++    fun `switch tabs`() = testDialog {
++        selectTab(0)
++        assertThat(viewModel.currentTab, equalTo(Tab.SINGLE_DAY))
++        selectTab(1)
++        assertThat(viewModel.currentTab, equalTo(Tab.DATE_RANGE))
++    }
++
++    @Test
++    fun `initial suffix is set`() = testDialog {
++        selectTab(0)
++        assertThat(singleDayTextLayout.suffixText, equalTo("days"))
++        assertThat(dateRangeStartLayout.suffixText, equalTo("days"))
++        assertThat(dateRangeEndLayout.suffixText, equalTo("days"))
++    }
++
++    @Test
++    fun `set single day`() = testDialog {
++        selectTab(0)
++        assertThat(positiveButtonIsEnabled, equalTo(false))
++        singleDayText.setText("1")
++        assertThat(positiveButtonIsEnabled, equalTo(true))
++    }
++
++    @Test
++    fun `set date range`() = testDialog {
++        selectTab(1)
++        assertThat(positiveButtonIsEnabled, equalTo(false))
++        dateRangeStart.setText("1")
++        dateRangeEnd.setText("5")
++        assertThat(positiveButtonIsEnabled, equalTo(true))
++    }
++
++    @Test
++    fun `set update interval`() = testDialog {
++        assertThat(viewModel.updateIntervalToMatchDueDate, equalTo(false))
++        changeInterval.isChecked = true
++        assertThat(viewModel.updateIntervalToMatchDueDate, equalTo(true))
++    }
++
++    @Test
++    fun `singular text`() = testDialog(cards = listOf(1)) {
++        selectTab(0)
++        assertThat(singleDayTextLayout.hint, equalTo("Show card in"))
++        selectTab(1)
++        assertThat(dateRangeLabel.text, equalTo("Show card in range"))
++    }
++
++    @Test
++    fun `plural text`() = testDialog(cards = listOf(1, 2)) {
++        selectTab(0)
++        assertThat(singleDayTextLayout.hint, equalTo("Show cards in"))
++        selectTab(1)
++        assertThat(dateRangeLabel.text, equalTo("Show cards in range"))
++    }
++
++    @Test
++    fun `integration test`() = testDialog {
++        assertThat(viewModel.updateIntervalToMatchDueDate, equalTo(false))
++        selectTab(1)
++        dateRangeStart.setText("1")
++        dateRangeEnd.setText("2")
++        changeInterval.isChecked = true
++
++        assertThat(viewModel.calculateDaysParameter(), equalTo("1-2!"))
++    }
++
++    private fun testDialog(
++        cards: List<CardId> = listOf(1),
++        action: SetDueDateDialog.() -> Unit
++    ) = runTest {
++        val dialog = SetDueDateDialog.newInstance(cards)
++        launchFragment(
++            themeResId = R.style.Base_Theme_Light,
++            fragmentArgs = dialog.arguments
++        ) {
++            return@launchFragment dialog
++        }.apply {
++            moveToState(Lifecycle.State.CREATED)
++            this.onFragment {
++                action(it)
++            }
++        }
++    }
++}
++
++fun TabLayout.selectTab(index: Int) = selectTab(getTabAt(index))
++
++fun SetDueDateDialog.selectTab(index: Int) {
++    val tabLayout = dialog!!.findViewById<TabLayout>(R.id.tab_layout)
++    tabLayout.selectTab(index)
++    if (index == 1) {
++        TODO("Flaky: FragmentStateAdapter does not include views")
++    }
++}
++
++val SetDueDateDialog.positiveButtonIsEnabled get() =
++    (dialog as AlertDialog).positiveButton.isEnabled
++
++val SetDueDateDialog.singleDayTextLayout: TextInputLayout get() =
++    dialog!!.findViewById(R.id.set_due_date_single_day_text)
++
++val SetDueDateDialog.singleDayText: EditText get() = singleDayTextLayout.editText!!
++
++val SetDueDateDialog.dateRangeStartLayout: TextInputLayout get() =
++    dialog!!.findViewById(R.id.date_range_start_layout)
++
++val SetDueDateDialog.dateRangeStart: EditText get() =
++    dateRangeStartLayout.editText!!
++
++val SetDueDateDialog.dateRangeEndLayout: TextInputLayout get() =
++    dialog!!.findViewById(R.id.date_range_end_layout)
++
++val SetDueDateDialog.dateRangeEnd: EditText get() =
++    dateRangeEndLayout.editText!!
++
++val SetDueDateDialog.changeInterval: CheckBox get() =
++    dialog!!.findViewById(R.id.change_interval)!!
++
++val SetDueDateDialog.dateRangeLabel: TextView get() =
++    dialog!!.findViewById(R.id.date_range_label)
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/scheduling/SetDueDateViewModelTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/scheduling/SetDueDateViewModelTest.kt
+new file mode 100644
+index 000000000000..0ab29aa491c2
+--- /dev/null
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/scheduling/SetDueDateViewModelTest.kt
+@@ -0,0 +1,113 @@
++/*
++ *  Copyright (c) 2024 David Allison <davidallisongithub@gmail.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify it under
++ *  the terms of the GNU General Public License as published by the Free Software
++ *  Foundation; either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++ *  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with
++ *  this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package com.ichi2.anki.scheduling
++
++import androidx.test.ext.junit.runners.AndroidJUnit4
++import com.ichi2.anki.scheduling.SetDueDateViewModel.*
++import com.ichi2.libanki.CardId
++import com.ichi2.libanki.sched.SetDueDateDays
++import com.ichi2.testutils.JvmTest
++import org.hamcrest.MatcherAssert.assertThat
++import org.hamcrest.Matchers.equalTo
++import org.junit.Test
++import org.junit.runner.RunWith
++
++@RunWith(AndroidJUnit4::class)
++class SetDueDateViewModelTest : JvmTest() {
++    @Test
++    fun `initial values`() = runViewModelTest(cardIds = listOf(1, 2)) {
++        assertThat("card count", cardCount, equalTo(2))
++        assertThat("is not valid", !isValid)
++        assertThat("initial tab is single day", currentTab, equalTo(Tab.SINGLE_DAY))
++    }
++
++    @Test
++    fun `single day validation`() = runViewModelTest {
++        fun canSaveWithValue(input: NumberOfDaysInFuture?, expected: Boolean) {
++            nextSingleDayDueDate = input
++            assertThat("$input", isValid == expected, equalTo(true))
++        }
++        assertThat("is not valid", !isValid)
++        canSaveWithValue(-1, false)
++        canSaveWithValue(0, true)
++        canSaveWithValue(null, false)
++        canSaveWithValue(1, true)
++    }
++
++    @Test
++    fun `date range validation`() = runViewModelTest {
++        fun canSaveWithValue(
++            start: NumberOfDaysInFuture?,
++            end: NumberOfDaysInFuture?,
++            expected: Boolean,
++            message: String? = null
++        ) {
++            setNextDateRangeStart(start)
++            setNextDateRangeEnd(end)
++            assertThat(message ?: "${DateRange(start, end)}", isValid == expected, equalTo(true))
++        }
++        currentTab = Tab.DATE_RANGE
++        assertThat("initially not valid", !isValid)
++        canSaveWithValue(-1, -1, false)
++        canSaveWithValue(-1, 0, false)
++        canSaveWithValue(0, -1, false)
++
++        canSaveWithValue(0, 0, true)
++
++        canSaveWithValue(null, null, false)
++        canSaveWithValue(null, 1, false)
++        canSaveWithValue(1, null, false)
++
++        canSaveWithValue(2, 3, true)
++        canSaveWithValue(3, 2, false, "start must be <= end")
++    }
++
++    @Test
++    fun `test string output`() = runViewModelTest {
++        fun eq(s: String) = equalTo(SetDueDateDays(s))
++        currentTab = Tab.SINGLE_DAY
++        assertThat(calculateDaysParameter(), equalTo(null))
++
++        nextSingleDayDueDate = 1
++        assertThat(calculateDaysParameter(), eq("1"))
++
++        updateIntervalToMatchDueDate = true
++        assertThat(calculateDaysParameter(), eq("1!"))
++
++        updateIntervalToMatchDueDate = false
++        currentTab = Tab.DATE_RANGE
++        assertThat(calculateDaysParameter(), equalTo(null))
++
++        setNextDateRangeStart(0)
++        setNextDateRangeEnd(0)
++        assertThat(calculateDaysParameter(), eq("0"))
++
++        setNextDateRangeEnd(1)
++        assertThat(calculateDaysParameter(), eq("0-1"))
++
++        updateIntervalToMatchDueDate = true
++        assertThat(calculateDaysParameter(), eq("0-1!"))
++    }
++
++    private fun runViewModelTest(cardIds: List<CardId> = listOf(1, 2, 3), testBody: suspend SetDueDateViewModel.() -> Unit) = runTest {
++        val viewModel = SetDueDateViewModel()
++        viewModel.init(cardIds.toLongArray())
++        testBody(viewModel)
++    }
++}
++
++val SetDueDateViewModel.isValid: Boolean get() = isValidFlow.value

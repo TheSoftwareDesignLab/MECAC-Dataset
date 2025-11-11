@@ -1,0 +1,230 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/audio/AudioRecorder.java b/app/src/main/java/org/thoughtcrime/securesms/audio/AudioRecorder.java
+index 6b3faa45191..acc41141c7b 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/audio/AudioRecorder.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/audio/AudioRecorder.java
+@@ -7,6 +7,7 @@
+ import android.os.ParcelFileDescriptor;
+ 
+ import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
+ 
+ import org.signal.core.util.concurrent.SignalExecutors;
+ import org.signal.core.util.logging.Log;
+@@ -27,6 +28,7 @@ public class AudioRecorder {
+   private static final ExecutorService executor = SignalExecutors.newCachedSingleThreadExecutor("signal-AudioRecorder");
+ 
+   private final Context                   context;
++  private final AudioRecordingHandler     uiHandler;
+   private final AudioRecorderFocusManager audioFocusManager;
+ 
+   private Recorder recorder;
+@@ -34,12 +36,28 @@ public class AudioRecorder {
+ 
+   private SingleSubject<VoiceNoteDraft> recordingSubject;
+ 
+-  public AudioRecorder(@NonNull Context context) {
+-    this.context = context;
+-    audioFocusManager = AudioRecorderFocusManager.create(context, focusChange -> {
+-      Log.i(TAG, "Audio focus change " + focusChange + " stopping recording");
+-      stopRecording();
+-    });
++  public AudioRecorder(@NonNull Context context, @Nullable AudioRecordingHandler uiHandler) {
++    this.context   = context;
++    this.uiHandler = uiHandler;
++
++    AudioManager.OnAudioFocusChangeListener onAudioFocusChangeListener;
++
++    if (this.uiHandler != null) {
++      onAudioFocusChangeListener = focusChange -> {
++        if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
++          Log.i(TAG, "Audio focus change " + focusChange + " stopping recording");
++          this.uiHandler.onRecordCanceled(false);
++        }
++      };
++    } else {
++      onAudioFocusChangeListener = focusChange -> {
++        if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
++          Log.i(TAG, "Audio focus change " + focusChange + " stopping recording");
++          stopRecording();
++        }
++      };
++    }
++    audioFocusManager = AudioRecorderFocusManager.create(context, onAudioFocusChangeListener);
+   }
+ 
+   public @NonNull Single<VoiceNoteDraft> startRecording() {
+@@ -59,7 +77,7 @@ public AudioRecorder(@NonNull Context context) {
+                                  .forData(new ParcelFileDescriptor.AutoCloseInputStream(fds[0]), 0)
+                                  .withMimeType(MediaUtil.AUDIO_AAC)
+                                  .createForDraftAttachmentAsync(context, () -> Log.i(TAG, "Write successful."), e -> Log.w(TAG, "Error during recording", e));
+-        recorder = Build.VERSION.SDK_INT >= 26 ? new MediaRecorderWrapper() : new AudioCodec();
++        recorder   = Build.VERSION.SDK_INT >= 26 ? new MediaRecorderWrapper() : new AudioCodec();
+         int focusResult = audioFocusManager.requestAudioFocus();
+         if (focusResult != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+           Log.w(TAG, "Could not gain audio focus. Received result code " + focusResult);
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/audio/AudioRecordingHandler.kt b/app/src/main/java/org/thoughtcrime/securesms/audio/AudioRecordingHandler.kt
+new file mode 100644
+index 00000000000..6d99a0b3c48
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/audio/AudioRecordingHandler.kt
+@@ -0,0 +1,10 @@
++package org.thoughtcrime.securesms.audio
++
++interface AudioRecordingHandler {
++  fun onRecordPressed()
++  fun onRecordReleased()
++  fun onRecordCanceled(byUser: Boolean)
++  fun onRecordLocked()
++  fun onRecordMoved(offsetX: Float, absoluteX: Float)
++  fun onRecordPermissionRequired()
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/InputPanel.java b/app/src/main/java/org/thoughtcrime/securesms/components/InputPanel.java
+index caf4aba1e7d..4f238132251 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/InputPanel.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/InputPanel.java
+@@ -33,6 +33,7 @@
+ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.R;
+ import org.thoughtcrime.securesms.animation.AnimationCompleteListener;
++import org.thoughtcrime.securesms.audio.AudioRecordingHandler;
+ import org.thoughtcrime.securesms.components.emoji.EmojiEventListener;
+ import org.thoughtcrime.securesms.components.emoji.EmojiToggle;
+ import org.thoughtcrime.securesms.components.emoji.MediaKeyboard;
+@@ -63,7 +64,7 @@
+ import java.util.concurrent.TimeUnit;
+ 
+ public class InputPanel extends LinearLayout
+-    implements MicrophoneRecorderView.Listener,
++    implements AudioRecordingHandler,
+                KeyboardAwareLinearLayout.OnKeyboardShownListener,
+                EmojiEventListener,
+                ConversationStickerSuggestionAdapter.EventListener
+@@ -137,7 +138,7 @@ public void onFinishInflate() {
+     this.voiceNoteDraftView     = findViewById(R.id.voice_note_draft_view);
+     this.slideToCancel          = new SlideToCancel(findViewById(R.id.slide_to_cancel));
+     this.microphoneRecorderView = findViewById(R.id.recorder_view);
+-    this.microphoneRecorderView.setListener(this);
++    this.microphoneRecorderView.setHandler(this);
+     this.recordTime             = new RecordTime(findViewById(R.id.record_time),
+                                                  findViewById(R.id.microphone),
+                                                  TimeUnit.HOURS.toSeconds(1),
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/MicrophoneRecorderView.java b/app/src/main/java/org/thoughtcrime/securesms/components/MicrophoneRecorderView.java
+index bf96011af60..543acaa69f6 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/MicrophoneRecorderView.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/MicrophoneRecorderView.java
+@@ -21,6 +21,7 @@
+ import androidx.annotation.Nullable;
+ 
+ import org.thoughtcrime.securesms.R;
++import org.thoughtcrime.securesms.audio.AudioRecordingHandler;
+ import org.thoughtcrime.securesms.permissions.Permissions;
+ import org.thoughtcrime.securesms.util.ViewUtil;
+ 
+@@ -34,10 +35,10 @@ enum State {
+ 
+   public static final int ANIMATION_DURATION = 200;
+ 
+-  private           FloatingRecordButton floatingRecordButton;
+-  private           LockDropTarget       lockDropTarget;
+-  private @Nullable Listener             listener;
+-  private @NonNull  State                state = State.NOT_RUNNING;
++  private           FloatingRecordButton   floatingRecordButton;
++  private           LockDropTarget        lockDropTarget;
++  private @Nullable AudioRecordingHandler handler;
++  private @NonNull  State                 state = State.NOT_RUNNING;
+ 
+   public MicrophoneRecorderView(Context context) {
+     super(context);
+@@ -63,8 +64,8 @@ public void cancelAction(boolean byUser) {
+       state = State.NOT_RUNNING;
+       hideUi();
+ 
+-      if (listener != null) {
+-        listener.onRecordCanceled(byUser);
++      if (handler != null) {
++        handler.onRecordCanceled(byUser);
+       }
+     }
+   }
+@@ -78,7 +79,7 @@ private void lockAction() {
+       state = State.RUNNING_LOCKED;
+       hideUi();
+ 
+-      if (listener != null) listener.onRecordLocked();
++      if (handler != null) handler.onRecordLocked();
+     }
+   }
+ 
+@@ -87,7 +88,7 @@ public void unlockAction() {
+       state = State.NOT_RUNNING;
+       hideUi();
+ 
+-      if (listener != null) listener.onRecordReleased();
++      if (handler != null) handler.onRecordReleased();
+     }
+   }
+ 
+@@ -101,12 +102,12 @@ public boolean onTouch(View v, final MotionEvent event) {
+     switch (event.getAction()) {
+       case MotionEvent.ACTION_DOWN:
+         if (!Permissions.hasAll(getContext(), Manifest.permission.RECORD_AUDIO)) {
+-          if (listener != null) listener.onRecordPermissionRequired();
++          if (handler != null) handler.onRecordPermissionRequired();
+         } else if (state == State.NOT_RUNNING) {
+           state = State.RUNNING_HELD;
+           floatingRecordButton.display(event.getX(), event.getY());
+           lockDropTarget.display();
+-          if (listener != null) listener.onRecordPressed();
++          if (handler != null) handler.onRecordPressed();
+         }
+         break;
+       case MotionEvent.ACTION_CANCEL:
+@@ -114,13 +115,13 @@ public boolean onTouch(View v, final MotionEvent event) {
+         if (this.state == State.RUNNING_HELD) {
+           state = State.NOT_RUNNING;
+           hideUi();
+-          if (listener != null) listener.onRecordReleased();
++          if (handler != null) handler.onRecordReleased();
+         }
+         break;
+       case MotionEvent.ACTION_MOVE:
+         if (this.state == State.RUNNING_HELD) {
+           this.floatingRecordButton.moveTo(event.getX(), event.getY());
+-          if (listener != null) listener.onRecordMoved(floatingRecordButton.lastOffsetX, event.getRawX());
++          if (handler != null) handler.onRecordMoved(floatingRecordButton.lastOffsetX, event.getRawX());
+ 
+           int dimensionPixelSize = getResources().getDimensionPixelSize(R.dimen.recording_voice_lock_target);
+           if (floatingRecordButton.lastOffsetY <= dimensionPixelSize) {
+@@ -133,17 +134,8 @@ public boolean onTouch(View v, final MotionEvent event) {
+     return false;
+   }
+ 
+-  public void setListener(@Nullable Listener listener) {
+-    this.listener = listener;
+-  }
+-
+-  public interface Listener {
+-    void onRecordPressed();
+-    void onRecordReleased();
+-    void onRecordCanceled(boolean byUser);
+-    void onRecordLocked();
+-    void onRecordMoved(float offsetX, float absoluteX);
+-    void onRecordPermissionRequired();
++  public void setHandler(@Nullable AudioRecordingHandler handler) {
++    this.handler = handler;
+   }
+ 
+   private static class FloatingRecordButton {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationParentFragment.java b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationParentFragment.java
+index 251701d34f0..f2cbfb63395 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationParentFragment.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationParentFragment.java
+@@ -2071,7 +2071,7 @@ private void initializeViews(View view) {
+     inputPanel.setMediaListener(this);
+ 
+     attachmentManager = new AttachmentManager(requireContext(), view, this);
+-    audioRecorder     = new AudioRecorder(requireContext());
++    audioRecorder     = new AudioRecorder(requireContext(), inputPanel);
+     typingTextWatcher = new ComposeTextWatcher();
+ 
+     SendButtonListener        sendButtonListener        = new SendButtonListener();

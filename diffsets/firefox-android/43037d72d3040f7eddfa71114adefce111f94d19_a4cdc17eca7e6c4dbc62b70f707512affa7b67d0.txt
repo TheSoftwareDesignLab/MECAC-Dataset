@@ -1,0 +1,454 @@
+diff --git a/android-components/components/service/nimbus/messaging.fml.yaml b/android-components/components/service/nimbus/messaging.fml.yaml
+index 639bac1320e5..bd53a22aa166 100644
+--- a/android-components/components/service/nimbus/messaging.fml.yaml
++++ b/android-components/components/service/nimbus/messaging.fml.yaml
+@@ -61,7 +61,9 @@ features:
+         type: Map<ActionName, String>
+         description: A growable map of action URLs.
+         string-alias: ActionName
+-        default: {}
++        default:
++          OPEN_URL: ://open
++
+       on-control:
+         type: ControlMessageBehavior
+         description: What should be displayed when a control message is selected.
+@@ -90,15 +92,23 @@ objects:
+       and call to action.
+     fields:
+       action:
+-        # We'd like this to be ActionName, but actions can be https:// URLs,
+-        # not just limited to keys in the actions map.
+-        # This would be a breaking change.
+-        type: Text
++        type: ActionName
+         description: >
+           A URL of a page or a deeplink.
+           This may have substitution variables in.
+         # This should never be defaulted.
+-        default: ""
++        default: OPEN_URL
++      action-params:
++        description: >
++          A string map containing query parameters that will be appended to the action URL.
++          This is useful for opening URLs in tabs, or specifying that the tab should be private.
++          The values may have substitutions, e.g. "url": "https://example.com/id={uuid}",
++          "private": "true".
++
++          The params and their values are all determined downstream of the messaging component, by
++          the embedding app's deeplink processing machinery.
++        type: Map<String, String>
++        default: {}
+       title:
+         type: Option<Text>
+         description: "The title text displayed to the user"
+diff --git a/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/NimbusMessagingController.kt b/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/NimbusMessagingController.kt
+index 8408c2faaf75..391dfe0cb758 100644
+--- a/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/NimbusMessagingController.kt
++++ b/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/NimbusMessagingController.kt
+@@ -6,6 +6,7 @@ package mozilla.components.service.nimbus.messaging
+ 
+ import android.content.Intent
+ import android.net.Uri
++import androidx.annotation.VisibleForTesting
+ import androidx.core.net.toUri
+ import mozilla.components.service.nimbus.GleanMetrics.Messaging as GleanMessaging
+ 
+@@ -14,16 +15,11 @@ import mozilla.components.service.nimbus.GleanMetrics.Messaging as GleanMessagin
+  *
+  * @param messagingStorage a NimbusMessagingStorage instance
+  * @param deepLinkScheme the deepLinkScheme for the app
+- * @param httpActionToDeepLinkUriConverter will be used to create a deepLinkUri from the action associated to a message.
+- * It can be customized to fit the needs of any app. A default implementation is provided.
+  * @param now will be used to get the current time
+  */
+ open class NimbusMessagingController(
+     private val messagingStorage: NimbusMessagingStorage,
+     private val deepLinkScheme: String,
+-    private val httpActionToDeepLinkUriConverter: (String) -> Uri = { action ->
+-        "$deepLinkScheme://open?url=${Uri.encode(action)}".toUri()
+-    },
+ ) : NimbusMessagingControllerInterface {
+     /**
+      * Records telemetry and metadata for a newly processed displayed message.
+@@ -90,8 +86,9 @@ open class NimbusMessagingController(
+      * We call this `process` as it has a side effect of logging a Glean event while it
+      * creates a URI string for the message action.
+      */
++    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+     fun processMessageActionToUri(message: Message): Uri {
+-        val (uuid, action) = messagingStorage.generateUuidAndFormatAction(message.action)
++        val (uuid, action) = messagingStorage.generateUuidAndFormatMessage(message)
+         sendClickedMessageTelemetry(message.id, uuid)
+ 
+         return convertActionIntoDeepLinkSchemeUri(action)
+@@ -116,9 +113,7 @@ open class NimbusMessagingController(
+     }
+ 
+     private fun convertActionIntoDeepLinkSchemeUri(action: String): Uri =
+-        if (action.startsWith("http", ignoreCase = true)) {
+-            httpActionToDeepLinkUriConverter(action)
+-        } else if (action.startsWith("://")) {
++        if (action.startsWith("://")) {
+             "$deepLinkScheme$action".toUri()
+         } else {
+             action.toUri()
+diff --git a/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorage.kt b/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorage.kt
+index b24d8a45a83a..9828883337eb 100644
+--- a/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorage.kt
++++ b/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorage.kt
+@@ -5,6 +5,7 @@
+ package mozilla.components.service.nimbus.messaging
+ 
+ import android.content.Context
++import android.net.Uri
+ import androidx.annotation.VisibleForTesting
+ import androidx.annotation.VisibleForTesting.Companion.PRIVATE
+ import kotlinx.coroutines.runBlocking
+@@ -218,28 +219,6 @@ class NimbusMessagingStorage(
+         }
+     }
+ 
+-    /**
+-     * Returns a pair of uuid and valid action for the provided [action].
+-     *
+-     * Uses Nimbus' targeting attributes to do basic string interpolation.
+-     *
+-     * e.g.
+-     * `https://example.com/{locale}/whatsnew.html?version={app_version}`
+-     *
+-     * If the string `{uuid}` is detected in the [action] string, then it is
+-     * replaced with a random UUID. This is returned as the first value of the returned
+-     * [Pair].
+-     *
+-     * The fully resolved (with all substitutions) action is returned as the second value
+-     * of the [Pair].
+-     */
+-    fun generateUuidAndFormatAction(action: String): Pair<String?, String> =
+-        createMessagingHelper().use { helper ->
+-            val uuid = helper.getUuid(action)
+-            val url = helper.stringFormat(action, uuid)
+-            Pair(uuid, url)
+-        }
+-
+     /**
+      * Record the time and optional [bootIdentifier] of the display of the given message.
+      *
+@@ -272,6 +251,83 @@ class NimbusMessagingStorage(
+         return nextMessage
+     }
+ 
++    /**
++     * Returns a pair of uuid and valid action for the provided [message].
++     *
++     * The message's action-params are appended as query parameters to the action URI,
++     * URI encoding the values as it goes.
++     *
++     * Uses Nimbus' targeting attributes to do basic string interpolation.
++     *
++     * e.g.
++     * `https://example.com/{locale}/whats-new.html?version={app_version}`
++     *
++     * If the string `{uuid}` is detected in the [message]'s action, then it is
++     * replaced with a random UUID. This is returned as the first value of the returned
++     * [Pair].
++     *
++     * The fully resolved (with all substitutions) action is returned as the second value
++     * of the [Pair].
++     */
++    internal fun generateUuidAndFormatMessage(message: Message): Pair<String?, String> =
++        createMessagingHelper().use { helper ->
++            generateUuidAndFormatMessage(message, helper)
++        }
++
++    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
++    internal fun generateUuidAndFormatMessage(
++        message: Message,
++        helper: NimbusMessagingHelperInterface,
++    ): Pair<String?, String> {
++        // The message action is part or all of a valid URL, likely to be a deeplink.
++        // If it's an internal deeplink, we don't yet know the scheme, so
++        // we'll prepend it later: these should just have a :// prefix right now.
++        // e.g. market://details?id=org.mozilla.blah or ://open
++
++        // We need to construct it from the parts coming in from the message:
++        // the message.action, the message.actionParams and the attribute context.
++        //
++        // Any part of the action may have string params taken from the attribute
++        // context, and a special {uuid}.
++        // e.g. market://details?id={app_id} becomes market://details?id=org.mozilla.blah
++        // If there is a {uuid}, we want to create a uuid for later usage, i.e. recording in Glean
++        var uuid: String? = null
++        fun formatWithUuid(string: String): String {
++            if (uuid == null) {
++                uuid = helper.getUuid(string)
++            }
++            return helper.stringFormat(string, uuid)
++        }
++
++        // We also want to do any string substitutions e.g. locale
++        // or UUID for the action.
++        val action = formatWithUuid(message.action)
++
++        // Now we use a string builder to add the actionParams as query params to the URL.
++        val sb = StringBuilder(action)
++
++        // Before the first query parameter is a `?`, and subsequent ones are `&`.
++        // The action may already have a query parameter.
++        var separator = if (action.contains('?')) {
++            '&'
++        } else {
++            '?'
++        }
++
++        for ((queryParamName, queryParamValue) in message.data.actionParams) {
++            val v = formatWithUuid(queryParamValue)
++            sb
++                .append(separator)
++                .append(queryParamName)
++                .append('=')
++                .append(Uri.encode(v))
++
++            separator = '&'
++        }
++
++        return uuid to sb.toString()
++    }
++
+     /**
+      * Updated the provided [metadata] in the storage.
+      */
+@@ -283,20 +339,7 @@ class NimbusMessagingStorage(
+     internal fun sanitizeAction(
+         unsafeAction: String,
+         nimbusActions: Map<String, String>,
+-    ): String? =
+-        when {
+-            unsafeAction.startsWith("http") -> {
+-                unsafeAction
+-            }
+-            else -> {
+-                val safeAction = nimbusActions[unsafeAction]
+-                if (safeAction.isNullOrBlank() || safeAction.isEmpty()) {
+-                    null
+-                } else {
+-                    safeAction
+-                }
+-            }
+-        }
++    ): String? = nimbusActions[unsafeAction]
+ 
+     @VisibleForTesting
+     internal fun sanitizeTriggers(
+diff --git a/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingControllerTest.kt b/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingControllerTest.kt
+index e956b4269bea..00cdb14d6aca 100644
+--- a/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingControllerTest.kt
++++ b/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingControllerTest.kt
+@@ -5,7 +5,6 @@
+ package mozilla.components.service.nimbus.messaging
+ 
+ import android.content.Intent
+-import android.net.Uri
+ import androidx.core.net.toUri
+ import kotlinx.coroutines.test.runTest
+ import mozilla.components.service.glean.testing.GleanTestRule
+@@ -118,18 +117,16 @@ class NimbusMessagingControllerTest {
+         }
+ 
+     @Test
+-    fun `GIVEN action is URL WHEN calling processMessageActionToUri THEN record a clicked telemetry event and return an open URI`() {
+-        val url = "http://mozilla.org"
+-        val message = createMessage("id-1", action = url)
++    fun `GIVEN action is URL WHEN calling processMessageActionToUri THEN record a clicked telemetry event`() {
++        val message = createMessage("id-1")
+ 
+-        `when`(storage.generateUuidAndFormatAction(message.action))
+-            .thenReturn(Pair(null, message.action))
++        `when`(storage.generateUuidAndFormatMessage(message))
++            .thenReturn(Pair(null, "://mock-uri"))
+ 
+         // Assert telemetry is initially null
+         assertNull(GleanMessaging.messageClicked.testGetValue())
+ 
+-        val encodedUrl = Uri.encode(url)
+-        val expectedUri = "$deepLinkScheme://open?url=$encodedUrl".toUri()
++        val expectedUri = "$deepLinkScheme://mock-uri".toUri()
+ 
+         val actualUri = controller.processMessageActionToUri(message)
+ 
+@@ -143,17 +140,16 @@ class NimbusMessagingControllerTest {
+     }
+ 
+     @Test
+-    fun `GIVEN a URL with a {uuid} WHEN calling processMessageActionToUri THEN record a clicked telemetry event and return an open URI`() {
++    fun `GIVEN a URL with a {uuid} WHEN calling processMessageActionToUri THEN record a clicked telemetry event`() {
+         val url = "http://mozilla.org?uuid={uuid}"
+-        val message = createMessage("id-1", action = url)
++        val message = createMessage("id-1", action = "://open", messageData = MessageData(actionParams = mapOf("url" to url)))
+         val uuid = UUID.randomUUID().toString()
+-        `when`(storage.generateUuidAndFormatAction(any())).thenReturn(Pair(uuid, message.action))
++        `when`(storage.generateUuidAndFormatMessage(message)).thenReturn(Pair(uuid, "://mock-uri"))
+ 
+         // Assert telemetry is initially null
+         assertNull(GleanMessaging.messageClicked.testGetValue())
+ 
+-        val encodedUrl = Uri.encode(url)
+-        val expectedUri = "$deepLinkScheme://open?url=$encodedUrl".toUri()
++        val expectedUri = "$deepLinkScheme://mock-uri".toUri()
+ 
+         val actualUri = controller.processMessageActionToUri(message)
+ 
+@@ -170,7 +166,7 @@ class NimbusMessagingControllerTest {
+     @Test
+     fun `GIVEN action is deeplink WHEN calling processMessageActionToUri THEN return a deeplink URI`() {
+         val message = createMessage("id-1", action = "://a-deep-link")
+-        `when`(storage.generateUuidAndFormatAction(message.action))
++        `when`(storage.generateUuidAndFormatMessage(message))
+             .thenReturn(Pair(null, message.action))
+ 
+         // Assert telemetry is initially null
+@@ -191,7 +187,7 @@ class NimbusMessagingControllerTest {
+     @Test
+     fun `GIVEN action unknown format WHEN calling processMessageActionToUri THEN return the action URI`() {
+         val message = createMessage("id-1", action = "unknown")
+-        `when`(storage.generateUuidAndFormatAction(message.action))
++        `when`(storage.generateUuidAndFormatMessage(message))
+             .thenReturn(Pair(null, message.action))
+ 
+         // Assert telemetry is initially null
+@@ -224,7 +220,7 @@ class NimbusMessagingControllerTest {
+     @Test
+     fun `WHEN getIntentForMessageAction is called THEN return a generated Intent with the processed Message action`() {
+         val message = createMessage("id-1", action = "unknown")
+-        `when`(storage.generateUuidAndFormatAction(message.action))
++        `when`(storage.generateUuidAndFormatMessage(message))
+             .thenReturn(Pair(null, message.action))
+         assertNull(GleanMessaging.messageClicked.testGetValue())
+ 
+diff --git a/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorageTest.kt b/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorageTest.kt
+index 3ff19ef91248..a5c17e1cb237 100644
+--- a/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorageTest.kt
++++ b/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/messaging/NimbusMessagingStorageTest.kt
+@@ -4,6 +4,7 @@
+ 
+ package mozilla.components.service.nimbus.messaging
+ 
++import android.net.Uri
+ import kotlinx.coroutines.runBlocking
+ import kotlinx.coroutines.test.runTest
+ import mozilla.components.service.nimbus.messaging.ControlMessageBehavior.SHOW_NEXT_MESSAGE
+@@ -38,6 +39,7 @@ import org.mozilla.experiments.nimbus.Res
+ import org.mozilla.experiments.nimbus.internal.FeatureHolder
+ import org.mozilla.experiments.nimbus.internal.NimbusException
+ import org.robolectric.RobolectricTestRunner
++import java.util.UUID
+ 
+ private const val MOCK_TIME_MILLIS = 1000L
+ 
+@@ -790,16 +792,92 @@ class NimbusMessagingStorageTest {
+         assertFalse(malformedMessageIds.contains("control"))
+     }
+ 
++    @Test
++    fun `GIVEN a message with an action and params THEN do string interpolation`() = runTest {
++        val (feature, _) = createMessagingFeature(
++            actions = mapOf("OPEN_URL" to "://open", "INSTALL_FOCUS" to "market://details?app=org.mozilla.focus"),
++            messages = mapOf(
++                "open-url" to createMessageData(
++                    action = "OPEN_URL",
++                    actionParams = mapOf("url" to "https://mozilla.org"),
++                ),
++
++                // with uuid in the param value
++                "open-url-with-uuid" to createMessageData(
++                    action = "OPEN_URL",
++                    actionParams = mapOf("url" to "https://mozilla.org?uuid={uuid}"),
++                ),
++
++                // with ? in the action
++                "install-focus" to createMessageData(
++                    action = "INSTALL_FOCUS",
++                    actionParams = mapOf("utm" to "my-utm"),
++                ),
++            ),
++        )
++        val storage = NimbusMessagingStorage(
++            testContext,
++            metadataStorage,
++            reportMalformedMessage,
++            nimbus,
++            messagingFeature = feature,
++        )
++
++        val myUuid = UUID.randomUUID().toString()
++        val helper = object : NimbusMessagingHelperInterface {
++            override fun evalJexl(expression: String) = false
++            override fun getUuid(template: String): String? =
++                if (template.contains("{uuid}")) {
++                    myUuid
++                } else {
++                    null
++                }
++
++            override fun stringFormat(template: String, uuid: String?): String =
++                uuid?.let {
++                    template.replace("{uuid}", it)
++                } ?: template
++        }
++
++        run {
++            val message = storage.getMessage("open-url")!!
++            assertEquals(message.action, "://open")
++            val (uuid, url) = storage.generateUuidAndFormatMessage(message, helper)
++            assertEquals(uuid, null)
++            val urlParam = "https://mozilla.org"
++            assertEquals(url, "://open?url=${Uri.encode(urlParam)}")
++        }
++
++        run {
++            val message = storage.getMessage("open-url-with-uuid")!!
++            assertEquals(message.action, "://open")
++            val (uuid, url) = storage.generateUuidAndFormatMessage(message, helper)
++            assertEquals(uuid, myUuid)
++            val urlParam = "https://mozilla.org?uuid=$myUuid"
++            assertEquals(url, "://open?url=${Uri.encode(urlParam)}")
++        }
++
++        run {
++            val message = storage.getMessage("install-focus")!!
++            assertEquals(message.action, "market://details?app=org.mozilla.focus")
++            val (uuid, url) = storage.generateUuidAndFormatMessage(message, helper)
++            assertEquals(uuid, null)
++            assertEquals(url, "market://details?app=org.mozilla.focus&utm=my-utm")
++        }
++    }
++
+     private fun createMessageData(
+         text: String = "text-1",
+         action: String = "action-1",
++        actionParams: Map<String, String> = mapOf(),
+         style: String = "style-1",
+         triggers: List<String> = listOf("trigger-1"),
+         surface: MessageSurfaceId = HOMESCREEN,
+         isControl: Boolean = false,
+         experiment: String? = null,
+     ) = MessageData(
+-        action = Res.string(action),
++        action = action,
++        actionParams = actionParams,
+         style = style,
+         triggerIfAll = triggers,
+         surface = surface,
+diff --git a/fenix/app/src/androidTest/java/org/mozilla/fenix/ui/NimbusMessagingHomescreenTest.kt b/fenix/app/src/androidTest/java/org/mozilla/fenix/ui/NimbusMessagingHomescreenTest.kt
+index 22f4dd412829..95ced206a26c 100644
+--- a/fenix/app/src/androidTest/java/org/mozilla/fenix/ui/NimbusMessagingHomescreenTest.kt
++++ b/fenix/app/src/androidTest/java/org/mozilla/fenix/ui/NimbusMessagingHomescreenTest.kt
+@@ -55,7 +55,7 @@ class NimbusMessagingHomescreenTest : TestSetup() {
+             Messaging(
+                 messages = mapOf(
+                     "test-message" to MessageData(
+-                        action = Res.string("TEST ACTION"),
++                        action = "TEST ACTION",
+                         style = "TEST STYLE",
+                         buttonLabel = Res.string(messageButtonLabel),
+                         text = Res.string(messageText),

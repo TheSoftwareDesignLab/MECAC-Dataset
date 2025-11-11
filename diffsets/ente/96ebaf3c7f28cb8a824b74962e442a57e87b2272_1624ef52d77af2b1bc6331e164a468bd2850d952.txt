@@ -1,0 +1,285 @@
+diff --git a/mobile/lib/app.dart b/mobile/lib/app.dart
+index 55491085c48..c0f1b0950c7 100644
+--- a/mobile/lib/app.dart
++++ b/mobile/lib/app.dart
+@@ -75,7 +75,7 @@ class _EnteAppState extends State<EnteApp> with WidgetsBindingObserver {
+       (event) async {
+         _changeCallbackDebouncer.run(
+           () async =>
+-              unawaited(PeopleHomeWidgetService.instance.peopleChanged()),
++              unawaited(PeopleHomeWidgetService.instance.checkPeopleChanged()),
+         );
+       },
+     );
+diff --git a/mobile/lib/models/ml/face/person.dart b/mobile/lib/models/ml/face/person.dart
+index f373c89303b..9d7d437c770 100644
+--- a/mobile/lib/models/ml/face/person.dart
++++ b/mobile/lib/models/ml/face/person.dart
+@@ -6,19 +6,23 @@ import "package:flutter/foundation.dart";
+ class PersonEntity {
+   final String remoteID;
+   final PersonData data;
++  final DateTime updatedAt;
+   PersonEntity(
+     this.remoteID,
+     this.data,
++    this.updatedAt,
+   );
+ 
+   // copyWith
+   PersonEntity copyWith({
+     String? remoteID,
+     PersonData? data,
++    DateTime? updatedAt,
+   }) {
+     return PersonEntity(
+       remoteID ?? this.remoteID,
+       data ?? this.data,
++      updatedAt ?? this.updatedAt,
+     );
+   }
+ }
+diff --git a/mobile/lib/services/album_home_widget_service.dart b/mobile/lib/services/album_home_widget_service.dart
+index 4bf8864940b..c380bd221e9 100644
+--- a/mobile/lib/services/album_home_widget_service.dart
++++ b/mobile/lib/services/album_home_widget_service.dart
+@@ -110,6 +110,7 @@ class AlbumHomeWidgetService {
+     await _setTotalAlbums(null);
+     await updateAlbumsStatus(WidgetStatus.syncedEmpty);
+     _hasSyncedAlbums = false;
++    await setAlbumsLastHash("");
+     await _refreshWidget(message: "AlbumsHomeWidget cleared & updated");
+   }
+ 
+@@ -386,6 +387,7 @@ class AlbumHomeWidgetService {
+   }
+ 
+   Future<void> _loadAndRenderAlbums() async {
++    final selectedAlbumIds = await _getEffectiveSelectedAlbumIds();
+     final albumsWithFiles = await _getAlbumsWithFiles();
+ 
+     if (albumsWithFiles.isEmpty) {
+@@ -465,7 +467,6 @@ class AlbumHomeWidgetService {
+     }
+ 
+     // Update the hash to track changes
+-    final selectedAlbumIds = await _getEffectiveSelectedAlbumIds();
+     final hash = _calculateHash(selectedAlbumIds);
+     await setAlbumsLastHash(hash);
+ 
+diff --git a/mobile/lib/services/machine_learning/face_ml/person/person_service.dart b/mobile/lib/services/machine_learning/face_ml/person/person_service.dart
+index 7c96a67deac..407cc1b0f1a 100644
+--- a/mobile/lib/services/machine_learning/face_ml/person/person_service.dart
++++ b/mobile/lib/services/machine_learning/face_ml/person/person_service.dart
+@@ -75,7 +75,11 @@ class PersonService {
+     final entities = await entityService.getEntities(EntityType.cgroup);
+     return entities
+         .map(
+-          (e) => PersonEntity(e.id, PersonData.fromJson(json.decode(e.data))),
++          (e) => PersonEntity(
++            e.id,
++            PersonData.fromJson(json.decode(e.data)),
++            DateTime.fromMicrosecondsSinceEpoch(e.updatedAt),
++          ),
+         )
+         .toList();
+   }
+@@ -85,7 +89,11 @@ class PersonService {
+       if (e == null) {
+         return null;
+       }
+-      return PersonEntity(e.id, PersonData.fromJson(json.decode(e.data)));
++      return PersonEntity(
++        e.id,
++        PersonData.fromJson(json.decode(e.data)),
++        DateTime.fromMicrosecondsSinceEpoch(e.updatedAt),
++      );
+     });
+   }
+ 
+@@ -93,8 +101,11 @@ class PersonService {
+     final entities = await entityService.getEntities(EntityType.cgroup);
+     final Map<String, PersonEntity> map = {};
+     for (var e in entities) {
+-      final person =
+-          PersonEntity(e.id, PersonData.fromJson(json.decode(e.data)));
++      final person = PersonEntity(
++        e.id,
++        PersonData.fromJson(json.decode(e.data)),
++        DateTime.fromMicrosecondsSinceEpoch(e.updatedAt),
++      );
+       map[person.remoteID] = person;
+     }
+     return map;
+@@ -211,7 +222,11 @@ class PersonService {
+       await resetEmailToPartialPersonDataCache();
+     }
+     memoriesCacheService.queueUpdateCache();
+-    return PersonEntity(result.id, data);
++    return PersonEntity(
++      result.id,
++      data,
++      DateTime.fromMicrosecondsSinceEpoch(result.updatedAt),
++    );
+   }
+ 
+   Future<void> removeClusterToPerson({
+@@ -287,8 +302,11 @@ class PersonService {
+       if (entity == null) {
+         return;
+       }
+-      final PersonEntity justName =
+-          PersonEntity(personID, PersonData(name: entity.data.name));
++      final PersonEntity justName = PersonEntity(
++        personID,
++        PersonData(name: entity.data.name),
++        entity.updatedAt,
++      );
+       await entityService.addOrUpdate(
+         EntityType.cgroup,
+         justName.data.toJson(),
+diff --git a/mobile/lib/services/people_home_widget_service.dart b/mobile/lib/services/people_home_widget_service.dart
+index d9f618f6fca..530cc60194d 100644
+--- a/mobile/lib/services/people_home_widget_service.dart
++++ b/mobile/lib/services/people_home_widget_service.dart
+@@ -1,6 +1,8 @@
++import "dart:convert";
+ import "dart:math";
+ 
+ import "package:collection/collection.dart";
++import "package:crypto/crypto.dart";
+ import 'package:flutter/material.dart';
+ import 'package:fluttertoast/fluttertoast.dart';
+ import 'package:logging/logging.dart';
+@@ -23,6 +25,7 @@ import 'package:synchronized/synchronized.dart';
+ class PeopleHomeWidgetService {
+   // Constants
+   static const String SELECTED_PEOPLE_KEY = "selectedPeopleHW";
++  static const String PEOPLE_LAST_HASH_KEY = "peopleLastHash";
+   static const String ANDROID_CLASS_NAME = "EntePeopleWidgetProvider";
+   static const String IOS_CLASS_NAME = "EntePeopleWidget";
+   static const String PEOPLE_STATUS_KEY = "peopleStatusKey.widget";
+@@ -39,6 +42,7 @@ class PeopleHomeWidgetService {
+   final Logger _logger = Logger((PeopleHomeWidgetService).toString());
+   late final SharedPreferences _prefs;
+   final _peopleForceRefreshLock = Lock();
++  final _lock2 = Lock();
+   bool _hasSyncedPeople = false;
+ 
+   // Initialization
+@@ -69,6 +73,14 @@ class PeopleHomeWidgetService {
+     await updatePeopleChanged(true);
+   }
+ 
++  String? getPeopleLastHash() {
++    return _prefs.getString(PEOPLE_LAST_HASH_KEY);
++  }
++
++  Future<void> setPeopleLastHash(String hash) async {
++    await _prefs.setString(PEOPLE_LAST_HASH_KEY, hash);
++  }
++
+   Future<int> countHomeWidgets() async {
+     return await HomeWidgetService.instance.countHomeWidgets(
+       ANDROID_CLASS_NAME,
+@@ -112,6 +124,7 @@ class PeopleHomeWidgetService {
+     await _setTotalPeople(null);
+     _hasSyncedPeople = false;
+     await updatePeopleStatus(WidgetStatus.syncedEmpty);
++    await setPeopleLastHash("");
+     await _refreshWidget(message: "PeopleHomeWidget cleared & updated");
+   }
+ 
+@@ -147,20 +160,23 @@ class PeopleHomeWidgetService {
+     await HomeWidgetService.instance.initHomeWidget();
+   }
+ 
+-  Future<void> peopleChanged() async {
+-    await updatePeopleChanged(true);
+-
+-    final cachedMemories = await _getPeople();
+-    final currentTotal = cachedMemories.length;
+-    final existingTotal = await _getTotalPeople() ?? 0;
++  Future<void> checkPeopleChanged() async {
++    final havePeopleChanged = await _lock2.synchronized(() async {
++      final peopleIds = await _getEffectiveSelectedPeopleIds();
++      final currentHash = await _calculateHash(peopleIds);
++      final lastHash = getPeopleLastHash();
++      if (peopleIds.isEmpty || currentHash == lastHash) {
++        return false;
++      }
++      return true;
++    });
+ 
+-    if (existingTotal == currentTotal && existingTotal == 0) {
+-      await updatePeopleChanged(false);
+-      _logger.info("People empty, no update needed");
++    _logger.info("People changed, updating widget");
++    await updatePeopleChanged(havePeopleChanged);
++    if (!havePeopleChanged) {
++      _logger.info("No changes detected in people, skipping update");
+       return;
+     }
+-
+-    _logger.info("People changed, updating widget");
+     await initHomeWidget(true);
+   }
+ 
+@@ -219,6 +235,26 @@ class PeopleHomeWidgetService {
+     await updatePeopleChanged(false);
+   }
+ 
++  Future<String> _calculateHash(List<String> peopleIds) async {
++    String updationTimestamps = "";
++    // Check if selected people exist
++    for (final id in peopleIds) {
++      try {
++        final person = await PersonService.instance.getPerson(id);
++        if (person != null) {
++          updationTimestamps += "${person.updatedAt.toString()}_";
++        }
++      } catch (e) {
++        _logger.warning("Error looking up people: $e");
++      }
++    }
++    final hash = md5
++        .convert(utf8.encode(updationTimestamps))
++        .toString()
++        .substring(0, 10);
++    return hash;
++  }
++
+   Future<bool> _hasAnyBlockers() async {
+     // Check if first import is completed
+     final hasCompletedFirstImport =
+@@ -363,6 +399,7 @@ class PeopleHomeWidgetService {
+   }
+ 
+   Future<void> _loadAndRenderPeople() async {
++    final peopleIds = await _getEffectiveSelectedPeopleIds();
+     final peopleWithFiles = await _getPeople();
+ 
+     if (peopleWithFiles.isEmpty) {
+@@ -448,6 +485,9 @@ class PeopleHomeWidgetService {
+       await updatePeopleStatus(WidgetStatus.syncedAll);
+     }
+ 
++    final hash = await _calculateHash(peopleIds);
++    await setPeopleLastHash(hash);
++
+     await _refreshWidget(
+       message: "Switched to next people set, total: $renderedCount",
+     );
+diff --git a/mobile/lib/ui/settings/widgets/people_widget_settings.dart b/mobile/lib/ui/settings/widgets/people_widget_settings.dart
+index 564aa736e54..a0d0abbaaaa 100644
+--- a/mobile/lib/ui/settings/widgets/people_widget_settings.dart
++++ b/mobile/lib/ui/settings/widgets/people_widget_settings.dart
+@@ -72,7 +72,7 @@ class _PeopleWidgetSettingsState extends State<PeopleWidgetSettings> {
+                             );
+                             Navigator.pop(context);
+                             await PeopleHomeWidgetService.instance
+-                                .peopleChanged();
++                                .checkPeopleChanged();
+                           },
+                   );
+                 },

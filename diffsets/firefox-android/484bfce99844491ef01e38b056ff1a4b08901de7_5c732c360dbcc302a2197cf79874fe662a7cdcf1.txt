@@ -1,0 +1,656 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/search/SearchController.kt b/fenix/app/src/main/java/org/mozilla/fenix/search/SearchController.kt
+index 8e668c7eac75..058bf715b633 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/search/SearchController.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/search/SearchController.kt
+@@ -4,7 +4,13 @@
+ 
+ package org.mozilla.fenix.search
+ 
++import android.content.DialogInterface
+ import android.content.Intent
++import android.net.Uri
++import android.os.Build
++import android.text.SpannableString
++import androidx.annotation.VisibleForTesting
++import androidx.appcompat.app.AlertDialog
+ import androidx.navigation.NavController
+ import mozilla.components.browser.search.SearchEngine
+ import mozilla.components.browser.session.Session
+@@ -29,6 +35,7 @@ import org.mozilla.fenix.utils.Settings
+ /**
+  * An interface that handles the view manipulation of the Search, triggered by the Interactor
+  */
++@Suppress("TooManyFunctions")
+ interface SearchController {
+     fun handleUrlCommitted(url: String)
+     fun handleEditingCancelled()
+@@ -40,6 +47,7 @@ interface SearchController {
+     fun handleExistingSessionSelected(session: Session)
+     fun handleExistingSessionSelected(tabId: String)
+     fun handleSearchShortcutsButtonClicked()
++    fun handleCameraPermissionsNeeded()
+ }
+ 
+ @Suppress("TooManyFunctions", "LongParameterList")
+@@ -194,4 +202,51 @@ class DefaultSearchController(
+             handleExistingSessionSelected(session)
+         }
+     }
++
++    /**
++     * Creates and shows an [AlertDialog] when camera permissions are needed.
++     *
++     * In versions above M, [AlertDialog.BUTTON_POSITIVE] takes the user to the app settings. This
++     * intent only exists in M and above. Below M, [AlertDialog.BUTTON_POSITIVE] routes to a SUMO
++     * help page to find the app settings.
++     *
++     * [AlertDialog.BUTTON_NEGATIVE] dismisses the dialog.
++     */
++    override fun handleCameraPermissionsNeeded() {
++        val dialog = buildDialog()
++        dialog.show()
++    }
++
++    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
++    fun buildDialog(): AlertDialog.Builder {
++        return AlertDialog.Builder(activity).apply {
++            val spannableText = SpannableString(
++                activity.resources.getString(R.string.camera_permissions_needed_message)
++            )
++            setMessage(spannableText)
++            setNegativeButton(R.string.camera_permissions_needed_negative_button_text) {
++                    dialog: DialogInterface, _ ->
++                dialog.cancel()
++            }
++            setPositiveButton(R.string.camera_permissions_needed_positive_button_text) {
++                    dialog: DialogInterface, _ ->
++                val intent: Intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
++                    Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
++                } else {
++                    SupportUtils.createCustomTabIntent(
++                        activity,
++                        SupportUtils.getSumoURLForTopic(
++                            activity,
++                            SupportUtils.SumoTopic.QR_CAMERA_ACCESS
++                        )
++                    )
++                }
++                val uri = Uri.fromParts("package", activity.packageName, null)
++                intent.data = uri
++                dialog.cancel()
++                activity.startActivity(intent)
++            }
++            create()
++        }
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/search/SearchFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/search/SearchFragment.kt
+index 01877979e4b6..0da68c01db25 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/search/SearchFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/search/SearchFragment.kt
+@@ -26,6 +26,7 @@ import androidx.core.widget.NestedScrollView
+ import androidx.fragment.app.Fragment
+ import androidx.navigation.fragment.findNavController
+ import androidx.navigation.fragment.navArgs
++import androidx.preference.PreferenceManager
+ import kotlinx.android.synthetic.main.fragment_search.*
+ import kotlinx.android.synthetic.main.fragment_search.view.*
+ import kotlinx.android.synthetic.main.search_suggestions_hint.view.*
+@@ -50,6 +51,7 @@ import org.mozilla.fenix.components.metrics.Event
+ import org.mozilla.fenix.components.searchengine.CustomSearchEngineStore
+ import org.mozilla.fenix.components.searchengine.FenixSearchEngineProvider
+ import org.mozilla.fenix.ext.components
++import org.mozilla.fenix.ext.getPreferenceKey
+ import org.mozilla.fenix.ext.hideToolbar
+ import org.mozilla.fenix.ext.requireComponents
+ import org.mozilla.fenix.ext.settings
+@@ -219,6 +221,7 @@ class SearchFragment : Fragment(), UserInteractionHandler {
+                             setNegativeButton(R.string.qr_scanner_dialog_negative) { dialog: DialogInterface, _ ->
+                                 requireComponents.analytics.metrics.track(Event.QRScannerNavigationDenied)
+                                 dialog.cancel()
++                                resetFocus()
+                             }
+                             setPositiveButton(R.string.qr_scanner_dialog_positive) { dialog: DialogInterface, _ ->
+                                 requireComponents.analytics.metrics.track(Event.QRScannerNavigationAllowed)
+@@ -229,6 +232,7 @@ class SearchFragment : Fragment(), UserInteractionHandler {
+                                         from = BrowserDirection.FromSearch
+                                     )
+                                 dialog.dismiss()
++                                resetFocus()
+                             }
+                             create()
+                         }.show()
+@@ -241,8 +245,19 @@ class SearchFragment : Fragment(), UserInteractionHandler {
+ 
+         view.search_scan_button.setOnClickListener {
+             toolbarView.view.clearFocus()
+-            requireComponents.analytics.metrics.track(Event.QRScannerOpened)
+-            qrFeature.get()?.scan(R.id.container)
++
++            val cameraPermissionsDenied = PreferenceManager.getDefaultSharedPreferences(context)
++                .getBoolean(
++                    getPreferenceKey(R.string.pref_key_camera_permissions),
++                    false
++                )
++
++            if (cameraPermissionsDenied) {
++                searchInteractor.onCameraPermissionsNeeded()
++            } else {
++                requireComponents.analytics.metrics.track(Event.QRScannerOpened)
++                qrFeature.get()?.scan(R.id.container)
++            }
+         }
+ 
+         view.search_engines_shortcut_button.setOnClickListener {
+@@ -368,15 +383,19 @@ class SearchFragment : Fragment(), UserInteractionHandler {
+     override fun onBackPressed(): Boolean {
+         return when {
+             qrFeature.onBackPressed() -> {
+-                toolbarView.view.edit.focus()
+-                view?.search_scan_button?.isChecked = false
+-                toolbarView.view.requestFocus()
++                resetFocus()
+                 true
+             }
+             else -> false
+         }
+     }
+ 
++    private fun resetFocus() {
++        search_scan_button.isChecked = false
++        toolbarView.view.edit.focus()
++        toolbarView.view.requestFocus()
++    }
++
+     private fun updateSearchWithLabel(searchState: SearchFragmentState) {
+         search_engine_shortcut.visibility =
+             if (searchState.showSearchShortcuts) View.VISIBLE else View.GONE
+@@ -408,8 +427,16 @@ class SearchFragment : Fragment(), UserInteractionHandler {
+                 context?.let { context: Context ->
+                     if (context.isPermissionGranted(Manifest.permission.CAMERA)) {
+                         permissionDidUpdate = true
++                        PreferenceManager.getDefaultSharedPreferences(context)
++                            .edit().putBoolean(
++                                getPreferenceKey(R.string.pref_key_camera_permissions), false
++                            ).apply()
+                     } else {
+-                        view?.search_scan_button?.isChecked = false
++                        PreferenceManager.getDefaultSharedPreferences(context)
++                            .edit().putBoolean(
++                                getPreferenceKey(R.string.pref_key_camera_permissions), true
++                            ).apply()
++                        resetFocus()
+                     }
+                 }
+             }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/search/SearchInteractor.kt b/fenix/app/src/main/java/org/mozilla/fenix/search/SearchInteractor.kt
+index dc4080aa4dca..823945453e06 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/search/SearchInteractor.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/search/SearchInteractor.kt
+@@ -13,6 +13,7 @@ import org.mozilla.fenix.search.toolbar.ToolbarInteractor
+  * Interactor for the search screen
+  * Provides implementations for the AwesomeBarView and ToolbarView
+  */
++@Suppress("TooManyFunctions")
+ class SearchInteractor(
+     private val searchController: SearchController
+ ) : AwesomeBarInteractor, ToolbarInteractor {
+@@ -56,4 +57,8 @@ class SearchInteractor(
+     override fun onExistingSessionSelected(tabId: String) {
+         searchController.handleExistingSessionSelected(tabId)
+     }
++
++    fun onCameraPermissionsNeeded() {
++        searchController.handleCameraPermissionsNeeded()
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/searchdialog/SearchDialogController.kt b/fenix/app/src/main/java/org/mozilla/fenix/searchdialog/SearchDialogController.kt
+index 8f210124a3ca..476a7d615e27 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/searchdialog/SearchDialogController.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/searchdialog/SearchDialogController.kt
+@@ -4,7 +4,13 @@
+ 
+ package org.mozilla.fenix.searchdialog
+ 
++import android.content.DialogInterface
+ import android.content.Intent
++import android.net.Uri
++import android.os.Build
++import android.text.SpannableString
++import androidx.annotation.VisibleForTesting
++import androidx.appcompat.app.AlertDialog
+ import androidx.navigation.NavController
+ import mozilla.components.browser.search.SearchEngine
+ import mozilla.components.browser.session.Session
+@@ -186,4 +192,50 @@ class SearchDialogController(
+             handleExistingSessionSelected(session)
+         }
+     }
++
++    /**
++     * Creates and shows an [AlertDialog] when camera permissions are needed.
++     *
++     * In versions above M, [AlertDialog.BUTTON_POSITIVE] takes the user to the app settings. This
++     * intent only exists in M and above. Below M, [AlertDialog.BUTTON_POSITIVE] routes to a SUMO
++     * help page to find the app settings.
++     *
++     * [AlertDialog.BUTTON_NEGATIVE] dismisses the dialog.
++     */
++    override fun handleCameraPermissionsNeeded() {
++        val dialog = buildDialog()
++        dialog.show()
++    }
++
++    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
++    fun buildDialog(): AlertDialog.Builder {
++        return AlertDialog.Builder(activity).apply {
++            val spannableText = SpannableString(
++                activity.resources.getString(R.string.camera_permissions_needed_message)
++            )
++            setMessage(spannableText)
++            setNegativeButton(R.string.camera_permissions_needed_negative_button_text) { _, _ ->
++                dismissDialog()
++            }
++            setPositiveButton(R.string.camera_permissions_needed_positive_button_text) {
++                    dialog: DialogInterface, _ ->
++                val intent: Intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
++                    Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
++                } else {
++                    SupportUtils.createCustomTabIntent(
++                        activity,
++                        SupportUtils.getSumoURLForTopic(
++                            activity,
++                            SupportUtils.SumoTopic.QR_CAMERA_ACCESS
++                        )
++                    )
++                }
++                val uri = Uri.fromParts("package", activity.packageName, null)
++                intent.data = uri
++                dialog.cancel()
++                activity.startActivity(intent)
++            }
++            create()
++        }
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/searchdialog/SearchDialogFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/searchdialog/SearchDialogFragment.kt
+index 9a1d1d0b832e..b5c7e9a88ab8 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/searchdialog/SearchDialogFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/searchdialog/SearchDialogFragment.kt
+@@ -4,6 +4,7 @@
+ 
+ package org.mozilla.fenix.searchdialog
+ 
++import android.Manifest
+ import android.app.Activity
+ import android.app.Dialog
+ import android.content.Context
+@@ -28,11 +29,8 @@ import androidx.core.content.ContextCompat
+ import androidx.core.view.isVisible
+ import androidx.navigation.fragment.findNavController
+ import androidx.navigation.fragment.navArgs
++import androidx.preference.PreferenceManager
+ import kotlinx.android.synthetic.main.fragment_search_dialog.*
+-import kotlinx.android.synthetic.main.fragment_search_dialog.fill_link_from_clipboard
+-import kotlinx.android.synthetic.main.fragment_search_dialog.pill_wrapper
+-import kotlinx.android.synthetic.main.fragment_search_dialog.qr_scan_button
+-import kotlinx.android.synthetic.main.fragment_search_dialog.toolbar
+ import kotlinx.android.synthetic.main.fragment_search_dialog.view.*
+ import kotlinx.android.synthetic.main.search_suggestions_hint.view.*
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+@@ -44,6 +42,7 @@ import mozilla.components.support.base.feature.UserInteractionHandler
+ import mozilla.components.support.base.feature.ViewBoundFeatureWrapper
+ import mozilla.components.support.ktx.android.content.getColorFromAttr
+ import mozilla.components.support.ktx.android.content.hasCamera
++import mozilla.components.support.ktx.android.content.isPermissionGranted
+ import mozilla.components.support.ktx.android.content.res.getSpanned
+ import mozilla.components.support.ktx.android.view.hideKeyboard
+ import mozilla.components.ui.autocomplete.InlineAutocompleteEditText
+@@ -55,6 +54,7 @@ import org.mozilla.fenix.components.searchengine.CustomSearchEngineStore
+ import org.mozilla.fenix.components.searchengine.FenixSearchEngineProvider
+ import org.mozilla.fenix.components.toolbar.ToolbarPosition
+ import org.mozilla.fenix.ext.components
++import org.mozilla.fenix.ext.getPreferenceKey
+ import org.mozilla.fenix.ext.requireComponents
+ import org.mozilla.fenix.ext.settings
+ import org.mozilla.fenix.search.SearchFragmentAction
+@@ -204,8 +204,22 @@ class SearchDialogFragment : AppCompatDialogFragment(), UserInteractionHandler {
+             if (!requireContext().hasCamera()) { return@setOnClickListener }
+ 
+             toolbarView.view.clearFocus()
+-            requireComponents.analytics.metrics.track(Event.QRScannerOpened)
+-            qrFeature.get()?.scan(R.id.search_wrapper)
++
++            val cameraPermissionsDenied =
++                PreferenceManager.getDefaultSharedPreferences(context).getBoolean(
++                    getPreferenceKey(R.string.pref_key_camera_permissions),
++                    false
++                )
++
++            if (cameraPermissionsDenied) {
++                interactor.onCameraPermissionsNeeded()
++                resetFocus()
++                view.hideKeyboard()
++                toolbarView.view.requestFocus()
++            } else {
++                requireComponents.analytics.metrics.track(Event.QRScannerOpened)
++                qrFeature.get()?.scan(R.id.search_wrapper)
++            }
+         }
+ 
+         fill_link_from_clipboard.setOnClickListener {
+@@ -280,6 +294,19 @@ class SearchDialogFragment : AppCompatDialogFragment(), UserInteractionHandler {
+         }
+     }
+ 
++    override fun onResume() {
++        super.onResume()
++        resetFocus()
++        toolbarView.view.edit.focus()
++    }
++
++    override fun onPause() {
++        super.onPause()
++        qr_scan_button.isChecked = false
++        view?.hideKeyboard()
++        toolbarView.view.requestFocus()
++    }
++
+     override fun onActivityResult(requestCode: Int, resultCode: Int, intent: Intent?) {
+         if (requestCode == VoiceSearchActivity.SPEECH_REQUEST_CODE && resultCode == Activity.RESULT_OK) {
+             intent?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.first()?.also {
+@@ -293,9 +320,7 @@ class SearchDialogFragment : AppCompatDialogFragment(), UserInteractionHandler {
+     override fun onBackPressed(): Boolean {
+         return when {
+             qrFeature.onBackPressed() -> {
+-                toolbarView.view.edit.focus()
+-                view?.qr_scan_button?.isChecked = false
+-                toolbarView.view.requestFocus()
++                resetFocus()
+                 true
+             }
+             else -> {
+@@ -350,6 +375,39 @@ class SearchDialogFragment : AppCompatDialogFragment(), UserInteractionHandler {
+             })
+     }
+ 
++    override fun onRequestPermissionsResult(
++        requestCode: Int,
++        permissions: Array<String>,
++        grantResults: IntArray
++    ) {
++        when (requestCode) {
++            REQUEST_CODE_CAMERA_PERMISSIONS -> qrFeature.withFeature {
++                context?.let { context: Context ->
++                    it.onPermissionsResult(permissions, grantResults)
++                    if (!context.isPermissionGranted(Manifest.permission.CAMERA)) {
++                        PreferenceManager.getDefaultSharedPreferences(context)
++                            .edit().putBoolean(
++                                getPreferenceKey(R.string.pref_key_camera_permissions), true
++                            ).apply()
++                        resetFocus()
++                    } else {
++                        PreferenceManager.getDefaultSharedPreferences(context)
++                            .edit().putBoolean(
++                                getPreferenceKey(R.string.pref_key_camera_permissions), false
++                            ).apply()
++                    }
++                }
++            }
++            else -> super.onRequestPermissionsResult(requestCode, permissions, grantResults)
++        }
++    }
++
++    private fun resetFocus() {
++        qr_scan_button.isChecked = false
++        toolbarView.view.edit.focus()
++        toolbarView.view.requestFocus()
++    }
++
+     private fun setupConstraints(view: View) {
+         if (view.context.settings().toolbarPosition == ToolbarPosition.BOTTOM) {
+             ConstraintSet().apply {
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/PairFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/PairFragment.kt
+index b1127f2ce5ca..b7a20951ce52 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/PairFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/PairFragment.kt
+@@ -4,27 +4,35 @@
+ 
+ package org.mozilla.fenix.settings
+ 
++import android.content.DialogInterface
++import android.content.Intent
+ import android.content.pm.PackageManager
+ import android.os.Build
+ import android.os.Bundle
+ import android.os.VibrationEffect
+ import android.os.Vibrator
++import android.provider.Settings
++import android.text.SpannableString
+ import android.view.View
++import androidx.appcompat.app.AlertDialog
+ import androidx.core.content.ContextCompat
+ import androidx.core.content.getSystemService
+ import androidx.fragment.app.Fragment
+ import androidx.navigation.fragment.NavHostFragment.findNavController
+ import androidx.navigation.fragment.findNavController
++import androidx.preference.PreferenceManager
+ import mozilla.components.feature.qr.QrFeature
+ import mozilla.components.support.base.feature.UserInteractionHandler
+ import mozilla.components.support.base.feature.ViewBoundFeatureWrapper
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ext.getPreferenceKey
+ import org.mozilla.fenix.ext.requireComponents
+ import org.mozilla.fenix.ext.showToolbar
+ 
+ class PairFragment : Fragment(R.layout.fragment_pair), UserInteractionHandler {
+ 
+     private val qrFeature = ViewBoundFeatureWrapper<QrFeature>()
++    private val preferences = PreferenceManager.getDefaultSharedPreferences(context)
+ 
+     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+         super.onViewCreated(view, savedInstanceState)
+@@ -63,8 +71,17 @@ class PairFragment : Fragment(R.layout.fragment_pair), UserInteractionHandler {
+             view = view
+         )
+ 
++        val cameraPermissionsDenied = preferences.getBoolean(
++            getPreferenceKey(R.string.pref_key_camera_permissions),
++            false
++        )
++
+         qrFeature.withFeature {
+-            it.scan(R.id.pair_layout)
++            if (cameraPermissionsDenied) {
++                showPermissionsNeededDialog()
++            } else {
++                it.scan(R.id.pair_layout)
++            }
+         }
+     }
+ 
+@@ -99,10 +116,55 @@ class PairFragment : Fragment(R.layout.fragment_pair), UserInteractionHandler {
+                     qrFeature.withFeature {
+                         it.onPermissionsResult(permissions, grantResults)
+                     }
++                    preferences.edit().putBoolean(
++                        getPreferenceKey(R.string.pref_key_camera_permissions), false
++                    ).apply()
+                 } else {
++                    preferences.edit().putBoolean(
++                        getPreferenceKey(R.string.pref_key_camera_permissions), true
++                    ).apply()
+                     findNavController().popBackStack(R.id.turnOnSyncFragment, false)
+                 }
+             }
+         }
+     }
++
++    /**
++     * Shows an [AlertDialog] when camera permissions are needed.
++     *
++     * In versions above M, [AlertDialog.BUTTON_POSITIVE] takes the user to the app settings. This
++     * intent only exists in M and above. Below M, [AlertDialog.BUTTON_POSITIVE] routes to a SUMO
++     * help page to find the app settings.
++     *
++     * [AlertDialog.BUTTON_NEGATIVE] dismisses the dialog.
++     */
++    private fun showPermissionsNeededDialog() {
++        AlertDialog.Builder(requireContext()).apply {
++            val spannableText = SpannableString(
++                resources.getString(R.string.camera_permissions_needed_message)
++            )
++            setMessage(spannableText)
++            setNegativeButton(R.string.camera_permissions_needed_negative_button_text) {
++                    dialog: DialogInterface, _ ->
++                dialog.cancel()
++            }
++            setPositiveButton(R.string.camera_permissions_needed_positive_button_text) {
++                    dialog: DialogInterface, _ ->
++                val intent: Intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
++                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
++                } else {
++                    SupportUtils.createCustomTabIntent(
++                        requireContext(),
++                        SupportUtils.getSumoURLForTopic(
++                            requireContext(),
++                            SupportUtils.SumoTopic.QR_CAMERA_ACCESS
++                        )
++                    )
++                }
++                dialog.cancel()
++                startActivity(intent)
++            }
++            create()
++        }.show()
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/SupportUtils.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/SupportUtils.kt
+index 3e1bae04a9f0..07fef7c93130 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/SupportUtils.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/SupportUtils.kt
+@@ -40,7 +40,8 @@ object SupportUtils {
+         SEARCH_SUGGESTION("how-search-firefox-preview"),
+         CUSTOM_SEARCH_ENGINES("custom-search-engines"),
+         UPGRADE_FAQ("firefox-preview-upgrade-faqs"),
+-        SYNC_SETUP("how-set-firefox-sync-firefox-preview")
++        SYNC_SETUP("how-set-firefox-sync-firefox-preview"),
++        QR_CAMERA_ACCESS("qr-camera-access")
+     }
+ 
+     enum class MozillaPage(internal val path: String) {
+diff --git a/fenix/app/src/main/res/values/preference_keys.xml b/fenix/app/src/main/res/values/preference_keys.xml
+index cb27836a4728..98aa99d536a6 100644
+--- a/fenix/app/src/main/res/values/preference_keys.xml
++++ b/fenix/app/src/main/res/values/preference_keys.xml
+@@ -222,4 +222,6 @@
+     <string name="pref_key_close_tabs_after_one_day" translatable="false">pref_key_close_tabs_after_one_day</string>
+     <string name="pref_key_close_tabs_after_one_week" translatable="false">pref_key_close_tabs_after_one_week</string>
+     <string name="pref_key_close_tabs_after_one_month" translatable="false">pref_key_close_tabs_after_one_month</string>
++
++    <string name="pref_key_camera_permissions" translatable="false">pref_key_camera_permissions</string>
+ </resources>
+diff --git a/fenix/app/src/main/res/values/strings.xml b/fenix/app/src/main/res/values/strings.xml
+index 433d1d99ffeb..abd5168b8a9c 100644
+--- a/fenix/app/src/main/res/values/strings.xml
++++ b/fenix/app/src/main/res/values/strings.xml
+@@ -1543,7 +1543,7 @@
+     <!-- Content description for close button in collection placeholder. -->
+     <string name="remove_home_collection_placeholder_content_description">Remove</string>
+ 
+-    <!-- depcrecated: text for the firefox account onboarding card header
++    <!-- Deprecated: text for the firefox account onboarding card header
+     The first parameter is the name of the app (e.g. Firefox Preview) -->
+     <string name="onboarding_firefox_account_header">Get the most out of %s.</string>
+ 
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/search/DefaultSearchControllerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/search/DefaultSearchControllerTest.kt
+index d6a223342832..52b8dbbf029d 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/search/DefaultSearchControllerTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/search/DefaultSearchControllerTest.kt
+@@ -4,6 +4,7 @@
+ 
+ package org.mozilla.fenix.search
+ 
++import androidx.appcompat.app.AlertDialog
+ import androidx.navigation.NavController
+ import androidx.navigation.NavDirections
+ import io.mockk.MockKAnnotations
+@@ -13,6 +14,7 @@ import io.mockk.impl.annotations.MockK
+ import io.mockk.just
+ import io.mockk.mockk
+ import io.mockk.mockkObject
++import io.mockk.spyk
+ import io.mockk.unmockkObject
+ import io.mockk.verify
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+@@ -32,6 +34,8 @@ import org.mozilla.fenix.components.metrics.MetricsUtils
+ import org.mozilla.fenix.settings.SupportUtils
+ import org.mozilla.fenix.utils.Settings
+ 
++typealias AlertDialogBuilder = AlertDialog.Builder
++
+ @ExperimentalCoroutinesApi
+ class DefaultSearchControllerTest {
+ 
+@@ -58,7 +62,6 @@ class DefaultSearchControllerTest {
+             every { id } returns R.id.searchFragment
+         }
+         every { MetricsUtils.createSearchEvent(searchEngine, activity, any()) } returns null
+-
+         controller = DefaultSearchController(
+             activity = activity,
+             sessionManager = sessionManager,
+@@ -328,4 +331,16 @@ class DefaultSearchControllerTest {
+         verify { sessionManager.select(any()) }
+         verify { activity.openToBrowser(from = BrowserDirection.FromSearch) }
+     }
++
++    @Test
++    fun `show camera permissions needed dialog`() {
++        val dialogBuilder: AlertDialogBuilder = mockk(relaxed = true)
++
++        val spyController = spyk(controller)
++        every { spyController.buildDialog() } returns dialogBuilder
++
++        spyController.handleCameraPermissionsNeeded()
++
++        verify { dialogBuilder.show() }
++    }
+ }
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/searchdialog/SearchDialogControllerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/searchdialog/SearchDialogControllerTest.kt
+index 0aaed6fe8cd4..d30fde735d97 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/searchdialog/SearchDialogControllerTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/searchdialog/SearchDialogControllerTest.kt
+@@ -13,6 +13,7 @@ import io.mockk.impl.annotations.MockK
+ import io.mockk.just
+ import io.mockk.mockk
+ import io.mockk.mockkObject
++import io.mockk.spyk
+ import io.mockk.unmockkObject
+ import io.mockk.verify
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+@@ -29,6 +30,7 @@ import org.mozilla.fenix.R
+ import org.mozilla.fenix.components.metrics.Event
+ import org.mozilla.fenix.components.metrics.MetricController
+ import org.mozilla.fenix.components.metrics.MetricsUtils
++import org.mozilla.fenix.search.AlertDialogBuilder
+ import org.mozilla.fenix.search.SearchFragmentAction
+ import org.mozilla.fenix.settings.SupportUtils
+ import org.mozilla.fenix.utils.Settings
+@@ -342,4 +344,16 @@ class SearchDialogControllerTest {
+         verify { sessionManager.select(any()) }
+         verify { activity.openToBrowser(from = BrowserDirection.FromSearchDialog) }
+     }
++
++    @Test
++    fun `show camera permissions needed dialog`() {
++        val dialogBuilder: AlertDialogBuilder = mockk(relaxed = true)
++
++        val spyController = spyk(controller)
++        every { spyController.buildDialog() } returns dialogBuilder
++
++        spyController.handleCameraPermissionsNeeded()
++
++        verify { dialogBuilder.show() }
++    }
+ }

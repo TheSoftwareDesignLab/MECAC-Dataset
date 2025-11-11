@@ -1,0 +1,347 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryController.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryController.kt
+index 0d47d73f7455..867c37bd6b84 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryController.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryController.kt
+@@ -10,6 +10,8 @@ import android.content.ClipData
+ import android.content.ClipboardManager
+ import android.content.res.Resources
+ import androidx.navigation.NavController
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.launch
+ import mozilla.components.concept.engine.prompt.ShareData
+ import org.mozilla.fenix.R
+ import org.mozilla.fenix.browser.browsingmode.BrowsingMode
+@@ -25,6 +27,7 @@ interface HistoryController {
+     fun handleDeleteSome(items: Set<HistoryItem>)
+     fun handleCopyUrl(item: HistoryItem)
+     fun handleShare(item: HistoryItem)
++    fun handleRequestSync()
+ }
+ 
+ class DefaultHistoryController(
+@@ -33,16 +36,21 @@ class DefaultHistoryController(
+     private val resources: Resources,
+     private val snackbar: FenixSnackbar,
+     private val clipboardManager: ClipboardManager,
++    private val scope: CoroutineScope,
+     private val openToBrowser: (item: HistoryItem, mode: BrowsingMode?) -> Unit,
+     private val displayDeleteAll: () -> Unit,
+     private val invalidateOptionsMenu: () -> Unit,
+-    private val deleteHistoryItems: (Set<HistoryItem>) -> Unit
++    private val deleteHistoryItems: (Set<HistoryItem>) -> Unit,
++    private val syncHistory: suspend () -> Unit
+ ) : HistoryController {
+     override fun handleOpen(item: HistoryItem, mode: BrowsingMode?) {
+         openToBrowser(item, mode)
+     }
+ 
+     override fun handleSelect(item: HistoryItem) {
++        if (store.state.mode === HistoryFragmentState.Mode.Syncing) {
++            return
++        }
+         store.dispatch(HistoryFragmentAction.AddItemForRemoval(item))
+     }
+ 
+@@ -87,4 +95,12 @@ class DefaultHistoryController(
+             )
+         )
+     }
++
++    override fun handleRequestSync() {
++        scope.launch {
++            store.dispatch(HistoryFragmentAction.StartSync)
++            syncHistory.invoke()
++            store.dispatch(HistoryFragmentAction.FinishSync)
++        }
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryFragment.kt
+index 18d48197077d..ffc327cec0a8 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryFragment.kt
+@@ -24,6 +24,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
+ import kotlinx.coroutines.launch
+ import mozilla.components.concept.engine.prompt.ShareData
+ import mozilla.components.lib.state.ext.consumeFrom
++import mozilla.components.service.fxa.sync.SyncReason
+ import mozilla.components.support.base.feature.UserInteractionHandler
+ import org.mozilla.fenix.BrowserDirection
+ import org.mozilla.fenix.HomeActivity
+@@ -72,10 +73,12 @@ class HistoryFragment : LibraryPageFragment<HistoryItem>(), UserInteractionHandl
+                 isDisplayedWithBrowserToolbar = false
+             ),
+             activity?.getSystemService(CLIPBOARD_SERVICE) as ClipboardManager,
++            lifecycleScope,
+             ::openItem,
+             ::displayDeleteAllDialog,
+             ::invalidateOptionsMenu,
+-            ::deleteHistoryItems
++            ::deleteHistoryItems,
++            ::syncHistory
+         )
+         historyInteractor = HistoryInteractor(
+             historyController
+@@ -268,4 +271,10 @@ class HistoryFragment : LibraryPageFragment<HistoryItem>(), UserInteractionHandl
+         )
+         nav(R.id.historyFragment, directions)
+     }
++
++    private suspend fun syncHistory() {
++        val accountManager = requireComponents.backgroundServices.accountManager
++        accountManager.syncNowAsync(SyncReason.User).await()
++        viewModel.invalidate()
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryFragmentStore.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryFragmentStore.kt
+index 44ea6e1ccb15..5b16b200c112 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryFragmentStore.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryFragmentStore.kt
+@@ -32,6 +32,8 @@ sealed class HistoryFragmentAction : Action {
+     data class RemoveItemForRemoval(val item: HistoryItem) : HistoryFragmentAction()
+     object EnterDeletionMode : HistoryFragmentAction()
+     object ExitDeletionMode : HistoryFragmentAction()
++    object StartSync : HistoryFragmentAction()
++    object FinishSync : HistoryFragmentAction()
+ }
+ 
+ /**
+@@ -45,6 +47,7 @@ data class HistoryFragmentState(val items: List<HistoryItem>, val mode: Mode) :
+ 
+         object Normal : Mode()
+         object Deleting : Mode()
++        object Syncing : Mode()
+         data class Editing(override val selectedItems: Set<HistoryItem>) : Mode()
+     }
+ }
+@@ -72,5 +75,7 @@ private fun historyStateReducer(
+         is HistoryFragmentAction.ExitEditMode -> state.copy(mode = HistoryFragmentState.Mode.Normal)
+         is HistoryFragmentAction.EnterDeletionMode -> state.copy(mode = HistoryFragmentState.Mode.Deleting)
+         is HistoryFragmentAction.ExitDeletionMode -> state.copy(mode = HistoryFragmentState.Mode.Normal)
++        is HistoryFragmentAction.StartSync -> state.copy(mode = HistoryFragmentState.Mode.Syncing)
++        is HistoryFragmentAction.FinishSync -> state.copy(mode = HistoryFragmentState.Mode.Normal)
+     }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryInteractor.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryInteractor.kt
+index f41fb55620f8..48d0c7a1e160 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryInteractor.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryInteractor.kt
+@@ -57,4 +57,8 @@ class HistoryInteractor(
+     override fun onDeleteSome(items: Set<HistoryItem>) {
+         historyController.handleDeleteSome(items)
+     }
++
++    override fun onRequestSync() {
++        historyController.handleRequestSync()
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryView.kt b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryView.kt
+index c56a1b76ae0c..b26f3ad99ab3 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryView.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/library/history/HistoryView.kt
+@@ -16,6 +16,7 @@ import mozilla.components.support.base.feature.UserInteractionHandler
+ import org.mozilla.fenix.R
+ import org.mozilla.fenix.library.LibraryPageView
+ import org.mozilla.fenix.library.SelectionInteractor
++import org.mozilla.fenix.theme.ThemeManager
+ 
+ /**
+  * Interface for the HistoryViewInteractor. This interface is implemented by objects that want
+@@ -71,6 +72,11 @@ interface HistoryViewInteractor : SelectionInteractor<HistoryItem> {
+      * @param items the history items to delete
+      */
+     fun onDeleteSome(items: Set<HistoryItem>)
++
++    /**
++     * Called when the user requests a sync of the history
++     */
++    fun onRequestSync()
+ }
+ 
+ /**
+@@ -97,12 +103,23 @@ class HistoryView(
+             adapter = historyAdapter
+             (itemAnimator as SimpleItemAnimator).supportsChangeAnimations = false
+         }
++
++        val primaryTextColor =
++            ThemeManager.resolveAttribute(R.attr.primaryText, context)
++        view.swipe_refresh.setColorSchemeColors(primaryTextColor)
++        view.swipe_refresh.setOnRefreshListener {
++            interactor.onRequestSync()
++            view.history_list.scrollToPosition(0)
++        }
+     }
+ 
+     fun update(state: HistoryFragmentState) {
+         val oldMode = mode
+ 
+         view.progress_bar.isVisible = state.mode === HistoryFragmentState.Mode.Deleting
++        view.swipe_refresh.isRefreshing = state.mode === HistoryFragmentState.Mode.Syncing
++        view.swipe_refresh.isEnabled =
++            state.mode === HistoryFragmentState.Mode.Normal || state.mode === HistoryFragmentState.Mode.Syncing
+         items = state.items
+         mode = state.mode
+ 
+diff --git a/fenix/app/src/main/res/layout/component_history.xml b/fenix/app/src/main/res/layout/component_history.xml
+index 71c3bc6af217..4c4892e2984c 100644
+--- a/fenix/app/src/main/res/layout/component_history.xml
++++ b/fenix/app/src/main/res/layout/component_history.xml
+@@ -33,9 +33,16 @@
+             app:layout_constraintTop_toTopOf="parent"
+             app:layout_constraintBottom_toBottomOf="parent"
+             app:layout_constraintEnd_toEndOf="parent" />
+-    <androidx.recyclerview.widget.RecyclerView
++
++    <androidx.swiperefreshlayout.widget.SwipeRefreshLayout
++        android:id="@+id/swipe_refresh"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent" >
++
++        <androidx.recyclerview.widget.RecyclerView
+             android:id="@+id/history_list"
+             android:layout_width="match_parent"
+             android:layout_height="match_parent"
+             tools:listitem="@layout/history_list_item"/>
++    </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
+ </androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryControllerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryControllerTest.kt
+index c0372e3c4f47..028ccfd2a08e 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryControllerTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryControllerTest.kt
+@@ -9,10 +9,14 @@ import android.content.ClipboardManager
+ import android.content.res.Resources
+ import androidx.navigation.NavController
+ import androidx.navigation.NavDirections
++import io.mockk.coVerifyOrder
+ import io.mockk.every
+ import io.mockk.mockk
+ import io.mockk.slot
+ import io.mockk.verify
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.test.TestCoroutineScope
+ import mozilla.components.concept.engine.prompt.ShareData
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertFalse
+@@ -26,9 +30,11 @@ import org.mozilla.fenix.components.FenixSnackbar
+ import org.mozilla.fenix.helpers.FenixRobolectricTestRunner
+ 
+ // Robolectric needed for `onShareItem()`
++@ExperimentalCoroutinesApi
+ @RunWith(FenixRobolectricTestRunner::class)
+ class HistoryControllerTest {
+     private val historyItem = HistoryItem(0, "title", "url", 0.toLong())
++    private val scope: CoroutineScope = TestCoroutineScope()
+     private val store: HistoryFragmentStore = mockk(relaxed = true)
+     private val state: HistoryFragmentState = mockk(relaxed = true)
+     private val navController: NavController = mockk(relaxed = true)
+@@ -39,16 +45,19 @@ class HistoryControllerTest {
+     private val displayDeleteAll: () -> Unit = mockk(relaxed = true)
+     private val invalidateOptionsMenu: () -> Unit = mockk(relaxed = true)
+     private val deleteHistoryItems: (Set<HistoryItem>) -> Unit = mockk(relaxed = true)
++    private val syncHistory: suspend () -> Unit = mockk(relaxed = true)
+     private val controller = DefaultHistoryController(
+         store,
+         navController,
+         resources,
+         snackbar,
+         clipboardManager,
++        scope,
+         openInBrowser,
+         displayDeleteAll,
+         invalidateOptionsMenu,
+-        deleteHistoryItems
++        deleteHistoryItems,
++        syncHistory
+     )
+ 
+     @Before
+@@ -105,6 +114,17 @@ class HistoryControllerTest {
+         }
+     }
+ 
++    @Test
++    fun onSelectHistoryItemDuringSync() {
++        every { state.mode } returns HistoryFragmentState.Mode.Syncing
++
++        controller.handleSelect(historyItem)
++
++        verify(exactly = 0) {
++            store.dispatch(HistoryFragmentAction.AddItemForRemoval(historyItem))
++        }
++    }
++
+     @Test
+     fun onBackPressedInNormalMode() {
+         every { state.mode } returns HistoryFragmentState.Mode.Normal
+@@ -190,4 +210,19 @@ class HistoryControllerTest {
+         assertEquals(historyItem.title, (directions.captured.arguments["data"] as Array<ShareData>)[0].title)
+         assertEquals(historyItem.url, (directions.captured.arguments["data"] as Array<ShareData>)[0].url)
+     }
++
++    @Test
++    fun onRequestSync() {
++        controller.handleRequestSync()
++
++        verify(exactly = 2) {
++            store.dispatch(any())
++        }
++
++        coVerifyOrder {
++            store.dispatch(HistoryFragmentAction.StartSync)
++            syncHistory.invoke()
++            store.dispatch(HistoryFragmentAction.FinishSync)
++        }
++    }
+ }
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryFragmentStoreTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryFragmentStoreTest.kt
+index d1fa987fd1a5..ee68f7b6c9de 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryFragmentStoreTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryFragmentStoreTest.kt
+@@ -46,6 +46,29 @@ class HistoryFragmentStoreTest {
+         assertEquals(store.state.mode, HistoryFragmentState.Mode.Editing(setOf(historyItem)))
+     }
+ 
++    @Test
++    fun startSync() = runBlocking {
++        val initialState = emptyDefaultState()
++        val store = HistoryFragmentStore(initialState)
++
++        store.dispatch(HistoryFragmentAction.StartSync).join()
++        assertNotSame(initialState, store.state)
++        assertEquals(HistoryFragmentState.Mode.Syncing, store.state.mode)
++    }
++
++    @Test
++    fun finishSync() = runBlocking {
++        val initialState = HistoryFragmentState(
++            items = listOf(),
++            mode = HistoryFragmentState.Mode.Syncing
++        )
++        val store = HistoryFragmentStore(initialState)
++
++        store.dispatch(HistoryFragmentAction.FinishSync).join()
++        assertNotSame(initialState, store.state)
++        assertEquals(HistoryFragmentState.Mode.Normal, store.state.mode)
++    }
++
+     private fun emptyDefaultState(): HistoryFragmentState = HistoryFragmentState(
+         items = listOf(),
+         mode = HistoryFragmentState.Mode.Normal
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryInteractorTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryInteractorTest.kt
+index b5ee0800d102..05e054b3ef3a 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryInteractorTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/library/history/HistoryInteractorTest.kt
+@@ -120,4 +120,12 @@ class HistoryInteractorTest {
+             controller.handleDeleteSome(items)
+         }
+     }
++
++    @Test
++    fun onRequestSync() {
++        interactor.onRequestSync()
++        verifyAll {
++            controller.handleRequestSync()
++        }
++    }
+ }

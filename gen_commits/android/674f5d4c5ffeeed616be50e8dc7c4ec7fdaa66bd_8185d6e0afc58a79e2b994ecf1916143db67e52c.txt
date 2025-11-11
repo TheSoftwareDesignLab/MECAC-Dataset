@@ -1,0 +1,854 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index b0c8806cb2e..e49a33200a0 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -52,6 +52,7 @@ android {
+     }
+ 
+     compileOptions {
++        isCoreLibraryDesugaringEnabled = true
+         sourceCompatibility(libs.versions.javaVersion.get())
+         targetCompatibility(libs.versions.javaVersion.get())
+     }
+@@ -125,6 +126,8 @@ android {
+ dependencies {
+     implementation(project(":common"))
+ 
++    coreLibraryDesugaring(libs.tools.desugar.jdk)
++
+     implementation(libs.blurView)
+ 
+     implementation(libs.kotlin.stdlib)
+@@ -179,6 +182,7 @@ dependencies {
+     implementation(libs.compose.uiTooling)
+     implementation(libs.activity.compose)
+     implementation(libs.navigation.compose)
++    implementation(libs.androidx.lifecycle.runtime.compose)
+ 
+     implementation(libs.iconics.core)
+     implementation(libs.iconics.compose)
+@@ -189,6 +193,8 @@ dependencies {
+     implementation(libs.reorderable)
+     implementation(libs.changeLog)
+ 
++    implementation(libs.zxing)
++
+     implementation(libs.car.core)
+     "fullImplementation"(libs.car.projected)
+ }
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 81bee8d3cb3..3a6e8525add 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -393,6 +393,11 @@
+             </intent-filter>
+         </activity>
+ 
++        <activity
++            android:name=".barcode.BarcodeScannerActivity"
++            android:exported="false"
++            android:theme="@style/Theme.HomeAssistant.Config" />
++
+         <activity android:name=".assist.AssistActivity"
+             android:exported="true"
+             android:windowSoftInputMode="adjustResize"
+diff --git a/app/src/main/java/io/homeassistant/companion/android/barcode/BarcodeScannerAction.kt b/app/src/main/java/io/homeassistant/companion/android/barcode/BarcodeScannerAction.kt
+new file mode 100644
+index 00000000000..f3162d02954
+--- /dev/null
++++ b/app/src/main/java/io/homeassistant/companion/android/barcode/BarcodeScannerAction.kt
+@@ -0,0 +1,15 @@
++package io.homeassistant.companion.android.barcode
++
++data class BarcodeScannerAction(
++    val type: BarcodeActionType,
++    val message: String? = null
++)
++
++enum class BarcodeActionType(val externalBusType: String) {
++    NOTIFY("bar_code/notify"),
++    CLOSE("bar_code/close");
++
++    companion object {
++        fun fromExternalBus(type: String) = entries.firstOrNull { it.externalBusType == type }
++    }
++}
+diff --git a/app/src/main/java/io/homeassistant/companion/android/barcode/BarcodeScannerActivity.kt b/app/src/main/java/io/homeassistant/companion/android/barcode/BarcodeScannerActivity.kt
+new file mode 100644
+index 00000000000..bc7ea43aadb
+--- /dev/null
++++ b/app/src/main/java/io/homeassistant/companion/android/barcode/BarcodeScannerActivity.kt
+@@ -0,0 +1,149 @@
++package io.homeassistant.companion.android.barcode
++
++import android.Manifest
++import android.content.Context
++import android.content.Intent
++import android.net.Uri
++import android.os.Bundle
++import android.provider.Settings
++import androidx.activity.SystemBarStyle
++import androidx.activity.addCallback
++import androidx.activity.compose.setContent
++import androidx.activity.enableEdgeToEdge
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.activity.viewModels
++import androidx.appcompat.app.AlertDialog
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.graphics.toArgb
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.lifecycleScope
++import androidx.lifecycle.repeatOnLifecycle
++import com.google.zxing.BarcodeFormat
++import dagger.hilt.android.AndroidEntryPoint
++import io.homeassistant.companion.android.BaseActivity
++import io.homeassistant.companion.android.barcode.view.BarcodeScannerView
++import io.homeassistant.companion.android.barcode.view.barcodeScannerOverlayColor
++import io.homeassistant.companion.android.common.R as commonR
++import io.homeassistant.companion.android.util.compose.HomeAssistantAppTheme
++import java.util.Locale
++import kotlinx.coroutines.launch
++
++@AndroidEntryPoint
++class BarcodeScannerActivity : BaseActivity() {
++
++    companion object {
++        private const val TAG = "BarcodeScannerActivity"
++
++        private const val EXTRA_MESSAGE_ID = "message_id"
++        private const val EXTRA_TITLE = "title"
++        private const val EXTRA_SUBTITLE = "subtitle"
++        private const val EXTRA_ACTION = "action"
++
++        fun newInstance(
++            context: Context,
++            messageId: Int,
++            title: String,
++            subtitle: String,
++            action: String?
++        ): Intent {
++            return Intent(context, BarcodeScannerActivity::class.java).apply {
++                putExtra(EXTRA_MESSAGE_ID, messageId)
++                putExtra(EXTRA_TITLE, title)
++                putExtra(EXTRA_SUBTITLE, subtitle)
++                putExtra(EXTRA_ACTION, action)
++            }
++        }
++    }
++
++    private val viewModel: BarcodeScannerViewModel by viewModels()
++
++    private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
++        viewModel.checkPermission()
++        requestSilently = false
++    }
++
++    private var requestSilently by mutableStateOf(true)
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        val overlaySystemBarStyle = SystemBarStyle.dark(barcodeScannerOverlayColor.toArgb())
++        enableEdgeToEdge(overlaySystemBarStyle, overlaySystemBarStyle)
++        super.onCreate(savedInstanceState)
++
++        val messageId = intent.getIntExtra(EXTRA_MESSAGE_ID, -1)
++
++        val title = if (intent.hasExtra(EXTRA_TITLE)) intent.getStringExtra(EXTRA_TITLE) else null
++        val subtitle = if (intent.hasExtra(EXTRA_SUBTITLE)) intent.getStringExtra(EXTRA_SUBTITLE) else null
++        if (title == null || subtitle == null) finish() // Invalid state
++        val action = if (intent.hasExtra(EXTRA_ACTION)) intent.getStringExtra(EXTRA_ACTION) else null
++
++        setContent {
++            HomeAssistantAppTheme {
++                BarcodeScannerView(
++                    title = title!!,
++                    subtitle = subtitle!!,
++                    action = action,
++                    hasFlashlight = viewModel.hasFlashlight,
++                    hasPermission = viewModel.hasPermission,
++                    requestPermission = { requestPermission(false) },
++                    didRequestPermission = !requestSilently,
++                    onResult = { text, format ->
++                        val frontendFormat = when (format) {
++                            BarcodeFormat.PDF_417 -> "pdf417"
++                            BarcodeFormat.MAXICODE,
++                            BarcodeFormat.RSS_14,
++                            BarcodeFormat.RSS_EXPANDED,
++                            BarcodeFormat.UPC_EAN_EXTENSION -> "unknown"
++                            else -> format.toString().lowercase(Locale.getDefault())
++                        }
++                        viewModel.sendScannerResult(messageId, text, frontendFormat)
++                    },
++                    onCancel = { forAction ->
++                        viewModel.sendScannerClosing(messageId, forAction)
++                        finish()
++                    }
++                )
++            }
++        }
++
++        onBackPressedDispatcher.addCallback(this) {
++            viewModel.sendScannerClosing(messageId, false)
++            finish()
++        }
++
++        lifecycleScope.launch {
++            lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
++                viewModel.actionsFlow.collect {
++                    when (it.type) {
++                        BarcodeActionType.NOTIFY -> {
++                            if (it.message.isNullOrBlank()) return@collect
++                            AlertDialog.Builder(this@BarcodeScannerActivity)
++                                .setMessage(it.message)
++                                .setPositiveButton(commonR.string.ok, null)
++                                .show()
++                        }
++                        BarcodeActionType.CLOSE -> finish()
++                    }
++                }
++            }
++        }
++    }
++
++    override fun onResume() {
++        super.onResume()
++        viewModel.checkPermission()
++        if (!viewModel.hasPermission && requestSilently) {
++            requestPermission(true)
++        }
++    }
++
++    private fun requestPermission(inContext: Boolean) {
++        if (inContext) {
++            cameraPermission.launch(Manifest.permission.CAMERA)
++        } else {
++            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
++            requestSilently = true // Reset state to trigger new in context dialog/check when resumed
++        }
++    }
++}
+diff --git a/app/src/main/java/io/homeassistant/companion/android/barcode/BarcodeScannerViewModel.kt b/app/src/main/java/io/homeassistant/companion/android/barcode/BarcodeScannerViewModel.kt
+new file mode 100644
+index 00000000000..04dbab40b2b
+--- /dev/null
++++ b/app/src/main/java/io/homeassistant/companion/android/barcode/BarcodeScannerViewModel.kt
+@@ -0,0 +1,95 @@
++package io.homeassistant.companion.android.barcode
++
++import android.Manifest
++import android.app.Application
++import android.content.pm.PackageManager
++import android.util.Log
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.core.content.ContextCompat
++import androidx.lifecycle.AndroidViewModel
++import androidx.lifecycle.viewModelScope
++import dagger.hilt.android.lifecycle.HiltViewModel
++import io.homeassistant.companion.android.webview.externalbus.ExternalBusMessage
++import io.homeassistant.companion.android.webview.externalbus.ExternalBusRepository
++import javax.inject.Inject
++import kotlinx.coroutines.flow.MutableSharedFlow
++import kotlinx.coroutines.flow.asSharedFlow
++import kotlinx.coroutines.launch
++
++@HiltViewModel
++class BarcodeScannerViewModel @Inject constructor(
++    private val externalBusRepository: ExternalBusRepository,
++    val app: Application
++) : AndroidViewModel(app) {
++
++    companion object {
++        private const val TAG = "BarcodeScannerViewModel"
++    }
++
++    var hasPermission by mutableStateOf(false)
++        private set
++
++    var hasFlashlight by mutableStateOf(false)
++        private set
++
++    private val frontendActionsFlow = MutableSharedFlow<BarcodeScannerAction>()
++    val actionsFlow = frontendActionsFlow.asSharedFlow()
++
++    init {
++        checkPermission()
++        hasFlashlight = app.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_FLASH)
++
++        viewModelScope.launch {
++            externalBusRepository.receive(
++                listOf(BarcodeActionType.NOTIFY.externalBusType, BarcodeActionType.CLOSE.externalBusType)
++            ).collect { message ->
++                when (val type = BarcodeActionType.fromExternalBus(message.getString("type"))) {
++                    BarcodeActionType.NOTIFY -> frontendActionsFlow.emit(
++                        BarcodeScannerAction(type, message.getJSONObject("payload").getString("message"))
++                    )
++                    BarcodeActionType.CLOSE -> frontendActionsFlow.emit(
++                        BarcodeScannerAction(type)
++                    )
++                    else -> Log.w(TAG, "Received unexpected external bus message of type ${type?.name}")
++                }
++            }
++        }
++    }
++
++    fun checkPermission() {
++        hasPermission = ContextCompat.checkSelfPermission(app, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
++    }
++
++    fun sendScannerResult(messageId: Int, text: String, format: String) {
++        viewModelScope.launch {
++            externalBusRepository.send(
++                ExternalBusMessage(
++                    id = messageId,
++                    type = "command",
++                    command = "bar_code/scan_result",
++                    payload = mapOf(
++                        "rawValue" to text,
++                        "format" to format
++                    )
++                )
++            )
++        }
++    }
++
++    fun sendScannerClosing(messageId: Int, forAction: Boolean) {
++        viewModelScope.launch {
++            externalBusRepository.send(
++                ExternalBusMessage(
++                    id = messageId,
++                    type = "command",
++                    command = "bar_code/aborted",
++                    payload = mapOf(
++                        "reason" to (if (forAction) "alternative_options" else "canceled")
++                    )
++                )
++            )
++        }
++    }
++}
+diff --git a/app/src/main/java/io/homeassistant/companion/android/barcode/view/BarcodeScannerOverlay.kt b/app/src/main/java/io/homeassistant/companion/android/barcode/view/BarcodeScannerOverlay.kt
+new file mode 100644
+index 00000000000..30e3d6904d5
+--- /dev/null
++++ b/app/src/main/java/io/homeassistant/companion/android/barcode/view/BarcodeScannerOverlay.kt
+@@ -0,0 +1,66 @@
++package io.homeassistant.companion.android.barcode.view
++
++import androidx.compose.foundation.Canvas
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.CornerRadius
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.geometry.Size
++import androidx.compose.ui.graphics.BlendMode
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.nativeCanvas
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.dp
++
++/**
++ * A semi-transparent overlay with a rounded square cutout in the middle (portrait) or on
++ * the right half (landscape), to use as a QR code viewfinder for the scanner's camera.
++ * Based on https://stackoverflow.com/a/73533699/4214819.
++ */
++@Composable
++fun BarcodeScannerOverlay(
++    modifier: Modifier,
++    cutout: Dp
++) {
++    val widthInPx: Float
++    val heightInPx: Float
++    val cornerInPx: Float
++
++    with(LocalDensity.current) {
++        widthInPx = cutout.toPx()
++        heightInPx = cutout.toPx()
++        cornerInPx = 28.dp.toPx() // Material 3 extra large rounding
++    }
++
++    Canvas(modifier = modifier) {
++        val canvasWidth = size.width
++        val canvasHeight = size.height
++
++        with(drawContext.canvas.nativeCanvas) {
++            val checkPoint = saveLayer(null, null)
++
++            // Destination
++            drawRect(barcodeScannerOverlayColor)
++
++            // Source
++            drawRoundRect(
++                topLeft = Offset(
++                    x = if (canvasWidth > canvasHeight) {
++                        (canvasWidth / 2) + (((canvasWidth / 2) - widthInPx) / 2)
++                    } else {
++                        (canvasWidth - widthInPx) / 2
++                    },
++                    y = (canvasHeight - heightInPx) / 2
++                ),
++                size = Size(widthInPx, heightInPx),
++                cornerRadius = CornerRadius(cornerInPx, cornerInPx),
++                color = Color.Transparent,
++                blendMode = BlendMode.Clear
++            )
++            restoreToCount(checkPoint)
++        }
++    }
++}
++
++val barcodeScannerOverlayColor = Color(0xAA000000)
+diff --git a/app/src/main/java/io/homeassistant/companion/android/barcode/view/BarcodeScannerView.kt b/app/src/main/java/io/homeassistant/companion/android/barcode/view/BarcodeScannerView.kt
+new file mode 100644
+index 00000000000..6379b1d2e07
+--- /dev/null
++++ b/app/src/main/java/io/homeassistant/companion/android/barcode/view/BarcodeScannerView.kt
+@@ -0,0 +1,242 @@
++package io.homeassistant.companion.android.barcode.view
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.BoxWithConstraints
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.asPaddingValues
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.offset
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.safeDrawingPadding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.systemBars
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.material.ButtonDefaults
++import androidx.compose.material.Icon
++import androidx.compose.material.IconButton
++import androidx.compose.material.MaterialTheme
++import androidx.compose.material.OutlinedButton
++import androidx.compose.material.Scaffold
++import androidx.compose.material.SnackbarDuration
++import androidx.compose.material.SnackbarResult
++import androidx.compose.material.Text
++import androidx.compose.material.TextButton
++import androidx.compose.material.TopAppBar
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Close
++import androidx.compose.material.icons.filled.FlashlightOff
++import androidx.compose.material.icons.filled.FlashlightOn
++import androidx.compose.material.rememberScaffoldState
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalConfiguration
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.times
++import androidx.compose.ui.viewinterop.AndroidView
++import androidx.core.view.isVisible
++import androidx.lifecycle.compose.LifecycleResumeEffect
++import com.google.zxing.BarcodeFormat
++import com.journeyapps.barcodescanner.CaptureManager
++import com.journeyapps.barcodescanner.DecoratedBarcodeView
++import io.homeassistant.companion.android.common.R as commonR
++import io.homeassistant.companion.android.util.compose.darkColorBackground
++import io.homeassistant.companion.android.util.getActivity
++
++@Composable
++fun BarcodeScannerView(
++    title: String,
++    subtitle: String,
++    action: String?,
++    hasFlashlight: Boolean,
++    hasPermission: Boolean,
++    didRequestPermission: Boolean,
++    requestPermission: () -> Unit,
++    onResult: (String, BarcodeFormat) -> Unit,
++    onCancel: (Boolean) -> Unit,
++    resultTimeoutMillis: Long = 1500L
++) {
++    val context = LocalContext.current
++    val barcodeView = remember {
++        // The app remembers last time scanned to prevent spamming the frontend
++        var resultScanned = System.currentTimeMillis()
++
++        DecoratedBarcodeView(context).apply {
++            val activity = context.getActivity() ?: return@apply
++            // Hide default UI
++            viewFinder.isVisible = false
++            statusView.isVisible = false
++
++            val captureManager = CaptureManager(activity, this)
++            captureManager.initializeFromIntent(null, null)
++            captureManager.decode()
++            decodeContinuous { result ->
++                if ((System.currentTimeMillis() - resultScanned) < resultTimeoutMillis) return@decodeContinuous
++                result.text.ifBlank { null }?.let {
++                    resultScanned = System.currentTimeMillis()
++                    onResult(it, result.barcodeFormat)
++                }
++            }
++        }
++    }
++
++    // Main screen structure:
++    // - Starting with composables that should go edge to edge (background)
++    // - Box with overlay fitting inside insets for main contents/controls
++    Box {
++        AndroidView(
++            modifier = Modifier.fillMaxSize(),
++            factory = { barcodeView }
++        )
++        if (hasPermission) {
++            LifecycleResumeEffect("barcodeView") {
++                barcodeView.resume()
++                onPauseOrDispose {
++                    barcodeView.pause()
++                }
++            }
++        }
++
++        BoxWithConstraints(
++            modifier = Modifier
++                .safeDrawingPadding()
++                .fillMaxSize()
++        ) {
++            val configuration = LocalConfiguration.current
++            val systemBarsPadding = WindowInsets.systemBars.asPaddingValues()
++            val screenHeight = configuration.screenHeightDp.dp - systemBarsPadding.calculateTopPadding() - systemBarsPadding.calculateBottomPadding()
++            val screenWidth = configuration.screenWidthDp.dp
++            val cutoutSize = minOf(minOf(screenHeight, screenWidth) - 48.dp, 320.dp)
++
++            val scaffoldState = rememberScaffoldState()
++            if (!hasPermission && didRequestPermission) {
++                LaunchedEffect("permission") {
++                    scaffoldState.snackbarHostState.showSnackbar(
++                        context.getString(commonR.string.missing_camera_permission),
++                        context.getString(commonR.string.settings),
++                        SnackbarDuration.Indefinite
++                    ).let { result ->
++                        if (result == SnackbarResult.ActionPerformed) {
++                            requestPermission()
++                        }
++                    }
++                }
++            }
++
++            BarcodeScannerOverlay(modifier = Modifier.fillMaxSize(), cutout = cutoutSize)
++            Scaffold(
++                scaffoldState = scaffoldState,
++                topBar = {
++                    TopAppBar(
++                        title = {},
++                        navigationIcon = {
++                            IconButton(onClick = { onCancel(false) }) {
++                                Icon(
++                                    imageVector = Icons.Default.Close,
++                                    contentDescription = stringResource(commonR.string.cancel),
++                                    tint = Color.White
++                                )
++                            }
++                        },
++                        backgroundColor = Color.Transparent,
++                        elevation = 0.dp
++                    )
++                },
++                backgroundColor = Color.Transparent
++            ) { paddingValues ->
++                Column(
++                    modifier = Modifier
++                        .fillMaxWidth(if (screenWidth > screenHeight) 0.5f else 1f)
++                        .padding(paddingValues)
++                        .padding(horizontal = 16.dp)
++                        .padding(top = 32.dp),
++                    horizontalAlignment = Alignment.CenterHorizontally
++                ) {
++                    Text(
++                        text = title,
++                        color = Color.White,
++                        style = MaterialTheme.typography.h6
++                    )
++                    Text(
++                        text = subtitle,
++                        color = Color.White,
++                        style = MaterialTheme.typography.subtitle1
++                    )
++                    action?.let {
++                        Spacer(Modifier.height(32.dp))
++                        TextButton(onClick = { onCancel(true) }) {
++                            Text(it)
++                        }
++                    }
++                }
++            }
++            if (hasFlashlight && hasPermission) {
++                // Align to bottom right of cutout - button size - margin
++                // Note in landscape that the cutout is pushed to the right half of the screen
++                val offsetX = if (screenWidth > screenHeight) {
++                    screenWidth - (0.5 * ((0.5 * screenWidth) - cutoutSize)) - 48.dp - 8.dp
++                } else {
++                    screenWidth - (0.5 * (screenWidth - cutoutSize)) - 48.dp - 8.dp
++                }
++                val offsetY = with(LocalDensity.current) {
++                    (0.5 * constraints.maxHeight).toInt().toDp()
++                } + (0.5 * cutoutSize) - 48.dp - 8.dp
++                FlashlightButton(
++                    onToggle = { turnOn ->
++                        if (turnOn) {
++                            barcodeView.setTorchOn()
++                        } else {
++                            barcodeView.setTorchOff()
++                        }
++                    },
++                    modifier = Modifier.offset(offsetX, offsetY)
++                )
++            }
++        }
++    }
++}
++
++/**
++ * A 48x48dp dark round button/mini FAB to toggle the flashlight on the device on and off.
++ * The button size fits with the overlay radius.
++ */
++@Composable
++fun FlashlightButton(
++    onToggle: (Boolean) -> Unit,
++    modifier: Modifier = Modifier
++) {
++    var flashlightOn by rememberSaveable { mutableStateOf(false) }
++    OutlinedButton(
++        modifier = modifier.size(48.dp),
++        elevation = ButtonDefaults.elevation(),
++        shape = CircleShape,
++        border = null,
++        contentPadding = PaddingValues(0.dp),
++        colors = ButtonDefaults.outlinedButtonColors(backgroundColor = darkColorBackground),
++        onClick = {
++            onToggle(!flashlightOn)
++            flashlightOn = !flashlightOn
++        }
++    ) {
++        Icon(
++            imageVector = if (flashlightOn) Icons.Default.FlashlightOff else Icons.Default.FlashlightOn,
++            contentDescription = stringResource(commonR.string.toggle_flashlight),
++            tint = Color.White
++        )
++    }
++}
+diff --git a/app/src/main/java/io/homeassistant/companion/android/util/ContextExtensions.kt b/app/src/main/java/io/homeassistant/companion/android/util/ContextExtensions.kt
+index 0a410179228..58313803d24 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/util/ContextExtensions.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/util/ContextExtensions.kt
+@@ -1,10 +1,12 @@
+ package io.homeassistant.companion.android.util
+ 
+ import android.content.Context
++import android.content.ContextWrapper
+ import android.net.ConnectivityManager
+ import android.net.NetworkCapabilities
+ import android.os.Build
+ import android.util.TypedValue
++import androidx.activity.ComponentActivity
+ import androidx.annotation.ColorRes
+ import androidx.core.content.ContextCompat
+ import androidx.core.content.getSystemService
+@@ -32,3 +34,9 @@ fun Context.hasActiveConnection(): Boolean {
+         cm.activeNetworkInfo?.isConnected == true
+     }
+ }
++
++fun Context.getActivity(): ComponentActivity? = when (this) {
++    is ComponentActivity -> this
++    is ContextWrapper -> baseContext.getActivity()
++    else -> null
++}
+diff --git a/app/src/main/java/io/homeassistant/companion/android/webview/WebViewActivity.kt b/app/src/main/java/io/homeassistant/companion/android/webview/WebViewActivity.kt
+index 1969cc93e32..a35aeb9e6ff 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/webview/WebViewActivity.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/webview/WebViewActivity.kt
+@@ -77,6 +77,7 @@ import io.homeassistant.companion.android.BuildConfig
+ import io.homeassistant.companion.android.R
+ import io.homeassistant.companion.android.assist.AssistActivity
+ import io.homeassistant.companion.android.authenticator.Authenticator
++import io.homeassistant.companion.android.barcode.BarcodeScannerActivity
+ import io.homeassistant.companion.android.common.R as commonR
+ import io.homeassistant.companion.android.common.data.HomeAssistantApis
+ import io.homeassistant.companion.android.common.data.keychain.KeyChainRepository
+@@ -730,6 +731,15 @@ class WebViewActivity : BaseActivity(), io.homeassistant.companion.android.webvi
+                                     val hasNfc = pm.hasSystemFeature(PackageManager.FEATURE_NFC)
+                                     val canCommissionMatter = presenter.appCanCommissionMatterDevice()
+                                     val canExportThread = presenter.appCanExportThreadCredentials()
++                                    val hasBarCodeScanner =
++                                        if (
++                                            pm.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY) &&
++                                            !pm.hasSystemFeature(PackageManager.FEATURE_AUTOMOTIVE)
++                                        ) {
++                                            1
++                                        } else {
++                                            0
++                                        }
+                                     sendExternalBusMessage(
+                                         ExternalBusMessage(
+                                             id = JSONObject(message).get("id"),
+@@ -742,7 +752,8 @@ class WebViewActivity : BaseActivity(), io.homeassistant.companion.android.webvi
+                                                     "hasExoPlayer" to true,
+                                                     "canCommissionMatter" to canCommissionMatter,
+                                                     "canImportThreadCredentials" to canExportThread,
+-                                                    "hasAssist" to true
++                                                    "hasAssist" to true,
++                                                    "hasBarCodeScanner" to hasBarCodeScanner
+                                                 )
+                                             ),
+                                             callback = {
+@@ -795,6 +806,19 @@ class WebViewActivity : BaseActivity(), io.homeassistant.companion.android.webvi
+                                         .create()
+                                     alertDialog?.show()
+                                 }
++                                "bar_code/scan" -> {
++                                    val payload = if (json.has("payload")) json.getJSONObject("payload") else null
++                                    if (payload?.has("title") != true || !payload.has("description")) return@post
++                                    startActivity(
++                                        BarcodeScannerActivity.newInstance(
++                                            this@WebViewActivity,
++                                            messageId = json.getInt("id"),
++                                            title = payload.getString("title"),
++                                            subtitle = payload.getString("description"),
++                                            action = if (payload.has("alternative_option_label")) payload.getString("alternative_option_label").ifBlank { null } else null
++                                        )
++                                    )
++                                }
+                                 "exoplayer/play_hls" -> exoPlayHls(json)
+                                 "exoplayer/stop" -> exoStopHls()
+                                 "exoplayer/resize" -> exoResizeHls(json)
+@@ -1503,11 +1527,13 @@ class WebViewActivity : BaseActivity(), io.homeassistant.companion.android.webvi
+     override fun sendExternalBusMessage(message: ExternalBusMessage) {
+         val map = mutableMapOf(
+             "id" to message.id,
+-            "type" to message.type,
+-            "success" to message.success
++            "type" to message.type
+         )
++        message.command?.let { map["command"] = it }
++        message.success?.let { map["success"] = it }
+         message.result?.let { map["result"] = it }
+         message.error?.let { map["error"] = it }
++        message.payload?.let { map["payload"] = it }
+ 
+         val json = JSONObject(map.toMap())
+         val script = "externalBus($json);"
+diff --git a/app/src/main/java/io/homeassistant/companion/android/webview/externalbus/ExternalBusMessage.kt b/app/src/main/java/io/homeassistant/companion/android/webview/externalbus/ExternalBusMessage.kt
+index 741715b3e9b..cbbfd89593f 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/webview/externalbus/ExternalBusMessage.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/webview/externalbus/ExternalBusMessage.kt
+@@ -5,8 +5,10 @@ import android.webkit.ValueCallback
+ data class ExternalBusMessage(
+     val id: Any,
+     val type: String,
+-    val success: Boolean,
++    val command: String? = null,
++    val success: Boolean? = null,
+     val result: Any? = null,
+     val error: Any? = null,
++    val payload: Any? = null,
+     val callback: ValueCallback<String>? = null
+ )
+diff --git a/automotive/build.gradle.kts b/automotive/build.gradle.kts
+index c5eb09cf61d..78a6e1fdec1 100644
+--- a/automotive/build.gradle.kts
++++ b/automotive/build.gradle.kts
+@@ -87,6 +87,7 @@ android {
+     }
+ 
+     compileOptions {
++        isCoreLibraryDesugaringEnabled = true
+         sourceCompatibility(libs.versions.javaVersion.get())
+         targetCompatibility(libs.versions.javaVersion.get())
+     }
+@@ -154,6 +155,8 @@ android {
+ dependencies {
+     implementation(project(":common"))
+ 
++    coreLibraryDesugaring(libs.tools.desugar.jdk)
++
+     implementation(libs.blurView)
+ 
+     implementation(libs.kotlin.stdlib)
+@@ -208,6 +211,7 @@ dependencies {
+     implementation(libs.compose.uiTooling)
+     implementation(libs.activity.compose)
+     implementation(libs.navigation.compose)
++    implementation(libs.androidx.lifecycle.runtime.compose)
+ 
+     implementation(libs.iconics.core)
+     implementation(libs.iconics.compose)
+@@ -218,6 +222,8 @@ dependencies {
+     implementation(libs.reorderable)
+     implementation(libs.changeLog)
+ 
++    implementation(libs.zxing)
++
+     implementation(libs.car.core)
+     implementation(libs.car.automotive)
+ }
+diff --git a/common/src/main/res/values/strings.xml b/common/src/main/res/values/strings.xml
+index a083e967d50..f0747219cc7 100644
+--- a/common/src/main/res/values/strings.xml
++++ b/common/src/main/res/values/strings.xml
+@@ -933,6 +933,7 @@
+     <string name="tile_updated">Tile data updated</string>
+     <string name="tiles">Tiles</string>
+     <string name="toast_message">%1$s was selected</string>
++    <string name="toggle_flashlight">Toggle flashlight</string>
+     <string name="trust_server_title">Remotely control app &amp; device</string>
+     <string name="trust_server_summary">Manage enabled sensors and use notification commands from this server</string>
+     <string name="tts_error">Unable to process notification \"%1$s\" as text to speech.</string>
+@@ -1081,6 +1082,7 @@
+     <string name="sensor_update_type_info_worker_setting">You can change how often this sensor is updated by using the \'%1$s\' setting.</string>
+     <string name="sensor_update_type_info_location">For more information about location updates, please check the documentation.</string>
+     <string name="sensor_update_type_info_custom">This sensor updates on a non-standard schedule, please check the documentation.</string>
++    <string name="missing_camera_permission">\'Camera\' permission required</string>
+     <string name="missing_phone_permission">Please grant Phone permission to make a phone call</string>
+     <string name="missing_bluetooth_permission">Please grant Nearby devices permission to control Bluetooth</string>
+     <string name="notification_channels_description">Notification channels allow you to control the look and feel of a certain type of notification. You can create notification channels by sending a notification with the channel parameter, refer to the help icon in the upper right hand corner to learn more. Below is a list of all notification channels created by your server and the app. Select the edit icon to adjust channel settings like ringtone and Do Not Disturb override. Select the delete icon to remove the channel from this list.\n\nDeleting a channel does not reset channel settings, if a notification is received with the same channel name then it will re-use its previous settings. You can only delete channels created by your server.</string>
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 26a85c10ad9..3f6588101e9 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -69,6 +69,7 @@ webkit = "1.10.0"
+ wear-remote-interactions = "1.0.0"
+ workRuntimeKtx = "2.9.0"
+ horologist = "0.5.27"
++zxing = "4.3.0"
+ 
+ [plugins]
+ android-application = { id = "com.android.application", version.ref = "androidPlugin" }
+@@ -93,6 +94,7 @@ androidx-room-ktx = { module = "androidx.room:room-ktx", version.ref = "room" }
+ androidx-room-paging = { module = "androidx.room:room-paging", version.ref = "room" }
+ androidx-room-runtime = { module = "androidx.room:room-runtime", version.ref = "room" }
+ androidx-lifecycle-viewmodel-ktx = { module = "androidx.lifecycle:lifecycle-viewmodel-ktx", version.ref = "lifecycle" }
++androidx-lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
+ androidx-lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "lifecycle" }
+ androidx-watchface-complications-data-source-ktx = { module = "androidx.wear.watchface:watchface-complications-data-source-ktx", version.ref = "watchfaceComplicationsDataSourceKtx" }
+ androidx-work-runtime-ktx = { module = "androidx.work:work-runtime-ktx", version.ref = "workRuntimeKtx" }
+@@ -171,6 +173,7 @@ wear-remote-interactions = { module = "androidx.wear:wear-remote-interactions",
+ wear-tiles = { module = "androidx.wear.tiles:tiles", version.ref = "wear-tiles" }
+ wear-tooling = { module = "androidx.wear:wear-tooling-preview", version.ref = "wear-tooling" }
+ webkit = { module = "androidx.webkit:webkit", version.ref = "webkit" }
++zxing = { module = "com.journeyapps:zxing-android-embedded", version.ref = "zxing" }
+ 
+ [bundles]
+ horologist = ["horologist-layout", "horologist-composables"]

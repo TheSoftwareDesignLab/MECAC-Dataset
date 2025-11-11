@@ -1,0 +1,196 @@
+diff --git a/android-components/components/service/firefox-accounts/build.gradle b/android-components/components/service/firefox-accounts/build.gradle
+index e1f03c442c1b..57d92c3186e6 100644
+--- a/android-components/components/service/firefox-accounts/build.gradle
++++ b/android-components/components/service/firefox-accounts/build.gradle
+@@ -49,6 +49,7 @@ dependencies {
+ 
+     testImplementation "junit:junit:${rootProject.ext.dependencies['junit']}"
+     testImplementation "org.robolectric:robolectric:${rootProject.ext.dependencies['robolectric']}"
++    testImplementation "org.mockito:mockito-core:${rootProject.ext.dependencies['mockito']}"
+ }
+ 
+ task unzipJniLibs(type: Copy) {
+diff --git a/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/FxaClient.kt b/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/FxaClient.kt
+index 3b6cc17bfa65..7c97aa761293 100644
+--- a/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/FxaClient.kt
++++ b/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/FxaClient.kt
+@@ -8,18 +8,30 @@ import com.sun.jna.Library
+ import com.sun.jna.Native
+ import com.sun.jna.Pointer
+ import com.sun.jna.PointerType
++import java.lang.reflect.Proxy
+ 
+-@Suppress("FunctionNaming", "TooManyFunctions")
++@Suppress("FunctionNaming", "TooManyFunctions", "TooGenericExceptionThrown")
+ internal interface FxaClient : Library {
+     companion object {
+         private const val JNA_LIBRARY_NAME = "fxa_client"
+-        internal val INSTANCE: FxaClient
++        internal var INSTANCE: FxaClient
+ 
+         init {
+-            System.loadLibrary("crypto")
+-            System.loadLibrary("ssl")
+-            System.loadLibrary("fxa_client")
+-            INSTANCE = Native.loadLibrary(JNA_LIBRARY_NAME, FxaClient::class.java) as FxaClient
++            try {
++                System.loadLibrary("crypto")
++                System.loadLibrary("ssl")
++                System.loadLibrary("fxa_client")
++                INSTANCE = Native.loadLibrary(JNA_LIBRARY_NAME, FxaClient::class.java) as FxaClient
++            } catch (e: UnsatisfiedLinkError) {
++                // We want to be able load this class in environments that don't have FxA native
++                // libs available (for unit testing purposes). This also has the advantage of
++                // not stopping the whole world in case of missing native FxA libs.
++                INSTANCE = Proxy.newProxyInstance(
++                        FxaClient::class.java.classLoader,
++                        arrayOf(FxaClient::class.java)) { _, _, _ ->
++                    throw RuntimeException("Firefox Account functionality not available", e)
++                } as FxaClient
++            }
+         }
+     }
+ 
+diff --git a/android-components/components/service/firefox-accounts/src/test/java/mozilla/components/service/fxa/RustObjectTest.kt b/android-components/components/service/firefox-accounts/src/test/java/mozilla/components/service/fxa/RustObjectTest.kt
+new file mode 100644
+index 000000000000..cf66c010d7cb
+--- /dev/null
++++ b/android-components/components/service/firefox-accounts/src/test/java/mozilla/components/service/fxa/RustObjectTest.kt
+@@ -0,0 +1,136 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package mozilla.components.service.fxa
++
++import com.sun.jna.Memory
++import com.sun.jna.PointerType
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Assert.fail
++import org.junit.BeforeClass
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.mockito.Mockito.mock
++import org.robolectric.RobolectricTestRunner
++import java.util.concurrent.CountDownLatch
++
++@RunWith(RobolectricTestRunner::class)
++class RustObjectTest {
++
++    companion object {
++        @BeforeClass
++        @JvmStatic
++        fun setup() {
++            FxaClient.INSTANCE = mock(FxaClient::class.java)
++        }
++    }
++
++    class MockRawPointer : PointerType()
++
++    class MockRustObject(override var rawPointer: MockRawPointer?) : RustObject<MockRawPointer>() {
++        var destroyed = false
++
++        override fun destroy(p: MockRawPointer) {
++            destroyed = true
++        }
++    }
++
++    @Test(expected = NullPointerException::class)
++    fun testValidPointerThrowsIfNull() {
++        val rustObject = MockRustObject(null)
++        rustObject.validPointer()
++    }
++
++    @Test
++    fun testConsumePointer() {
++        val rustObject = MockRustObject(MockRawPointer())
++        assertFalse(rustObject.isConsumed)
++
++        rustObject.consumePointer()
++        assertTrue(rustObject.isConsumed)
++    }
++
++    @Test
++    fun testCloseConsumesAndDestroys() {
++        val rustObject = MockRustObject(MockRawPointer())
++        assertFalse(rustObject.isConsumed)
++        assertFalse(rustObject.destroyed)
++
++        rustObject.close()
++        assertTrue(rustObject.isConsumed)
++        assertTrue(rustObject.destroyed)
++    }
++
++    @Test
++    fun testGetAndConsumeString() {
++        val str = "test"
++        val strPointer = Memory(str.length.toLong() + 1)
++        strPointer.setString(0, str)
++
++        assertNull(RustObject.getAndConsumeString(null))
++        assertEquals("test", RustObject.getAndConsumeString(strPointer))
++    }
++
++    @Test
++    fun testSafeAsync() {
++        var latch = CountDownLatch(1)
++        var complete = false
++        var error = false
++
++        RustObject.safeAsync { }.then({
++            complete = true
++            latch.countDown()
++            FxaResult<Void>()
++        }, {
++            error = true
++            latch.countDown()
++            FxaResult()
++        })
++
++        latch.await()
++        assertFalse(error)
++        assertTrue(complete)
++
++        latch = CountDownLatch(1)
++        complete = false
++
++        RustObject.safeAsync { it.code = FxaClient.ErrorCode.AuthenticationError.ordinal }.then({
++            complete = true
++            latch.countDown()
++            FxaResult<Void>()
++        }, {
++            assertTrue(it is FxaException.Unauthorized)
++            error = true
++            latch.countDown()
++            FxaResult()
++        })
++
++        latch.await()
++        assertTrue(error)
++        assertFalse(complete)
++    }
++
++    @Test
++    fun testSafeSync() {
++        assertTrue(RustObject.safeSync { true })
++
++        try {
++            RustObject.safeSync { it.code = FxaClient.ErrorCode.AuthenticationError.ordinal }
++            fail("Should have thrown FxaException.Unauthorized")
++        } catch (e: FxaException.Unauthorized) { }
++
++        try {
++            RustObject.safeSync { it.code = FxaClient.ErrorCode.InternalPanic.ordinal }
++            fail("Should have thrown FxaException.Panic")
++        } catch (e: FxaException.Panic) { }
++
++        try {
++            RustObject.safeSync { it.code = FxaClient.ErrorCode.Other.ordinal }
++            fail("Should have thrown FxaException.Unspecified")
++        } catch (e: FxaException.Unspecified) { }
++    }
++}
+\ No newline at end of file

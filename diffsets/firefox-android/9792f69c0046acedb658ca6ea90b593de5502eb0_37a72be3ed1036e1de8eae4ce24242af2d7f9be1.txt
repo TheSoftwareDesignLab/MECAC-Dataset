@@ -1,0 +1,731 @@
+diff --git a/fenix/taskcluster/ci/beetmover/kind.yml b/fenix/taskcluster/ci/beetmover/kind.yml
+new file mode 100644
+index 000000000000..59034397cac4
+--- /dev/null
++++ b/fenix/taskcluster/ci/beetmover/kind.yml
+@@ -0,0 +1,28 @@
++# This source code form is subject to the terms of the mozilla public
++# license, v. 2.0. if a copy of the mpl was not distributed with this
++# file, you can obtain one at http://mozilla.org/mpl/2.0/.
++---
++loader: fenix_taskgraph.loader.multi_dep:loader
++
++group-by: build-type
++
++transforms:
++    - fenix_taskgraph.transforms.multi_dep:transforms
++    - fenix_taskgraph.transforms.beetmover:transforms
++    - taskgraph.transforms.task:transforms
++
++kind-dependencies:
++    - signing
++
++primary-dependency: signing
++
++only-for-build-types:
++    - release
++    - beta
++    - nightly
++
++job-template:
++    attributes:
++        artifact_map: taskcluster/fenix_taskgraph/manifests/fenix_candidates.yml
++    treeherder:
++        job-symbol: BM
+diff --git a/fenix/taskcluster/ci/config.yml b/fenix/taskcluster/ci/config.yml
+index 520e6bf074f6..9b0e581b0d1c 100644
+--- a/fenix/taskcluster/ci/config.yml
++++ b/fenix/taskcluster/ci/config.yml
+@@ -51,6 +51,11 @@ workers:
+             implementation: docker-worker
+             os: linux
+             worker-type: b-linux-xlarge
++        beetmover:
++            provisioner: scriptworker-k8s
++            implementation: scriptworker-beetmover
++            os: scriptworker
++            worker-type: 'mobile-1-beetmover-dev'
+         dep-signing:
+             provisioner: scriptworker-k8s
+             implementation: scriptworker-signing
+diff --git a/fenix/taskcluster/ci/signing/kind.yml b/fenix/taskcluster/ci/signing/kind.yml
+index 6399ffb69a4d..66f8cdbb85f1 100644
+--- a/fenix/taskcluster/ci/signing/kind.yml
++++ b/fenix/taskcluster/ci/signing/kind.yml
+@@ -25,6 +25,7 @@ job-template:
+             beta-mozillaonline: autograph_apk_mozillaonline
+             release-mozillaonline: autograph_apk_mozillaonline
+             default: autograph_apk
++    signing-format: autograph_apk
+     index:
+         by-tasks-for:
+             (action|cron|github-release):
+diff --git a/fenix/taskcluster/fenix_taskgraph/loader/__init__.py b/fenix/taskcluster/fenix_taskgraph/loader/__init__.py
+index 73d5c33f69af..aa76d6676dc7 100644
+--- a/fenix/taskcluster/fenix_taskgraph/loader/__init__.py
++++ b/fenix/taskcluster/fenix_taskgraph/loader/__init__.py
+@@ -71,3 +71,36 @@ def attributes_grouping(config, tasks):
+         groups.setdefault(task.label, []).append(task)
+ 
+     return groups
++
++
++@group_by("single-locale")
++def single_locale_grouping(config, tasks):
++    """Split by a single locale (but also by platform, build-type, product)
++
++    The locale can be `None` (en-US build/signing/repackage), a single locale,
++    or multiple locales per task, e.g. for l10n chunking. In the case of a task
++    with, say, five locales, the task will show up in all five locale groupings.
++
++    This grouping is written for non-partner-repack beetmover, but might also
++    be useful elsewhere.
++
++    """
++    groups = {}
++
++    for task in tasks:
++        if task.kind not in config.get("kind-dependencies", []):
++            continue
++
++        platform = task.attributes.get("build_platform")
++        build_type = task.attributes.get("build_type")
++        task_locale = task.attributes.get("locale")
++        chunk_locales = task.attributes.get("chunk_locales")
++        locales = chunk_locales or [task_locale]
++
++        for locale in locales:
++            locale_key = (platform, build_type, locale)
++            groups.setdefault(locale_key, [])
++            if task not in groups[locale_key]:
++                groups[locale_key].append(task)
++
++    return groups
+diff --git a/fenix/taskcluster/fenix_taskgraph/manifests/fenix_candidates.yml b/fenix/taskcluster/fenix_taskgraph/manifests/fenix_candidates.yml
+new file mode 100644
+index 000000000000..a6a2d80fbb96
+--- /dev/null
++++ b/fenix/taskcluster/fenix_taskgraph/manifests/fenix_candidates.yml
+@@ -0,0 +1,87 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++---
++# This file contains exhaustive information about all the release artifacs that
++# are needed within a type of release.
++#
++# Structure
++# --------
++# `s3_bucket_paths`       -- prefix to be used per product to correctly access our S3 buckets
++# `default_locales`       -- list of locales to be used when composing upstream artifacts or the list of
++#                      destinations. If given an empty locale, it uses these locales instead.
++# `tasktype_map`          -- mapping between task reference and task type, particularly usefule when
++#                      composing the upstreamArtifacts for scriptworker.
++# `platform_names`        -- various platform mappings used in reckoning artifacts or other paths
++# `default`               -- a default entry, which the mappings extend and override in such a way that
++#                      final path full-destinations will be a concatenation of the following:
++#                      `s3_bucket_paths`, `destinations`, `locale_prefix`, `pretty_name`
++# `from`                  -- specifies the dependency(ies) from which to expect the particular artifact
++# `all_locales`           -- boolean argument to specify whether that particular artifact is to be expected
++#                      for all locales or just the default one
++# `description`           -- brief summary of what that artifact is
++# `locale_prefix`         -- prefix to be used in the final destination paths, whether that's for default locale or not
++# `source_path_modifier`  -- any parent dir that might be used in between artifact prefix and filename at source location
++#                            for example `public/build` vs `public/build/ach/`.
++# `destinations`          -- final list of directories where to push the artifacts in S3
++# `pretty_name`           -- the final name the artifact will have at destination
++# `checksums_path`        -- the name to identify one artifact within the checksums file
++# `not_for_platforms`     -- filtering option to avoid associating an artifact with a specific platform
++# `only_for_platforms`    -- filtering option to exclusively include the association of an artifact for a specific platform
++# `partials_only`         -- filtering option to avoid associating an artifact unless this flag is present
++# `update_balrog_manifest`-- flag needed downstream in beetmover jobs to reckon the balrog manifest
++# `from_buildid`          -- flag needed downstream in beetmover jobs to reckon the balrog manifest
++
++s3_bucket_paths:
++    by-release-type:
++        nightly:
++            - pub/fenix/nightly
++        default:
++            - pub/fenix/releases
++default_locales:
++    - multi
++tasktype_map:
++    signing: signing
++platform_names:
++    path_platform: android
++    tools_platform: android
++    filename_platform: android
++
++default: &default
++    from:
++        - signing
++    all_locales: true
++    description: "TO_BE_OVERRIDDEN"
++    # Hard coded 'multi' locale
++    locale_prefix: '${locale}'
++    source_path_modifier:
++        by-locale:
++            default: '${locale}'
++            multi: ''
++    checksums_path: "TODO"
++
++mapping:
++    arm64-v8a/target.apk:
++        <<: *default
++        description: "Android package for arm64-v8a"
++        pretty_name: fenix-${version}.${locale}.android-arm64-v8a.apk
++        destinations:
++            - ${version}/android-arm64-v8a
++    armeabi-v7a/target.apk:
++        <<: *default
++        description: "Android package for armeabi-v7a"
++        pretty_name: fenix-${version}.${locale}.android-armeabi-v7a.apk
++        destinations:
++            - ${version}/android-armeabi-v7a
++    x86/target.apk:
++        <<: *default
++        description: "Android package for x86"
++        pretty_name: fenix-${version}.${locale}.android-x86.apk
++        destinations:
++            - ${version}/android-x86
++    x86_64/target.apk:
++        <<: *default
++        description: "Android package for x86_64"
++        pretty_name: fenix-${version}.${locale}.android-x86_64.apk
++        destinations:
++            - ${version}/android-x86_64
+diff --git a/fenix/taskcluster/fenix_taskgraph/transforms/beetmover.py b/fenix/taskcluster/fenix_taskgraph/transforms/beetmover.py
+new file mode 100644
+index 000000000000..f30cd8f2b32d
+--- /dev/null
++++ b/fenix/taskcluster/fenix_taskgraph/transforms/beetmover.py
+@@ -0,0 +1,103 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++"""
++Transform the beetmover task into an actual task description.
++"""
++
++from __future__ import absolute_import, print_function, unicode_literals
++import logging
++
++from six import text_type, ensure_text
++
++from taskgraph.transforms.base import TransformSequence
++from taskgraph.transforms.task import task_description_schema
++from voluptuous import Any, Optional, Required, Schema
++
++from fenix_taskgraph.util.scriptworker import generate_beetmover_artifact_map
++
++logger = logging.getLogger(__name__)
++
++beetmover_description_schema = Schema(
++    {
++        # unique name to describe this beetmover task, defaults to {dep.label}-beetmover
++        Required("name"): text_type,
++        Required("worker"): {"upstream-artifacts": [dict]},
++        # treeherder is allowed here to override any defaults we use for beetmover.
++        Optional("treeherder"): task_description_schema["treeherder"],
++        Optional("attributes"): task_description_schema["attributes"],
++        Optional("dependencies"): task_description_schema["dependencies"],
++        Optional("run-on-tasks-for"): [text_type],
++    }
++)
++
++transforms = TransformSequence()
++transforms.add_validate(beetmover_description_schema)
++
++
++@transforms.add
++def make_task_description(config, tasks):
++    for task in tasks:
++        attributes = task["attributes"]
++
++        label = "beetmover-{}".format(task["name"])
++        description = (
++            "Beetmover submission for build type '{build_type}'".format(
++                build_type=attributes.get("build-type"),
++            )
++        )
++
++        if task.get("locale"):
++            attributes["locale"] = task["locale"]
++
++        task = {
++            "label": label,
++            "description": description,
++            "worker-type": "beetmover",
++            "worker": task["worker"],
++            "scopes": [
++                "project:mobile:fenix:releng:beetmover:bucket:dep",
++                "project:mobile:fenix:releng:beetmover:action:direct-push-to-bucket",
++            ],
++            "dependencies": task["dependencies"],
++            "attributes": attributes,
++            "run-on-projects": attributes.get("run_on_projects"),
++            "run-on-tasks-for": attributes.get("run_on_tasks_for"),
++            "treeherder": task["treeherder"],
++        }
++
++        yield task
++
++
++def craft_release_properties(config, task):
++    params = config.params
++    return {
++        "app-name": ensure_text(params["project"]),
++        "app-version": ensure_text(params["version"]),
++        "branch": ensure_text(params["project"]),
++        "build-id": ensure_text(params["moz_build_date"]),
++        "hash-type": "sha512",
++        "platform": "android",
++    }
++
++
++@transforms.add
++def make_task_worker(config, tasks):
++    for task in tasks:
++        locale = task["attributes"].get("locale")
++        build_type = task["attributes"]["build-type"]
++
++        task["worker"].update(
++            {
++                "implementation": "beetmover",
++                "release-properties": craft_release_properties(config, task),
++                "artifact-map": generate_beetmover_artifact_map(
++                    config, task, platform=build_type, locale=locale
++                ),
++            }
++        )
++
++        if locale:
++            task["worker"]["locale"] = locale
++
++        yield task
+diff --git a/fenix/taskcluster/fenix_taskgraph/transforms/multi_dep.py b/fenix/taskcluster/fenix_taskgraph/transforms/multi_dep.py
+index 6c932696ded4..76d28dd0a060 100644
+--- a/fenix/taskcluster/fenix_taskgraph/transforms/multi_dep.py
++++ b/fenix/taskcluster/fenix_taskgraph/transforms/multi_dep.py
+@@ -11,6 +11,8 @@
+ from taskgraph.util.schema import resolve_keyed_by
+ from taskgraph.util.treeherder import inherit_treeherder_from_dep, join_symbol
+ 
++from fenix_taskgraph.util.scriptworker import generate_beetmover_upstream_artifacts
++
+ 
+ transforms = TransformSequence()
+ 
+@@ -24,7 +26,7 @@ def build_name_and_attributes(config, tasks):
+         }
+         primary_dep = task["primary-dependency"]
+         copy_of_attributes = primary_dep.attributes.copy()
+-        task.setdefault("attributes", copy_of_attributes)
++        task.setdefault("attributes", {}).update(copy_of_attributes)
+         # run_on_tasks_for is set as an attribute later in the pipeline
+         task.setdefault("run-on-tasks-for", copy_of_attributes['run_on_tasks_for'])
+         task["name"] = _get_dependent_job_name_without_its_kind(primary_dep)
+@@ -65,19 +67,27 @@ def build_upstream_artifacts(config, tasks):
+             "upstream-artifacts": [],
+         }
+ 
+-        for dep in _get_all_deps(task).values():
+-            paths = sorted([
+-                apk_metadata["name"]
+-                for apk_metadata in dep.attributes.get("apks", {}).values()
+-            ])
+-            if paths:
+-                worker_definition["upstream-artifacts"].append({
+-                    "taskId": {"task-reference": "<{}>".format(dep.kind)},
+-                    "taskType": dep.kind,
+-                    "paths": paths,
+-                })
+-
+-        task["worker"].update(worker_definition)
++        if "artifact_map" in task["attributes"]:
++            # Beetmover tasks use declarative artifacts.
++            locale = task["attributes"].get("locale")
++            build_type = task["attributes"]["build-type"]
++            worker_definition["upstream-artifacts"] = generate_beetmover_upstream_artifacts(
++                config, task, build_type, locale
++            )
++        else:
++            for dep in _get_all_deps(task).values():
++                paths = sorted([
++                    apk_metadata["name"]
++                    for apk_metadata in dep.attributes.get("apks", {}).values()
++                ])
++                if paths:
++                    worker_definition["upstream-artifacts"].append({
++                        "taskId": {"task-reference": "<{}>".format(dep.kind)},
++                        "taskType": dep.kind,
++                        "paths": paths,
++                    })
++
++        task.setdefault("worker", {}).update(worker_definition)
+         yield task
+ 
+ 
+diff --git a/fenix/taskcluster/fenix_taskgraph/util/__init__.py b/fenix/taskcluster/fenix_taskgraph/util/__init__.py
+new file mode 100644
+index 000000000000..e69de29bb2d1
+diff --git a/fenix/taskcluster/fenix_taskgraph/util/scriptworker.py b/fenix/taskcluster/fenix_taskgraph/util/scriptworker.py
+new file mode 100644
+index 000000000000..53da83e84e19
+--- /dev/null
++++ b/fenix/taskcluster/fenix_taskgraph/util/scriptworker.py
+@@ -0,0 +1,296 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++from __future__ import absolute_import, print_function, unicode_literals
++
++import itertools
++import os
++from copy import deepcopy
++from datetime import datetime
++
++import jsone
++
++from taskgraph.util.memoize import memoize
++from taskgraph.util.schema import resolve_keyed_by
++from taskgraph.util.taskcluster import get_artifact_prefix
++from taskgraph.util.yaml import load_yaml
++
++cached_load_yaml = memoize(load_yaml)
++
++
++def generate_beetmover_upstream_artifacts(
++    config, job, platform, locale=None, dependencies=None, **kwargs
++):
++    """Generate the upstream artifacts for beetmover, using the artifact map.
++
++    Currently only applies to beetmover tasks.
++
++    Args:
++        job (dict): The current job being generated
++        dependencies (list): A list of the job's dependency labels.
++        platform (str): The current build platform
++        locale (str): The current locale being beetmoved.
++
++    Returns:
++        list: A list of dictionaries conforming to the upstream_artifacts spec.
++    """
++    base_artifact_prefix = get_artifact_prefix(job)
++    resolve_keyed_by(
++        job,
++        "attributes.artifact_map",
++        "artifact map",
++        **{
++            "release-type": config.params["release_type"],
++            "platform": platform,
++        }
++    )
++    map_config = deepcopy(cached_load_yaml(job["attributes"]["artifact_map"]))
++    upstream_artifacts = list()
++
++    if not locale:
++        locales = map_config["default_locales"]
++    elif isinstance(locale, list):
++        locales = locale
++    else:
++        locales = [locale]
++
++    if not dependencies:
++        if job.get("dependencies"):
++            dependencies = job["dependencies"].keys()
++        elif job.get("primary-dependency"):
++            dependencies = [job["primary-dependency"].kind]
++        else:
++            raise Exception("Unsupported type of dependency. Got job: {}".format(job))
++
++    for locale, dep in itertools.product(locales, dependencies):
++        paths = list()
++
++        for filename in map_config["mapping"]:
++            if dep not in map_config["mapping"][filename]["from"]:
++                continue
++            if locale != "multi" and not map_config["mapping"][filename]["all_locales"]:
++                continue
++            if (
++                "only_for_platforms" in map_config["mapping"][filename]
++                and platform
++                not in map_config["mapping"][filename]["only_for_platforms"]
++            ):
++                continue
++            if (
++                "not_for_platforms" in map_config["mapping"][filename]
++                and platform in map_config["mapping"][filename]["not_for_platforms"]
++            ):
++                continue
++            if "partials_only" in map_config["mapping"][filename]:
++                continue
++            # The next time we look at this file it might be a different locale.
++            file_config = deepcopy(map_config["mapping"][filename])
++            resolve_keyed_by(
++                file_config,
++                "source_path_modifier",
++                "source path modifier",
++                locale=locale,
++            )
++
++            kwargs["locale"] = locale
++
++            paths.append(
++                os.path.join(
++                    base_artifact_prefix,
++                    jsone.render(file_config["source_path_modifier"], kwargs),
++                    jsone.render(filename, kwargs),
++                )
++            )
++
++        if job.get("dependencies") and getattr(
++            job["dependencies"][dep], "release_artifacts", None
++        ):
++            paths = [
++                path
++                for path in paths
++                if path in job["dependencies"][dep].release_artifacts
++            ]
++
++        if not paths:
++            continue
++
++        upstream_artifacts.append(
++            {
++                "taskId": {"task-reference": "<{}>".format(dep)},
++                "taskType": map_config["tasktype_map"].get(dep),
++                "paths": sorted(paths),
++                "locale": locale,
++            }
++        )
++
++    upstream_artifacts.sort(key=lambda u: u["paths"])
++    return upstream_artifacts
++
++
++def generate_beetmover_artifact_map(config, job, **kwargs):
++    """Generate the beetmover artifact map.
++
++    Currently only applies to beetmover tasks.
++
++    Args:
++        config (): Current taskgraph configuration.
++        job (dict): The current job being generated
++    Common kwargs:
++        platform (str): The current build platform
++        locale (str): The current locale being beetmoved.
++
++    Returns:
++        list: A list of dictionaries containing source->destination
++            maps for beetmover.
++    """
++    platform = kwargs.get("platform", "")
++    resolve_keyed_by(
++        job,
++        "attributes.artifact_map",
++        job["label"],
++        **{
++            "release-type": config.params["release_type"],
++            "platform": platform,
++        }
++    )
++    map_config = deepcopy(cached_load_yaml(job["attributes"]["artifact_map"]))
++    base_artifact_prefix = map_config.get(
++        "base_artifact_prefix", get_artifact_prefix(job)
++    )
++
++    artifacts = list()
++
++    dependencies = job["dependencies"].keys()
++
++    if kwargs.get("locale"):
++        if isinstance(kwargs["locale"], list):
++            locales = kwargs["locale"]
++        else:
++            locales = [kwargs["locale"]]
++    else:
++        locales = map_config["default_locales"]
++
++    resolve_keyed_by(
++        map_config,
++        "s3_bucket_paths",
++        job["label"],
++        **{
++            "release-type": config.params['release_type'],
++        }
++    )
++
++    for locale, dep in sorted(itertools.product(locales, dependencies)):
++        paths = dict()
++        for filename in map_config["mapping"]:
++            # Relevancy checks
++            if dep not in map_config["mapping"][filename]["from"]:
++                # We don't get this file from this dependency.
++                continue
++            if locale != "multi" and not map_config["mapping"][filename]["all_locales"]:
++                # This locale either doesn't produce or shouldn't upload this file.
++                continue
++            if (
++                "only_for_platforms" in map_config["mapping"][filename]
++                and platform
++                not in map_config["mapping"][filename]["only_for_platforms"]
++            ):
++                # This platform either doesn't produce or shouldn't upload this file.
++                continue
++            if (
++                "not_for_platforms" in map_config["mapping"][filename]
++                and platform in map_config["mapping"][filename]["not_for_platforms"]
++            ):
++                # This platform either doesn't produce or shouldn't upload this file.
++                continue
++            if "partials_only" in map_config["mapping"][filename]:
++                continue
++
++            # deepcopy because the next time we look at this file the locale will differ.
++            file_config = deepcopy(map_config["mapping"][filename])
++
++            for field in [
++                "destinations",
++                "locale_prefix",
++                "source_path_modifier",
++                "update_balrog_manifest",
++                "pretty_name",
++                "checksums_path",
++            ]:
++                resolve_keyed_by(
++                    file_config,
++                    field,
++                    job["label"],
++                    locale=locale,
++                    path_platform=platform,
++                    version=config.params["version"],
++                )
++
++            # This format string should ideally be in the configuration file,
++            # but this would mean keeping variable names in sync between code + config.
++            destinations = [
++                "{s3_bucket_path}/{dest_path}/{locale_prefix}/{filename}".format(
++                    s3_bucket_path=bucket_path,
++                    dest_path=dest_path,
++                    locale_prefix=file_config["locale_prefix"],
++                    filename=file_config.get("pretty_name", filename),
++                )
++                for dest_path, bucket_path in itertools.product(
++                    file_config["destinations"], map_config["s3_bucket_paths"]
++                )
++            ]
++            # Creating map entries
++            # Key must be artifact path, to avoid trampling duplicates, such
++            # as public/build/target.apk and public/build/multi/target.apk
++            key = os.path.join(
++                base_artifact_prefix,
++                file_config["source_path_modifier"],
++                filename,
++            )
++
++            paths[key] = {
++                "destinations": destinations,
++            }
++            if file_config.get("checksums_path"):
++                paths[key]["checksums_path"] = file_config["checksums_path"]
++
++            # optional flag: balrog manifest
++            if file_config.get("update_balrog_manifest"):
++                paths[key]["update_balrog_manifest"] = True
++                if file_config.get("balrog_format"):
++                    paths[key]["balrog_format"] = file_config["balrog_format"]
++
++        if not paths:
++            # No files for this dependency/locale combination.
++            continue
++
++        # Render all variables for the artifact map
++        platforms = deepcopy(map_config.get("platform_names", {}))
++        if platform:
++            for key in platforms.keys():
++                resolve_keyed_by(platforms, key, job["label"], platform=platform)
++
++        upload_date = datetime.fromtimestamp(config.params["build_date"])
++
++        kwargs.update(
++            {
++                "locale": locale,
++                "version": config.params["version"],
++                "branch": config.params["project"],
++                "build_number": config.params["build_date"],
++                "year": upload_date.year,
++                "month": upload_date.strftime("%m"),  # zero-pad the month
++                "upload_date": upload_date.strftime("%Y-%m-%d-%H-%M-%S"),
++            }
++        )
++        kwargs.update(**platforms)
++        paths = jsone.render(paths, kwargs)
++        artifacts.append(
++            {
++                "taskId": {"task-reference": "<{}>".format(dep)},
++                "locale": locale,
++                "paths": paths,
++            }
++        )
++
++    return artifacts
+diff --git a/fenix/taskcluster/fenix_taskgraph/worker_types.py b/fenix/taskcluster/fenix_taskgraph/worker_types.py
+index 11b27a017d6e..3c36a63aa0ff 100644
+--- a/fenix/taskcluster/fenix_taskgraph/worker_types.py
++++ b/fenix/taskcluster/fenix_taskgraph/worker_types.py
+@@ -59,6 +59,53 @@ def build_scriptworker_signing_payload(config, task, task_def):
+     )
+ 
+ 
++@payload_builder(
++    "scriptworker-beetmover",
++    schema={
++        Required("action"): text_type,
++        Required("version"): text_type,
++        Required("artifact-map"): [{
++            Required("paths"): {
++                Any(text_type): {
++                    Required("destinations"): [text_type],
++                },
++            },
++            Required("taskId"): taskref_or_string,
++        }],
++        Required("beetmover-application-name"): text_type,
++        Required("bucket"): text_type,
++        Required("upstream-artifacts"): [{
++            Required("taskId"): taskref_or_string,
++            Required("taskType"): text_type,
++            Required("paths"): [text_type],
++        }],
++    },
++)
++def build_scriptworker_beetmover_payload(config, task, task_def):
++    worker = task["worker"]
++
++    task_def["tags"]["worker-implementation"] = "scriptworker"
++
++    # Needed by beetmover-scriptworker
++    for map_ in worker["artifact-map"]:
++        map_["locale"] = "multi"
++        for path_config in map_["paths"].values():
++            path_config["checksums_path"] = ""
++
++    task_def["payload"] = {
++        "artifactMap": worker["artifact-map"],
++        "releaseProperties": {"appName": worker.pop("beetmover-application-name")},
++        "upstreamArtifacts": worker["upstream-artifacts"],
++        "version": worker["version"]
++    }
++
++    scope_prefix = config.graph_config["scriptworker"]["scope-prefix"]
++    task_def["scopes"].extend([
++        "{}:beetmover:action:{}".format(scope_prefix, worker["action"]),
++        "{}:beetmover:bucket:{}".format(scope_prefix, worker["bucket"]),
++    ])
++
++
+ @payload_builder(
+     "scriptworker-pushapk",
+     schema={

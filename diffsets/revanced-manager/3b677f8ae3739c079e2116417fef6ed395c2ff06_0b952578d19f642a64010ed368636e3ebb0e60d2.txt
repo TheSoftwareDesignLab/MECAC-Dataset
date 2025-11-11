@@ -1,0 +1,1009 @@
+diff --git a/assets/i18n/en_US.json b/assets/i18n/en_US.json
+index 1a86cb6271..0ab716b6be 100644
+--- a/assets/i18n/en_US.json
++++ b/assets/i18n/en_US.json
+@@ -13,6 +13,7 @@
+         "settingsTab": "Settings"
+     },
+     "homeView": {
++        "refreshSuccess": "Refresh successfully",
+         "widgetTitle": "Dashboard",
+         "updatesSubtitle": "Updates",
+         "patchedSubtitle": "Patched applications",
+@@ -72,16 +73,15 @@
+         "viewTitle": "Select an application",
+         "searchBarHint": "Search applications",
+         "storageButton": "Storage",
+-        "errorMessage": "Unable to use selected application"
++        "errorMessage": "Unable to use selected application",
++        "downloadToast": "Download function is not available yet"
+     },
+     "patchesSelectorView": {
+         "viewTitle": "Select patches",
+         "searchBarHint": "Search patches",
+         "doneButton": "Done",
+-        "recommended": "Recommended",
+-        "recommendedTooltip": "Select all recommended patches",
+-        "all": "All",
+-        "allTooltip": "Select all patches",
++        "default": "Default",
++        "defaultTooltip": "Select all default patches",
+         "none": "None",
+         "noneTooltip": "Deselect all patches",
+         "loadPatchesSelection": "Load patches selection",
+diff --git a/lib/services/github_api.dart b/lib/services/github_api.dart
+index 0af9fbb143..74bbde6983 100644
+--- a/lib/services/github_api.dart
++++ b/lib/services/github_api.dart
+@@ -3,20 +3,23 @@ import 'dart:io';
+ 
+ import 'package:collection/collection.dart';
+ import 'package:dio/dio.dart';
+-import 'package:dio_http_cache_lts/dio_http_cache_lts.dart';
++import 'package:dio_cache_interceptor/dio_cache_interceptor.dart';
+ import 'package:flutter/foundation.dart';
+ import 'package:flutter_cache_manager/flutter_cache_manager.dart';
+ import 'package:injectable/injectable.dart';
++import 'package:native_dio_adapter/native_dio_adapter.dart';
+ import 'package:revanced_manager/models/patch.dart';
+ 
+ @lazySingleton
+ class GithubAPI {
+   late Dio _dio = Dio();
+-  final DioCacheManager _dioCacheManager = DioCacheManager(CacheConfig());
+-  final Options _cacheOptions = buildCacheOptions(
+-    const Duration(hours: 6),
++
++  final _cacheOptions = CacheOptions(
++    store: MemCacheStore(),
+     maxStale: const Duration(days: 1),
++    priority: CachePriority.high,
+   );
++
+   final Map<String, String> repoAppPath = {
+     'com.google.android.youtube': 'youtube',
+     'com.google.android.apps.youtube.music': 'music',
+@@ -30,13 +33,29 @@ class GithubAPI {
+ 
+   Future<void> initialize(String repoUrl) async {
+     try {
++      if (Platform.isIOS || Platform.isMacOS || Platform.isAndroid) {
++        final CronetEngine androidCronetEngine = await CronetEngine.build(
++          userAgent: 'ReVanced Manager',
++          enableBrotli: true,
++          enableQuic: true,
++        );
++        _dio.httpClientAdapter =
++            NativeAdapter(androidCronetEngine: androidCronetEngine);
++
++        _dio = Dio(
++          BaseOptions(
++            baseUrl: repoUrl,
++          ),
++        );
++      }
++
+       _dio = Dio(
+         BaseOptions(
+           baseUrl: repoUrl,
+         ),
+       );
+ 
+-      _dio.interceptors.add(_dioCacheManager.interceptor);
++      _dio.interceptors.add(DioCacheInterceptor(options: _cacheOptions));
+     } on Exception catch (e) {
+       if (kDebugMode) {
+         print(e);
+@@ -46,7 +65,7 @@ class GithubAPI {
+ 
+   Future<void> clearAllCache() async {
+     try {
+-      await _dioCacheManager.clearAll();
++      await _cacheOptions.store!.clean();
+     } on Exception catch (e) {
+       if (kDebugMode) {
+         print(e);
+@@ -58,7 +77,6 @@ class GithubAPI {
+     try {
+       final response = await _dio.get(
+         '/repos/$repoName/releases',
+-        options: _cacheOptions,
+       );
+       return response.data[0];
+     } on Exception catch (e) {
+@@ -83,7 +101,6 @@ class GithubAPI {
+           'path': path,
+           'since': since.toIso8601String(),
+         },
+-        options: _cacheOptions,
+       );
+       final List<dynamic> commits = response.data;
+       return commits
+diff --git a/lib/services/manager_api.dart b/lib/services/manager_api.dart
+index c4eaeb60f8..7991c64100 100644
+--- a/lib/services/manager_api.dart
++++ b/lib/services/manager_api.dart
+@@ -29,6 +29,10 @@ class ManagerAPI {
+   String defaultIntegrationsRepo = 'revanced/revanced-integrations';
+   String defaultCliRepo = 'revanced/revanced-cli';
+   String defaultManagerRepo = 'revanced/revanced-manager';
++  String? patchesVersion = '';
++  bool isDefaultPatchesRepo() {
++    return getPatchesRepo() == 'revanced/revanced-patches';
++  }
+ 
+   Future<void> initialize() async {
+     _prefs = await SharedPreferences.getInstance();
+@@ -267,6 +271,19 @@ class ManagerAPI {
+     return packageInfo.version;
+   }
+ 
++  Future<String?> getCurrentPatchesVersion() async {
++    if (isDefaultPatchesRepo()) {
++      patchesVersion = await getLatestPatchesVersion();
++      // print('Patches version: $patchesVersion');
++      return patchesVersion ?? '0.0.0';
++    } else {
++      // fetch from github
++      patchesVersion =
++          await _githubAPI.getLastestReleaseVersion(getPatchesRepo());
++    }
++    return null;
++  }
++
+   Future<List<PatchedApplication>> getAppsToRemove(
+     List<PatchedApplication> patchedApps,
+   ) async {
+diff --git a/lib/services/revanced_api.dart b/lib/services/revanced_api.dart
+index f7626d458c..eac575b125 100644
+--- a/lib/services/revanced_api.dart
++++ b/lib/services/revanced_api.dart
+@@ -3,11 +3,11 @@ import 'dart:io';
+ 
+ import 'package:collection/collection.dart';
+ import 'package:dio/dio.dart';
+-import 'package:dio_http_cache_lts/dio_http_cache_lts.dart';
++import 'package:dio_cache_interceptor/dio_cache_interceptor.dart';
+ import 'package:flutter/foundation.dart';
+ import 'package:flutter_cache_manager/flutter_cache_manager.dart';
+ import 'package:injectable/injectable.dart';
+-import 'package:native_dio_client/native_dio_client.dart';
++import 'package:native_dio_adapter/native_dio_adapter.dart';
+ import 'package:revanced_manager/models/patch.dart';
+ import 'package:revanced_manager/utils/check_for_gms.dart';
+ import 'package:timeago/timeago.dart';
+@@ -15,10 +15,11 @@ import 'package:timeago/timeago.dart';
+ @lazySingleton
+ class RevancedAPI {
+   late Dio _dio = Dio();
+-  final DioCacheManager _dioCacheManager = DioCacheManager(CacheConfig());
+-  final Options _cacheOptions = buildCacheOptions(
+-    const Duration(hours: 6),
++
++  final _cacheOptions = CacheOptions(
++    store: MemCacheStore(),
+     maxStale: const Duration(days: 1),
++    priority: CachePriority.high,
+   );
+ 
+   Future<void> initialize(String apiUrl) async {
+@@ -33,14 +34,25 @@ class RevancedAPI {
+         );
+         log('ReVanced API: Using default engine + $isGMSInstalled');
+       } else {
+-        _dio = Dio(
+-          BaseOptions(
+-            baseUrl: apiUrl,
+-          ),
+-        )..httpClientAdapter = NativeAdapter();
++        if (Platform.isIOS || Platform.isMacOS || Platform.isAndroid) {
++          final CronetEngine androidCronetEngine = await CronetEngine.build(
++            userAgent: 'ReVanced Manager',
++            enableBrotli: true,
++            enableQuic: true,
++          );
++          _dio.httpClientAdapter =
++              NativeAdapter(androidCronetEngine: androidCronetEngine);
++
++          _dio = Dio(
++            BaseOptions(
++              baseUrl: apiUrl,
++            ),
++          );
++        }
++
+         log('ReVanced API: Using CronetEngine + $isGMSInstalled');
+       }
+-      _dio.interceptors.add(_dioCacheManager.interceptor);
++      _dio.interceptors.add(DioCacheInterceptor(options: _cacheOptions));
+     } on Exception catch (e) {
+       if (kDebugMode) {
+         print(e);
+@@ -50,7 +62,7 @@ class RevancedAPI {
+ 
+   Future<void> clearAllCache() async {
+     try {
+-      await _dioCacheManager.clearAll();
++      await _cacheOptions.store!.clean();
+     } on Exception catch (e) {
+       if (kDebugMode) {
+         print(e);
+@@ -61,7 +73,7 @@ class RevancedAPI {
+   Future<Map<String, List<dynamic>>> getContributors() async {
+     final Map<String, List<dynamic>> contributors = {};
+     try {
+-      final response = await _dio.get('/contributors', options: _cacheOptions);
++      final response = await _dio.get('/contributors');
+       final List<dynamic> repositories = response.data['repositories'];
+       for (final Map<String, dynamic> repo in repositories) {
+         final String name = repo['name'];
+@@ -78,7 +90,7 @@ class RevancedAPI {
+ 
+   Future<List<Patch>> getPatches() async {
+     try {
+-      final response = await _dio.get('/patches', options: _cacheOptions);
++      final response = await _dio.get('/patches');
+       final List<dynamic> patches = response.data;
+       return patches.map((patch) => Patch.fromJson(patch)).toList();
+     } on Exception catch (e) {
+@@ -94,7 +106,7 @@ class RevancedAPI {
+     String repoName,
+   ) async {
+     try {
+-      final response = await _dio.get('/tools', options: _cacheOptions);
++      final response = await _dio.get('/tools');
+       final List<dynamic> tools = response.data['tools'];
+       return tools.firstWhereOrNull(
+         (t) =>
+diff --git a/lib/ui/views/app_selector/app_selector_view.dart b/lib/ui/views/app_selector/app_selector_view.dart
+index ea2c9264ef..26d3218fd5 100644
+--- a/lib/ui/views/app_selector/app_selector_view.dart
++++ b/lib/ui/views/app_selector/app_selector_view.dart
+@@ -3,6 +3,7 @@ import 'package:flutter_i18n/flutter_i18n.dart';
+ import 'package:revanced_manager/ui/views/app_selector/app_selector_viewmodel.dart';
+ import 'package:revanced_manager/ui/widgets/appSelectorView/app_skeleton_loader.dart';
+ import 'package:revanced_manager/ui/widgets/appSelectorView/installed_app_item.dart';
++import 'package:revanced_manager/ui/widgets/appSelectorView/not_installed_app_item.dart';
+ import 'package:revanced_manager/ui/widgets/shared/search_bar.dart';
+ import 'package:stacked/stacked.dart' hide SkeletonLoader;
+ 
+@@ -76,7 +77,16 @@ class _AppSelectorViewState extends State<AppSelectorView> {
+             SliverToBoxAdapter(
+               child: model.noApps
+                   ? Center(
+-                      child: I18nText('appSelectorCard.noAppsLabel'),
++                      child: I18nText(
++                        'appSelectorView.noApps',
++                        child: Text(
++                          '',
++                          style: TextStyle(
++                            color:
++                                Theme.of(context).textTheme.titleLarge!.color,
++                          ),
++                        ),
++                      ),
+                     )
+                   : model.apps.isEmpty
+                       ? const AppSkeletonLoader()
+@@ -84,22 +94,42 @@ class _AppSelectorViewState extends State<AppSelectorView> {
+                           padding: const EdgeInsets.symmetric(horizontal: 12.0)
+                               .copyWith(bottom: 80),
+                           child: Column(
+-                            children: model
+-                                .getFilteredApps(_query)
+-                                .map(
+-                                  (app) => InstalledAppItem(
+-                                    name: app.appName,
+-                                    pkgName: app.packageName,
+-                                    icon: app.icon,
+-                                    patchesCount:
+-                                        model.patchesCount(app.packageName),
+-                                    onTap: () {
+-                                      model.selectApp(app);
+-                                      Navigator.of(context).pop();
+-                                    },
+-                                  ),
+-                                )
+-                                .toList(),
++                            children: [
++                              ...model
++                                  .getFilteredApps(_query)
++                                  .map(
++                                    (app) => InstalledAppItem(
++                                      name: app.appName,
++                                      pkgName: app.packageName,
++                                      icon: app.icon,
++                                      patchesCount:
++                                          model.patchesCount(app.packageName),
++                                      recommendedVersion:
++                                          model.getRecommendedVersion(
++                                        app.packageName,
++                                      ),
++                                      onTap: () {
++                                        model.selectApp(app);
++                                        Navigator.of(context).pop();
++                                      },
++                                    ),
++                                  )
++                                  .toList(),
++                              ...model
++                                  .getFilteredAppsNames(_query)
++                                  .map(
++                                    (app) => NotInstalledAppItem(
++                                      name: app,
++                                      patchesCount: model.patchesCount(app),
++                                      recommendedVersion:
++                                          model.getRecommendedVersion(app),
++                                      onTap: () {
++                                        model.showDownloadToast();
++                                      },
++                                    ),
++                                  )
++                                  .toList(),
++                            ],
+                           ),
+                         ),
+             ),
+diff --git a/lib/ui/views/app_selector/app_selector_viewmodel.dart b/lib/ui/views/app_selector/app_selector_viewmodel.dart
+index 21d21d96f5..bcc580997b 100644
+--- a/lib/ui/views/app_selector/app_selector_viewmodel.dart
++++ b/lib/ui/views/app_selector/app_selector_viewmodel.dart
+@@ -5,9 +5,11 @@ import 'package:file_picker/file_picker.dart';
+ import 'package:flutter/foundation.dart';
+ import 'package:flutter/material.dart';
+ import 'package:revanced_manager/app/app.locator.dart';
++import 'package:revanced_manager/models/patch.dart';
+ import 'package:revanced_manager/models/patched_application.dart';
+ import 'package:revanced_manager/services/manager_api.dart';
+ import 'package:revanced_manager/services/patcher_api.dart';
++import 'package:revanced_manager/services/revanced_api.dart';
+ import 'package:revanced_manager/services/toast.dart';
+ import 'package:revanced_manager/ui/views/patcher/patcher_viewmodel.dart';
+ import 'package:stacked/stacked.dart';
+@@ -15,14 +17,20 @@ import 'package:stacked/stacked.dart';
+ class AppSelectorViewModel extends BaseViewModel {
+   final PatcherAPI _patcherAPI = locator<PatcherAPI>();
+   final ManagerAPI _managerAPI = locator<ManagerAPI>();
++  final RevancedAPI _revancedAPI = locator<RevancedAPI>();
+   final Toast _toast = locator<Toast>();
+   final List<ApplicationWithIcon> apps = [];
++  List<String> allApps = [];
+   bool noApps = false;
+   int patchesCount(String packageName) {
+     return _patcherAPI.getFilteredPatches(packageName).length;
+   }
+ 
++  List<Patch> patches = [];
++
+   Future<void> initialize() async {
++    patches = await _revancedAPI.getPatches();
++
+     apps.addAll(
+       await _patcherAPI
+           .getFilteredInstalledApps(_managerAPI.areUniversalPatchesEnabled()),
+@@ -34,9 +42,25 @@ class AppSelectorViewModel extends BaseViewModel {
+           .compareTo(_patcherAPI.getFilteredPatches(a.packageName).length),
+     );
+     noApps = apps.isEmpty;
++    getAllApps();
++
+     notifyListeners();
+   }
+ 
++  List<String> getAllApps() {
++    allApps = patches
++        .expand((e) => e.compatiblePackages.map((p) => p.name))
++        .toSet()
++        .where((name) => !apps.any((app) => app.packageName == name))
++        .toList();
++
++    return allApps;
++  }
++
++  String getRecommendedVersion(String packageName) {
++    return _patcherAPI.getRecommendedVersion(packageName);
++  }
++
+   Future<void> selectApp(ApplicationWithIcon application) async {
+     locator<PatcherViewModel>().selectedApp = PatchedApplication(
+       name: application.appName,
+@@ -105,4 +129,18 @@ class AppSelectorViewModel extends BaseViewModel {
+         )
+         .toList();
+   }
++
++  List<String> getFilteredAppsNames(String query) {
++    return allApps
++        .where(
++          (app) =>
++              query.isEmpty ||
++              query.length < 2 ||
++              app.toLowerCase().contains(query.toLowerCase()),
++        )
++        .toList();
++  }
++
++  void showDownloadToast() =>
++      _toast.showBottom('appSelectorView.downloadToast');
+ }
+diff --git a/lib/ui/views/home/home_view.dart b/lib/ui/views/home/home_view.dart
+index 4d067d5c8e..1f923390bc 100644
+--- a/lib/ui/views/home/home_view.dart
++++ b/lib/ui/views/home/home_view.dart
+@@ -50,8 +50,9 @@ class HomeView extends StatelessWidget {
+                       ),
+                       const SizedBox(height: 10),
+                       LatestCommitCard(
+-                        onPressed: () =>
++                        onPressedManager: () =>
+                             model.showUpdateConfirmationDialog(context),
++                        onPressedPatches: () => model.forceRefresh(context),
+                       ),
+                       const SizedBox(height: 23),
+                       I18nText(
+diff --git a/lib/ui/views/home/home_viewmodel.dart b/lib/ui/views/home/home_viewmodel.dart
+index ac55306146..c16d971f7c 100644
+--- a/lib/ui/views/home/home_viewmodel.dart
++++ b/lib/ui/views/home/home_viewmodel.dart
+@@ -105,6 +105,26 @@ class HomeViewModel extends BaseViewModel {
+     return false;
+   }
+ 
++  Future<bool> hasPatchesUpdates() async {
++    final String? latestVersion = await _managerAPI.getLatestPatchesVersion();
++    final String? currentVersion = await _managerAPI.getCurrentPatchesVersion();
++    if (latestVersion != null) {
++      try {
++        final int latestVersionInt =
++            int.parse(latestVersion.replaceAll(RegExp('[^0-9]'), ''));
++        final int currentVersionInt =
++            int.parse(currentVersion!.replaceAll(RegExp('[^0-9]'), ''));
++        return latestVersionInt > currentVersionInt;
++      } on Exception catch (e) {
++        if (kDebugMode) {
++          print(e);
++        }
++        return false;
++      }
++    }
++    return false;
++  }
++
+   Future<void> updateManager(BuildContext context) async {
+     try {
+       _toast.showBottom('homeView.downloadingMessage');
+@@ -180,6 +200,7 @@ class HomeViewModel extends BaseViewModel {
+         _lastUpdate!.difference(DateTime.now()).inSeconds > 2) {
+       _managerAPI.clearAllData();
+     }
++    _toast.showBottom('homeView.refreshSuccess');
+     initialize(context);
+   }
+ }
+diff --git a/lib/ui/views/patches_selector/patches_selector_view.dart b/lib/ui/views/patches_selector/patches_selector_view.dart
+index 91f75c9c86..a303e45f18 100644
+--- a/lib/ui/views/patches_selector/patches_selector_view.dart
++++ b/lib/ui/views/patches_selector/patches_selector_view.dart
+@@ -135,25 +135,13 @@ class _PatchesSelectorViewState extends State<PatchesSelectorView> {
+                           Row(
+                             children: [
+                               ActionChip(
+-                                label: I18nText('patchesSelectorView.recommended'),
++                                label: I18nText('patchesSelectorView.default'),
+                                 tooltip: FlutterI18n.translate(
+                                   context,
+-                                  'patchesSelectorView.recommendedTooltip',
++                                  'patchesSelectorView.defaultTooltip',
+                                 ),
+                                 onPressed: () {
+-                                  model.selectRecommendedPatches();
+-                                },
+-                              ),
+-                              const SizedBox(width: 8),
+-                              ActionChip(
+-                                label: I18nText('patchesSelectorView.all'),
+-                                tooltip: FlutterI18n.translate(
+-                                  context,
+-                                  'patchesSelectorView.allTooltip',
+-                                ),
+-                                onPressed: () {
+-                                  model.selectAllPatcherWarning(context);
+-                                  model.selectAllPatches(true);
++                                  model.selectDefaultPatches();
+                                 },
+                               ),
+                               const SizedBox(width: 8),
+diff --git a/lib/ui/views/patches_selector/patches_selector_viewmodel.dart b/lib/ui/views/patches_selector/patches_selector_viewmodel.dart
+index b44e23f0aa..75d24c5c40 100644
+--- a/lib/ui/views/patches_selector/patches_selector_viewmodel.dart
++++ b/lib/ui/views/patches_selector/patches_selector_viewmodel.dart
+@@ -1,6 +1,4 @@
+ import 'package:collection/collection.dart';
+-import 'package:flutter/material.dart';
+-import 'package:flutter_i18n/widgets/I18nText.dart';
+ import 'package:revanced_manager/app/app.locator.dart';
+ import 'package:revanced_manager/models/patch.dart';
+ import 'package:revanced_manager/models/patched_application.dart';
+@@ -9,7 +7,6 @@ import 'package:revanced_manager/services/manager_api.dart';
+ import 'package:revanced_manager/services/patcher_api.dart';
+ import 'package:revanced_manager/services/toast.dart';
+ import 'package:revanced_manager/ui/views/patcher/patcher_viewmodel.dart';
+-import 'package:revanced_manager/ui/widgets/shared/custom_material_button.dart';
+ import 'package:stacked/stacked.dart';
+ 
+ class PatchesSelectorViewModel extends BaseViewModel {
+@@ -50,39 +47,7 @@ class PatchesSelectorViewModel extends BaseViewModel {
+     notifyListeners();
+   }
+ 
+-  Future<void> selectAllPatcherWarning(BuildContext context) {
+-    return showDialog(
+-      context: context,
+-      builder: (context) => AlertDialog(
+-        title: I18nText('warning'),
+-        backgroundColor: Theme.of(context).colorScheme.secondaryContainer,
+-        content: I18nText('patchesSelectorView.selectAllPatchesWarningContent'),
+-        actions: <Widget>[
+-          CustomMaterialButton(
+-            label: I18nText('okButton'),
+-            onPressed: () => Navigator.of(context).pop(),
+-          )
+-        ],
+-      ),
+-    );
+-  }
+-
+-  void selectAllPatches(bool isSelected) {
+-    selectedPatches.clear();
+-
+-    if (isSelected && _managerAPI.areExperimentalPatchesEnabled() == false) {
+-      selectedPatches
+-          .addAll(patches.where((element) => isPatchSupported(element)));
+-    }
+-
+-    if (isSelected && _managerAPI.areExperimentalPatchesEnabled()) {
+-      selectedPatches.addAll(patches);
+-    }
+-
+-    notifyListeners();
+-  }
+-
+-  void selectRecommendedPatches() {
++  void selectDefaultPatches() {
+     selectedPatches.clear();
+ 
+     if (_managerAPI.areExperimentalPatchesEnabled() == false) {
+diff --git a/lib/ui/views/settings/settingsFragment/settings_manage_api_url.dart b/lib/ui/views/settings/settingsFragment/settings_manage_api_url.dart
+index 438f519b1e..92b4889527 100644
+--- a/lib/ui/views/settings/settingsFragment/settings_manage_api_url.dart
++++ b/lib/ui/views/settings/settingsFragment/settings_manage_api_url.dart
+@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
+ import 'package:flutter_i18n/flutter_i18n.dart';
+ import 'package:revanced_manager/app/app.locator.dart';
+ import 'package:revanced_manager/services/manager_api.dart';
++import 'package:revanced_manager/services/toast.dart';
+ import 'package:revanced_manager/ui/widgets/settingsView/custom_text_field.dart';
+ import 'package:revanced_manager/ui/widgets/settingsView/settings_tile_dialog.dart';
+ import 'package:revanced_manager/ui/widgets/shared/custom_material_button.dart';
+@@ -11,6 +12,7 @@ import 'package:stacked/stacked.dart';
+ 
+ class SManageApiUrl extends BaseViewModel {
+   final ManagerAPI _managerAPI = locator<ManagerAPI>();
++  final Toast _toast = locator<Toast>();
+ 
+   final TextEditingController _apiUrlController = TextEditingController();
+ 
+@@ -90,7 +92,7 @@ class SManageApiUrl extends BaseViewModel {
+             label: I18nText('yesButton'),
+             onPressed: () {
+               _managerAPI.setApiUrl('');
+-              Navigator.of(context).pop();
++              _toast.showBottom('settingsView.restartAppForChanges');
+               Navigator.of(context).pop();
+             },
+           )
+diff --git a/lib/ui/views/settings/settingsFragment/settings_manage_sources.dart b/lib/ui/views/settings/settingsFragment/settings_manage_sources.dart
+index 72825aee69..0df1127867 100644
+--- a/lib/ui/views/settings/settingsFragment/settings_manage_sources.dart
++++ b/lib/ui/views/settings/settingsFragment/settings_manage_sources.dart
+@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
+ import 'package:flutter_i18n/flutter_i18n.dart';
+ import 'package:revanced_manager/app/app.locator.dart';
+ import 'package:revanced_manager/services/manager_api.dart';
++import 'package:revanced_manager/services/toast.dart';
+ import 'package:revanced_manager/ui/widgets/settingsView/custom_text_field.dart';
+ import 'package:revanced_manager/ui/widgets/settingsView/settings_tile_dialog.dart';
+ import 'package:revanced_manager/ui/widgets/shared/custom_material_button.dart';
+@@ -11,6 +12,7 @@ import 'package:stacked/stacked.dart';
+ 
+ class SManageSources extends BaseViewModel {
+   final ManagerAPI _managerAPI = locator<ManagerAPI>();
++  final Toast _toast = locator<Toast>();
+ 
+   final TextEditingController _hostSourceController = TextEditingController();
+   final TextEditingController _orgPatSourceController = TextEditingController();
+@@ -124,6 +126,7 @@ class SManageSources extends BaseViewModel {
+               _managerAPI.setIntegrationsRepo(
+                 '${_orgIntSourceController.text}/${_intSourceController.text}',
+               );
++              _toast.showBottom('settingsView.restartAppForChanges');
+               Navigator.of(context).pop();
+             },
+           )
+@@ -151,6 +154,7 @@ class SManageSources extends BaseViewModel {
+               _managerAPI.setRepoUrl('');
+               _managerAPI.setPatchesRepo('');
+               _managerAPI.setIntegrationsRepo('');
++              _toast.showBottom('settingsView.restartAppForChanges');
+               Navigator.of(context).pop();
+             },
+           )
+diff --git a/lib/ui/widgets/appSelectorView/installed_app_item.dart b/lib/ui/widgets/appSelectorView/installed_app_item.dart
+index 839960c5e3..5d15d92e97 100644
+--- a/lib/ui/widgets/appSelectorView/installed_app_item.dart
++++ b/lib/ui/widgets/appSelectorView/installed_app_item.dart
+@@ -9,12 +9,14 @@ class InstalledAppItem extends StatefulWidget {
+     required this.pkgName,
+     required this.icon,
+     required this.patchesCount,
++    required this.recommendedVersion,
+     this.onTap,
+   }) : super(key: key);
+   final String name;
+   final String pkgName;
+   final Uint8List icon;
+   final int patchesCount;
++  final String recommendedVersion;
+   final Function()? onTap;
+ 
+   @override
+@@ -46,31 +48,35 @@ class _InstalledAppItemState extends State<InstalledAppItem> {
+               child: Column(
+                 crossAxisAlignment: CrossAxisAlignment.start,
+                 children: <Widget>[
++                  Text(
++                    widget.name,
++                    maxLines: 2,
++                    overflow: TextOverflow.visible,
++                    style: const TextStyle(
++                      fontSize: 16,
++                      fontWeight: FontWeight.w500,
++                    ),
++                  ),
++                  const SizedBox(height: 4),
++                  Text(widget.pkgName),
+                   Row(
+-                    children: <Widget>[
++                    children: [
+                       Text(
+-                        widget.name,
+-                        maxLines: 2,
+-                        overflow: TextOverflow.visible,
+-                        style: const TextStyle(
+-                          fontSize: 16,
+-                          fontWeight: FontWeight.w500,
+-                        ),
++                        widget.recommendedVersion.isEmpty
++                            ? 'All versions'
++                            : widget.recommendedVersion,
+                       ),
+-                      const SizedBox(width: 6),
++                      const SizedBox(width: 4),
+                       Text(
+                         widget.patchesCount == 1
+-                            ? '${widget.patchesCount} patch'
+-                            : '${widget.patchesCount} patches',
++                            ? '• ${widget.patchesCount} patch'
++                            : '• ${widget.patchesCount} patches',
+                         style: TextStyle(
+-                          fontSize: 8,
+                           color: Theme.of(context).colorScheme.secondary,
+                         ),
+                       ),
+                     ],
+                   ),
+-                  const SizedBox(height: 4),
+-                  Text(widget.pkgName),
+                 ],
+               ),
+             ),
+diff --git a/lib/ui/widgets/appSelectorView/not_installed_app_item.dart b/lib/ui/widgets/appSelectorView/not_installed_app_item.dart
+new file mode 100644
+index 0000000000..807a31a125
+--- /dev/null
++++ b/lib/ui/widgets/appSelectorView/not_installed_app_item.dart
+@@ -0,0 +1,85 @@
++import 'package:flutter/material.dart';
++import 'package:revanced_manager/ui/widgets/shared/custom_card.dart';
++
++class NotInstalledAppItem extends StatefulWidget {
++  const NotInstalledAppItem({
++    Key? key,
++    required this.name,
++    required this.patchesCount,
++    required this.recommendedVersion,
++    this.onTap,
++  }) : super(key: key);
++  final String name;
++  final int patchesCount;
++  final String recommendedVersion;
++  final Function()? onTap;
++
++  @override
++  State<NotInstalledAppItem> createState() => _NotInstalledAppItem();
++}
++
++class _NotInstalledAppItem extends State<NotInstalledAppItem> {
++  @override
++  Widget build(BuildContext context) {
++    return Padding(
++      padding: const EdgeInsets.symmetric(vertical: 4.0),
++      child: CustomCard(
++        onTap: widget.onTap,
++        child: Row(
++          mainAxisAlignment: MainAxisAlignment.spaceBetween,
++          children: <Widget>[
++            Container(
++              height: 48,
++              padding: const EdgeInsets.symmetric(vertical: 4.0),
++              alignment: Alignment.center,
++              child: const CircleAvatar(
++                backgroundColor: Colors.transparent,
++                child: Icon(
++                  Icons.square_rounded,
++                  color: Colors.grey,
++                  size: 44,
++                ),
++              ),
++            ),
++            const SizedBox(width: 12),
++            Expanded(
++              child: Column(
++                crossAxisAlignment: CrossAxisAlignment.start,
++                children: <Widget>[
++                  Text(
++                    widget.name,
++                    style: const TextStyle(
++                      fontSize: 16,
++                      fontWeight: FontWeight.w500,
++                    ),
++                  ),
++                  const SizedBox(height: 4),
++                  const Text('App not installed.'),
++                  const SizedBox(height: 4),
++                  Row(
++                    children: [
++                      Text(
++                        widget.recommendedVersion.isEmpty
++                            ? 'All versions'
++                            : widget.recommendedVersion,
++                      ),
++                      const SizedBox(width: 4),
++                      Text(
++                        widget.patchesCount == 1
++                            ? '• ${widget.patchesCount} patch'
++                            : '• ${widget.patchesCount} patches',
++                        style: TextStyle(
++                          color: Theme.of(context).colorScheme.secondary,
++                        ),
++                      ),
++                    ],
++                  ),
++                ],
++              ),
++            ),
++          ],
++        ),
++      ),
++    );
++  }
++}
+diff --git a/lib/ui/widgets/homeView/latest_commit_card.dart b/lib/ui/widgets/homeView/latest_commit_card.dart
+index f23beb0796..e6830621ae 100644
+--- a/lib/ui/widgets/homeView/latest_commit_card.dart
++++ b/lib/ui/widgets/homeView/latest_commit_card.dart
+@@ -8,9 +8,11 @@ import 'package:revanced_manager/ui/widgets/shared/custom_material_button.dart';
+ class LatestCommitCard extends StatefulWidget {
+   const LatestCommitCard({
+     Key? key,
+-    required this.onPressed,
++    required this.onPressedManager,
++    required this.onPressedPatches,
+   }) : super(key: key);
+-  final Function() onPressed;
++  final Function() onPressedManager;
++  final Function() onPressedPatches;
+ 
+   @override
+   State<LatestCommitCard> createState() => _LatestCommitCardState();
+@@ -21,66 +23,109 @@ class _LatestCommitCardState extends State<LatestCommitCard> {
+ 
+   @override
+   Widget build(BuildContext context) {
+-    return CustomCard(
+-      child: Row(
+-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+-        children: <Widget>[
+-          Column(
+-            crossAxisAlignment: CrossAxisAlignment.start,
++    return Column(
++      children: [
++        // ReVanced Manager
++        CustomCard(
++          child: Row(
++            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+             children: <Widget>[
+-              Row(
++              Column(
++                crossAxisAlignment: CrossAxisAlignment.start,
+                 children: <Widget>[
+-                  I18nText('latestCommitCard.patcherLabel'),
+-                  FutureBuilder<String?>(
+-                    future: model.getLatestPatcherReleaseTime(),
+-                    builder: (context, snapshot) => Text(
+-                      snapshot.hasData && snapshot.data!.isNotEmpty
+-                          ? FlutterI18n.translate(
+-                              context,
+-                              'latestCommitCard.timeagoLabel',
+-                              translationParams: {'time': snapshot.data!},
+-                            )
+-                          : FlutterI18n.translate(
+-                              context,
+-                              'latestCommitCard.loadingLabel',
+-                            ),
+-                    ),
++                  Row(
++                    children: const <Widget>[
++                      Text('ReVanced Manager'),
++                    ],
++                  ),
++                  const SizedBox(height: 4),
++                  Row(
++                    children: <Widget>[
++                      FutureBuilder<String?>(
++                        future: model.getLatestManagerReleaseTime(),
++                        builder: (context, snapshot) =>
++                            snapshot.hasData && snapshot.data!.isNotEmpty
++                                ? I18nText(
++                                    'latestCommitCard.timeagoLabel',
++                                    translationParams: {'time': snapshot.data!},
++                                  )
++                                : I18nText('latestCommitCard.loadingLabel'),
++                      ),
++                    ],
+                   ),
+                 ],
+               ),
+-              const SizedBox(height: 4),
+-              Row(
+-                children: <Widget>[
+-                  I18nText('latestCommitCard.managerLabel'),
+-                  FutureBuilder<String?>(
+-                    future: model.getLatestManagerReleaseTime(),
+-                    builder: (context, snapshot) =>
+-                        snapshot.hasData && snapshot.data!.isNotEmpty
+-                            ? I18nText(
+-                                'latestCommitCard.timeagoLabel',
+-                                translationParams: {'time': snapshot.data!},
+-                              )
+-                            : I18nText('latestCommitCard.loadingLabel'),
++              FutureBuilder<bool>(
++                future: locator<HomeViewModel>().hasManagerUpdates(),
++                initialData: false,
++                builder: (context, snapshot) => Opacity(
++                  opacity: snapshot.hasData && snapshot.data! ? 1.0 : 0.25,
++                  child: CustomMaterialButton(
++                    label: I18nText('updateButton'),
++                    onPressed: snapshot.hasData && snapshot.data!
++                        ? widget.onPressedManager
++                        : () => {},
+                   ),
+-                ],
++                ),
+               ),
+             ],
+           ),
+-          FutureBuilder<bool>(
+-            future: locator<HomeViewModel>().hasManagerUpdates(),
+-            initialData: false,
+-            builder: (context, snapshot) => Opacity(
+-              opacity: snapshot.hasData && snapshot.data! ? 1.0 : 0.25,
+-              child: CustomMaterialButton(
+-                label: I18nText('latestCommitCard.updateButton'),
+-                onPressed: snapshot.hasData && snapshot.data!
+-                    ? widget.onPressed
+-                    : () => {},
++        ),
++
++        const SizedBox(height: 16),
++
++        // ReVanced Patches
++        CustomCard(
++          child: Row(
++            mainAxisAlignment: MainAxisAlignment.spaceBetween,
++            children: <Widget>[
++              Column(
++                crossAxisAlignment: CrossAxisAlignment.start,
++                children: <Widget>[
++                  Row(
++                    children: const <Widget>[
++                      Text('ReVanced Patches'),
++                    ],
++                  ),
++                  const SizedBox(height: 4),
++                  Row(
++                    children: <Widget>[
++                      FutureBuilder<String?>(
++                        future: model.getLatestPatcherReleaseTime(),
++                        builder: (context, snapshot) => Text(
++                          snapshot.hasData && snapshot.data!.isNotEmpty
++                              ? FlutterI18n.translate(
++                                  context,
++                                  'latestCommitCard.timeagoLabel',
++                                  translationParams: {'time': snapshot.data!},
++                                )
++                              : FlutterI18n.translate(
++                                  context,
++                                  'latestCommitCard.loadingLabel',
++                                ),
++                        ),
++                      ),
++                    ],
++                  ),
++                ],
+               ),
+-            ),
++              FutureBuilder<bool>(
++                future: locator<HomeViewModel>().hasPatchesUpdates(),
++                initialData: false,
++                builder: (context, snapshot) => Opacity(
++                  opacity: snapshot.hasData && snapshot.data! ? 1.0 : 0.25,
++                  child: CustomMaterialButton(
++                    label: I18nText('updateButton'),
++                    onPressed: snapshot.hasData && snapshot.data!
++                        ? widget.onPressedPatches
++                        : () => {},
++                  ),
++                ),
++              ),
++            ],
+           ),
+-        ],
+-      ),
++        ),
++      ],
+     );
+   }
+ }
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 19c087728e..425cc487c7 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -20,9 +20,7 @@ dependencies:
+       url: https://github.com/ponces/flutter_plugin_device_apps
+       ref: revanced-manager
+   device_info_plus: ^4.1.2
+-  dio: ^4.0.6
+-  dio_brotli_transformer: ^1.0.1
+-  dio_http_cache_lts: ^0.4.1
++  dio: ^5.0.0
+   dynamic_color: ^1.5.4
+   dynamic_themes: ^1.1.0
+   expandable: ^5.0.1
+@@ -52,7 +50,7 @@ dependencies:
+     git:
+       url: https://github.com/SuaMusica/logcat
+       ref: feature/nullSafe
+-  native_dio_client: ^0.0.1-dev+1
++  native_dio_adapter: ^0.1.0
+   package_info_plus: ^1.4.3+1
+   path_provider: ^2.0.11
+   permission_handler: ^10.0.0
+@@ -75,6 +73,7 @@ dependencies:
+   flutter_dotenv: ^5.0.2
+   pub_release: ^8.0.3
+   flutter_markdown: ^0.6.13
++  dio_cache_interceptor: ^3.4.0
+ 
+ dev_dependencies:
+   json_serializable: ^6.3.1

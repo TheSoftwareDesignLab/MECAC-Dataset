@@ -1,0 +1,356 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index f10d1b512e4..f82bd25c31f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3431,9 +3431,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "libc"
+-version = "0.2.144"
++version = "0.2.149"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "2b00cc1c228a6782d0f076e7b232802e0c5689d41bb5df366f2a6b6621cfdfe1"
++checksum = "a08173bc88b7955d1b3145aa561539096c421ac8debde8cbc3612ec635fee29b"
+ 
+ [[package]]
+ name = "libdbus-sys"
+diff --git a/libs/clipboard/src/context_send.rs b/libs/clipboard/src/context_send.rs
+index 3235d7bfe1a..e8fc33c1e65 100644
+--- a/libs/clipboard/src/context_send.rs
++++ b/libs/clipboard/src/context_send.rs
+@@ -38,7 +38,7 @@ impl ContextSend {
+                     }
+                     Err(err) => {
+                         log::error!(
+-                            "Create clipboard context for file transfer: {}",
++                            "create clipboard context for file transfer: {}",
+                             err.to_string()
+                         );
+                     }
+diff --git a/libs/clipboard/src/lib.rs b/libs/clipboard/src/lib.rs
+index 15570d71fb6..6340eed0832 100644
+--- a/libs/clipboard/src/lib.rs
++++ b/libs/clipboard/src/lib.rs
+@@ -198,6 +198,18 @@ pub fn get_rx_cliprdr_server(conn_id: i32) -> Arc<TokioMutex<UnboundedReceiver<C
+ 
+ #[inline]
+ fn send_data(conn_id: i32, data: ClipboardFile) {
++    #[cfg(target_os = "windows")]
++    return send_data_to_channel(conn_id, data);
++    #[cfg(not(target_os = "windows"))]
++    if conn_id == 0 {
++        send_data_to_all(data);
++    } else {
++        send_data_to_channel(conn_id, data);
++    }
++}
++
++#[inline]
++fn send_data_to_channel(conn_id: i32, data: ClipboardFile) {
+     // no need to handle result here
+     if let Some(msg_channel) = VEC_MSG_CHANNEL
+         .read()
+@@ -205,10 +217,20 @@ fn send_data(conn_id: i32, data: ClipboardFile) {
+         .iter()
+         .find(|x| x.conn_id == conn_id)
+     {
++        log::debug!("send data to connection: {}", conn_id);
+         allow_err!(msg_channel.sender.send(data));
+     }
+ }
+ 
++#[inline]
++fn send_data_to_all(data: ClipboardFile) {
++    // no need to handle result here
++    for msg_channel in VEC_MSG_CHANNEL.read().unwrap().iter() {
++        log::debug!("send data to connection: {}", msg_channel.conn_id);
++        allow_err!(msg_channel.sender.send(data.clone()));
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     // #[test]
+diff --git a/libs/clipboard/src/platform/fuse.rs b/libs/clipboard/src/platform/fuse.rs
+index e4fa0a09f87..606237d8bde 100644
+--- a/libs/clipboard/src/platform/fuse.rs
++++ b/libs/clipboard/src/platform/fuse.rs
+@@ -126,6 +126,11 @@ impl CliprdrTxnDispatcher {
+         self.txn_handler
+             .insert((conn_id, stream_id.copied()), req.clone());
+ 
++        log::debug!(
++            "send request to conn_id={}, stream_id={:?}",
++            conn_id,
++            stream_id
++        );
+         crate::send_data(conn_id, request);
+         req
+     }
+@@ -137,6 +142,7 @@ impl CliprdrTxnDispatcher {
+             _ => unreachable!(),
+         };
+         let key = (conn_id, stream_id.cloned());
++        log::debug!("recv response for {:?}", key);
+         match self.txn_handler.remove(&key) {
+             Some((_, tx)) => tx.set(response),
+             None => log::warn!("no request found for {:?}", key),
+@@ -570,17 +576,19 @@ impl FuseServer {
+     fn gc_files(&self) {
+         {
+             let mut status = self.status.write();
+-            // really update only when:
+-            // running: Active
+-            if *status != Status::Active {
+-                return;
+-            }
++
+             // received update after fetching complete
+             // should fetch again
+             if *status == Status::Building {
+                 *status = Status::GcComplete;
+                 return;
+             }
++
++            // really update only when:
++            // running: Active
++            if *status != Status::Active {
++                return;
++            }
+             *status = Status::Gc;
+         }
+ 
+diff --git a/libs/clipboard/src/platform/linux/mod.rs b/libs/clipboard/src/platform/linux/mod.rs
+index 0c53f0c9ed4..cd3bbe2b50c 100644
+--- a/libs/clipboard/src/platform/linux/mod.rs
++++ b/libs/clipboard/src/platform/linux/mod.rs
+@@ -20,7 +20,7 @@ use lazy_static::lazy_static;
+ use parking_lot::{Mutex, RwLock};
+ use utf16string::WString;
+ 
+-use crate::{send_data, ClipboardFile, CliprdrError, CliprdrServiceContext};
++use crate::{send_data, send_data_to_all, ClipboardFile, CliprdrError, CliprdrServiceContext};
+ 
+ use super::{fuse::FuseServer, LDAP_EPOCH_DELTA};
+ 
+@@ -364,7 +364,6 @@ impl ClipboardContext {
+ 
+             if fuse_handle.is_none() {
+                 let mount_path = &self.fuse_mount_point;
+-                create_if_not_exists(mount_path);
+ 
+                 let mnt_opts = [
+                     MountOption::FSName("rustdesk-cliprdr-fs".to_string()),
+@@ -408,6 +407,7 @@ impl ClipboardContext {
+ 
+         let mut fuse_handle = self.fuse_handle.lock();
+         if let Some(fuse_handle) = fuse_handle.take() {
++            log::debug!("unmounting clipboard FUSE");
+             fuse_handle.join();
+         }
+         self.clipboard.stop();
+@@ -446,7 +446,7 @@ impl ClipboardContext {
+                 ],
+             };
+ 
+-            send_data(0, data);
++            send_data_to_all(data);
+             log::debug!("format list update sent");
+         }
+         Ok(())
+@@ -649,26 +649,39 @@ fn resp_file_contents_fail(conn_id: i32, stream_id: i32) {
+     send_data(conn_id, resp)
+ }
+ 
+-fn create_if_not_exists(path: &PathBuf) {
+-    if std::fs::metadata(path).is_ok() {
+-        return;
++impl ClipboardContext {
++    pub fn is_stopped(&self) -> bool {
++        self.fuse_handle.lock().is_none()
+     }
+-    std::fs::create_dir(path).unwrap();
+-}
+ 
+-impl ClipboardContext {
+     pub fn set_is_stopped(&self) -> Result<(), CliprdrError> {
+-        // do nothing
++        if self.is_stopped() {
++            log::debug!("cliprdr already stopped");
++            return Ok(());
++        }
++        // unmount the fuse
++        if let Some(fuse_handle) = self.fuse_handle.lock().take() {
++            fuse_handle.join();
++        }
+         Ok(())
+     }
+ 
+     pub fn empty_clipboard(&self, conn_id: i32) -> Result<bool, CliprdrError> {
+         // gc all files, the clipboard is going to shutdown
++        if self.is_stopped() {
++            log::debug!("cliprdr stopped, skip emptying clipboard");
++            return Ok(true);
++        }
++
+         self.fuse_server
+             .update_files(conn_id, FILEDESCRIPTOR_FORMAT_ID, FILECONTENTS_FORMAT_ID)
+     }
+ 
+     pub fn serve(&self, conn_id: i32, msg: ClipboardFile) -> Result<(), CliprdrError> {
++        if self.is_stopped() {
++            log::debug!("cliprdr stopped, skip serving clipboard");
++            return Ok(());
++        }
+         match msg {
+             ClipboardFile::NotifyCallback { .. } => {
+                 unreachable!()
+@@ -683,6 +696,7 @@ impl ClipboardContext {
+             }
+ 
+             ClipboardFile::FormatList { format_list } => {
++                log::debug!("server_format_list called");
+                 // filter out "FileGroupDescriptorW" and "FileContents"
+                 let fmt_lst: Vec<(i32, String)> = format_list
+                     .into_iter()
+@@ -713,6 +727,7 @@ impl ClipboardContext {
+                 Ok(())
+             }
+             ClipboardFile::FormatListResponse { msg_flags } => {
++                log::debug!("server_format_list_response called");
+                 if msg_flags != 0x1 {
+                     self.send_format_list(conn_id)
+                 } else {
+@@ -722,6 +737,7 @@ impl ClipboardContext {
+             ClipboardFile::FormatDataRequest {
+                 requested_format_id,
+             } => {
++                log::debug!("server_format_data_request called");
+                 let Some(format) = get_local_format(requested_format_id) else {
+                     log::error!(
+                         "got unsupported format data request: id={} from conn={}",
+@@ -752,6 +768,7 @@ impl ClipboardContext {
+             }
+             ClipboardFile::FormatDataResponse { .. } => {
+                 // we don't know its corresponding request, no resend can be performed
++                log::debug!("server_format_data_response called");
+ 
+                 self.fuse_server.recv(conn_id, msg);
+                 let paths = self.fuse_server.list_root();
+@@ -759,6 +776,7 @@ impl ClipboardContext {
+                 Ok(())
+             }
+             ClipboardFile::FileContentsResponse { .. } => {
++                log::debug!("server_file_contents_response called");
+                 // we don't know its corresponding request, no resend can be performed
+                 self.fuse_server.recv(conn_id, msg);
+                 Ok(())
+@@ -772,6 +790,7 @@ impl ClipboardContext {
+                 cb_requested,
+                 ..
+             } => {
++                log::debug!("server_file_contents_request called");
+                 let fcr = if dw_flags == 0x1 {
+                     FileContentsRequest::Size {
+                         stream_id,
+diff --git a/libs/clipboard/src/platform/linux/x11.rs b/libs/clipboard/src/platform/linux/x11.rs
+index 99a711623be..81aaa498d81 100644
+--- a/libs/clipboard/src/platform/linux/x11.rs
++++ b/libs/clipboard/src/platform/linux/x11.rs
+@@ -3,6 +3,7 @@ use std::{
+     sync::atomic::{AtomicBool, Ordering},
+ };
+ 
++use hbb_common::log;
+ use once_cell::sync::OnceCell;
+ use x11_clipboard::Clipboard;
+ use x11rb::protocol::xproto::Atom;
+@@ -44,6 +45,7 @@ impl X11Clipboard {
+     fn load(&self, target: Atom) -> Result<Vec<u8>, CliprdrError> {
+         let clip = get_clip()?.setter.atoms.clipboard;
+         let prop = get_clip()?.setter.atoms.property;
++        log::debug!("try to load clipboard content");
+         get_clip()?
+             .load_wait(clip, target, prop)
+             .map_err(|_| CliprdrError::ConversionFailure)
+@@ -51,6 +53,7 @@ impl X11Clipboard {
+ 
+     fn store_batch(&self, batch: Vec<(Atom, Vec<u8>)>) -> Result<(), CliprdrError> {
+         let clip = get_clip()?.setter.atoms.clipboard;
++        log::debug!("try to store clipboard content");
+         get_clip()?
+             .store_batch(clip, batch)
+             .map_err(|_| CliprdrError::ClipboardInternalError)
+diff --git a/libs/clipboard/src/platform/mod.rs b/libs/clipboard/src/platform/mod.rs
+index 7933ced4b3f..c6e8551438f 100644
+--- a/libs/clipboard/src/platform/mod.rs
++++ b/libs/clipboard/src/platform/mod.rs
+@@ -37,7 +37,11 @@ pub fn create_cliprdr_context(
+     let mut tmp_path = std::env::temp_dir();
+     tmp_path.push("rustdesk-cliprdr");
+ 
+-    log::info!("check mount point existence");
++    log::info!("clear previously mounted cliprdr FUSE");
++    if let Err(e) = std::process::Command::new("umount").arg(&tmp_path).status() {
++        log::warn!("umount {:?} may fail: {:?}", tmp_path, e);
++    }
++
+     let rd_mnt = if !tmp_path.exists() {
+         log::info!("create mount point: {}", tmp_path.display());
+         std::fs::create_dir_all(tmp_path.clone())?;
+diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
+index 648a50c60d8..f0ffbdf68d2 100644
+--- a/src/client/io_loop.rs
++++ b/src/client/io_loop.rs
+@@ -146,6 +146,7 @@ impl<T: InvokeUiSession> Remote<T> {
+                         || self.handler.is_port_forward()
+                         || self.handler.is_rdp();
+                     if !is_conn_not_default {
++                        log::debug!("get cliprdr client for conn_id {}", self.client_conn_id);
+                         (self.client_conn_id, rx_clip_client_lock) =
+                             clipboard::get_rx_cliprdr_client(&self.handler.session_id);
+                     };
+@@ -251,6 +252,7 @@ impl<T: InvokeUiSession> Remote<T> {
+         #[cfg(any(target_os = "windows", target_os = "linux"))]
+         {
+             let conn_id = self.client_conn_id;
++            log::debug!("try empty cliprdr for conn_id {}", conn_id);
+             let _ = ContextSend::proc(|context| -> ResultType<()> {
+                 context.empty_clipboard(conn_id)?;
+                 Ok(())
+diff --git a/src/ui/cm.html b/src/ui/cm.html
+index aabaa029483..86641907e56 100644
+--- a/src/ui/cm.html
++++ b/src/ui/cm.html
+@@ -18,4 +18,4 @@
+ </header>
+ <body #handler>
+ </body>
+-</html>
+\ No newline at end of file
++</html>
+diff --git a/src/ui/header.tis b/src/ui/header.tis
+index 2adc37027a8..061f1eec4f1 100644
+--- a/src/ui/header.tis
++++ b/src/ui/header.tis
+@@ -196,7 +196,7 @@ class Header: Reactor.Component {
+                 {!cursor_embedded && <li #show-remote-cursor .toggle-option><span>{svg_checkmark}</span>{translate('Show remote cursor')}</li>}
+                 <li #show-quality-monitor .toggle-option><span>{svg_checkmark}</span>{translate('Show quality monitor')}</li> 
+                 {audio_enabled ? <li #disable-audio .toggle-option><span>{svg_checkmark}</span>{translate('Mute')}</li> : ""}
+-                {is_win && pi.platform == 'Windows' && file_enabled ? <li #enable-file-transfer .toggle-option><span>{svg_checkmark}</span>{translate('Allow file copy and paste')}</li> : ""}
++                {((is_win && pi.platform == "Windows")||(is_linux && pi.platform == "Linux")) && file_enabled ? <li #enable-file-transfer .toggle-option><span>{svg_checkmark}</span>{translate('Allow file copy and paste')}</li> : ""}
+                 {keyboard_enabled && clipboard_enabled ? <li #disable-clipboard .toggle-option><span>{svg_checkmark}</span>{translate('Disable clipboard')}</li> : ""} 
+                 {keyboard_enabled ? <li #lock-after-session-end .toggle-option><span>{svg_checkmark}</span>{translate('Lock after session end')}</li> : ""} 
+                 {keyboard_enabled && pi.platform == "Windows" ? <li #privacy-mode><span>{svg_checkmark}</span>{translate('Privacy mode')}</li> : ""}
+diff --git a/src/ui_cm_interface.rs b/src/ui_cm_interface.rs
+index 207d7377251..53d1252aef6 100644
+--- a/src/ui_cm_interface.rs
++++ b/src/ui_cm_interface.rs
+@@ -354,6 +354,7 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
+         #[cfg(any(target_os = "windows", target_os = "linux"))]
+         {
+             if ContextSend::is_enabled() {
++                log::debug!("Clipboard is enabled");
+                 allow_err!(
+                     self.stream
+                         .send(&Data::ClipboardFile(clipboard::ClipboardFile::MonitorReady))

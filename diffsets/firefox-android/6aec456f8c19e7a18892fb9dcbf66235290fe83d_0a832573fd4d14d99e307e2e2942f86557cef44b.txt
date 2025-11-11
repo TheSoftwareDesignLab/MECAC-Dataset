@@ -1,0 +1,1101 @@
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/Components.kt b/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
+index ea7793af345a..1f94295f8848 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
+@@ -34,6 +34,9 @@ import org.mozilla.focus.notification.PrivateNotificationMiddleware
+ import org.mozilla.focus.search.BingSearchEngineFilter
+ import org.mozilla.focus.search.CustomSearchEngineProvider
+ import org.mozilla.focus.search.HiddenSearchEngineFilter
++import org.mozilla.focus.state.AppState
++import org.mozilla.focus.state.AppStore
++import org.mozilla.focus.state.Screen
+ import org.mozilla.focus.telemetry.TelemetryMiddleware
+ import org.mozilla.focus.utils.Settings
+ 
+@@ -45,6 +48,12 @@ class Components(
+     private val engineOverride: Engine? = null,
+     private val clientOverride: Client? = null
+ ) {
++    val appStore: AppStore by lazy {
++        AppStore(AppState(
++            screen = determineInitialScreen(context)
++        ))
++    }
++
+     val engineDefaultSettings by lazy {
+         val settings = Settings.getInstance(context)
+ 
+@@ -123,3 +132,11 @@ class Components(
+         SearchEngineManager(listOf(assetsProvider, customProvider))
+     }
+ }
++
++private fun determineInitialScreen(context: Context): Screen {
++    return if (Settings.getInstance(context).shouldShowFirstrun()) {
++        Screen.FirstRun
++    } else {
++        Screen.Home
++    }
++}
+\ No newline at end of file
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt b/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
+index 9544fe0ddd48..f46d7dda0abe 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
+@@ -16,6 +16,7 @@ import mozilla.components.support.base.log.Log
+ import mozilla.components.support.base.log.sink.AndroidLogSink
+ import mozilla.components.support.ktx.android.content.isMainProcess
+ import org.mozilla.focus.locale.LocaleAwareApplication
++import org.mozilla.focus.navigation.StoreLink
+ import org.mozilla.focus.session.VisibilityLifeCycleCallback
+ import org.mozilla.focus.telemetry.CrashReporterWrapper
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+@@ -33,6 +34,8 @@ open class FocusApplication : LocaleAwareApplication(), CoroutineScope {
+     var visibilityLifeCycleCallback: VisibilityLifeCycleCallback? = null
+         private set
+ 
++    private val storeLink by lazy { StoreLink(components.appStore, components.store) }
++
+     override fun onCreate() {
+         super.onCreate()
+ 
+@@ -60,6 +63,8 @@ open class FocusApplication : LocaleAwareApplication(), CoroutineScope {
+             registerActivityLifecycleCallbacks(visibilityLifeCycleCallback)
+ 
+             components.engine.warmUp()
++
++            storeLink.start()
+         }
+     }
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
+index fae1febddce6..79d542b57aa5 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
+@@ -11,7 +11,6 @@ import android.util.AttributeSet
+ import android.view.View
+ import androidx.preference.PreferenceManager
+ import mozilla.components.browser.state.selector.findCustomTab
+-import mozilla.components.browser.state.selector.privateTabs
+ import mozilla.components.browser.state.selector.selectedTab
+ import mozilla.components.browser.state.state.SessionState
+ import mozilla.components.concept.engine.EngineView
+@@ -20,19 +19,18 @@ import mozilla.components.support.utils.SafeIntent
+ import org.mozilla.focus.R
+ import org.mozilla.focus.activity.CustomTabActivity.Companion.CUSTOM_TAB_ID
+ import org.mozilla.focus.biometrics.Biometrics
+-import org.mozilla.focus.browser.binding.NavigationBinding
+ import org.mozilla.focus.ext.components
+ import org.mozilla.focus.fragment.BrowserFragment
+-import org.mozilla.focus.fragment.FirstrunFragment
+ import org.mozilla.focus.fragment.UrlInputFragment
+ import org.mozilla.focus.locale.LocaleAwareAppCompatActivity
++import org.mozilla.focus.navigation.MainActivityNavigation
++import org.mozilla.focus.navigation.Navigator
+ import org.mozilla.focus.session.IntentProcessor
+ import org.mozilla.focus.session.ui.TabSheetFragment
+ import org.mozilla.focus.shortcut.HomeScreen
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.utils.Settings
+ import org.mozilla.focus.utils.SupportUtils
+-import org.mozilla.focus.utils.ViewUtils
+ 
+ @Suppress("TooManyFunctions")
+ open class MainActivity : LocaleAwareAppCompatActivity() {
+@@ -46,9 +44,7 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+         IntentProcessor(this, components.tabsUseCases, components.customTabsUseCases)
+     }
+ 
+-    private var previousSessionCount = 0
+-
+-    private val navigation by lazy { NavigationBinding(components.store, activity = this) }
++    private val navigator by lazy { Navigator(components.appStore, MainActivityNavigation(this)) }
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+@@ -89,6 +85,8 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+                 .edit()
+                 .putInt(getString(R.string.app_launch_count), launchCount + 1)
+                 .apply()
++
++        lifecycle.addObserver(navigator)
+     }
+ 
+     override fun applyLocale() {
+@@ -117,15 +115,7 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+         TelemetryWrapper.stopSession()
+     }
+ 
+-    override fun onStart() {
+-        super.onStart()
+-
+-        navigation.start()
+-    }
+-
+     override fun onStop() {
+-        navigation.stop()
+-
+         super.onStop()
+ 
+         TelemetryWrapper.stopMainActivity()
+@@ -182,77 +172,6 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+         }
+     }
+ 
+-    internal fun showUrlInputScreen() {
+-        val fragmentManager = supportFragmentManager
+-        val browserFragment = fragmentManager.findFragmentByTag(BrowserFragment.FRAGMENT_TAG) as BrowserFragment?
+-
+-        val isShowingBrowser = browserFragment != null
+-        val crashReporterIsVisible = browserFragment?.crashReporterIsVisible() ?: false
+-
+-        if (isShowingBrowser && !crashReporterIsVisible) {
+-            ViewUtils.showBrandedSnackbar(findViewById(android.R.id.content),
+-                    R.string.feedback_erase,
+-                    resources.getInteger(R.integer.erase_snackbar_delay))
+-        }
+-
+-        // We add the url input fragment to the layout if it doesn't exist yet.
+-        val transaction = fragmentManager
+-                .beginTransaction()
+-
+-        // We only want to play the animation if a browser fragment is added and resumed.
+-        // If it is not resumed then the application is currently in the process of resuming
+-        // and the session was removed while the app was in the background (e.g. via the
+-        // notification). In this case we do not want to show the content and remove the
+-        // browser fragment immediately.
+-        val shouldAnimate = isShowingBrowser && browserFragment!!.isResumed
+-
+-        if (shouldAnimate) {
+-            transaction.setCustomAnimations(0, R.anim.erase_animation)
+-        }
+-
+-        // Currently this callback can get invoked while the app is in the background. Therefore we are using
+-        // commitAllowingStateLoss() here because we can't do a fragment transaction while the app is in the
+-        // background - like we already do in showBrowserScreenForCurrentSession().
+-        // Ideally we'd make it possible to pause observers while the app is in the background:
+-        // https://github.com/mozilla-mobile/android-components/issues/876
+-        transaction
+-                .replace(R.id.container, UrlInputFragment.createWithoutSession(), UrlInputFragment.FRAGMENT_TAG)
+-                .commitAllowingStateLoss()
+-    }
+-
+-    internal fun showFirstrun(tabId: String? = null) {
+-        supportFragmentManager
+-                .beginTransaction()
+-                .add(R.id.container, FirstrunFragment.create(tabId), FirstrunFragment.FRAGMENT_TAG)
+-                .commit()
+-    }
+-
+-    internal fun showBrowserScreenForCurrentSession() {
+-        val fragmentManager = supportFragmentManager
+-        val tab = currentTabForActivity ?: return
+-
+-        val fragment = fragmentManager.findFragmentByTag(BrowserFragment.FRAGMENT_TAG) as BrowserFragment?
+-        if (fragment != null && fragment.tab.id == tab.id) {
+-            // There's already a BrowserFragment displaying this session.
+-            return
+-        }
+-
+-        val browserFragment = BrowserFragment.createForTab(tab.id)
+-        val isNewSession = previousSessionCount < components.store.state.privateTabs.size && previousSessionCount > 0
+-
+-        if ((tab.source == SessionState.Source.ACTION_SEND ||
+-                tab.source == SessionState.Source.HOME_SCREEN) && isNewSession) {
+-            browserFragment.openedFromExternalLink = true
+-        }
+-
+-        fragmentManager
+-                .beginTransaction()
+-                .replace(R.id.container, browserFragment, BrowserFragment.FRAGMENT_TAG)
+-            .commitAllowingStateLoss()
+-
+-        previousSessionCount = components.store.state.privateTabs.size
+-    }
+-
+     override fun onCreateView(name: String, context: Context, attrs: AttributeSet): View? {
+         return if (name == EngineView::class.java.name) {
+             components.engine.createView(context, attrs).asView()
+@@ -309,7 +228,5 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+         const val EXTRA_NOTIFICATION = "notification"
+ 
+         private const val EXTRA_SHORTCUT = "shortcut"
+-
+-        const val EXPERIMENTS_JOB_ID: Int = 4141
+     }
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/browser/binding/NavigationBinding.kt b/focus-android/app/src/main/java/org/mozilla/focus/browser/binding/NavigationBinding.kt
+deleted file mode 100644
+index 5dcd81e9e78a..000000000000
+--- a/focus-android/app/src/main/java/org/mozilla/focus/browser/binding/NavigationBinding.kt
++++ /dev/null
+@@ -1,93 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-package org.mozilla.focus.browser.binding
+-
+-import kotlinx.coroutines.CoroutineScope
+-import kotlinx.coroutines.MainScope
+-import kotlinx.coroutines.cancel
+-import kotlinx.coroutines.flow.Flow
+-import kotlinx.coroutines.flow.collect
+-import kotlinx.coroutines.flow.filter
+-import kotlinx.coroutines.flow.filterNotNull
+-import kotlinx.coroutines.flow.map
+-import kotlinx.coroutines.launch
+-import mozilla.components.browser.state.selector.privateTabs
+-import mozilla.components.browser.state.state.BrowserState
+-import mozilla.components.browser.state.store.BrowserStore
+-import mozilla.components.lib.state.ext.flow
+-import mozilla.components.support.base.feature.LifecycleAwareFeature
+-import mozilla.components.support.ktx.kotlinx.coroutines.flow.ifChanged
+-import org.mozilla.focus.activity.MainActivity
+-import org.mozilla.focus.utils.Settings
+-
+-// This is more or less a translation of the SessionManager.Observer that existed in MainActivity.
+-// This is still not a great way to deal with navigation. But this was the most minimal change for
+-// now.
+-class NavigationBinding(
+-    private val store: BrowserStore,
+-    private val activity: MainActivity
+-) : LifecycleAwareFeature {
+-    private var shouldShowFirstRun =
+-        Settings.getInstance(activity).shouldShowFirstrun() && !activity.isCustomTabMode
+-    private var scope: CoroutineScope? = null
+-
+-    override fun start() {
+-        scope = MainScope().also { scope ->
+-            scope.launch { observeSelectionChanges(store.flow(activity)) }
+-            scope.launch { observeTabsClosed(store.flow(activity)) }
+-        }
+-
+-        // If we are in a custom tab then we do not need to wait for the selected tab and can
+-        // display the current tab immediately.
+-        if (activity.isCustomTabMode) {
+-            activity.showBrowserScreenForCurrentSession()
+-        }
+-    }
+-
+-    override fun stop() {
+-        scope?.cancel()
+-    }
+-
+-    private suspend fun observeSelectionChanges(flow: Flow<BrowserState>) {
+-        flow.map { state -> state.selectedTabId }
+-            .ifChanged()
+-            .filterNotNull()
+-            .collect { navigateToBrowser() }
+-    }
+-
+-    private suspend fun observeTabsClosed(flow: Flow<BrowserState>) {
+-        flow.map { state -> state.privateTabs.isEmpty() }
+-            .ifChanged()
+-            .filter { isEmpty -> isEmpty }
+-            .collect { navigateToHomeScreen() }
+-    }
+-
+-    private fun navigateToHomeScreen() {
+-        if (activity.isCustomTabMode) {
+-            return
+-        }
+-
+-        if (!activity.isCustomTabMode) {
+-            activity.showUrlInputScreen()
+-        }
+-
+-        if (shouldShowFirstRun) {
+-            showFirstRun()
+-        }
+-    }
+-
+-    private fun navigateToBrowser() {
+-        activity.showBrowserScreenForCurrentSession()
+-
+-        if (shouldShowFirstRun) {
+-            showFirstRun()
+-        }
+-    }
+-
+-    private fun showFirstRun() {
+-        shouldShowFirstRun = false
+-        activity.showFirstrun()
+-    }
+-}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
+index 4ead4e694010..22b4956e4eb5 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
+@@ -80,7 +80,7 @@ import org.mozilla.focus.locale.LocaleAwareAppCompatActivity
+ import org.mozilla.focus.locale.LocaleAwareFragment
+ import org.mozilla.focus.open.OpenWithFragment
+ import org.mozilla.focus.popup.PopupUtils
+-import org.mozilla.focus.session.ui.TabSheetFragment
++import org.mozilla.focus.state.AppAction
+ import org.mozilla.focus.telemetry.CrashReporterWrapper
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.utils.AppPermissionCodes.REQUEST_CODE_DOWNLOAD_PERMISSIONS
+@@ -764,13 +764,20 @@ class BrowserFragment :
+     override fun onClick(view: View) {
+         when (view.id) {
+             R.id.display_url -> if (!crashReporterIsVisible()) {
+-                val urlFragment = UrlInputFragment
+-                    .createWithTab(tab.id, urlView!!)
+-
+-                requireActivity().supportFragmentManager
+-                    .beginTransaction()
+-                    .add(R.id.container, urlFragment, UrlInputFragment.FRAGMENT_TAG)
+-                    .commit()
++                val urlView = urlView!!
++
++                val screenLocation = IntArray(2)
++                urlView.getLocationOnScreen(screenLocation)
++
++                requireComponents.appStore.dispatch(
++                    AppAction.EditAction(
++                        tab.id,
++                        screenLocation[0],
++                        screenLocation[1],
++                        urlView.width,
++                        urlView.height
++                    )
++                )
+             }
+ 
+             R.id.erase -> {
+@@ -780,10 +787,7 @@ class BrowserFragment :
+             }
+ 
+             R.id.tabs -> {
+-                requireActivity().supportFragmentManager
+-                    .beginTransaction()
+-                    .add(R.id.container, TabSheetFragment(), TabSheetFragment.FRAGMENT_TAG)
+-                    .commit()
++                requireComponents.appStore.dispatch(AppAction.ShowTabs)
+ 
+                 TelemetryWrapper.openTabsTrayEvent()
+             }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/fragment/FirstrunFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/fragment/FirstrunFragment.kt
+index 9d9926eb8fd1..26a96883bac5 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/fragment/FirstrunFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/fragment/FirstrunFragment.kt
+@@ -16,7 +16,9 @@ import androidx.preference.PreferenceManager
+ import androidx.viewpager.widget.ViewPager
+ import com.google.android.material.tabs.TabLayout
+ import org.mozilla.focus.R
++import org.mozilla.focus.ext.requireComponents
+ import org.mozilla.focus.firstrun.FirstrunPagerAdapter
++import org.mozilla.focus.state.AppAction
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.utils.StatusBarUtils
+ 
+@@ -101,28 +103,13 @@ class FirstrunFragment : Fragment(), View.OnClickListener {
+     }
+ 
+     private fun finishFirstrun() {
+-        val fragmentManager = requireActivity().supportFragmentManager
+-
+         PreferenceManager.getDefaultSharedPreferences(requireContext())
+             .edit()
+             .putBoolean(FIRSTRUN_PREF, true)
+             .apply()
+ 
+-        val sessionUUID = requireArguments().getString(ARGUMENT_SESSION_UUID)
+-
+-        val fragment: Fragment = if (sessionUUID == null) {
+-            UrlInputFragment.createWithoutSession()
+-        } else {
+-            BrowserFragment.createForTab(sessionUUID)
+-        }
+-
+-        val fragmentTag =
+-            if (fragment is BrowserFragment) BrowserFragment.FRAGMENT_TAG else UrlInputFragment.FRAGMENT_TAG
+-
+-        fragmentManager
+-            .beginTransaction()
+-            .replace(R.id.container, fragment, fragmentTag)
+-            .commit()
++        val selectedTabId = requireComponents.store.state.selectedTabId
++        requireComponents.appStore.dispatch(AppAction.FinishFirstRun(selectedTabId))
+     }
+ 
+     override fun onResume() {
+@@ -141,11 +128,8 @@ class FirstrunFragment : Fragment(), View.OnClickListener {
+         const val FRAGMENT_TAG = "firstrun"
+         const val FIRSTRUN_PREF = "firstrun_shown"
+ 
+-        private const val ARGUMENT_SESSION_UUID = "sessionUUID"
+-
+-        fun create(tabId: String?): FirstrunFragment {
++        fun create(): FirstrunFragment {
+             val arguments = Bundle()
+-            arguments.putString(ARGUMENT_SESSION_UUID, tabId)
+ 
+             val fragment = FirstrunFragment()
+             fragment.arguments = arguments
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt
+index 2b5538523b09..be2fd9ec9d2b 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt
+@@ -50,6 +50,7 @@ import org.mozilla.focus.locale.LocaleAwareFragment
+ import org.mozilla.focus.menu.home.HomeMenu
+ import org.mozilla.focus.searchsuggestions.SearchSuggestionsViewModel
+ import org.mozilla.focus.searchsuggestions.ui.SearchSuggestionsFragment
++import org.mozilla.focus.state.AppAction
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.tips.Tip
+ import org.mozilla.focus.tips.TipManager
+@@ -109,19 +110,22 @@ class UrlInputFragment :
+         }
+ 
+         @JvmStatic
+-        fun createWithTab(tabId: String, urlView: View): UrlInputFragment {
++        fun createWithTab(
++            tabId: String,
++            x: Int,
++            y: Int,
++            width: Int,
++            height: Int
++        ): UrlInputFragment {
+             val arguments = Bundle()
+ 
+             arguments.putString(ARGUMENT_SESSION_UUID, tabId)
+             arguments.putString(ARGUMENT_ANIMATION, ANIMATION_BROWSER_SCREEN)
+ 
+-            val screenLocation = IntArray(2)
+-            urlView.getLocationOnScreen(screenLocation)
+-
+-            arguments.putInt(ARGUMENT_X, screenLocation[0])
+-            arguments.putInt(ARGUMENT_Y, screenLocation[1])
+-            arguments.putInt(ARGUMENT_WIDTH, urlView.width)
+-            arguments.putInt(ARGUMENT_HEIGHT, urlView.height)
++            arguments.putInt(ARGUMENT_X, x)
++            arguments.putInt(ARGUMENT_Y, y)
++            arguments.putInt(ARGUMENT_WIDTH, width)
++            arguments.putInt(ARGUMENT_HEIGHT, height)
+ 
+             val fragment = UrlInputFragment()
+             fragment.arguments = arguments
+@@ -350,6 +354,7 @@ class UrlInputFragment :
+ 
+     override fun applyLocale() {
+         if (isOverlay) {
++            /*
+             activity?.supportFragmentManager
+                     ?.beginTransaction()
+                     ?.replace(
+@@ -357,6 +362,7 @@ class UrlInputFragment :
+                         createWithTab(tab!!.id, urlView),
+                         FRAGMENT_TAG)
+                     ?.commit()
++             */
+         } else {
+             activity?.supportFragmentManager
+                     ?.beginTransaction()
+@@ -650,10 +656,8 @@ class UrlInputFragment :
+         // IllegalStateException because we already saved the state (of the activity / fragment) before
+         // this transaction is committed. To avoid this we commit while allowing a state loss here.
+         // We do not save any state in this fragment (It's getting destroyed) so this should not be a problem.
+-        activity?.supportFragmentManager
+-            ?.beginTransaction()
+-            ?.remove(this)
+-            ?.commitAllowingStateLoss()
++
++        requireComponents.appStore.dispatch(AppAction.FinishEdit(tab!!.id))
+     }
+ 
+     private fun onCommit() {
+@@ -748,14 +752,11 @@ class UrlInputFragment :
+             }
+         }
+ 
+-        val fragmentManager = requireActivity().supportFragmentManager
+-
++        val tab = tab
+         if (tab != null) {
+-            requireComponents.sessionUseCases.loadUrl(url, tab?.id)
++            requireComponents.sessionUseCases.loadUrl(url, tab.id)
+ 
+-            fragmentManager.beginTransaction()
+-                .remove(this)
+-                .commit()
++            requireComponents.appStore.dispatch(AppAction.FinishEdit(tab.id))
+         } else {
+             val tabId = requireComponents.tabsUseCases.addPrivateTab(
+                 url,
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/navigation/MainActivityNavigation.kt b/focus-android/app/src/main/java/org/mozilla/focus/navigation/MainActivityNavigation.kt
+new file mode 100644
+index 000000000000..816adbd8e7b0
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/navigation/MainActivityNavigation.kt
+@@ -0,0 +1,133 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.navigation
++
++import org.mozilla.focus.R
++import org.mozilla.focus.activity.MainActivity
++import org.mozilla.focus.fragment.BrowserFragment
++import org.mozilla.focus.fragment.FirstrunFragment
++import org.mozilla.focus.fragment.UrlInputFragment
++import org.mozilla.focus.session.ui.TabSheetFragment
++import org.mozilla.focus.utils.ViewUtils
++
++/**
++ * Class performing the actual navigation in [MainActivity] by performing fragment transactions if
++ * needed.
++ */
++class MainActivityNavigation(
++    private val activity: MainActivity
++) {
++    /**
++     * Home screen.
++     */
++    fun home() {
++        val fragmentManager = activity.supportFragmentManager
++        val browserFragment = fragmentManager.findFragmentByTag(BrowserFragment.FRAGMENT_TAG) as BrowserFragment?
++
++        val isShowingBrowser = browserFragment != null
++        val crashReporterIsVisible = browserFragment?.crashReporterIsVisible() ?: false
++
++        if (isShowingBrowser && !crashReporterIsVisible) {
++            ViewUtils.showBrandedSnackbar(activity.findViewById(android.R.id.content),
++                R.string.feedback_erase,
++                activity.resources.getInteger(R.integer.erase_snackbar_delay))
++        }
++
++        // We add the url input fragment to the layout if it doesn't exist yet.
++        val transaction = fragmentManager
++            .beginTransaction()
++
++        // We only want to play the animation if a browser fragment is added and resumed.
++        // If it is not resumed then the application is currently in the process of resuming
++        // and the session was removed while the app was in the background (e.g. via the
++        // notification). In this case we do not want to show the content and remove the
++        // browser fragment immediately.
++        val shouldAnimate = isShowingBrowser && browserFragment!!.isResumed
++
++        if (shouldAnimate) {
++            transaction.setCustomAnimations(0, R.anim.erase_animation)
++        }
++
++        // Currently this callback can get invoked while the app is in the background. Therefore we are using
++        // commitAllowingStateLoss() here because we can't do a fragment transaction while the app is in the
++        // background - like we already do in showBrowserScreenForCurrentSession().
++        // Ideally we'd make it possible to pause observers while the app is in the background:
++        // https://github.com/mozilla-mobile/android-components/issues/876
++        transaction
++            .replace(R.id.container, UrlInputFragment.createWithoutSession(), UrlInputFragment.FRAGMENT_TAG)
++            .commitAllowingStateLoss()
++    }
++
++    /**
++     * Show browser for tab with the given [tabId].
++     */
++    fun browser(tabId: String, showTabs: Boolean) {
++        val fragmentManager = activity.supportFragmentManager
++
++        val urlInputFragment = fragmentManager.findFragmentByTag(UrlInputFragment.FRAGMENT_TAG) as UrlInputFragment?
++        if (urlInputFragment != null) {
++            fragmentManager
++                .beginTransaction()
++                .remove(urlInputFragment)
++                .commitAllowingStateLoss()
++        }
++
++        val browserFragment = fragmentManager.findFragmentByTag(BrowserFragment.FRAGMENT_TAG) as BrowserFragment?
++        if (browserFragment == null || browserFragment.tab.id != tabId) {
++            fragmentManager
++                .beginTransaction()
++                .replace(R.id.container, BrowserFragment.createForTab(tabId), BrowserFragment.FRAGMENT_TAG)
++                .commitAllowingStateLoss()
++        }
++
++        val tabsTrayFragment = fragmentManager.findFragmentByTag(TabSheetFragment.FRAGMENT_TAG) as TabSheetFragment?
++        if (tabsTrayFragment == null && showTabs) {
++            fragmentManager
++                .beginTransaction()
++                .add(R.id.container, TabSheetFragment(), TabSheetFragment.FRAGMENT_TAG)
++                .commitAllowingStateLoss()
++        } else if (tabsTrayFragment != null && !showTabs) {
++            fragmentManager
++                .beginTransaction()
++                .remove(tabsTrayFragment)
++                .commitAllowingStateLoss()
++        }
++    }
++
++    /**
++     * Edit URL of tab with the given [tabId].
++     */
++    fun edit(
++        tabId: String,
++        x: Int,
++        y: Int,
++        width: Int,
++        height: Int
++    ) {
++        val urlFragment = UrlInputFragment.createWithTab(tabId, x, y, width, height)
++
++        activity.supportFragmentManager
++            .beginTransaction()
++            .add(R.id.container, urlFragment, UrlInputFragment.FRAGMENT_TAG)
++            .commit()
++    }
++
++    /**
++     * Show first run onboarding.
++     */
++    fun firstRun() {
++        activity.supportFragmentManager
++            .beginTransaction()
++            .replace(R.id.container, FirstrunFragment.create(), FirstrunFragment.FRAGMENT_TAG)
++            .commit()
++    }
++
++    /**
++     * Lock app.
++     */
++    fun lock() {
++        TODO()
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/navigation/Navigator.kt b/focus-android/app/src/main/java/org/mozilla/focus/navigation/Navigator.kt
+new file mode 100644
+index 000000000000..c6b51d7074cf
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/navigation/Navigator.kt
+@@ -0,0 +1,59 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.navigation
++
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.collect
++import kotlinx.coroutines.flow.map
++import mozilla.components.lib.state.ext.flowScoped
++import mozilla.components.support.base.feature.LifecycleAwareFeature
++import mozilla.components.support.ktx.kotlinx.coroutines.flow.ifChanged
++import org.mozilla.focus.state.AppState
++import org.mozilla.focus.state.AppStore
++import org.mozilla.focus.state.Screen
++
++/**
++ * The [Navigator] subscribes to the [AppStore] and initiates a navigation with the help of the
++ * provided [MainActivityNavigation] if the [Screen] in the [AppState] changes.
++ */
++class Navigator(
++    val store: AppStore,
++    val navigation: MainActivityNavigation
++) : LifecycleAwareFeature {
++    private var scope: CoroutineScope? = null
++
++    override fun start() {
++        scope = store.flowScoped { flow -> subscribe(flow) }
++    }
++
++    override fun stop() {
++        scope?.cancel()
++    }
++
++    private suspend fun subscribe(flow: Flow<AppState>) {
++        flow.map { state -> state.screen }
++            .ifChanged { screen -> screen.id }
++            .collect { screen -> navigateTo(screen) }
++    }
++
++    private fun navigateTo(screen: Screen) {
++        when (screen) {
++            is Screen.Home -> navigation.home()
++            is Screen.Browser -> navigation.browser(screen.tabId, screen.showTabs)
++            is Screen.EditUrl -> navigation.edit(
++                screen.tabId,
++                screen.x,
++                screen.y,
++                screen.width,
++                screen.height
++            )
++            is Screen.FirstRun -> navigation.firstRun()
++            is Screen.Locked -> navigation.lock()
++            is Screen.Crashed -> TODO()
++        }
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/navigation/StoreLink.kt b/focus-android/app/src/main/java/org/mozilla/focus/navigation/StoreLink.kt
+new file mode 100644
+index 000000000000..f8a85691ce47
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/navigation/StoreLink.kt
+@@ -0,0 +1,50 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.navigation
++
++import kotlinx.coroutines.MainScope
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.collect
++import kotlinx.coroutines.flow.filter
++import kotlinx.coroutines.flow.filterNotNull
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.launch
++import mozilla.components.browser.state.selector.privateTabs
++import mozilla.components.browser.state.state.BrowserState
++import mozilla.components.browser.state.store.BrowserStore
++import mozilla.components.lib.state.ext.flow
++import mozilla.components.support.ktx.kotlinx.coroutines.flow.ifChanged
++import org.mozilla.focus.state.AppAction
++import org.mozilla.focus.state.AppStore
++
++/**
++ * Helper for subscribing to the [BrowserStore] and updating the [AppStore] for certain state changes.
++ */
++class StoreLink(
++    private val appStore: AppStore,
++    private val browserStore: BrowserStore
++) {
++    fun start() {
++        MainScope().also { scope ->
++            scope.launch { observeSelectionChanges(browserStore.flow()) }
++            scope.launch { observeTabsClosed(browserStore.flow()) }
++        }
++    }
++
++    private suspend fun observeSelectionChanges(flow: Flow<BrowserState>) {
++        flow.map { state -> state.selectedTabId }
++            .ifChanged()
++            .filterNotNull()
++            .collect { tabId -> appStore.dispatch(AppAction.SelectionChanged(tabId)) }
++    }
++
++    private suspend fun observeTabsClosed(flow: Flow<BrowserState>) {
++        flow.map { state -> state.privateTabs.isEmpty() }
++            .ifChanged()
++            .filter { isEmpty -> isEmpty }
++            .collect { appStore.dispatch(AppAction.NoTabs)
++        }
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/session/ui/TabSheetFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/session/ui/TabSheetFragment.kt
+index f8e43b18262c..0c0581bba6fa 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/session/ui/TabSheetFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/session/ui/TabSheetFragment.kt
+@@ -7,22 +7,22 @@ package org.mozilla.focus.session.ui
+ import android.animation.Animator
+ import android.animation.AnimatorListenerAdapter
+ import android.os.Bundle
+-import androidx.recyclerview.widget.LinearLayoutManager
+-import androidx.recyclerview.widget.RecyclerView
+ import android.view.LayoutInflater
+ import android.view.View
+ import android.view.ViewAnimationUtils
+ import android.view.ViewGroup
+ import android.view.animation.AccelerateInterpolator
++import androidx.recyclerview.widget.LinearLayoutManager
++import androidx.recyclerview.widget.RecyclerView
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.cancel
+ import mozilla.components.browser.state.selector.privateTabs
+ import mozilla.components.lib.state.ext.flowScoped
+-
+ import org.mozilla.focus.R
+-import org.mozilla.focus.activity.MainActivity
+ import org.mozilla.focus.ext.components
++import org.mozilla.focus.ext.requireComponents
+ import org.mozilla.focus.locale.LocaleAwareFragment
++import org.mozilla.focus.state.AppAction
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.utils.OneShotOnPreDrawListener
+ 
+@@ -113,8 +113,7 @@ class TabSheetFragment : LocaleAwareFragment(), View.OnClickListener {
+ 
+         animator.addListener(object : AnimatorListenerAdapter() {
+             override fun onAnimationEnd(animation: Animator) {
+-                val activity = activity as MainActivity?
+-                activity?.supportFragmentManager?.beginTransaction()?.remove(this@TabSheetFragment)?.commit()
++                requireComponents.appStore.dispatch(AppAction.HideTabs)
+             }
+         })
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/state/AppAction.kt b/focus-android/app/src/main/java/org/mozilla/focus/state/AppAction.kt
+new file mode 100644
+index 000000000000..af0b70fa9275
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/state/AppAction.kt
+@@ -0,0 +1,57 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.state
++
++import mozilla.components.lib.state.Action
++
++/**
++ * An [Action] to be dispatched on the [AppStore].
++ */
++sealed class AppAction : Action {
++    /**
++     * The selected tab has changed.
++     */
++    data class SelectionChanged(
++        val tabId: String
++    ) : AppAction()
++
++    /**
++     * Action for editing the URL of the tab with the given [tabId].
++     */
++    data class EditAction(
++        val tabId: String,
++        val x: Int,
++        val y: Int,
++        val width: Int,
++        val height: Int
++    ) : AppAction()
++
++    /**
++     * All tabs have been removed.
++     */
++    object NoTabs : AppAction()
++
++    /**
++     * The user finished edition the URL of the tab with the given [tabId].
++     */
++    data class FinishEdit(
++        val tabId: String
++    ) : AppAction()
++
++    /**
++     * Show the tabs tray.
++     */
++    object ShowTabs : AppAction()
++
++    /**
++     * Hide the tabs tray.
++     */
++    object HideTabs : AppAction()
++
++    /**
++     * The user finished the first run onboarding.
++     */
++    data class FinishFirstRun(val tabId: String?) : AppAction()
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/state/AppReducer.kt b/focus-android/app/src/main/java/org/mozilla/focus/state/AppReducer.kt
+new file mode 100644
+index 000000000000..e85a35b36099
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/state/AppReducer.kt
+@@ -0,0 +1,105 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.state
++
++import mozilla.components.lib.state.Reducer
++
++/**
++ * Reducer creating a new [AppState] for dispatched [AppAction]s.
++ */
++object AppReducer : Reducer<AppState, AppAction> {
++    override fun invoke(state: AppState, action: AppAction): AppState {
++        return when (action) {
++            is AppAction.SelectionChanged -> selectionChanged(state, action)
++            is AppAction.NoTabs -> noTabs(state)
++            is AppAction.EditAction -> editAction(state, action)
++            is AppAction.FinishEdit -> finishEditing(state, action)
++            is AppAction.ShowTabs -> showTabs(state)
++            is AppAction.HideTabs -> hideTabs(state)
++            is AppAction.FinishFirstRun -> finishFirstRun(state, action)
++        }
++    }
++}
++
++/**
++ * The currently selected tab has changed.
++ */
++private fun selectionChanged(state: AppState, action: AppAction.SelectionChanged): AppState {
++    if (state.screen is Screen.FirstRun) {
++        return state
++    }
++
++    return state.copy(
++        screen = Screen.Browser(tabId = action.tabId, showTabs = false)
++    )
++}
++
++/**
++ * All tabs have been closed.
++ */
++private fun noTabs(state: AppState): AppState {
++    if (state.screen is Screen.Home || state.screen is Screen.FirstRun) {
++        return state
++    }
++
++    return state.copy(screen = Screen.Home)
++}
++
++/**
++ * The user wants to edit the URL of a tab.
++ */
++private fun editAction(state: AppState, action: AppAction.EditAction): AppState {
++    return state.copy(
++        screen = Screen.EditUrl(
++            action.tabId,
++            action.x,
++            action.y,
++            action.width,
++            action.height
++        )
++    )
++}
++
++/**
++ * The user finished editing the URL.
++ */
++private fun finishEditing(state: AppState, action: AppAction.FinishEdit): AppState {
++    return state.copy(
++        screen = Screen.Browser(tabId = action.tabId, showTabs = false)
++    )
++}
++
++/**
++ * Show the tabs tray.
++ */
++private fun showTabs(state: AppState): AppState {
++    return if (state.screen is Screen.Browser) {
++        state.copy(screen = state.screen.copy(showTabs = true))
++    } else {
++        state
++    }
++}
++
++/**
++ * Hide the tabs tray.
++ */
++private fun hideTabs(state: AppState): AppState {
++    return if (state.screen is Screen.Browser) {
++        state.copy(screen = state.screen.copy(showTabs = false))
++    } else {
++        state
++    }
++}
++
++/**
++ * The user finished the first run onboarding.
++ */
++private fun finishFirstRun(state: AppState, action: AppAction.FinishFirstRun): AppState {
++    return if (action.tabId != null) {
++        state.copy(screen = Screen.Browser(action.tabId, showTabs = false))
++    } else {
++        state.copy(screen = Screen.Home)
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/state/AppState.kt b/focus-android/app/src/main/java/org/mozilla/focus/state/AppState.kt
+new file mode 100644
+index 000000000000..88a7900e854c
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/state/AppState.kt
+@@ -0,0 +1,74 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.state
++
++import mozilla.components.lib.state.State
++import java.util.UUID
++
++/**
++ * Global state of the application.
++ *
++ * @property screen The currently displayed screen.
++ */
++data class AppState(
++    val screen: Screen
++) : State
++
++/**
++ * A group of screens that the app can display.
++ *
++ * @property id A unique ID for identifying a screen. Only if this ID changes the screen is
++ * considered a new screen that requires a navigation (as opposed to the state of the screen
++ * changing).
++ */
++sealed class Screen {
++    open val id = UUID.randomUUID().toString()
++
++    /**
++     * First run onboarding.
++     */
++    object FirstRun : Screen()
++
++    /**
++     * The home screen.
++     */
++    object Home : Screen()
++
++    /**
++     * Browser screen.
++     *
++     * @property tabId The ID of the displayed tab.
++     * @property showTabs Whether to show the tabs tray.
++     */
++    data class Browser(
++        val tabId: String,
++        val showTabs: Boolean
++    ) : Screen() {
++        // Whenever the showTabs property changes we want to treat this as a new screen and force
++        // a navigation.
++        override val id: String = "${super.id}_$showTabs}"
++    }
++
++    /**
++     * Editing the URL of a tab.
++     */
++    data class EditUrl(
++        val tabId: String,
++        val x: Int,
++        val y: Int,
++        val width: Int,
++        val height: Int
++    ) : Screen()
++
++    /**
++     * The application is locked (and requires unlocking).
++     */
++    object Locked : Screen()
++
++    /**
++     * Tabs have crashed and the user needs to decide whether to restore or close them.
++     */
++    object Crashed : Screen()
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/state/AppStore.kt b/focus-android/app/src/main/java/org/mozilla/focus/state/AppStore.kt
+new file mode 100644
+index 000000000000..00fac5f45e45
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/state/AppStore.kt
+@@ -0,0 +1,14 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.state
++
++import mozilla.components.lib.state.Store
++
++/**
++ * A [Store] keeping track of the global app state.
++ */
++class AppStore(
++    initialState: AppState
++) : Store<AppState, AppAction>(initialState, AppReducer)

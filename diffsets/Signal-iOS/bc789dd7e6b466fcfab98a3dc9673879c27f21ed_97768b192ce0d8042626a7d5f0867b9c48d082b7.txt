@@ -1,0 +1,570 @@
+diff --git a/SignalServiceKit/Util/TaskQueueLoader.swift b/SignalServiceKit/Util/TaskQueueLoader.swift
+index e6d240ee402..4cefebf826a 100644
+--- a/SignalServiceKit/Util/TaskQueueLoader.swift
++++ b/SignalServiceKit/Util/TaskQueueLoader.swift
+@@ -196,7 +196,40 @@ public actor TaskQueueLoader<Runner: TaskRecordRunner & Sendable> {
+         )
+     }
+ 
+-    private var runningTask: Task<Void, Error>?
++    private enum State {
++        case notRunning
++        case running(UUID, Task<Void, Error>)
++        case cleaningUp(UUID, Task<Void, Error>)
++        case cancelled(UUID, Task<Void, Error>)
++
++        func isUnchanged(from oldState: State) -> Bool {
++            switch (oldState, self) {
++            case (.notRunning, .notRunning):
++                return true
++            case (.notRunning, _):
++                return false
++
++            case (.running(let oldId, _), .running(let newId, _)):
++                return oldId == newId
++            case (.running, _):
++                return false
++
++            case (.cleaningUp(let oldId, _), .cleaningUp(let newId, _)):
++                return oldId == newId
++            case (.cleaningUp, _):
++                return false
++
++            case (.cancelled(let oldId, _), .cancelled(let newId, _)):
++                return oldId == newId
++            case (.cancelled, _):
++                return false
++            }
++        }
++    }
++
++    private var state = State.notRunning
++    /// Random IDs of un-cancelled observers of the currently running task.
++    private var runningTaskObservers = Set<UUID>()
+     /// Error provided when the task was stopped; if not nil, throw it on callers of loadAndRunTasks.
+     private var stoppedReason: Error?
+ 
+@@ -204,54 +237,116 @@ public actor TaskQueueLoader<Runner: TaskRecordRunner & Sendable> {
+ 
+     /// Load tasks, N at a time, and begin running any that are not already running.
+     /// (N = max concurrent tasks)
+-    /// Runs until cooperative parent Task cancellation, some task throws an error, or
+-    /// all tasks are finished (finished = table peek returns empty).
++    /// Runs until all tasks are finished (finished = table peek returns empty).
+     ///
+     /// Throws an error IFF some database operation relating to the queue or post-task cleanup fails;
+     /// within-task failures are handled by the runner and do NOT interrupt processing of subsequent tasks.
++    ///
++    /// Cancellation causes code execution to be returned to the caller but does not _necessarily_ cancel
++    /// the execution of subsequent tasks. All callers of `loadAndRunTasks()` await a single runner.
++    /// As long as some uncancelled task context is awaiting the result, the runner will continue to execute
++    /// subsequent tasks. A single caller cancelling simply releases that caller from waiting on the runner
++    /// to finish; the runner isn't cancelled until _all_ callers cancel.
++    /// If some caller wishes to _force_ the runner to stop, call `stop()` instead of cancelling the task.
+     public func loadAndRunTasks() async throws {
+-        if let runningTask {
++        let task: Task<Void, Error>
++        let state = self.state
++        switch state {
++        case .notRunning:
++            // Start a new task.
++            let taskId = UUID()
++            task = Task {
++                try await self._loadAndRunTasks(taskId: taskId)
++            }
++            self.state = .running(taskId, task)
++            self.runningTaskObservers = Set()
++        case .running(_, let _task):
++            task = _task
++        case .cancelled(_, let cancelledTask):
++            // We want to wait for cancellation to finish
++            // applying, and then try again.
++            try? await cancelledTask.value
++            // We expect that state will have been cleaned
++            // up by the time runningTask finishes, but
++            // just in case do cleanup here.
++            if self.state.isUnchanged(from: state) {
++                self.state = .notRunning
++            }
++            return try await loadAndRunTasks()
++        case .cleaningUp(_, let runningTask):
++            // We want to wait for cleanup to finish
++            // applying, and then try again.
++            try? await runningTask.value
++            // We expect that state will have been cleaned
++            // up by the time runningTask finishes, but
++            // just in case do cleanup here.
++            if self.state.isUnchanged(from: state) {
++                self.state = .notRunning
++            }
++            return try await loadAndRunTasks()
++        }
++
++        let observerId = UUID()
++        runningTaskObservers.insert(observerId)
++        // The cancellable continuation means if the calling context cancels
++        // it will immediately resume while the inner task keeps running.
++        // In addition, we use `withTaskCancellationHandler` to get the
++        // onCancel callback so that we can track when _all_ observers
++        // have cancelled and then we pass along the cancellation to
++        // the actual running task.
++        let continuation = CancellableContinuation<Void>()
++        Task {
+             do {
+-                return try await runningTask.value
++                try await task.value
++                continuation.resume(with: .success(()))
+             } catch let cancellationError as CancellationError {
+-                throw stoppedReason ?? cancellationError
++                let error = self.stoppedReason ?? cancellationError
++                continuation.resume(with: .failure(error))
+             } catch let error {
+-                throw error
+-            }
+-        }
+-        let task = Task {
+-            defer {
+-                self.runningTask = nil
++                continuation.resume(with: .failure(error))
+             }
+-            try await self._loadAndRunTasks()
+         }
+-        self.runningTask = task
++
+         try await withTaskCancellationHandler(
+             operation: {
+-                do {
+-                    return try await task.value
+-                } catch let cancellationError as CancellationError {
+-                    throw stoppedReason ?? cancellationError
+-                } catch let error {
+-                    throw error
+-                }
++                try await continuation.wait()
+             },
+             onCancel: {
+-                task.cancel()
++                continuation.cancel()
++                Task {
++                    try await observerDidCancel(observerId)
++                }
+             }
+         )
+     }
+ 
+-    public func stop(reason: Error? = nil) async throws {
+-        guard let runningTask, !runningTask.isCancelled else {
++    private func observerDidCancel(_ id: UUID) throws {
++        guard runningTaskObservers.contains(id) else {
+             return
+         }
+-        self.stoppedReason = reason
+-        runningTask.cancel()
+-        self.runningTask = nil
++        self.runningTaskObservers.remove(id)
++        if runningTaskObservers.isEmpty {
++            // We can stop and cancel the running task.
++            try self.stop()
++        }
+     }
+ 
+-    private func _loadAndRunTasks() async throws {
++    public func stop(reason: Error? = nil) throws {
++        switch state {
++        case .notRunning:
++            break
++        case .cancelled:
++            // Already cancelled; prefer the initial
++            // reason (if any) and let it finish cancelling.
++            return
++        case .running(let taskId, let runningTask), .cleaningUp(let taskId, let runningTask):
++            self.stoppedReason = reason
++            runningTask.cancel()
++            self.state = .cancelled(taskId, runningTask)
++        }
++    }
++
++    private func _loadAndRunTasks(taskId: UUID) async throws {
+         // Check cancellation at the start of each attempt.
+         // This method is called recursively, so now is a good time to check.
+         try Task.checkCancellation()
+@@ -272,7 +367,36 @@ public actor TaskQueueLoader<Runner: TaskRecordRunner & Sendable> {
+         }
+         guard !records.isEmpty else {
+             if currentTaskIds.isEmpty {
+-                await self.runner.didDrainQueue()
++                switch self.state {
++                case .notRunning:
++                    return
++                case .cancelled:
++                    owsFailDebug("Cancel should have applied to the task context")
++                    return
++                case .cleaningUp:
++                    return
++                case .running(let stateTaskId, let runningTask):
++                    if stateTaskId == taskId {
++                        state = .cleaningUp(taskId, runningTask)
++                        await self.runner.didDrainQueue()
++                        switch self.state {
++                        case .notRunning:
++                            owsFailDebug("State is not running but we are, in fact, running")
++                            return
++                        case .running(let stateTaskId, _):
++                            owsFailDebug("Not cleaning up? How?")
++                            fallthrough
++                        case .cancelled(let stateTaskId, _):
++                            // Cancellation might've applied while running didDrainQueue;
++                            // We're done now so just finish.
++                            fallthrough
++                        case .cleaningUp(let stateTaskId, _):
++                            if stateTaskId == taskId {
++                                state = .notRunning
++                            }
++                        }
++                    }
++                }
+             }
+             return
+         }
+@@ -301,7 +425,7 @@ public actor TaskQueueLoader<Runner: TaskRecordRunner & Sendable> {
+                         try await self.didCancel(record: record)
+                     }
+                     // As soon as we finish any task, start loading more tasks to run.
+-                    try await self._loadAndRunTasks()
++                    try await self._loadAndRunTasks(taskId: taskId)
+                 }
+             }
+             try await taskGroup.waitForAll()
+diff --git a/SignalServiceKit/Util/TaskQueueLoaderTest.swift b/SignalServiceKit/Util/TaskQueueLoaderTest.swift
+index 4b2994974c7..80eadaa616b 100644
+--- a/SignalServiceKit/Util/TaskQueueLoaderTest.swift
++++ b/SignalServiceKit/Util/TaskQueueLoaderTest.swift
+@@ -175,10 +175,10 @@ public class TaskQueueLoaderTest: XCTestCase {
+         XCTAssertEqual(runner.cancelledTasks.get(), [1])
+     }
+ 
+-    func testAsyncTaskCancellation() async throws {
++    func testSingleTaskCancellation() async throws {
+         let runner = MockRunner(numRecords: 100)
+         let loader = TaskQueueLoader(
+-            maxConcurrentTasks: 4,
++            maxConcurrentTasks: 1,
+             dateProvider: { Date() },
+             db: InMemoryDB(),
+             runner: runner
+@@ -205,10 +205,299 @@ public class TaskQueueLoaderTest: XCTestCase {
+             XCTFail("Unexpected error: \(error)")
+         }
+         // Should have cancelled after 50 of them;
+-        // that could leave us with anywhere from 50 to 53
+-        // of them completed because we run 4 at a time.
+-        XCTAssert(runner.completedTasks.count >= 50)
+-        XCTAssert(runner.completedTasks.count <= 53)
++        // give or take 1 or 2 to let stuff yield.
++        XCTAssert(runner.completedTasks.count >= 48)
++        XCTAssert(runner.completedTasks.count <= 52)
++    }
++
++    func testMultipleTaskCancellation_OnlyOneCancels() async throws {
++        let runner = MockRunner(numRecords: 100)
++        let loader = TaskQueueLoader(
++            maxConcurrentTasks: 1,
++            dateProvider: { Date() },
++            db: InMemoryDB(),
++            runner: runner
++        )
++
++        // Make two tasks that wait on `loadAndRunTasks`.
++        // The first will be cancelled after 50 tasks
++        // have run; the second will never cancel. By
++        // TaskQueueLoader semantics, the runner should
++        // never stop running as long as some un-cancelled
++        // task is still around.
++        var firstTask: Task<Void, Error>!
++        var firstTaskContinuation: AsyncStream<Task<Void, Error>>.Continuation! = nil
++        let firstTaskStream = AsyncStream<Task<Void, Error>> {
++            firstTaskContinuation = $0
++        }
++        var secondTask: Task<Void, Error>!
++        var secondTaskContinuation: AsyncStream<Task<Void, Error>>.Continuation! = nil
++        let secondTaskStream = AsyncStream<Task<Void, Error>> {
++            secondTaskContinuation = $0
++        }
++        runner.taskRunner = { id in
++            if id == 1 {
++                // Make sure both tasks are created before we
++                // allow anything to continue
++                for await _ in secondTaskStream {}
++                for await _ in firstTaskStream {}
++                return .success
++            } else if id == 50 {
++                firstTask.cancel()
++                return .success
++            } else {
++                return .success
++            }
++        }
++
++        firstTask = Task {
++            try await loader.loadAndRunTasks()
++        }
++        firstTaskContinuation.yield(firstTask)
++        firstTaskContinuation.finish()
++        secondTask = Task {
++            try await loader.loadAndRunTasks()
++        }
++        secondTaskContinuation.yield(secondTask)
++        secondTaskContinuation.finish()
++        do {
++            try await firstTask.value
++        } catch is CancellationError {
++            // This is what we want
++        } catch {
++            XCTFail("Unexpected error: \(error)")
++        }
++        do {
++            try await secondTask.value
++        } catch {
++            XCTFail("Unexpected error: \(error)")
++        }
++        let completedTaskCount = runner.completedTasks.count
++        // Should have kept going until done!
++        XCTAssert(completedTaskCount == 100)
++    }
++
++    func testMultipleTaskCancellation_BothCancel() async throws {
++        let runner = MockRunner(numRecords: 150)
++        let loader = TaskQueueLoader(
++            maxConcurrentTasks: 1,
++            dateProvider: { Date() },
++            db: InMemoryDB(),
++            runner: runner
++        )
++
++        // Make two tasks that wait on `loadAndRunTasks`.
++        // The first will be cancelled after 50 tasks
++        // have run; the second after 100. By
++        // TaskQueueLoader semantics, the runner should
++        // never stop running as long as some un-cancelled
++        // task is still around, so it will only stop
++        // after both cancel at 100.
++        var firstTask: Task<Void, Error>!
++        var firstTaskContinuation: AsyncStream<Task<Void, Error>>.Continuation! = nil
++        let firstTaskStream = AsyncStream<Task<Void, Error>> {
++            firstTaskContinuation = $0
++        }
++        var secondTask: Task<Void, Error>!
++        var secondTaskContinuation: AsyncStream<Task<Void, Error>>.Continuation! = nil
++        let secondTaskStream = AsyncStream<Task<Void, Error>> {
++            secondTaskContinuation = $0
++        }
++        runner.taskRunner = { id in
++            if id <= 4 {
++                // Make sure both tasks are created before we
++                // allow anything to continue
++                for await _ in secondTaskStream {}
++                for await _ in firstTaskStream {}
++                return .success
++            } else if id == 50 {
++                firstTask.cancel()
++                return .success
++            } else if id == 100 {
++                secondTask.cancel()
++                return .success
++            } else {
++                return .success
++            }
++        }
++
++        firstTask = Task {
++            try await loader.loadAndRunTasks()
++        }
++        firstTaskContinuation.yield(firstTask)
++        firstTaskContinuation.finish()
++        secondTask = Task {
++            try await loader.loadAndRunTasks()
++        }
++        secondTaskContinuation.yield(secondTask)
++        secondTaskContinuation.finish()
++        do {
++            try await firstTask.value
++        } catch is CancellationError {
++            // This is what we want
++        } catch {
++            XCTFail("Unexpected error: \(error)")
++        }
++        do {
++            try await secondTask.value
++        } catch is CancellationError {
++            // This is what we want
++        } catch {
++            XCTFail("Unexpected error: \(error)")
++        }
++        let completedTaskCount = runner.completedTasks.count
++        // Should have cancelled after 100 of them;
++        // give or take 1 or 2 to let stuff yield.
++        XCTAssert(completedTaskCount >= 98)
++        XCTAssert(completedTaskCount <= 102)
++    }
++
++    func testMultipleTaskCancellation_NewAwaitAfterCancel() async throws {
++        let runner = MockRunner(numRecords: 250)
++        let loader = TaskQueueLoader(
++            maxConcurrentTasks: 1,
++            dateProvider: { Date() },
++            db: InMemoryDB(),
++            runner: runner
++        )
++
++        // Make two tasks that wait on `loadAndRunTasks`.
++        // The first will be cancelled after 50 tasks
++        // have run; the second after 100. By
++        // TaskQueueLoader semantics, the runner should
++        // never stop running as long as some un-cancelled
++        // task is still around, so it will only stop
++        // after both cancel at 100.
++        var tasks = [Task<Void, Error>?]()
++        var taskContinuations = [AsyncStream<Void>.Continuation?]()
++        var taskContinuationStreams = [AsyncStream<Void>]()
++        for i in 0..<3 {
++            tasks.append(nil)
++            taskContinuations.append(nil)
++            taskContinuationStreams.append(AsyncStream<Void> {
++                taskContinuations[i] = $0
++            })
++        }
++        runner.taskRunner = { [weak loader] id in
++            if id == 0 {
++                // Make sure the first two tasks are created before we
++                // allow anything to continue
++                for await _ in taskContinuationStreams[0] {}
++                for await _ in taskContinuationStreams[1] {}
++            }
++            if id == 50 {
++                tasks[0]!.cancel()
++            }
++            if id == 100 {
++                tasks[2] = Task {
++                    try await loader!.loadAndRunTasks()
++                }
++                taskContinuations[2]!.finish()
++            }
++            if id == 101 {
++                for await _ in taskContinuationStreams[2] {}
++            }
++            if id == 150 {
++                tasks[1]!.cancel()
++            }
++            if id == 200 {
++                tasks[2]!.cancel()
++            }
++            return .success
++        }
++
++        tasks[0] = Task {
++            try await loader.loadAndRunTasks()
++        }
++        taskContinuations[0]!.finish()
++        tasks[1] = Task {
++            try await loader.loadAndRunTasks()
++        }
++        taskContinuations[1]!.finish()
++        for i in 0...2 {
++            do {
++                try await tasks[i]!.value
++            } catch is CancellationError {
++                // This is what we want
++            } catch {
++                XCTFail("Unexpected error: \(error)")
++            }
++        }
++
++        var completedTaskCount = runner.completedTasks.count
++        // Should have cancelled after 200 of them;
++        // give or take 1 or 2 to let stuff yield.
++        XCTAssert(completedTaskCount >= 198)
++        XCTAssert(completedTaskCount <= 202)
++
++        // If we now create a new task, it should complete everything.
++        try await loader.loadAndRunTasks()
++        completedTaskCount = runner.completedTasks.count
++        XCTAssert(completedTaskCount <= 250)
++    }
++
++    func testCleaningUp_newLoadAndRunTasks() async throws {
++        let db = InMemoryDB()
++
++        let store = MockStore(numRecords: 1)
++        let runner = MockRunner(store: store)
++        let loader = TaskQueueLoader(
++            maxConcurrentTasks: 1,
++            dateProvider: { Date() },
++            db: db,
++            runner: runner
++        )
++
++        var beginDidDrainQueueContinuation: AsyncStream<Void>.Continuation!
++        // Awaiting this guy to finish will mean after that point, the first
++        // task succeeded and the loader is awaiting didDrainQueue
++        let beginDidDrainQueueStream = AsyncStream<Void> {
++            beginDidDrainQueueContinuation = $0
++        }
++
++        // Finish this guy to release the loader from await didDrainQueue
++        var releaseDidDrainQueueContinuation: AsyncStream<Void>.Continuation!
++        let releaseDidDrainQueueStream = AsyncStream<Void> {
++            releaseDidDrainQueueContinuation = $0
++        }
++
++        runner.didDrainQueueBlock = {
++            beginDidDrainQueueContinuation.finish()
++            for await _ in releaseDidDrainQueueStream {}
++        }
++
++        let firstRunTask = Task {
++            try await loader.loadAndRunTasks()
++        }
++
++        // Ensure we've started the first run, and have put ourselves
++        // into the suspended state with didDrainQueue
++        for await _ in beginDidDrainQueueStream {}
++
++        // Now, while the queue is in this "cleaning up" state where it
++        // is done running and is waiting for didDrainQueue, insert a new
++        // record and start up a new loader run.
++        store.records.append(MockTaskRecord(id: 2))
++        var secondRunContinuation: AsyncStream<Void>.Continuation!
++        let secondRunStream = AsyncStream<Void> {
++            secondRunContinuation = $0
++        }
++        let secondRunTask = Task {
++            secondRunContinuation.finish()
++            try await loader.loadAndRunTasks()
++        }
++        for await _ in secondRunStream {}
++
++        // Now we can release didDrainQueue for the first run.
++        // The second run should start up and pick up the second task
++        // record we added.
++        releaseDidDrainQueueContinuation.finish()
++
++        try await firstRunTask.value
++        try await secondRunTask.value
++
++        let completedTaskCount = runner.completedTasks.count
++        XCTAssertEqual(completedTaskCount, 2)
+     }
+ 
+     func testStopWithReason() async throws {
+@@ -431,5 +720,11 @@ public class TaskQueueLoaderTest: XCTestCase {
+         func didCancel(record: MockTaskRecord, tx: DBWriteTransaction) throws {
+             cancelledTasks.append(record.id)
+         }
++
++        var didDrainQueueBlock: (() async -> Void)?
++
++        func didDrainQueue() async {
++            await didDrainQueueBlock?()
++        }
+     }
+ }

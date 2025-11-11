@@ -1,0 +1,169 @@
+diff --git a/Podfile.lock b/Podfile.lock
+index 8cb65093e8a..73b29d1588c 100644
+--- a/Podfile.lock
++++ b/Podfile.lock
+@@ -141,7 +141,7 @@ CHECKOUT OPTIONS:
+     :commit: 919d541d6b8a8802a94f943026b8f68394e2c0b8
+     :git: https://github.com/WhisperSystems/SignalProtocolKit.git
+   SignalServiceKit:
+-    :commit: 9fdbbb7f8b16ebfad074543281737626a0778be5
++    :commit: 6521a80c44d3db20a0bd5acc6af2e30a9dbcbd6b
+     :git: https://github.com/WhisperSystems/SignalServiceKit.git
+   SocketRocket:
+     :commit: 41b57bb2fc292a814f758441a05243eb38457027
+diff --git a/Signal/src/call/CallService.swift b/Signal/src/call/CallService.swift
+index 9790626f1ca..59913b207c5 100644
+--- a/Signal/src/call/CallService.swift
++++ b/Signal/src/call/CallService.swift
+@@ -424,7 +424,7 @@ protocol CallServiceObserver: class {
+         Logger.debug("\(TAG) called \(#function)")
+ 
+         guard self.thread != nil else {
+-            handleFailedCall(error: .assertionError(description: "ignoring remote ice update for thread: \(thread.uniqueId) since there is no current thread. TODO: Signaling messages out of order?"))
++            handleFailedCall(error: .assertionError(description: "ignoring remote ice update for thread: \(thread.uniqueId) since there is no current thread. Call already ended?"))
+             return
+         }
+ 
+@@ -960,7 +960,9 @@ protocol CallServiceObserver: class {
+             call.state = .localFailure
+             callUIAdapter.failCall(call, error: error)
+         } else {
+-            assertionFailure("\(TAG) in \(#function) but there was no call to fail.")
++            // This can happen when we receive an out of band signaling message (e.g. IceUpdate)
++            // after the call has ended
++            Logger.debug("\(TAG) in \(#function) but there was no call to fail.")
+         }
+ 
+         terminateCall()
+diff --git a/Signal/src/view controllers/AdvancedSettingsTableViewController.m b/Signal/src/view controllers/AdvancedSettingsTableViewController.m
+index 4c70a1dc054..81e09011c5e 100644
+--- a/Signal/src/view controllers/AdvancedSettingsTableViewController.m	
++++ b/Signal/src/view controllers/AdvancedSettingsTableViewController.m	
+@@ -155,6 +155,7 @@ - (void)didToggleEnableWebRTCSwitch:(UISwitch *)sender {
+ 
+     __weak AdvancedSettingsTableViewController *weakSelf = self;
+     BOOL isWebRTCEnabled = sender.isOn;
++    DDLogInfo(@"%@ User set WebRTC calling to: %@", self.tag, (isWebRTCEnabled ? @"ON" : @"OFF"));
+     TSUpdateAttributesRequest *request = [[TSUpdateAttributesRequest alloc] initWithUpdatedAttributes:isWebRTCEnabled];
+     [[TSNetworkManager sharedManager] makeRequest:request
+                                           success:^(NSURLSessionDataTask *task, id responseObject) {
+diff --git a/Signal/src/view controllers/MessagesViewController.m b/Signal/src/view controllers/MessagesViewController.m
+index 278344bd0fb..bb24e36cf54 100644
+--- a/Signal/src/view controllers/MessagesViewController.m	
++++ b/Signal/src/view controllers/MessagesViewController.m	
+@@ -51,6 +51,7 @@
+ #import <JSQMessagesViewController/UIColor+JSQMessages.h>
+ #import <JSQSystemSoundPlayer.h>
+ #import <MobileCoreServices/UTCoreTypes.h>
++#import <SignalServiceKit/ContactsUpdater.h>
+ #import <SignalServiceKit/MimeTypeUtil.h>
+ #import <SignalServiceKit/OWSAttachmentsProcessor.h>
+ #import <SignalServiceKit/OWSDisappearingMessagesConfiguration.h>
+@@ -626,32 +627,62 @@ - (void)showFingerprintWithTheirIdentityKey:(NSData *)theirIdentityKey theirSign
+ 
+ #pragma mark - Calls
+ 
+-- (PhoneNumber *)phoneNumberForThread {
+-    NSString *contactId = [(TSContactThread *)self.thread contactIdentifier];
+-    return [PhoneNumber tryParsePhoneNumberFromUserSpecifiedText:contactId];
+-}
+-
+ - (void)callAction {
+     OWSAssert([self.thread isKindOfClass:[TSContactThread class]]);
+ 
+-    if ([self canCall]) {
+-        PhoneNumber *number = [self phoneNumberForThread];
+-        Contact *contact = [self.contactsManager latestContactForPhoneNumber:number];
+-        SignalRecipient *recipient = [SignalRecipient recipientWithTextSecureIdentifier:self.thread.contactIdentifier];
+-
+-        BOOL localWantsWebRTC = [Environment preferences].isWebRTCEnabled;
+-        BOOL remoteWantsWebRTC = recipient.supportsWebRTC;
+-        DDLogDebug(@"%@ localWantsWebRTC?: %@, remoteWantsWebRTC?: %@", self.tag, (localWantsWebRTC ? @"YES": @"NO"), (remoteWantsWebRTC ? @"YES" : @"NO"));
+-        if (localWantsWebRTC && remoteWantsWebRTC) {
+-            // Place WebRTC Call
+-            [self performSegueWithIdentifier:OWSMessagesViewControllerSegueInitiateCall sender:self];
+-        } else {
+-            // Place Redphone call if either local or remote party has not opted in to WebRTC calling.
+-            [Environment.phoneManager initiateOutgoingCallToContact:contact atRemoteNumber:number];
+-        }
+-    } else {
++    if (![self canCall]) {
+         DDLogWarn(@"Tried to initiate a call but thread is not callable.");
++        return;
++    }
++
++    // Since users can toggle this setting, which is only communicated during contact sync, it's easy to imagine the
++    // preference getting stale. Especially as users are toggling the feature to test calls. So here, we opt for a
++    // blocking network request *every* time we place a call to make sure we've got up to date preferences.
++    //
++    // e.g. The following would suffice if we weren't worried about stale preferences.
++    // SignalRecipient *recipient = [SignalRecipient recipientWithTextSecureIdentifier:self.thread.contactIdentifier];
++    BOOL localWantsWebRTC = [Environment preferences].isWebRTCEnabled;
++
++    if (!localWantsWebRTC) {
++        [self placeRedphoneCall];
++        return;
+     }
++
++    [self.contactsUpdater lookupIdentifier:self.thread.contactIdentifier
++        success:^(SignalRecipient *_Nonnull recipient) {
++            BOOL remoteWantsWebRTC = recipient.supportsWebRTC;
++            DDLogDebug(@"%@ localWantsWebRTC?: %@, remoteWantsWebRTC?: %@",
++                self.tag,
++                (localWantsWebRTC ? @"YES" : @"NO"),
++                (remoteWantsWebRTC ? @"YES" : @"NO"));
++            if (localWantsWebRTC && remoteWantsWebRTC) {
++                [self placeWebRTCCall];
++            } else {
++                [self placeRedphoneCall];
++            }
++        }
++        failure:^(NSError *_Nonnull error) {
++            DDLogWarn(@"%@ looking up call recipient: %@ failed with error: %@", self.tag, self.thread, error);
++            SignalAlertView(NSLocalizedString(@"UNABLE_TO_PLACE_CALL", @"Alert Title"), error.localizedDescription);
++        }];
++}
++
++- (void)placeRedphoneCall
++{
++    DDLogInfo(@"%@ Placing redphone call to: %@", self.tag, self.thread);
++    PhoneNumber *number = [PhoneNumber tryParsePhoneNumberFromUserSpecifiedText:self.thread.contactIdentifier];
++    Contact *contact = [self.contactsManager latestContactForPhoneNumber:number];
++
++    OWSAssert(number != nil);
++    OWSAssert(contact != nil);
++
++    [Environment.phoneManager initiateOutgoingCallToContact:contact atRemoteNumber:number];
++}
++
++- (void)placeWebRTCCall
++{
++    DDLogInfo(@"%@ Placing WebRTC call to: %@", self.tag, self.thread);
++    [self performSegueWithIdentifier:OWSMessagesViewControllerSegueInitiateCall sender:self];
+ }
+ 
+ - (BOOL)canCall {
+diff --git a/Signal/translations/en.lproj/Localizable.strings b/Signal/translations/en.lproj/Localizable.strings
+index f7c640a456b..2970489d10b 100644
+--- a/Signal/translations/en.lproj/Localizable.strings
++++ b/Signal/translations/en.lproj/Localizable.strings
+@@ -543,9 +543,6 @@
+ /* No comment provided by engineer. */
+ "OUTGOING_CALL" = "Outgoing call";
+ 
+-/* No comment provided by engineer. */
+-"PHONE_NEEDS_UNLOCK" = "Your iPhone needs to be unlocked to receive new messages.";
+-
+ /* Alert body when verifying with {{contact name}} */
+ "PRIVACY_VERIFICATION_FAILED_I_HAVE_WRONG_KEY_FOR_THEM" = "This doesn't look like your safety number with %@. Are you verifying the correct contact?";
+ 
+@@ -843,6 +840,9 @@
+ /* No comment provided by engineer. */
+ "TXT_DELETE_TITLE" = "Delete";
+ 
++/* Alert Title */
++"UNABLE_TO_PLACE_CALL" = "Unable to place call.";
++
+ /* Pressing this button moves an archived thread from the archive back to the inbox */
+ "UNARCHIVE_ACTION" = "Unarchive";
+ 

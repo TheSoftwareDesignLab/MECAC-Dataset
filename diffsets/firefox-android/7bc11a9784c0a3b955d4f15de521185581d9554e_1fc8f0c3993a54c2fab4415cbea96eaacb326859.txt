@@ -1,0 +1,1287 @@
+diff --git a/focus-android/app/build.gradle b/focus-android/app/build.gradle
+index bd9225738638..2c589a10bcfd 100644
+--- a/focus-android/app/build.gradle
++++ b/focus-android/app/build.gradle
+@@ -151,9 +151,11 @@ dependencies {
+     implementation "org.mozilla.components:feature-findinpage:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:feature-prompts:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:feature-session:${AndroidComponents.VERSION}"
++    implementation "org.mozilla.components:feature-search:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:feature-tabs:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:lib-crash:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:service-telemetry:$mozilla_components_version_telemetry"
++    implementation "org.mozilla.components:service-location:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:support-ktx:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:support-utils:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:ui-autocomplete:${AndroidComponents.VERSION}"
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/Components.kt b/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
+index 1f94295f8848..f4db19032fae 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
+@@ -5,9 +5,6 @@
+ package org.mozilla.focus
+ 
+ import android.content.Context
+-import mozilla.components.browser.search.SearchEngineManager
+-import mozilla.components.browser.search.provider.AssetsSearchEngineProvider
+-import mozilla.components.browser.search.provider.localization.LocaleSearchLocalizationProvider
+ import mozilla.components.browser.session.Session
+ import mozilla.components.browser.session.SessionManager
+ import mozilla.components.browser.session.engine.EngineMiddleware
+@@ -20,20 +17,24 @@ import mozilla.components.feature.contextmenu.ContextMenuUseCases
+ import mozilla.components.feature.customtabs.store.CustomTabsServiceStore
+ import mozilla.components.feature.downloads.DownloadMiddleware
+ import mozilla.components.feature.downloads.DownloadsUseCases
++import mozilla.components.feature.search.SearchUseCases
++import mozilla.components.feature.search.ext.toDefaultSearchEngineProvider
++import mozilla.components.feature.search.middleware.SearchMiddleware
++import mozilla.components.feature.search.region.RegionMiddleware
+ import mozilla.components.feature.session.SessionUseCases
+ import mozilla.components.feature.session.SettingsUseCases
+ import mozilla.components.feature.session.TrackingProtectionUseCases
+ import mozilla.components.feature.tabs.CustomTabsUseCases
+ import mozilla.components.feature.tabs.TabsUseCases
++import mozilla.components.service.location.LocationService
+ import org.mozilla.focus.components.EngineProvider
+ import org.mozilla.focus.downloads.DownloadService
+ import org.mozilla.focus.engine.ClientWrapper
+ import org.mozilla.focus.engine.LocalizedContentInterceptor
+ import org.mozilla.focus.engine.SanityCheckMiddleware
+ import org.mozilla.focus.notification.PrivateNotificationMiddleware
+-import org.mozilla.focus.search.BingSearchEngineFilter
+-import org.mozilla.focus.search.CustomSearchEngineProvider
+-import org.mozilla.focus.search.HiddenSearchEngineFilter
++import org.mozilla.focus.search.SearchFilterMiddleware
++import org.mozilla.focus.search.SearchMigration
+ import org.mozilla.focus.state.AppState
+ import org.mozilla.focus.state.AppStore
+ import org.mozilla.focus.state.Screen
+@@ -86,7 +87,13 @@ class Components(
+                 PrivateNotificationMiddleware(context),
+                 TelemetryMiddleware(),
+                 DownloadMiddleware(context, DownloadService::class.java),
+-                SanityCheckMiddleware()
++                SanityCheckMiddleware(),
++                // We are currently using the default location service. We should consider using
++                // an actual implementation:
++                // https://github.com/mozilla-mobile/focus-android/issues/4781
++                RegionMiddleware(context, LocationService.default()),
++                SearchMiddleware(context, migration = SearchMigration(context)),
++                SearchFilterMiddleware()
+             ) + EngineMiddleware.create(engine, ::findSessionById)
+         )
+     }
+@@ -107,6 +114,10 @@ class Components(
+     @Suppress("DEPRECATION")
+     val tabsUseCases: TabsUseCases by lazy { TabsUseCases(store, sessionManager) }
+ 
++    val searchUseCases: SearchUseCases by lazy {
++        SearchUseCases(store, store.toDefaultSearchEngineProvider(), tabsUseCases)
++    }
++
+     val contextMenuUseCases: ContextMenuUseCases by lazy { ContextMenuUseCases(store) }
+ 
+     val downloadsUseCases: DownloadsUseCases by lazy { DownloadsUseCases(store) }
+@@ -120,17 +131,6 @@ class Components(
+     private val sessionManager by lazy {
+         SessionManager(engine, store)
+     }
+-
+-    val searchEngineManager by lazy {
+-        val assetsProvider = AssetsSearchEngineProvider(
+-                LocaleSearchLocalizationProvider(),
+-                filters = listOf(BingSearchEngineFilter(), HiddenSearchEngineFilter()),
+-                additionalIdentifiers = listOf("ddg"))
+-
+-        val customProvider = CustomSearchEngineProvider()
+-
+-        SearchEngineManager(listOf(assetsProvider, customProvider))
+-    }
+ }
+ 
+ private fun determineInitialScreen(context: Context): Screen {
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt b/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
+index bbbace52b05b..ee9b293b3fd9 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
+@@ -10,9 +10,7 @@ import androidx.lifecycle.ProcessLifecycleOwner
+ import androidx.preference.PreferenceManager
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.Dispatchers.IO
+ import kotlinx.coroutines.Job
+-import kotlinx.coroutines.launch
+ import mozilla.components.support.base.log.Log
+ import mozilla.components.support.base.log.sink.AndroidLogSink
+ import mozilla.components.support.ktx.android.content.isMainProcess
+@@ -52,14 +50,6 @@ open class FocusApplication : LocaleAwareApplication(), CoroutineScope {
+ 
+             enableStrictMode()
+ 
+-            components.searchEngineManager.apply {
+-                launch(IO) {
+-                    loadAsync(this@FocusApplication).await()
+-                }
+-
+-                registerForLocaleUpdates(this@FocusApplication)
+-            }
+-
+             AdjustHelper.setupAdjustIfNeeded(this@FocusApplication)
+ 
+             visibilityLifeCycleCallback = VisibilityLifeCycleCallback(this@FocusApplication)
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/activity/TextActionActivity.kt b/focus-android/app/src/main/java/org/mozilla/focus/activity/TextActionActivity.kt
+index 5d068e14b81c..0b64d7d96283 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/activity/TextActionActivity.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/activity/TextActionActivity.kt
+@@ -10,10 +10,8 @@ import android.net.Uri
+ import android.os.Build
+ import android.os.Bundle
+ import androidx.annotation.RequiresApi
+-
+-import org.mozilla.focus.utils.UrlUtils
+-
+ import mozilla.components.support.utils.SafeIntent
++import org.mozilla.focus.utils.SearchUtils
+ 
+ /**
+  * Activity for receiving and processing an ACTION_PROCESS_TEXT intent.
+@@ -28,7 +26,7 @@ class TextActionActivity : Activity() {
+         val searchTextCharSequence = intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)
+         val searchText = searchTextCharSequence?.toString() ?: ""
+ 
+-        val searchUrl = UrlUtils.createSearchUrl(this, searchText)
++        val searchUrl = SearchUtils.createSearchUrl(this, searchText)
+ 
+         val searchIntent = Intent(this, IntentReceiverActivity::class.java)
+         searchIntent.action = Intent.ACTION_VIEW
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/ext/AndroidViewModel.kt b/focus-android/app/src/main/java/org/mozilla/focus/ext/AndroidViewModel.kt
+new file mode 100644
+index 000000000000..216dc009e77b
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/ext/AndroidViewModel.kt
+@@ -0,0 +1,12 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.ext
++
++import androidx.lifecycle.AndroidViewModel
++import org.mozilla.focus.Components
++import org.mozilla.focus.FocusApplication
++
++val AndroidViewModel.components: Components
++    get() = getApplication<FocusApplication>().components
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt
+index be2fd9ec9d2b..b846b9a7818a 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt
+@@ -39,6 +39,7 @@ import mozilla.components.browser.state.action.ContentAction
+ import mozilla.components.browser.state.selector.findTab
+ import mozilla.components.browser.state.state.SessionState
+ import mozilla.components.browser.state.state.TabSessionState
++import mozilla.components.browser.state.state.selectedOrDefaultSearchEngine
+ import mozilla.components.support.utils.ThreadUtils
+ import mozilla.components.ui.autocomplete.InlineAutocompleteEditText
+ import mozilla.components.ui.autocomplete.InlineAutocompleteEditText.AutocompleteResult
+@@ -57,6 +58,7 @@ import org.mozilla.focus.tips.TipManager
+ import org.mozilla.focus.utils.AppConstants
+ import org.mozilla.focus.utils.Features
+ import org.mozilla.focus.utils.OneShotOnPreDrawListener
++import org.mozilla.focus.utils.SearchUtils
+ import org.mozilla.focus.utils.Settings
+ import org.mozilla.focus.utils.StatusBarUtils
+ import org.mozilla.focus.utils.SupportUtils
+@@ -325,7 +327,7 @@ class UrlInputFragment :
+         urlView?.setOnCommitListener(::onCommit)
+ 
+         val isDDG: Boolean =
+-            Settings.getInstance(requireContext()).defaultSearchEngineName == duckDuckGo
++            requireComponents.store.state.search.selectedOrDefaultSearchEngine?.name == duckDuckGo
+ 
+         tab?.let { tab ->
+             urlView?.setText(
+@@ -722,7 +724,7 @@ class UrlInputFragment :
+         val url = if (isUrl)
+             UrlUtils.normalize(input)
+         else
+-            UrlUtils.createSearchUrl(context, input)
++            SearchUtils.createSearchUrl(context, input)
+ 
+         val searchTerms = if (isUrl)
+             null
+@@ -733,11 +735,15 @@ class UrlInputFragment :
+ 
+     private fun onSearch(query: String, isSuggestion: Boolean = false, alwaysSearch: Boolean = false) {
+         if (alwaysSearch) {
+-            openUrl(UrlUtils.createSearchUrl(context, query), query)
++            val url = SearchUtils.createSearchUrl(context, query)
++            openUrl(url, query)
+         } else {
+             val searchTerms = if (UrlUtils.isUrl(query)) null else query
+-            val searchUrl =
+-                if (searchTerms != null) UrlUtils.createSearchUrl(context, searchTerms) else UrlUtils.normalize(query)
++            val searchUrl = if (searchTerms != null) {
++                SearchUtils.createSearchUrl(context, searchTerms)
++            } else {
++                UrlUtils.normalize(query)
++            }
+ 
+             openUrl(searchUrl, searchTerms)
+         }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/BingSearchEngineFilter.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/BingSearchEngineFilter.kt
+deleted file mode 100644
+index 1b79ed86754c..000000000000
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/BingSearchEngineFilter.kt
++++ /dev/null
+@@ -1,17 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-package org.mozilla.focus.search
+-
+-import android.content.Context
+-import mozilla.components.browser.search.SearchEngine
+-import mozilla.components.browser.search.provider.filter.SearchEngineFilter
+-
+-/**
+- * SearchEngineFilter implementation to hide Bing from the default list.
+- */
+-class BingSearchEngineFilter : SearchEngineFilter {
+-    override fun filter(context: Context, searchEngine: SearchEngine): Boolean =
+-            searchEngine.identifier != "bing"
+-}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/CustomSearchEngineProvider.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/CustomSearchEngineProvider.kt
+deleted file mode 100644
+index 19f05e347f30..000000000000
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/CustomSearchEngineProvider.kt
++++ /dev/null
+@@ -1,21 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-package org.mozilla.focus.search
+-
+-import android.content.Context
+-import kotlinx.coroutines.coroutineScope
+-import mozilla.components.browser.search.provider.SearchEngineProvider
+-import mozilla.components.browser.search.provider.SearchEngineList
+-
+-/**
+- * SearchEngineProvider implementation to load user entered custom search engines.
+- */
+-class CustomSearchEngineProvider : SearchEngineProvider {
+-    // Our version of ktlint enforces the wrong modifier order. We need to update the plugin: #2488
+-    /* ktlint-disable modifier-order */
+-    override suspend fun loadSearchEngines(context: Context): SearchEngineList = coroutineScope {
+-        SearchEngineList(CustomSearchEngineStore.loadCustomSearchEngines(context), null)
+-    }
+-}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/CustomSearchEngineStore.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/CustomSearchEngineStore.kt
+deleted file mode 100644
+index d0bb041204ca..000000000000
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/CustomSearchEngineStore.kt
++++ /dev/null
+@@ -1,128 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-package org.mozilla.focus.search
+-
+-import android.content.Context
+-import android.util.Log
+-import mozilla.components.browser.search.SearchEngine
+-import mozilla.components.browser.search.SearchEngineParser
+-import org.mozilla.focus.ext.components
+-import org.mozilla.focus.shortcut.IconGenerator
+-import org.xmlpull.v1.XmlPullParserException
+-import java.io.IOException
+-
+-object CustomSearchEngineStore {
+-    fun isSearchEngineNameUnique(context: Context, engineName: String): Boolean {
+-        val sharedPreferences = context.getSharedPreferences(PREF_FILE_SEARCH_ENGINES,
+-                Context.MODE_PRIVATE)
+-
+-        val defaultEngines = context.components.searchEngineManager.getSearchEngines(context)
+-
+-        return !sharedPreferences.contains(engineName) && !defaultEngines.any { it.name == engineName }
+-    }
+-
+-    fun restoreDefaultSearchEngines(context: Context) {
+-        pref(context)
+-                .edit()
+-                .remove(PREF_KEY_HIDDEN_DEFAULT_ENGINES)
+-                .apply()
+-    }
+-
+-    fun hasAllDefaultSearchEngines(context: Context): Boolean {
+-        return !pref(context)
+-                .contains(PREF_KEY_HIDDEN_DEFAULT_ENGINES)
+-    }
+-
+-    fun addSearchEngine(context: Context, engineName: String, searchQuery: String): Boolean {
+-        // This is not for a homescreen shortcut so we don't want an adaptive launcher icon.
+-        val iconBitmap = IconGenerator.generateSearchEngineIcon(context)
+-        val searchEngineXml = SearchEngineWriter.buildSearchEngineXML(engineName, searchQuery, iconBitmap)
+-                ?: return false
+-        val existingEngines = pref(context).getStringSet(PREF_KEY_CUSTOM_SEARCH_ENGINES, emptySet())
+-        val newEngines = LinkedHashSet<String>()
+-        newEngines.addAll(existingEngines!!)
+-        newEngines.add(engineName)
+-
+-        pref(context)
+-                .edit()
+-                .putInt(PREF_KEY_CUSTOM_SEARCH_VERSION, CUSTOM_SEARCH_VERSION)
+-                .putStringSet(PREF_KEY_CUSTOM_SEARCH_ENGINES, newEngines)
+-                .putString(engineName, searchEngineXml)
+-                .apply()
+-
+-        return true
+-    }
+-
+-    fun removeSearchEngines(context: Context, engineIdsToRemove: MutableSet<String>) {
+-        // Check custom engines first.
+-        val customEngines = pref(context).getStringSet(PREF_KEY_CUSTOM_SEARCH_ENGINES, emptySet())
+-        val remainingCustomEngines = LinkedHashSet<String>()
+-        val enginesEditor = pref(context).edit()
+-
+-        for (engineId in customEngines!!) {
+-            if (engineIdsToRemove.contains(engineId)) {
+-                enginesEditor.remove(engineId)
+-                // Handled engine removal.
+-                engineIdsToRemove.remove(engineId)
+-            } else {
+-                remainingCustomEngines.add(engineId)
+-            }
+-        }
+-        enginesEditor.putStringSet(PREF_KEY_CUSTOM_SEARCH_ENGINES, remainingCustomEngines)
+-
+-        // Everything else must be a default engine.
+-        val hiddenDefaultEngines = pref(context).getStringSet(PREF_KEY_HIDDEN_DEFAULT_ENGINES, emptySet())
+-        engineIdsToRemove.addAll(hiddenDefaultEngines!!)
+-        enginesEditor.putStringSet(PREF_KEY_HIDDEN_DEFAULT_ENGINES, engineIdsToRemove)
+-
+-        enginesEditor.apply()
+-    }
+-
+-    fun getRemovedSearchEngines(context: Context): Set<String> =
+-            pref(context).getStringSet(PREF_KEY_HIDDEN_DEFAULT_ENGINES, emptySet())!!
+-
+-    fun isCustomSearchEngine(engineId: String, context: Context): Boolean {
+-        for (e in loadCustomSearchEngines(context)) {
+-            if (e.identifier == engineId) {
+-                return true
+-            }
+-        }
+-        return false
+-    }
+-
+-    fun loadCustomSearchEngines(context: Context): List<SearchEngine> {
+-        val customEngines = mutableListOf<SearchEngine>()
+-        val parser = SearchEngineParser()
+-        val prefs = context.getSharedPreferences(PREF_FILE_SEARCH_ENGINES, Context.MODE_PRIVATE)
+-        val engines = prefs.getStringSet(PREF_KEY_CUSTOM_SEARCH_ENGINES, emptySet())
+-
+-        try {
+-            for (engine in engines!!) {
+-                val engineInputStream = prefs.getString(engine, "")!!.byteInputStream().buffered()
+-                // Search engine identifier is the search engine name.
+-                customEngines.add(parser.load(engine, engineInputStream))
+-            }
+-        } catch (e: IOException) {
+-            Log.e(LOG_TAG, "IOException while loading custom search engines", e)
+-        } catch (e: XmlPullParserException) {
+-            Log.e(LOG_TAG, "Couldn't load custom search engines", e)
+-        }
+-
+-        return customEngines
+-    }
+-
+-    private fun pref(context: Context) =
+-            context.getSharedPreferences(PREF_FILE_SEARCH_ENGINES, Context.MODE_PRIVATE)
+-
+-    const val ENGINE_TYPE_CUSTOM = "custom"
+-    const val ENGINE_TYPE_BUNDLED = "bundled"
+-
+-    private const val LOG_TAG = "CustomSearchEngineStore"
+-    private const val PREF_KEY_CUSTOM_SEARCH_ENGINES = "pref_custom_search_engines"
+-    private const val PREF_KEY_HIDDEN_DEFAULT_ENGINES = "hidden_default_engines"
+-    private const val PREF_KEY_CUSTOM_SEARCH_VERSION = "pref_custom_search_version"
+-    private const val CUSTOM_SEARCH_VERSION = 1
+-    private const val PREF_FILE_SEARCH_ENGINES = "custom-search-engines"
+-}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/HiddenSearchEngineFilter.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/HiddenSearchEngineFilter.kt
+deleted file mode 100644
+index c9340df255b8..000000000000
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/HiddenSearchEngineFilter.kt
++++ /dev/null
+@@ -1,19 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-package org.mozilla.focus.search
+-
+-import android.content.Context
+-import mozilla.components.browser.search.SearchEngine
+-import mozilla.components.browser.search.provider.filter.SearchEngineFilter
+-
+-/**
+- * SearchEngineFilter implementation for hiding removed search engines.
+- */
+-class HiddenSearchEngineFilter : SearchEngineFilter {
+-    override fun filter(context: Context, searchEngine: SearchEngine): Boolean {
+-        val hiddenSearchEngines: Set<String> = CustomSearchEngineStore.getRemovedSearchEngines(context)
+-        return !hiddenSearchEngines.contains(searchEngine.identifier)
+-    }
+-}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/ManualAddSearchEnginePreference.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/ManualAddSearchEnginePreference.kt
+index 401b38b0fe41..e185453275fe 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/ManualAddSearchEnginePreference.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/search/ManualAddSearchEnginePreference.kt
+@@ -83,9 +83,6 @@ class ManualAddSearchEnginePreference(context: Context, attrs: AttributeSet) :
+             TextUtils.isEmpty(engineName) ->
+                 context.getString(R.string.search_add_error_empty_name)
+ 
+-            !CustomSearchEngineStore.isSearchEngineNameUnique(context, engineName) ->
+-                context.getString(R.string.search_add_error_duplicate_name)
+-
+             else -> null
+         }
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/RadioSearchEngineListPreference.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/RadioSearchEngineListPreference.kt
+index 1f5b0882e7eb..275992f95149 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/RadioSearchEngineListPreference.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/search/RadioSearchEngineListPreference.kt
+@@ -5,13 +5,17 @@
+ package org.mozilla.focus.search
+ 
+ import android.content.Context
+-import androidx.preference.PreferenceViewHolder
+ import android.util.AttributeSet
+ import android.widget.CompoundButton
+ import android.widget.RadioGroup
++import androidx.preference.PreferenceViewHolder
++import mozilla.components.browser.state.search.SearchEngine
+ import org.mozilla.focus.R
++import org.mozilla.focus.ext.components
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+-import org.mozilla.focus.utils.Settings
++
++private const val ENGINE_TYPE_CUSTOM = "custom"
++private const val ENGINE_TYPE_BUNDLED = "bundled"
+ 
+ class RadioSearchEngineListPreference : SearchEngineListPreference, RadioGroup.OnCheckedChangeListener {
+ 
+@@ -34,7 +38,6 @@ class RadioSearchEngineListPreference : SearchEngineListPreference, RadioGroup.O
+     }
+ 
+     override fun onCheckedChanged(group: RadioGroup, checkedId: Int) {
+-
+         /* onCheckedChanged is called intermittently before the search engine table is full, so we
+            must check these conditions to prevent crashes and inconsistent states. */
+         if (group.childCount != searchEngines.count() || group.getChildAt(checkedId) == null ||
+@@ -43,11 +46,14 @@ class RadioSearchEngineListPreference : SearchEngineListPreference, RadioGroup.O
+         }
+ 
+         val newDefaultEngine = searchEngines[checkedId]
+-        Settings.getInstance(group.context).setDefaultSearchEngineByName(newDefaultEngine.name)
+-        val source = if (CustomSearchEngineStore.isCustomSearchEngine(newDefaultEngine.identifier, context))
+-            CustomSearchEngineStore.ENGINE_TYPE_CUSTOM
++
++        context.components.searchUseCases.selectSearchEngine(newDefaultEngine)
++
++        val source = if (newDefaultEngine.type == SearchEngine.Type.CUSTOM)
++            ENGINE_TYPE_CUSTOM
+         else
+-            CustomSearchEngineStore.ENGINE_TYPE_BUNDLED
++            ENGINE_TYPE_BUNDLED
++
+         TelemetryWrapper.setDefaultSearchEngineEvent(source)
+     }
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineListPreference.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineListPreference.kt
+index 73a64c7a3497..f86b2a928169 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineListPreference.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineListPreference.kt
+@@ -7,23 +7,22 @@ package org.mozilla.focus.search
+ import android.content.Context
+ import android.content.res.Resources
+ import android.graphics.drawable.BitmapDrawable
+-import androidx.preference.Preference
+-import androidx.preference.PreferenceViewHolder
+-import androidx.recyclerview.widget.RecyclerView
+ import android.util.AttributeSet
+ import android.view.LayoutInflater
+ import android.view.ViewGroup
+ import android.widget.CompoundButton
+ import android.widget.RadioGroup
++import androidx.preference.Preference
++import androidx.preference.PreferenceViewHolder
++import androidx.recyclerview.widget.RecyclerView
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.Dispatchers.Main
+ import kotlinx.coroutines.Job
+-import kotlinx.coroutines.launch
+-import mozilla.components.browser.search.SearchEngine
++import mozilla.components.browser.state.search.SearchEngine
++import mozilla.components.browser.state.state.searchEngines
++import mozilla.components.browser.state.state.selectedOrDefaultSearchEngine
+ import org.mozilla.focus.R
+ import org.mozilla.focus.ext.components
+-import org.mozilla.focus.utils.Settings
+ import kotlin.coroutines.CoroutineContext
+ 
+ abstract class SearchEngineListPreference : Preference, CoroutineScope {
+@@ -48,8 +47,7 @@ abstract class SearchEngineListPreference : Preference, CoroutineScope {
+         searchEngineGroup = holder!!.itemView.findViewById(R.id.search_engine_group)
+         val context = searchEngineGroup!!.context
+ 
+-        searchEngines = context.components.searchEngineManager.getSearchEngines(context)
+-            .sortedBy { it.name }
++        searchEngines = context.components.store.state.search.searchEngines
+ 
+         refreshSearchEngineViews(context)
+     }
+@@ -62,14 +60,8 @@ abstract class SearchEngineListPreference : Preference, CoroutineScope {
+     protected abstract fun updateDefaultItem(defaultButton: CompoundButton)
+ 
+     fun refetchSearchEngines() {
+-        launch(Main) {
+-            searchEngines = context.components.searchEngineManager
+-                    .loadAsync(this@SearchEngineListPreference.context)
+-                    .await()
+-                    .list
+-                    .sortedBy { it.name }
+-            refreshSearchEngineViews(this@SearchEngineListPreference.context)
+-        }
++        searchEngines = context.components.store.state.search.searchEngines
++        refreshSearchEngineViews(this@SearchEngineListPreference.context)
+     }
+ 
+     private fun refreshSearchEngineViews(context: Context) {
+@@ -80,10 +72,7 @@ abstract class SearchEngineListPreference : Preference, CoroutineScope {
+             return
+         }
+ 
+-        val defaultSearchEngine = context.components.searchEngineManager.getDefaultSearchEngine(
+-                context,
+-                Settings.getInstance(context).defaultSearchEngineName
+-        ).identifier
++        val defaultSearchEngine = context.components.store.state.search.selectedOrDefaultSearchEngine?.id
+ 
+         searchEngineGroup!!.removeAllViews()
+ 
+@@ -94,7 +83,7 @@ abstract class SearchEngineListPreference : Preference, CoroutineScope {
+ 
+         for (i in searchEngines.indices) {
+             val engine = searchEngines[i]
+-            val engineId = engine.identifier
++            val engineId = engine.id
+             val engineItem = makeButtonFromSearchEngine(engine, layoutInflater, context.resources)
+             engineItem.id = i
+             engineItem.tag = engineId
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEnginePreference.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEnginePreference.kt
+index 654b692d1a81..382017cdaf12 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEnginePreference.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEnginePreference.kt
+@@ -9,9 +9,9 @@ import android.content.Context
+ import android.content.SharedPreferences
+ import androidx.preference.Preference
+ import android.util.AttributeSet
++import mozilla.components.browser.state.state.selectedOrDefaultSearchEngine
+ import org.mozilla.focus.R
+ import org.mozilla.focus.ext.components
+-import org.mozilla.focus.utils.Settings
+ 
+ /**
+  * Preference for setting the default search engine.
+@@ -45,7 +45,5 @@ class SearchEnginePreference : Preference, SharedPreferences.OnSharedPreferenceC
+     }
+ 
+     private val defaultSearchEngineName: String
+-        get() = context.components.searchEngineManager.getDefaultSearchEngine(
+-                getContext(),
+-                Settings.getInstance(context).defaultSearchEngineName).name
++        get() = context.components.store.state.search.selectedOrDefaultSearchEngine?.name ?: ""
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineWriter.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineWriter.kt
+deleted file mode 100644
+index 7a94506aa557..000000000000
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineWriter.kt
++++ /dev/null
+@@ -1,75 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-package org.mozilla.focus.search
+-
+-import android.graphics.Bitmap
+-import android.util.Log
+-import org.mozilla.focus.utils.BitmapUtils
+-import org.w3c.dom.Document
+-import java.io.StringWriter
+-import javax.xml.parsers.DocumentBuilderFactory
+-import javax.xml.parsers.ParserConfigurationException
+-import javax.xml.transform.OutputKeys
+-import javax.xml.transform.TransformerConfigurationException
+-import javax.xml.transform.TransformerException
+-import javax.xml.transform.TransformerFactory
+-import javax.xml.transform.dom.DOMSource
+-import javax.xml.transform.stream.StreamResult
+-
+-internal class SearchEngineWriter {
+-    companion object {
+-        private const val LOG_TAG = "SearchEngineWriter"
+-
+-        fun buildSearchEngineXML(engineName: String, searchQuery: String, iconBitmap: Bitmap): String? {
+-            try {
+-                val document = DocumentBuilderFactory.newInstance().newDocumentBuilder().newDocument()
+-                val rootElement = document!!.createElement("OpenSearchDescription")
+-                rootElement.setAttribute("xmlns", "http://a9.com/-/spec/opensearch/1.1/")
+-                document.appendChild(rootElement)
+-
+-                val shortNameElement = document.createElement("ShortName")
+-                shortNameElement.textContent = engineName
+-                rootElement.appendChild(shortNameElement)
+-
+-                val imageElement = document.createElement("Image")
+-                imageElement.setAttribute("width", "16")
+-                imageElement.setAttribute("height", "16")
+-                imageElement.textContent = BitmapUtils.getBase64EncodedDataUriFromBitmap(iconBitmap)
+-                rootElement.appendChild(imageElement)
+-
+-                val descriptionElement = document.createElement("Description")
+-                descriptionElement.textContent = engineName
+-                rootElement.appendChild(descriptionElement)
+-
+-                val urlElement = document.createElement("Url")
+-                urlElement.setAttribute("type", "text/html")
+-
+-                val templateSearchString = searchQuery.replace("%s", "{searchTerms}")
+-                urlElement.setAttribute("template", templateSearchString)
+-                rootElement.appendChild(urlElement)
+-
+-                return xmlToString(document)
+-            } catch (e: ParserConfigurationException) {
+-                Log.e(LOG_TAG, "Couldn't create new Document for building search engine XML", e)
+-                return null
+-            }
+-        }
+-
+-        private fun xmlToString(doc: Document): String? {
+-            val writer = StringWriter()
+-            try {
+-                val tf = TransformerFactory.newInstance().newTransformer()
+-                tf.setOutputProperty(OutputKeys.ENCODING, "UTF-8")
+-                tf.transform(DOMSource(doc), StreamResult(writer))
+-            } catch (e: TransformerConfigurationException) {
+-                return null
+-            } catch (e: TransformerException) {
+-                return null
+-            }
+-
+-            return writer.toString()
+-        }
+-    }
+-}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchFilterMiddleware.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchFilterMiddleware.kt
+new file mode 100644
+index 000000000000..c787c0532d97
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchFilterMiddleware.kt
+@@ -0,0 +1,37 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.search
++
++import mozilla.components.browser.state.action.BrowserAction
++import mozilla.components.browser.state.action.SearchAction
++import mozilla.components.browser.state.search.SearchEngine
++import mozilla.components.browser.state.state.BrowserState
++import mozilla.components.lib.state.Middleware
++import mozilla.components.lib.state.MiddlewareContext
++
++/**
++ * [Middleware] for modifying the loaded list of [SearchEngine]s.
++ */
++class SearchFilterMiddleware : Middleware<BrowserState, BrowserAction> {
++    override fun invoke(
++        context: MiddlewareContext<BrowserState, BrowserAction>,
++        next: (BrowserAction) -> Unit,
++        action: BrowserAction
++    ) {
++        if (action is SearchAction.SetSearchEnginesAction) {
++            val newAction = action.copy(
++                regionSearchEngines = action.regionSearchEngines.filterBing()
++            )
++
++            next(newAction)
++        } else {
++            next(action)
++        }
++    }
++}
++
++private fun List<SearchEngine>.filterBing(): List<SearchEngine> {
++    return filter { searchEngine -> searchEngine.id != "bing" }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchMigration.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchMigration.kt
+new file mode 100644
+index 000000000000..4314c427e53e
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchMigration.kt
+@@ -0,0 +1,73 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.search
++
++import android.content.Context
++import android.content.SharedPreferences
++import mozilla.components.browser.search.SearchEngineParser
++import mozilla.components.browser.state.search.SearchEngine
++import mozilla.components.feature.search.ext.migrate
++import mozilla.components.feature.search.middleware.SearchMiddleware
++import org.mozilla.focus.utils.Settings
++import org.xmlpull.v1.XmlPullParserException
++import java.io.BufferedInputStream
++import java.io.IOException
++
++private const val PREF_FILE_SEARCH_ENGINES = "custom-search-engines"
++private const val PREF_KEY_MIGRATED = "pref_search_migrated"
++private const val PREF_KEY_CUSTOM_SEARCH_ENGINES = "pref_custom_search_engines"
++
++/**
++ * Helper class to migrate the search related data in Focus to the "Android Components" implementation.
++ */
++class SearchMigration(
++    private val context: Context
++) : SearchMiddleware.Migration {
++
++    override fun getValuesToMigrate(): SearchMiddleware.Migration.MigrationValues? {
++        val preferences = context.getSharedPreferences(PREF_FILE_SEARCH_ENGINES, Context.MODE_PRIVATE)
++        if (preferences.getBoolean(PREF_KEY_MIGRATED, false)) {
++            return null
++        }
++
++        @Suppress("DEPRECATION")
++        val values = SearchMiddleware.Migration.MigrationValues(
++            customSearchEngines = loadCustomSearchEngines(preferences),
++            defaultSearchEngineName = Settings.getInstance(context).defaultSearchEngineName
++        )
++
++        preferences.edit()
++            .putBoolean(PREF_KEY_MIGRATED, true)
++            .apply()
++
++        return values
++    }
++
++    private fun loadCustomSearchEngines(
++        preferences: SharedPreferences
++    ): List<SearchEngine> {
++        val parser = SearchEngineParser()
++        val engines = preferences.getStringSet(PREF_KEY_CUSTOM_SEARCH_ENGINES, emptySet())!!
++
++        return engines.mapNotNull { engine ->
++            val engineInputStream = preferences.getString(engine, "")!!
++                .byteInputStream()
++                .buffered()
++
++            parser.loadSafely(engine, engineInputStream)
++        }
++    }
++}
++
++@Suppress("SwallowedException")
++private fun SearchEngineParser.loadSafely(id: String, stream: BufferedInputStream?): SearchEngine? {
++    return try {
++        stream?.let { load(id, it).migrate() }
++    } catch (e: IOException) {
++        null
++    } catch (e: XmlPullParserException) {
++        null
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsFetcher.kt b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsFetcher.kt
+index a0b1a9448fde..afd12282edff 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsFetcher.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsFetcher.kt
+@@ -8,16 +8,15 @@ import androidx.lifecycle.LiveData
+ import androidx.lifecycle.MutableLiveData
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.Dispatchers.IO
+-import kotlinx.coroutines.Dispatchers.Main
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.channels.Channel
+ import kotlinx.coroutines.channels.consumeEach
+ import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.launch
+-import mozilla.components.browser.search.SearchEngine
+ import mozilla.components.browser.search.suggestions.SearchSuggestionClient
++import mozilla.components.browser.state.search.SearchEngine
+ import mozilla.components.concept.fetch.Client
++import mozilla.components.feature.search.ext.legacy
+ import mozilla.components.support.ktx.kotlin.sanitizeURL
+ import mozilla.components.concept.fetch.Request as FetchRequest
+ import org.mozilla.focus.utils.debounce
+@@ -25,7 +24,7 @@ import java.util.concurrent.TimeUnit
+ import kotlin.coroutines.CoroutineContext
+ 
+ class SearchSuggestionsFetcher(
+-    searchEngine: SearchEngine,
++    searchEngine: SearchEngine?,
+     private val fetchClient: Client
+ ) : CoroutineScope {
+     private var job = Job()
+@@ -47,7 +46,7 @@ class SearchSuggestionsFetcher(
+ 
+     init {
+         updateSearchEngine(searchEngine)
+-        launch(IO) {
++        launch(Dispatchers.IO) {
+             debounce(THROTTLE_AMOUNT, fetchChannel)
+                 .consumeEach { getSuggestions(it) }
+         }
+@@ -58,9 +57,13 @@ class SearchSuggestionsFetcher(
+         fetchChannel.offer(query)
+     }
+ 
+-    fun updateSearchEngine(searchEngine: SearchEngine) {
+-        canProvideSearchSuggestions = searchEngine.canProvideSearchSuggestions
+-        client = if (canProvideSearchSuggestions) SearchSuggestionClient(searchEngine) { fetch(it) } else null
++    fun updateSearchEngine(searchEngine: SearchEngine?) {
++        canProvideSearchSuggestions = searchEngine?.suggestUrl != null
++        client = if (canProvideSearchSuggestions) {
++            SearchSuggestionClient(searchEngine!!.legacy()) { fetch(it) }
++        } else {
++            null
++        }
+     }
+ 
+     private suspend fun getSuggestions(query: String) = coroutineScope {
+@@ -72,7 +75,7 @@ class SearchSuggestionsFetcher(
+             listOf<String>()
+         }
+ 
+-        launch(Main) {
++        launch(Dispatchers.Main) {
+             _results.value = SuggestionResult(query, suggestions)
+         }
+     }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsPreferences.kt b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsPreferences.kt
+index 9ebd97f9ed01..139c18e2af22 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsPreferences.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsPreferences.kt
+@@ -7,8 +7,6 @@ package org.mozilla.focus.searchsuggestions
+ import android.content.Context
+ import androidx.preference.PreferenceManager
+ import org.mozilla.focus.R
+-import mozilla.components.browser.search.SearchEngine
+-import org.mozilla.focus.ext.components
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.utils.Settings
+ 
+@@ -20,11 +18,6 @@ class SearchSuggestionsPreferences(private val context: Context) {
+     fun hasUserToggledSearchSuggestions(): Boolean = settings.userHasToggledSearchSuggestions()
+     fun userHasDismissedNoSuggestionsMessage(): Boolean = settings.userHasDismissedNoSuggestionsMessage()
+ 
+-    fun getSearchEngine(): SearchEngine {
+-        return context.components.searchEngineManager.getDefaultSearchEngine(
+-                context, settings.defaultSearchEngineName)
+-    }
+-
+     fun enableSearchSuggestions() {
+         preferences.edit()
+                 .putBoolean(TOGGLED_SUGGESTIONS_PREF, true)
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsViewModel.kt b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsViewModel.kt
+index af51330cd8d6..46d8341f399e 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsViewModel.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsViewModel.kt
+@@ -13,6 +13,7 @@ import android.graphics.Typeface
+ import android.text.Spannable
+ import android.text.SpannableStringBuilder
+ import android.text.style.StyleSpan
++import mozilla.components.browser.state.state.selectedOrDefaultSearchEngine
+ import org.mozilla.focus.ext.components
+ 
+ sealed class State {
+@@ -40,7 +41,7 @@ class SearchSuggestionsViewModel(application: Application) : AndroidViewModel(ap
+ 
+     init {
+         fetcher = SearchSuggestionsFetcher(
+-            preferences.getSearchEngine(),
++            components.store.state.search.selectedOrDefaultSearchEngine,
+             application.applicationContext.components.client
+         )
+ 
+@@ -86,7 +87,7 @@ class SearchSuggestionsViewModel(application: Application) : AndroidViewModel(ap
+     }
+ 
+     fun refresh() {
+-        val engine = preferences.getSearchEngine()
++        val engine = components.store.state.search.selectedOrDefaultSearchEngine
+         fetcher.updateSearchEngine(engine)
+         updateState()
+     }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/session/IntentProcessor.kt b/focus-android/app/src/main/java/org/mozilla/focus/session/IntentProcessor.kt
+index 39e5d7a22b3d..d13f5d48457c 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/session/IntentProcessor.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/session/IntentProcessor.kt
+@@ -18,6 +18,7 @@ import mozilla.components.support.utils.WebURLFinder
+ import org.mozilla.focus.activity.TextActionActivity
+ import org.mozilla.focus.ext.components
+ import org.mozilla.focus.shortcut.HomeScreen
++import org.mozilla.focus.utils.SearchUtils
+ import org.mozilla.focus.utils.UrlUtils
+ 
+ /**
+@@ -115,7 +116,7 @@ class IntentProcessor(
+                     } else {
+                         createSearchSession(
+                             SessionState.Source.ACTION_SEND,
+-                            UrlUtils.createSearchUrl(context, dataString),
++                            SearchUtils.createSearchUrl(context, dataString ?: ""),
+                             dataString ?: "")
+                     }
+                 } else {
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/settings/InstalledSearchEnginesSettingsFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/settings/InstalledSearchEnginesSettingsFragment.kt
+index d2eae0ce58d5..047e556339e0 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/settings/InstalledSearchEnginesSettingsFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/settings/InstalledSearchEnginesSettingsFragment.kt
+@@ -5,12 +5,16 @@
+ package org.mozilla.focus.settings
+ 
+ import android.os.Bundle
+-import androidx.preference.Preference
+ import android.view.Menu
+ import android.view.MenuInflater
+ import android.view.MenuItem
++import androidx.preference.Preference
++import mozilla.components.browser.state.state.SearchState
++import mozilla.components.browser.state.state.availableSearchEngines
++import mozilla.components.browser.state.store.BrowserStore
++import mozilla.components.feature.search.SearchUseCases
+ import org.mozilla.focus.R
+-import org.mozilla.focus.search.CustomSearchEngineStore
++import org.mozilla.focus.ext.requireComponents
+ import org.mozilla.focus.search.RadioSearchEngineListPreference
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ 
+@@ -45,7 +49,7 @@ class InstalledSearchEnginesSettingsFragment : BaseSettingsFragment() {
+     override fun onPrepareOptionsMenu(menu: Menu) {
+         super.onPrepareOptionsMenu(menu)
+         menu.findItem(R.id.menu_restore_default_engines)?.let {
+-            it.isEnabled = !CustomSearchEngineStore.hasAllDefaultSearchEngines(requireActivity())
++            it.isEnabled = !requireComponents.store.state.search.hasDefaultSearchEnginesOnly()
+         }
+     }
+ 
+@@ -65,7 +69,7 @@ class InstalledSearchEnginesSettingsFragment : BaseSettingsFragment() {
+     }
+ 
+     private fun restoreSearchEngines() {
+-        CustomSearchEngineStore.restoreDefaultSearchEngines(requireActivity())
++        restoreSearchDefaults(requireComponents.store, requireComponents.searchUseCases)
+         refetchSearchEngines()
+         TelemetryWrapper.menuRestoreEnginesEvent()
+         languageChanged = false
+@@ -96,3 +100,12 @@ class InstalledSearchEnginesSettingsFragment : BaseSettingsFragment() {
+         (pref as RadioSearchEngineListPreference).refetchSearchEngines()
+     }
+ }
++
++private fun SearchState.hasDefaultSearchEnginesOnly(): Boolean {
++    return availableSearchEngines.isEmpty() && additionalSearchEngines.isEmpty() && customSearchEngines.isEmpty()
++}
++
++private fun restoreSearchDefaults(store: BrowserStore, useCases: SearchUseCases) {
++    store.state.search.customSearchEngines.forEach { searchEngine -> useCases.removeSearchEngine(searchEngine) }
++    store.state.search.hiddenSearchEngines.forEach { searchEngine -> useCases.addSearchEngine(searchEngine) }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/settings/ManualAddSearchEngineSettingsFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/settings/ManualAddSearchEngineSettingsFragment.kt
+index 032d6eb41b2a..1beb72151884 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/settings/ManualAddSearchEngineSettingsFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/settings/ManualAddSearchEngineSettingsFragment.kt
+@@ -19,10 +19,11 @@ import com.google.android.material.snackbar.Snackbar
+ import mozilla.components.concept.fetch.Client
+ import mozilla.components.concept.fetch.Request
+ import mozilla.components.concept.fetch.Request.Redirect.FOLLOW
++import mozilla.components.feature.search.ext.createSearchEngine
+ import org.mozilla.focus.R
+ import org.mozilla.focus.ext.requireComponents
+-import org.mozilla.focus.search.CustomSearchEngineStore
+ import org.mozilla.focus.search.ManualAddSearchEnginePreference
++import org.mozilla.focus.shortcut.IconGenerator
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.utils.Settings
+ import org.mozilla.focus.utils.SupportUtils
+@@ -241,7 +242,14 @@ class ManualAddSearchEngineSettingsFragment : BaseSettingsFragment() {
+             }
+ 
+             if (isValidSearchQuery) {
+-                CustomSearchEngineStore.addSearchEngine(fragment.requireActivity(), engineName, query)
++                fragment.requireComponents.searchUseCases.addSearchEngine(
++                    createSearchEngine(
++                        engineName,
++                        query.toSearchUrl(),
++                        IconGenerator.generateSearchEngineIcon(fragment.requireContext())
++                    )
++                )
++
+                 Snackbar.make(fragment.requireView(), R.string.search_add_confirmation, Snackbar.LENGTH_SHORT).show()
+                 Settings.getInstance(fragment.requireActivity()).setDefaultSearchEngineByName(engineName)
+                 @Suppress("DEPRECATION")
+@@ -261,3 +269,7 @@ class ManualAddSearchEngineSettingsFragment : BaseSettingsFragment() {
+         }
+     }
+ }
++
++private fun String.toSearchUrl(): String {
++    return replace("%s", "{searchTerms}")
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/settings/RemoveSearchEnginesSettingsFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/settings/RemoveSearchEnginesSettingsFragment.kt
+index 0a83cb05c47c..ed660e0aabea 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/settings/RemoveSearchEnginesSettingsFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/settings/RemoveSearchEnginesSettingsFragment.kt
+@@ -8,8 +8,9 @@ import android.os.Bundle
+ import android.view.Menu
+ import android.view.MenuInflater
+ import android.view.MenuItem
++import mozilla.components.browser.state.state.searchEngines
+ import org.mozilla.focus.R
+-import org.mozilla.focus.search.CustomSearchEngineStore
++import org.mozilla.focus.ext.requireComponents
+ import org.mozilla.focus.search.MultiselectSearchEngineListPreference
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.utils.ViewUtils
+@@ -60,7 +61,13 @@ class RemoveSearchEnginesSettingsFragment : BaseSettingsFragment() {
+                 val enginesToRemove =
+                     (pref as MultiselectSearchEngineListPreference).checkedEngineIds
+                 TelemetryWrapper.removeSearchEnginesEvent(enginesToRemove.size)
+-                CustomSearchEngineStore.removeSearchEngines(requireActivity(), enginesToRemove as MutableSet<String>)
++
++                requireComponents.store.state.search.searchEngines.filter { searchEngine ->
++                    searchEngine.id in enginesToRemove
++                }.forEach { searchEngine ->
++                    requireComponents.searchUseCases.removeSearchEngine(searchEngine)
++                }
++
+                 @Suppress("DEPRECATION")
+                 requireFragmentManager().popBackStack()
+                 true
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetrySettingsProvider.kt b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetrySettingsProvider.kt
+index 806f6c38e23f..a77e7a1040c4 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetrySettingsProvider.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetrySettingsProvider.kt
+@@ -7,11 +7,11 @@
+ package org.mozilla.focus.telemetry
+ 
+ import android.content.Context
++import mozilla.components.browser.state.search.SearchEngine
++import mozilla.components.browser.state.state.selectedOrDefaultSearchEngine
+ import org.mozilla.focus.R
+ import org.mozilla.focus.ext.components
+-import org.mozilla.focus.search.CustomSearchEngineStore
+ import org.mozilla.focus.utils.Browsers
+-import org.mozilla.focus.utils.Settings
+ import org.mozilla.telemetry.TelemetryHolder
+ import org.mozilla.telemetry.measurement.SettingsMeasurement
+ 
+@@ -51,20 +51,14 @@ internal class TelemetrySettingsProvider(
+                 java.lang.Boolean.toString(browsers.isDefaultBrowser(context))
+             }
+             prefKeySearchEngine -> {
+-                var value: Any? = super.getValue(key)
+-                if (value == null) {
+-                    // If the user has never selected a search engine then this value is null.
+-                    // However we still want to report the current search engine of the user.
+-                    // Therefore we inject this value at runtime.
+-                    value = context.components.searchEngineManager.getDefaultSearchEngine(
+-                            context,
+-                            Settings.getInstance(context).defaultSearchEngineName
+-                    ).name
+-                } else if (CustomSearchEngineStore.isCustomSearchEngine((value as String?)!!, context)) {
+-                    // Don't collect possibly sensitive info for custom search engines, send "custom" instead
+-                    value = CustomSearchEngineStore.ENGINE_TYPE_CUSTOM
++                // The default search engine is no longer saved using this pref. But we will continue
++                // to report it here until we switch to our new telemetry system (glean).
++                val searchEngine = context.components.store.state.search.selectedOrDefaultSearchEngine
++                if (searchEngine?.type == SearchEngine.Type.CUSTOM) {
++                    "custom"
++                } else {
++                    searchEngine?.name ?: "<none>"
+                 }
+-                value
+             }
+             else -> super.getValue(key)
+         }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
+index 7589d03d026d..bfd4657b14dd 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
+@@ -16,16 +16,16 @@ import androidx.annotation.CheckResult
+ import androidx.annotation.VisibleForTesting
+ import androidx.preference.PreferenceManager
+ import kotlinx.coroutines.runBlocking
++import mozilla.components.browser.state.search.SearchEngine
+ import mozilla.components.browser.state.selector.privateTabs
++import mozilla.components.browser.state.state.selectedOrDefaultSearchEngine
+ import mozilla.components.ui.autocomplete.InlineAutocompleteEditText
+ import org.json.JSONObject
+ import org.mozilla.focus.BuildConfig
+ import org.mozilla.focus.R
+ import org.mozilla.focus.ext.components
+-import org.mozilla.focus.search.CustomSearchEngineStore
+ import org.mozilla.focus.utils.AppConstants
+ import org.mozilla.focus.utils.MobileMetricsPingStorage
+-import org.mozilla.focus.utils.Settings
+ import org.mozilla.focus.utils.UrlUtils
+ import org.mozilla.telemetry.Telemetry
+ import org.mozilla.telemetry.TelemetryHolder
+@@ -501,16 +501,11 @@ object TelemetryWrapper {
+     }
+ 
+     private fun getDefaultSearchEngineIdentifierForTelemetry(context: Context): String {
+-        val searchEngine = context.components.searchEngineManager.getDefaultSearchEngine(
+-            context,
+-            Settings.getInstance(context).defaultSearchEngineName
+-        ).identifier
+-
+-        return if (CustomSearchEngineStore.isCustomSearchEngine(searchEngine, context)) {
+-            // Don't collect possibly sensitive info for custom search engines, send "custom" instead
+-            CustomSearchEngineStore.ENGINE_TYPE_CUSTOM
++        val searchEngine = context.components.store.state.search.selectedOrDefaultSearchEngine
++        return if (searchEngine?.type == SearchEngine.Type.CUSTOM) {
++            "custom"
+         } else {
+-            searchEngine
++            searchEngine?.name ?: "<none>"
+         }
+     }
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/utils/SearchUtils.kt b/focus-android/app/src/main/java/org/mozilla/focus/utils/SearchUtils.kt
+new file mode 100644
+index 000000000000..4834570147ee
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/utils/SearchUtils.kt
+@@ -0,0 +1,19 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.utils
++
++import android.content.Context
++import mozilla.components.browser.state.state.selectedOrDefaultSearchEngine
++import mozilla.components.feature.search.ext.legacy
++import org.mozilla.focus.ext.components
++
++object SearchUtils {
++    fun createSearchUrl(context: Context?, text: String): String {
++        val searchEngine = context?.components?.store?.state?.search?.selectedOrDefaultSearchEngine
++            ?: return text
++
++        return searchEngine.legacy().buildSearchUrl(text)
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/utils/Settings.kt b/focus-android/app/src/main/java/org/mozilla/focus/utils/Settings.kt
+index 0589f5176a94..0d1f97eb85f2 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/utils/Settings.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/utils/Settings.kt
+@@ -89,6 +89,7 @@ class Settings private constructor(
+     val hasAddedToHomeScreen: Boolean
+         get() = preferences.getBoolean(getPreferenceKey(R.string.has_added_to_home_screen), false)
+ 
++    @Deprecated("This is no longer used. Read search engines from BrowserStore instead")
+     val defaultSearchEngineName: String
+         get() = preferences.getString(getPreferenceKey(R.string.pref_key_search_engine), "")!!
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/utils/UrlUtils.java b/focus-android/app/src/main/java/org/mozilla/focus/utils/UrlUtils.java
+index 0a02a1e3ddb6..51f605eb841c 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/utils/UrlUtils.java
++++ b/focus-android/app/src/main/java/org/mozilla/focus/utils/UrlUtils.java
+@@ -59,15 +59,6 @@ public static boolean isHttpOrHttps(String url) {
+ 
+     }
+ 
+-    public static String createSearchUrl(Context context, String searchTerm) {
+-        final String defaultIdentifier = Settings.getInstance(context).getDefaultSearchEngineName();
+-
+-        final SearchEngine searchEngine = ContextKt.getComponents(context).getSearchEngineManager()
+-                .getDefaultSearchEngine(context, defaultIdentifier);
+-
+-        return searchEngine.buildSearchUrl(searchTerm);
+-    }
+-
+     public static String stripUserInfo(@Nullable String url) {
+         if (TextUtils.isEmpty(url)) {
+             return "";
+diff --git a/focus-android/app/src/test/java/org/mozilla/focus/search/SearchEngineWriterTest.kt b/focus-android/app/src/test/java/org/mozilla/focus/search/SearchEngineWriterTest.kt
+deleted file mode 100644
+index c2e7e10866fc..000000000000
+--- a/focus-android/app/src/test/java/org/mozilla/focus/search/SearchEngineWriterTest.kt
++++ /dev/null
+@@ -1,52 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-package org.mozilla.focus.search
+-
+-import android.graphics.Bitmap
+-import org.junit.Assert.assertEquals
+-import org.junit.Test
+-import org.junit.runner.RunWith
+-import org.robolectric.RobolectricTestRunner
+-
+-@RunWith(RobolectricTestRunner::class)
+-class SearchEngineWriterTest {
+-
+-    @Test
+-    fun buildSearchEngineXML() {
+-        val endSearchTermXml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>" +
+-            "<OpenSearchDescription xmlns=\"http://a9.com/-/spec/opensearch/1.1/\">" +
+-            "<ShortName>testEngine</ShortName>" +
+-            "<Image height=\"16\" width=\"16\">" +
+-            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACAQAAAABazTCJAAAADElEQVR42mNgYGAAAAAEAAHI6uv5\n" +
+-                "AAAAAElFTkSuQmCC\n" +
+-            "</Image>" +
+-            "<Description>testEngine</Description>" +
+-            "<Url template=\"testEngine/?q={searchTerms}\" type=\"text/html\"/>" +
+-            "</OpenSearchDescription>"
+-
+-        assertEquals(endSearchTermXml,
+-            SearchEngineWriter.buildSearchEngineXML("testEngine", "testEngine/?q=%s", createBitmap()))
+-
+-        val middleSearchTermXml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>" +
+-            "<OpenSearchDescription xmlns=\"http://a9.com/-/spec/opensearch/1.1/\">" +
+-            "<ShortName>testEngine</ShortName>" +
+-            "<Image height=\"16\" width=\"16\">" +
+-            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACAQAAAABazTCJAAAADElEQVR42mNgYGAAAAAEAAHI6uv5\n" +
+-                "AAAAAElFTkSuQmCC\n" +
+-            "</Image>" +
+-            "<Description>testEngine</Description>" +
+-            "<Url template=\"testEngine/?q={searchTerms}/tests\" type=\"text/html\"/>" +
+-            "</OpenSearchDescription>"
+-
+-        assertEquals(middleSearchTermXml,
+-            SearchEngineWriter.buildSearchEngineXML("testEngine", "testEngine/?q=%s/tests", createBitmap()))
+-    }
+-
+-    private fun createBitmap(): Bitmap {
+-        val width = 2
+-        val height = 2
+-        return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+-    }
+-}

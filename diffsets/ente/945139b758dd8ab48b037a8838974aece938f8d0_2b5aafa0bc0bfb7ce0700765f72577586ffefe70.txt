@@ -1,0 +1,309 @@
+diff --git a/src/services/machineLearning/blazeFaceDetectionService.ts b/src/services/machineLearning/blazeFaceDetectionService.ts
+index e23d2acc0bb..de3c47dfce6 100644
+--- a/src/services/machineLearning/blazeFaceDetectionService.ts
++++ b/src/services/machineLearning/blazeFaceDetectionService.ts
+@@ -162,6 +162,7 @@ class BlazeFaceDetectionService implements FaceDetectionService {
+         const resized = resizeToSquare(imageBitmap, BLAZEFACE_INPUT_SIZE);
+         const tfImage = tf.browser.fromPixels(resized.image);
+         const blazeFaceModel = await this.getBlazefaceModel();
++        // TODO: check if this works concurrently, else use serialqueue
+         const faces = await blazeFaceModel.estimateFaces(tfImage);
+         tf.dispose(tfImage);
+ 
+diff --git a/src/services/machineLearning/machineLearningFactory.ts b/src/services/machineLearning/machineLearningFactory.ts
+index 83074b4d1db..277c21d3dd8 100644
+--- a/src/services/machineLearning/machineLearningFactory.ts
++++ b/src/services/machineLearning/machineLearningFactory.ts
+@@ -144,6 +144,7 @@ export class LocalMLSyncContext implements MLSyncContext {
+         this.concurrency = concurrency || CONCURRENCY;
+ 
+         console.log('Using concurrency: ', this.concurrency);
++        // TODO: set timeout
+         this.syncQueue = new PQueue({ concurrency: this.concurrency });
+         logQueueStats(this.syncQueue, 'sync');
+         // this.downloadQueue = new PQueue({ concurrency: 1 });
+diff --git a/src/services/machineLearning/machineLearningService.ts b/src/services/machineLearning/machineLearningService.ts
+index 73c79fd65c2..35207919add 100644
+--- a/src/services/machineLearning/machineLearningService.ts
++++ b/src/services/machineLearning/machineLearningService.ts
+@@ -23,6 +23,7 @@ import { toTSNE } from 'utils/machineLearning/visualization';
+ //     mlFilesStore
+ // } from 'utils/storage/mlStorage';
+ import {
++    extractFaceImages,
+     findFirstIfSorted,
+     getAllFacesFromMap,
+     getFaceId,
+@@ -538,15 +539,19 @@ class MachineLearningService {
+         ) {
+             fileContext.newMLFileData.faceEmbeddingMethod =
+                 syncContext.faceEmbeddingService.method;
+-            // TODO: when not storing face crops image will be needed to extract faces
++            // TODO: when not storing face crops, image will be needed to extract faces
+             // fileContext.imageBitmap ||
+             //     (await this.getImageBitmap(syncContext, fileContext));
++            const faceImages = await extractFaceImages(
++                fileContext.faces,
++                syncContext.faceEmbeddingService.faceSize
++            );
++
+             const embeddings =
+                 await syncContext.faceEmbeddingService.getFaceEmbeddings(
+-                    fileContext.imageBitmap,
+-                    fileContext.faces
++                    faceImages
+                 );
+-
++            faceImages.forEach((faceImage) => faceImage.close());
+             fileContext.faces.forEach((f, i) => (f.embedding = embeddings[i]));
+ 
+             console.log('[MLService] facesWithEmbeddings: ', fileContext.faces);
+@@ -768,7 +773,7 @@ class MachineLearningService {
+ 
+         const input = faces
+             .slice(0, syncContext.config.tsne.samples)
+-            .map((f) => f.embedding);
++            .map((f) => Array.from(f.embedding));
+         syncContext.tsne = toTSNE(input, syncContext.config.tsne);
+         console.log('tsne: ', syncContext.tsne);
+     }
+diff --git a/src/services/machineLearning/mobileFaceNetEmbeddingService.ts b/src/services/machineLearning/mobileFaceNetEmbeddingService.ts
+index 3b429c69bb3..5a2fce14d6b 100644
+--- a/src/services/machineLearning/mobileFaceNetEmbeddingService.ts
++++ b/src/services/machineLearning/mobileFaceNetEmbeddingService.ts
+@@ -1,29 +1,31 @@
+-import { gather } from '@tensorflow/tfjs';
+ import * as tf from '@tensorflow/tfjs-core';
+ import * as tflite from '@tensorflow/tfjs-tflite';
++import PQueue from 'p-queue';
+ import {
+-    AlignedFace,
+     FaceEmbedding,
+     FaceEmbeddingMethod,
+     FaceEmbeddingService,
++    MOBILEFACENET_FACE_SIZE,
+     Versioned,
+ } from 'types/machineLearning';
+ import { imageBitmapsToTensor4D } from 'utils/machineLearning';
+-import { ibExtractFaceImages } from 'utils/machineLearning/faceAlign';
+-import { ibExtractFaceImagesFromCrops } from 'utils/machineLearning/faceCrop';
+ 
+ class MobileFaceNetEmbeddingService implements FaceEmbeddingService {
+-    private mobileFaceNetModel: Promise<tflite.TFLiteModel>;
+-    private faceSize: number;
+     public method: Versioned<FaceEmbeddingMethod>;
++    public faceSize: number;
++
++    private mobileFaceNetModel: Promise<tflite.TFLiteModel>;
++    private serialQueue: PQueue;
+ 
+-    public constructor(faceSize: number = 112) {
++    public constructor(faceSize: number = MOBILEFACENET_FACE_SIZE) {
+         tflite.setWasmPath('/js/tflite/');
+         this.method = {
+             value: 'MobileFaceNet',
+             version: 2,
+         };
+         this.faceSize = faceSize;
++        // TODO: set timeout
++        this.serialQueue = new PQueue({ concurrency: 1 });
+     }
+ 
+     private async init() {
+@@ -46,68 +48,53 @@ class MobileFaceNetEmbeddingService implements FaceEmbeddingService {
+         return this.mobileFaceNetModel;
+     }
+ 
+-    public getEmbedding(
+-        face: tf.Tensor4D,
++    public getFaceEmbeddingTF(
++        faceTensor: tf.Tensor4D,
+         mobileFaceNetModel: tflite.TFLiteModel
+-    ) {
++    ): tf.Tensor2D {
+         return tf.tidy(() => {
+-            const normalizedFace = tf.sub(tf.div(face, 127.5), 1.0);
+-            return mobileFaceNetModel.predict(normalizedFace);
++            const normalizedFace = tf.sub(tf.div(faceTensor, 127.5), 1.0);
++            return mobileFaceNetModel.predict(normalizedFace) as tf.Tensor2D;
+         });
+     }
+ 
+-    public async getEmbeddingsBatch(
+-        faceImagesTensor
+-    ): Promise<Array<FaceEmbedding>> {
++    // Do not use this, use getFaceEmbedding which calls this through serialqueue
++    private async getFaceEmbeddingNoQueue(
++        faceImage: ImageBitmap
++    ): Promise<FaceEmbedding> {
+         const mobileFaceNetModel = await this.getMobileFaceNetModel();
+ 
+-        const embeddingsTensor = tf.tidy(() => {
+-            const embeddings = [];
+-            for (let i = 0; i < faceImagesTensor.shape[0]; i++) {
+-                const face = gather(faceImagesTensor, i).expandDims();
+-                const embedding = this.getEmbedding(face, mobileFaceNetModel);
+-                embeddings[i] = gather(embedding as any, 0);
+-            }
+-            return tf.stack(embeddings);
++        const embeddingTensor = tf.tidy(() => {
++            const faceTensor = imageBitmapsToTensor4D([faceImage]);
++            const embeddingsTensor = this.getFaceEmbeddingTF(
++                faceTensor,
++                mobileFaceNetModel
++            );
++            return tf.squeeze(embeddingsTensor, [0]);
+         });
+ 
+-        // TODO: return Float32Array instead of number[]
+-        const faceEmbeddings =
+-            (await embeddingsTensor.array()) as Array<FaceEmbedding>;
+-        tf.dispose(embeddingsTensor);
+-        return faceEmbeddings;
+-    }
+-
+-    public async getFaceEmbeddings(
+-        image: ImageBitmap,
+-        faces: Array<AlignedFace>
+-    ) {
+-        if (!faces || faces.length < 1) {
+-            return [];
+-        }
++        const embedding = new Float32Array(await embeddingTensor.data());
++        embeddingTensor.dispose();
+ 
+-        let faceImages: Array<ImageBitmap>;
+-        if (faces.length === faces.filter((f) => f.crop).length) {
+-            faceImages = await ibExtractFaceImagesFromCrops(
+-                faces,
+-                this.faceSize
+-            );
+-        } else {
+-            const faceAlignments = faces.map((f) => f.alignment);
+-            faceImages = await ibExtractFaceImages(
+-                image,
+-                faceAlignments,
+-                this.faceSize
+-            );
+-        }
++        return embedding;
++    }
+ 
+-        const faceImagesTensor = imageBitmapsToTensor4D(faceImages);
+-        faceImages.forEach((f) => f.close());
+-        const embeddings = await this.getEmbeddingsBatch(faceImagesTensor);
+-        tf.dispose(faceImagesTensor);
+-        // console.log('embeddings: ', embeddings[0]);
++    // TODO: TFLiteModel seems to not work concurrenly,
++    // remove serialqueue if that is not the case
++    private async getFaceEmbedding(
++        faceImage: ImageBitmap
++    ): Promise<FaceEmbedding> {
++        return this.serialQueue.add(() =>
++            this.getFaceEmbeddingNoQueue(faceImage)
++        );
++    }
+ 
+-        return embeddings;
++    public async getFaceEmbeddings(
++        faceImages: Array<ImageBitmap>
++    ): Promise<Array<FaceEmbedding>> {
++        return Promise.all(
++            faceImages.map((faceImage) => this.getFaceEmbedding(faceImage))
++        );
+     }
+ 
+     public async dispose() {
+diff --git a/src/types/machineLearning/index.ts b/src/types/machineLearning/index.ts
+index cf5434a5d82..6c4ac880535 100644
+--- a/src/types/machineLearning/index.ts
++++ b/src/types/machineLearning/index.ts
+@@ -158,7 +158,7 @@ export interface AlignedFace extends CroppedFace {
+     alignment?: FaceAlignment;
+ }
+ 
+-export declare type FaceEmbedding = Array<number>;
++export declare type FaceEmbedding = Float32Array;
+ 
+ export interface FaceWithEmbedding extends AlignedFace {
+     embedding?: FaceEmbedding;
+@@ -299,6 +299,7 @@ export const BLAZEFACE_IOU_THRESHOLD = 0.3;
+ export const BLAZEFACE_SCORE_THRESHOLD = 0.7;
+ export const BLAZEFACE_PASS1_SCORE_THRESHOLD = 0.4;
+ export const BLAZEFACE_FACE_SIZE = 112;
++export const MOBILEFACENET_FACE_SIZE = 112;
+ 
+ export interface FaceDetectionService {
+     method: Versioned<FaceDetectionMethod>;
+@@ -324,10 +325,10 @@ export interface FaceAlignmentService {
+ 
+ export interface FaceEmbeddingService {
+     method: Versioned<FaceEmbeddingMethod>;
++    faceSize: number;
+     // init(): Promise<void>;
+     getFaceEmbeddings(
+-        image: ImageBitmap,
+-        faces: Array<AlignedFace>
++        faceImages: Array<ImageBitmap>
+     ): Promise<Array<FaceEmbedding>>;
+     dispose(): Promise<void>;
+ }
+diff --git a/src/utils/machineLearning/faceAlign.ts b/src/utils/machineLearning/faceAlign.ts
+index 777f5f6dcd1..634a22259fd 100644
+--- a/src/utils/machineLearning/faceAlign.ts
++++ b/src/utils/machineLearning/faceAlign.ts
+@@ -114,7 +114,7 @@ export function extractFaceImage(
+     });
+ }
+ 
+-export function extractFaceImages(
++export function tfExtractFaceImages(
+     image: tf.Tensor3D | tf.Tensor4D,
+     alignments: Array<FaceAlignment>,
+     faceSize: number
+diff --git a/src/utils/machineLearning/index.ts b/src/utils/machineLearning/index.ts
+index 1fa1173eb6b..1a48beafaaf 100644
+--- a/src/utils/machineLearning/index.ts
++++ b/src/utils/machineLearning/index.ts
+@@ -21,8 +21,15 @@ import { imageBitmapToBlob } from 'utils/image';
+ import { cached } from 'utils/storage/cache';
+ import mlIDbStorage from 'utils/storage/mlIDbStorage';
+ import { Box, Point } from '../../../thirdparty/face-api/classes';
+-import { getArcfaceAlignment, ibExtractFaceImage } from './faceAlign';
+-import { getFaceImageBlobFromStorage } from './faceCrop';
++import {
++    getArcfaceAlignment,
++    ibExtractFaceImage,
++    ibExtractFaceImages,
++} from './faceAlign';
++import {
++    getFaceImageBlobFromStorage,
++    ibExtractFaceImagesFromCrops,
++} from './faceCrop';
+ 
+ export function f32Average(descriptors: Float32Array[]) {
+     if (descriptors.length < 1) {
+@@ -213,6 +220,23 @@ export async function getFaceImage(
+     return faceImage;
+ }
+ 
++export async function extractFaceImages(
++    faces: Array<AlignedFace>,
++    faceSize: number,
++    image?: ImageBitmap
++) {
++    if (faces.length === faces.filter((f) => f.crop).length) {
++        return ibExtractFaceImagesFromCrops(faces, faceSize);
++    } else if (image) {
++        const faceAlignments = faces.map((f) => f.alignment);
++        return ibExtractFaceImages(image, faceAlignments, faceSize);
++    } else {
++        throw Error(
++            'Either face crops or image is required to extract face images'
++        );
++    }
++}
++
+ export function leftFillNum(num: number, length: number, padding: number) {
+     return num.toString().padStart(length, padding.toString());
+ }

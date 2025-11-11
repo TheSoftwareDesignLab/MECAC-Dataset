@@ -1,0 +1,383 @@
+diff --git a/WordPressLoginFlow/build.gradle b/WordPressLoginFlow/build.gradle
+index 786af0be0fa2..55e2ec70f3ef 100644
+--- a/WordPressLoginFlow/build.gradle
++++ b/WordPressLoginFlow/build.gradle
+@@ -21,8 +21,8 @@ android {
+     buildToolsVersion "28.0.3"
+ 
+     defaultConfig {
+-        minSdkVersion 16
+-        targetSdkVersion 26
++        minSdkVersion 17
++        targetSdkVersion 28
+         versionCode 2
+         versionName "1.1"
+ 
+@@ -68,6 +68,12 @@ dependencies {
+     annotationProcessor 'com.google.dagger:dagger-android-processor:2.22.1'
+ 
+     lintChecks 'org.wordpress:lint:1.0.1'
++
++    testImplementation 'junit:junit:4.12'
++    testImplementation 'org.mockito:mockito-core:2.27.0'
++    testImplementation 'androidx.arch.core:core-testing:2.0.1'
++    testImplementation 'org.robolectric:robolectric:3.6.1'
++    testImplementation 'org.assertj:assertj-core:3.11.1'
+ }
+ 
+ // Add properties named "wp.xxx" to our BuildConfig
+diff --git a/WordPressLoginFlow/src/main/java/org/wordpress/android/login/LoginSiteAddressFragment.java b/WordPressLoginFlow/src/main/java/org/wordpress/android/login/LoginSiteAddressFragment.java
+index 2bcbfff80faa..03bdd7739bc3 100644
+--- a/WordPressLoginFlow/src/main/java/org/wordpress/android/login/LoginSiteAddressFragment.java
++++ b/WordPressLoginFlow/src/main/java/org/wordpress/android/login/LoginSiteAddressFragment.java
+@@ -5,9 +5,7 @@
+ import android.content.Intent;
+ import android.os.Bundle;
+ import android.text.Editable;
+-import android.text.TextUtils;
+ import android.text.TextWatcher;
+-import android.util.Patterns;
+ import android.view.View;
+ import android.view.View.OnClickListener;
+ import android.view.ViewGroup;
+@@ -18,6 +16,7 @@
+ import androidx.annotation.LayoutRes;
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
++import androidx.lifecycle.Observer;
+ 
+ import org.greenrobot.eventbus.Subscribe;
+ import org.greenrobot.eventbus.ThreadMode;
+@@ -57,6 +56,8 @@ public class LoginSiteAddressFragment extends LoginBaseFormFragment<LoginListene
+ 
+     private String mRequestedSiteAddress;
+ 
++    private LoginSiteAddressValidator mLoginSiteAddressValidator;
++
+     @Inject AccountStore mAccountStore;
+     @Inject Dispatcher mDispatcher;
+     @Inject HTTPAuthManager mHTTPAuthManager;
+@@ -139,6 +140,23 @@ public void onActivityCreated(@Nullable Bundle savedInstanceState) {
+         } else {
+             mAnalyticsListener.trackUrlFormViewed();
+         }
++
++        mLoginSiteAddressValidator = new LoginSiteAddressValidator();
++
++        mLoginSiteAddressValidator.getIsValid().observe(this, new Observer<Boolean>() {
++            @Override public void onChanged(Boolean enabled) {
++                getPrimaryButton().setEnabled(enabled);
++            }
++        });
++        mLoginSiteAddressValidator.getErrorMessageResId().observe(this, new Observer<Integer>() {
++            @Override public void onChanged(Integer resId) {
++                if (resId != null) {
++                    showError(resId);
++                } else {
++                    mSiteAddressInput.setError(null);
++                }
++            }
++        });
+     }
+ 
+     @Override
+@@ -148,24 +166,17 @@ public void onSaveInstanceState(Bundle outState) {
+         outState.putString(KEY_REQUESTED_SITE_ADDRESS, mRequestedSiteAddress);
+     }
+ 
++    @Override public void onDestroyView() {
++        super.onDestroyView();
++        mLoginSiteAddressValidator.dispose();
++    }
++
+     protected void discover() {
+         if (!NetworkUtils.checkConnection(getActivity())) {
+             return;
+         }
+ 
+-        String cleanedSiteAddress = getCleanedSiteAddress();
+-
+-        if (TextUtils.isEmpty(cleanedSiteAddress)) {
+-            showError(R.string.login_empty_site_url);
+-            return;
+-        }
+-
+-        if (!Patterns.WEB_URL.matcher(cleanedSiteAddress).matches()) {
+-            showError(R.string.login_invalid_site_url);
+-            return;
+-        }
+-
+-        mRequestedSiteAddress = cleanedSiteAddress;
++        mRequestedSiteAddress = mLoginSiteAddressValidator.getCleanedSiteAddress();
+ 
+         String cleanedXmlrpcSuffix = UrlUtils.removeXmlrpcSuffix(mRequestedSiteAddress);
+ 
+@@ -182,17 +193,16 @@ protected void discover() {
+         startProgress();
+     }
+ 
+-    private String getCleanedSiteAddress() {
+-        return EditTextUtils.getText(mSiteAddressInput.getEditText()).trim().replaceAll("[\r\n]", "");
+-    }
+-
+     @Override
+     public void onEditorCommit() {
+-        discover();
++        if (getPrimaryButton().isEnabled()) {
++            discover();
++        }
+     }
+ 
+     @Override
+     public void afterTextChanged(Editable s) {
++        mLoginSiteAddressValidator.setAddress(EditTextUtils.getText(mSiteAddressInput.getEditText()));
+     }
+ 
+     @Override
+@@ -359,7 +369,7 @@ public void onDiscoverySucceeded(OnDiscoveryResponse event) {
+                 return;
+             } else {
+                 AppLog.e(T.API, "onDiscoveryResponse has error: " + event.error.name()
+-                        + " - " + event.error.toString());
++                                + " - " + event.error.toString());
+                 handleDiscoveryError(event.error, event.failedEndpoint);
+                 return;
+             }
+diff --git a/WordPressLoginFlow/src/main/java/org/wordpress/android/login/LoginSiteAddressValidator.java b/WordPressLoginFlow/src/main/java/org/wordpress/android/login/LoginSiteAddressValidator.java
+new file mode 100644
+index 000000000000..fd8a430bdca3
+--- /dev/null
++++ b/WordPressLoginFlow/src/main/java/org/wordpress/android/login/LoginSiteAddressValidator.java
+@@ -0,0 +1,74 @@
++package org.wordpress.android.login;
++
++import android.util.Patterns;
++
++import androidx.annotation.NonNull;
++import androidx.lifecycle.LiveData;
++import androidx.lifecycle.MutableLiveData;
++
++import org.wordpress.android.util.helpers.Debouncer;
++
++import java.util.concurrent.TimeUnit;
++
++/**
++ * Encapsulates the site address validation, cleaning, and error reporting of {@link LoginSiteAddressFragment}.
++ */
++class LoginSiteAddressValidator {
++    private static final int SECONDS_DELAY_BEFORE_SHOWING_ERROR_MESSAGE = 2;
++
++    private MutableLiveData<Boolean> mIsValid = new MutableLiveData<>();
++    private MutableLiveData<Integer> mErrorMessageResId = new MutableLiveData<>();
++
++    private String mCleanedSiteAddress = "";
++    private final Debouncer mDebouncer;
++
++    @NonNull LiveData<Boolean> getIsValid() {
++        return mIsValid;
++    }
++
++    @NonNull LiveData<Integer> getErrorMessageResId() {
++        return mErrorMessageResId;
++    }
++
++    @NonNull String getCleanedSiteAddress() {
++        return mCleanedSiteAddress;
++    }
++
++    LoginSiteAddressValidator() {
++        this(new Debouncer());
++    }
++
++    LoginSiteAddressValidator(@NonNull Debouncer debouncer) {
++        mIsValid.setValue(false);
++        mDebouncer = debouncer;
++    }
++
++    void dispose() {
++        mDebouncer.shutdown();
++    }
++
++    void setAddress(@NonNull String siteAddress) {
++        mCleanedSiteAddress = cleanSiteAddress(siteAddress);
++        final boolean isValid = siteAddressIsValid(mCleanedSiteAddress);
++
++        mIsValid.setValue(isValid);
++        mErrorMessageResId.setValue(null);
++
++        // Call debounce regardless if there was an error so that the previous Runnable will be cancelled.
++        mDebouncer.debounce(Void.class, new Runnable() {
++            @Override public void run() {
++                if (!isValid && !mCleanedSiteAddress.isEmpty()) {
++                    mErrorMessageResId.postValue(R.string.login_invalid_site_url);
++                }
++            }
++        }, SECONDS_DELAY_BEFORE_SHOWING_ERROR_MESSAGE, TimeUnit.SECONDS);
++    }
++
++    private static String cleanSiteAddress(@NonNull String siteAddress) {
++        return siteAddress.trim().replaceAll("[\r\n]", "");
++    }
++
++    private static boolean siteAddressIsValid(@NonNull String cleanedSiteAddress) {
++        return Patterns.WEB_URL.matcher(cleanedSiteAddress).matches();
++    }
++}
+diff --git a/WordPressLoginFlow/src/main/res/values/strings.xml b/WordPressLoginFlow/src/main/res/values/strings.xml
+index 26c045e7c2ab..ae49cceed88c 100644
+--- a/WordPressLoginFlow/src/main/res/values/strings.xml
++++ b/WordPressLoginFlow/src/main/res/values/strings.xml
+@@ -39,7 +39,7 @@
+     <string name="login_continue">Continue</string>
+     <string name="login_already_logged_in_wpcom">Already logged in to WordPress.com</string>
+     <string name="login_username_at">\@%s</string>
+-    <string name="enter_site_address">Enter the address of your WordPress site you\'d like to connect.</string>
++    <string name="enter_site_address">Enter the address of the WordPress site you\'d like to connect.</string>
+     <string name="enter_site_address_share_intent">Enter the address of your WordPress site you\'d like to share the content to.</string>
+     <string name="login_site_address">Site address</string>
+     <string name="login_site_address_help">Need help finding your site address?</string>
+@@ -50,8 +50,7 @@
+     <string name="login_error_while_adding_site">Error while adding site. Error code: %s</string>
+     <string name="login_log_in_for_deeplink">Log in to WordPress.com to access the post.</string>
+     <string name="login_log_in_for_share_intent">Log in to WordPress.com to share the content.</string>
+-    <string name="login_empty_site_url">Please enter a site address</string>
+-    <string name="login_invalid_site_url">The site address you entered is invalid. Please re-enter it.</string>
++    <string name="login_invalid_site_url">Please enter a complete website address, like example.com.</string>
+     <string name="login_empty_username">Please enter a username</string>
+     <string name="login_empty_password">Please enter a password</string>
+     <string name="login_empty_2fa">Please enter a verification code</string>
+diff --git a/WordPressLoginFlow/src/test/java/org/wordpress/android/login/LoginSiteAddressValidatorTest.java b/WordPressLoginFlow/src/test/java/org/wordpress/android/login/LoginSiteAddressValidatorTest.java
+new file mode 100644
+index 000000000000..c31183a770e2
+--- /dev/null
++++ b/WordPressLoginFlow/src/test/java/org/wordpress/android/login/LoginSiteAddressValidatorTest.java
+@@ -0,0 +1,129 @@
++package org.wordpress.android.login;
++
++import androidx.arch.core.executor.testing.InstantTaskExecutorRule;
++import androidx.lifecycle.Observer;
++
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.invocation.InvocationOnMock;
++import org.mockito.stubbing.Answer;
++import org.robolectric.RobolectricTestRunner;
++import org.wordpress.android.util.helpers.Debouncer;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.Optional;
++import java.util.concurrent.TimeUnit;
++import java.util.function.Consumer;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.doAnswer;
++import static org.mockito.Mockito.mock;
++
++@RunWith(RobolectricTestRunner.class)
++public class LoginSiteAddressValidatorTest {
++    @Rule
++    public InstantTaskExecutorRule instantTaskExecutorRule = new InstantTaskExecutorRule();
++
++    private Debouncer mDebouncer;
++    private LoginSiteAddressValidator mValidator;
++
++    @Before
++    public void setUp() {
++        mDebouncer = mock(Debouncer.class);
++        doAnswer(new Answer<Void>() {
++            @Override public Void answer(InvocationOnMock invocation) {
++                final Runnable runnable = invocation.getArgument(1);
++                runnable.run();
++                return null;
++            }
++        }).when(mDebouncer).debounce(any(), any(Runnable.class), anyLong(), any(TimeUnit.class));
++
++        mValidator = new LoginSiteAddressValidator(mDebouncer);
++    }
++
++    @After
++    public void tearDown() {
++        mValidator = null;
++        mDebouncer = null;
++    }
++
++    @Test
++    public void testAnErrorIsReturnedWhenGivenAnInvalidAddress() {
++        // Arrange
++        assertThat(mValidator.getErrorMessageResId().getValue()).isNull();
++
++        // Act
++        mValidator.setAddress("invalid");
++
++        // Assert
++        assertThat(mValidator.getErrorMessageResId().getValue()).isNotNull();
++        assertThat(mValidator.getCleanedSiteAddress()).isEqualTo("invalid");
++        assertThat(mValidator.getIsValid().getValue()).isFalse();
++    }
++
++    @Test
++    public void testNoErrorIsReturnedButIsInvalidWhenGivenAnEmptyAddress() {
++        // Act
++        mValidator.setAddress("");
++
++        // Assert
++        assertThat(mValidator.getErrorMessageResId().getValue()).isNull();
++        assertThat(mValidator.getIsValid().getValue()).isFalse();
++        assertThat(mValidator.getCleanedSiteAddress()).isEqualTo("");
++    }
++
++    @Test
++    public void testTheErrorIsImmediatelyClearedWhenANewAddressIsGiven() {
++        // Arrange
++        final ArrayList<Optional<Integer>> resIdValues = new ArrayList<>();
++        mValidator.getErrorMessageResId().observeForever(new Observer<Integer>() {
++            @Override public void onChanged(Integer resId) {
++                resIdValues.add(Optional.ofNullable(resId));
++            }
++        });
++
++        // Act
++        mValidator.setAddress("invalid");
++        mValidator.setAddress("another-invalid");
++
++        // Assert
++        assertThat(resIdValues).hasSize(4);
++        assertThat(resIdValues.get(0)).isEmpty();
++        assertThat(resIdValues.get(1)).isNotEmpty();
++        assertThat(resIdValues.get(2)).isEmpty();
++        assertThat(resIdValues.get(3)).isNotEmpty();
++    }
++
++    @Test
++    public void testItReturnsValidWhenGivenValidURLs() {
++        // Arrange
++        final List<String> validUrls = Arrays.asList(
++                "http://subdomain.example.com",
++                "http://example.ca",
++                "example.ca",
++                "subdomain.example.com",
++                "  space-with-subdomain.example.net",
++                "https://subdomain.example.com/folder",
++                "http://subdomain.example.com/folder/over/there ",
++                "7.7.7.7",
++                "http://7.7.13.45",
++                "http://47.147.43.45/folder   ");
++
++        // Act and Assert
++        assertThat(validUrls).allSatisfy(new Consumer<String>() {
++            @Override public void accept(String url) {
++                mValidator.setAddress(url);
++
++                assertThat(mValidator.getErrorMessageResId().getValue()).isNull();
++                assertThat(mValidator.getIsValid().getValue()).isTrue();
++            }
++        });
++    }
++}

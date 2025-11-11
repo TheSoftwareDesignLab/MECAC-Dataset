@@ -1,0 +1,1352 @@
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_edit_document_service.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_edit_document_service.dart
+new file mode 100644
+index 0000000000000..1591b5ca9615a
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_edit_document_service.dart
+@@ -0,0 +1,96 @@
++import 'dart:async';
++
++import 'package:appflowy/generated/locale_keys.g.dart';
++import 'package:appflowy/plugins/document/application/document_data_pb_extension.dart';
++import 'package:appflowy/plugins/document/application/prelude.dart';
++import 'package:appflowy/shared/markdown_to_document.dart';
++import 'package:appflowy/workspace/application/view/view_service.dart';
++import 'package:appflowy_backend/log.dart';
++import 'package:appflowy_backend/protobuf/flowy-folder/protobuf.dart';
++import 'package:appflowy_editor/appflowy_editor.dart';
++import 'package:appflowy_result/appflowy_result.dart';
++import 'package:easy_localization/easy_localization.dart';
++import 'package:flutter/foundation.dart';
++import 'package:flutter_chat_core/flutter_chat_core.dart';
++
++class ChatEditDocumentService {
++  static Future<ViewPB?> saveMessagesToNewPage(
++    String chatPageName,
++    String parentViewId,
++    List<TextMessage> messages,
++  ) async {
++    if (messages.isEmpty) {
++      return null;
++    }
++
++    // Convert messages to markdown and trim the last empty newline.
++    final completeMessage = messages.map((m) => m.text).join('\n').trimRight();
++    if (completeMessage.isEmpty) {
++      return null;
++    }
++
++    final document = customMarkdownToDocument(completeMessage);
++    final initialBytes =
++        DocumentDataPBFromTo.fromDocument(document)?.writeToBuffer();
++    if (initialBytes == null) {
++      Log.error('Failed to convert messages to document');
++      return null;
++    }
++
++    return ViewBackendService.createView(
++      name: LocaleKeys.chat_addToNewPageName.tr(args: [chatPageName]),
++      layoutType: ViewLayoutPB.Document,
++      parentViewId: parentViewId,
++      initialDataBytes: initialBytes,
++    ).toNullable();
++  }
++
++  static Future<void> addMessageToPage(
++    String documentId,
++    TextMessage message,
++  ) async {
++    if (message.text.isEmpty) {
++      Log.error('Message is empty');
++      return;
++    }
++
++    final bloc = DocumentBloc(
++      documentId: documentId,
++      saveToBlocMap: false,
++    )..add(const DocumentEvent.initial());
++
++    if (bloc.state.editorState == null) {
++      await bloc.stream.firstWhere((state) => state.editorState != null);
++    }
++
++    final editorState = bloc.state.editorState;
++    if (editorState == null) {
++      Log.error("Can't get EditorState of document");
++      return;
++    }
++
++    final messageDocument = customMarkdownToDocument(message.text);
++    if (messageDocument.isEmpty) {
++      Log.error('Failed to convert message to document');
++      return;
++    }
++
++    final lastNodeOrNull = editorState.document.root.children.lastOrNull;
++
++    final rootIsEmpty = lastNodeOrNull == null;
++    final isLastLineEmpty = lastNodeOrNull?.children.isNotEmpty == false &&
++        lastNodeOrNull?.delta?.isNotEmpty == false;
++
++    final nodes = [
++      if (rootIsEmpty || !isLastLineEmpty) paragraphNode(),
++      ...messageDocument.root.children,
++    ];
++    final insertPath = rootIsEmpty || listEquals(lastNodeOrNull.path, const [0])
++        ? const [0]
++        : lastNodeOrNull.path.next;
++
++    final transaction = editorState.transaction..insertNodes(insertPath, nodes);
++    await editorState.apply(transaction);
++    await bloc.close();
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_select_sources_cubit.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_select_sources_cubit.dart
+index 9fc1f9932d7eb..06ead7d8d8134 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_select_sources_cubit.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_select_sources_cubit.dart
+@@ -100,10 +100,8 @@ class ChatSource {
+ }
+ 
+ class ChatSettingsCubit extends Cubit<ChatSettingsState> {
+-  ChatSettingsCubit({required this.chatId})
+-      : super(ChatSettingsState.initial());
++  ChatSettingsCubit() : super(ChatSettingsState.initial());
+ 
+-  final String chatId;
+   List<String> selectedSourceIds = [];
+   ChatSource? source;
+   List<ChatSource> selectedSources = [];
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
+index 422c926a19af3..dc6d9c649ce7a 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
+@@ -1,11 +1,6 @@
+-import 'dart:async';
+ import 'dart:io';
+ 
+ import 'package:appflowy/generated/locale_keys.g.dart';
+-import 'package:appflowy/mobile/application/mobile_router.dart';
+-import 'package:appflowy/startup/startup.dart';
+-import 'package:appflowy/workspace/application/tabs/tabs_bloc.dart';
+-import 'package:appflowy/workspace/application/view/view_ext.dart';
+ import 'package:appflowy/workspace/application/view/view_service.dart';
+ import 'package:appflowy_backend/log.dart';
+ import 'package:appflowy_backend/protobuf/flowy-folder/view.pb.dart';
+@@ -36,6 +31,7 @@ import 'presentation/chat_welcome_page.dart';
+ import 'presentation/layout_define.dart';
+ import 'presentation/message/ai_text_message.dart';
+ import 'presentation/message/error_text_message.dart';
++import 'presentation/message/message_util.dart';
+ import 'presentation/message/user_text_message.dart';
+ import 'presentation/scroll_to_bottom.dart';
+ 
+@@ -355,19 +351,8 @@ class _ChatContentPage extends StatelessWidget {
+     } else {
+       final sidebarView =
+           await ViewBackendService.getView(metadata.id).toNullable();
+-      if (sidebarView == null) {
+-        return;
+-      }
+-      if (UniversalPlatform.isDesktop) {
+-        getIt<TabsBloc>().add(
+-          TabsEvent.openSecondaryPlugin(
+-            plugin: sidebarView.plugin(),
+-          ),
+-        );
+-      } else {
+-        if (context.mounted) {
+-          unawaited(context.pushView(sidebarView));
+-        }
++      if (context.mounted) {
++        openPageFromMessage(context, sidebarView);
+       }
+     }
+   }
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/desktop_ai_prompt_input.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/desktop_ai_prompt_input.dart
+index 98f3e805b3b16..a44f446433f99 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/desktop_ai_prompt_input.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/desktop_ai_prompt_input.dart
+@@ -151,7 +151,6 @@ class _DesktopAIPromptInputState extends State<DesktopAIPromptInput> {
+                       top: null,
+                       child: TextFieldTapRegion(
+                         child: _PromptBottomActions(
+-                          chatId: widget.chatId,
+                           textController: textController,
+                           overlayController: overlayController,
+                           focusNode: focusNode,
+@@ -483,7 +482,6 @@ class _FocusNextItemIntent extends Intent {
+ 
+ class _PromptBottomActions extends StatelessWidget {
+   const _PromptBottomActions({
+-    required this.chatId,
+     required this.textController,
+     required this.overlayController,
+     required this.focusNode,
+@@ -493,7 +491,6 @@ class _PromptBottomActions extends StatelessWidget {
+     required this.onUpdateSelectedSources,
+   });
+ 
+-  final String chatId;
+   final TextEditingController textController;
+   final OverlayPortalController overlayController;
+   final FocusNode focusNode;
+@@ -539,7 +536,6 @@ class _PromptBottomActions extends StatelessWidget {
+ 
+   Widget _selectSourcesButton(BuildContext context) {
+     return PromptInputDesktopSelectSourcesButton(
+-      chatId: chatId,
+       onUpdateSelectedSources: onUpdateSelectedSources,
+     );
+   }
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/mobile_ai_prompt_input.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/mobile_ai_prompt_input.dart
+index a4d821746696c..65d2f138746c0 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/mobile_ai_prompt_input.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/mobile_ai_prompt_input.dart
+@@ -270,7 +270,6 @@ class _MobileAIPromptInputState extends State<MobileAIPromptInput> {
+       alignment: Alignment.bottomCenter,
+       padding: const EdgeInsets.only(bottom: 8.0),
+       child: _LeadingActions(
+-        chatId: widget.chatId,
+         textController: textController,
+         // onMention: () {
+         //   textController.text += '@';
+@@ -303,12 +302,10 @@ class _MobileAIPromptInputState extends State<MobileAIPromptInput> {
+ 
+ class _LeadingActions extends StatelessWidget {
+   const _LeadingActions({
+-    required this.chatId,
+     required this.textController,
+     required this.onUpdateSelectedSources,
+   });
+ 
+-  final String chatId;
+   final TextEditingController textController;
+   final void Function(List<String>) onUpdateSelectedSources;
+ 
+@@ -317,7 +314,6 @@ class _LeadingActions extends StatelessWidget {
+     return Material(
+       color: Theme.of(context).cardColor,
+       child: PromptInputMobileSelectSourcesButton(
+-        chatId: chatId,
+         onUpdateSelectedSources: onUpdateSelectedSources,
+       ),
+     );
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/select_sources_bottom_sheet.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/select_sources_bottom_sheet.dart
+index 78596c3ee9a8a..2cd34bfdf0521 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/select_sources_bottom_sheet.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/select_sources_bottom_sheet.dart
+@@ -20,11 +20,9 @@ import 'select_sources_menu.dart';
+ class PromptInputMobileSelectSourcesButton extends StatefulWidget {
+   const PromptInputMobileSelectSourcesButton({
+     super.key,
+-    required this.chatId,
+     required this.onUpdateSelectedSources,
+   });
+ 
+-  final String chatId;
+   final void Function(List<String>) onUpdateSelectedSources;
+ 
+   @override
+@@ -34,7 +32,7 @@ class PromptInputMobileSelectSourcesButton extends StatefulWidget {
+ 
+ class _PromptInputMobileSelectSourcesButtonState
+     extends State<PromptInputMobileSelectSourcesButton> {
+-  late final cubit = ChatSettingsCubit(chatId: widget.chatId);
++  late final cubit = ChatSettingsCubit();
+ 
+   @override
+   void initState() {
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/select_sources_menu.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/select_sources_menu.dart
+index c92d561e78907..47cfec9b4ae14 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/select_sources_menu.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/select_sources_menu.dart
+@@ -1,6 +1,7 @@
+ import 'dart:math';
+ 
+ import 'package:appflowy/generated/flowy_svgs.g.dart';
++import 'package:appflowy/generated/locale_keys.g.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_bloc.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_select_sources_cubit.dart';
+ import 'package:appflowy/workspace/application/sidebar/space/space_bloc.dart';
+@@ -10,6 +11,7 @@ import 'package:appflowy/workspace/presentation/home/menu/sidebar/space/shared_w
+ import 'package:appflowy/workspace/presentation/home/menu/view/view_item.dart';
+ import 'package:appflowy_backend/protobuf/flowy-folder/protobuf.dart';
+ import 'package:appflowy_backend/protobuf/flowy-folder/view.pb.dart';
++import 'package:easy_localization/easy_localization.dart';
+ import 'package:flowy_infra/theme_extension.dart';
+ import 'package:flowy_infra_ui/flowy_infra_ui.dart';
+ import 'package:flowy_infra_ui/style_widget/hover.dart';
+@@ -22,11 +24,9 @@ import 'chat_mention_page_menu.dart';
+ class PromptInputDesktopSelectSourcesButton extends StatefulWidget {
+   const PromptInputDesktopSelectSourcesButton({
+     super.key,
+-    required this.chatId,
+     required this.onUpdateSelectedSources,
+   });
+ 
+-  final String chatId;
+   final void Function(List<String>) onUpdateSelectedSources;
+ 
+   @override
+@@ -36,7 +36,7 @@ class PromptInputDesktopSelectSourcesButton extends StatefulWidget {
+ 
+ class _PromptInputDesktopSelectSourcesButtonState
+     extends State<PromptInputDesktopSelectSourcesButton> {
+-  late final cubit = ChatSettingsCubit(chatId: widget.chatId);
++  late final cubit = ChatSettingsCubit();
+   final popoverController = PopoverController();
+ 
+   @override
+@@ -280,6 +280,7 @@ class ChatSourceTreeItem extends StatefulWidget {
+     required this.isSelectedSection,
+     required this.onSelected,
+     required this.height,
++    this.showCheckbox = true,
+   });
+ 
+   final ChatSource chatSource;
+@@ -295,6 +296,8 @@ class ChatSourceTreeItem extends StatefulWidget {
+ 
+   final double height;
+ 
++  final bool showCheckbox;
++
+   @override
+   State<ChatSourceTreeItem> createState() => _ChatSourceTreeItemState();
+ }
+@@ -309,6 +312,7 @@ class _ChatSourceTreeItemState extends State<ChatSourceTreeItem> {
+         level: widget.level,
+         isDescendentOfSpace: widget.isDescendentOfSpace,
+         isSelectedSection: widget.isSelectedSection,
++        showCheckbox: widget.showCheckbox,
+         onSelected: widget.onSelected,
+       ),
+     );
+@@ -316,11 +320,13 @@ class _ChatSourceTreeItemState extends State<ChatSourceTreeItem> {
+     final disabledEnabledChild =
+         widget.chatSource.ignoreStatus == IgnoreViewType.disable
+             ? FlowyTooltip(
+-                message: switch (widget.chatSource.view.layout) {
+-                  ViewLayoutPB.Document =>
+-                    "You can only select up to 3 top-level documents and its children",
+-                  _ => "We don't support chatting with databases at this time",
+-                },
++                message: widget.showCheckbox
++                    ? switch (widget.chatSource.view.layout) {
++                        ViewLayoutPB.Document =>
++                          LocaleKeys.chat_sourcesLimitReached.tr(),
++                        _ => LocaleKeys.chat_sourceUnsupported.tr(),
++                      }
++                    : "",
+                 child: Opacity(
+                   opacity: 0.5,
+                   child: MouseRegion(
+@@ -358,6 +364,7 @@ class _ChatSourceTreeItemState extends State<ChatSourceTreeItem> {
+                 isSelectedSection: widget.isSelectedSection,
+                 onSelected: widget.onSelected,
+                 height: widget.height,
++                showCheckbox: widget.showCheckbox,
+               ),
+             ),
+           ],
+@@ -374,6 +381,7 @@ class ChatSourceTreeItemInner extends StatelessWidget {
+     required this.level,
+     required this.isDescendentOfSpace,
+     required this.isSelectedSection,
++    required this.showCheckbox,
+     this.onSelected,
+   });
+ 
+@@ -381,6 +389,7 @@ class ChatSourceTreeItemInner extends StatelessWidget {
+   final int level;
+   final bool isDescendentOfSpace;
+   final bool isSelectedSection;
++  final bool showCheckbox;
+   final void Function(ChatSource)? onSelected;
+ 
+   @override
+@@ -403,7 +412,7 @@ class ChatSourceTreeItemInner extends StatelessWidget {
+             ),
+             const HSpace(2.0),
+             // checkbox
+-            if (!chatSource.view.isSpace) ...[
++            if (!chatSource.view.isSpace && showCheckbox) ...[
+               SourceSelectedStatusCheckbox(
+                 chatSource: chatSource,
+               ),
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_message_action_bar.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_message_action_bar.dart
+new file mode 100644
+index 0000000000000..fe3f1413d9421
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_message_action_bar.dart
+@@ -0,0 +1,451 @@
++import 'dart:convert';
++
++import 'package:appflowy/generated/flowy_svgs.g.dart';
++import 'package:appflowy/generated/locale_keys.g.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_ai_message_bloc.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_edit_document_service.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_select_sources_cubit.dart';
++import 'package:appflowy/plugins/document/application/prelude.dart';
++import 'package:appflowy/plugins/document/presentation/editor_plugins/copy_and_paste/clipboard_service.dart';
++import 'package:appflowy/shared/markdown_to_document.dart';
++import 'package:appflowy/startup/startup.dart';
++import 'package:appflowy/util/theme_extension.dart';
++import 'package:appflowy/workspace/application/sidebar/space/space_bloc.dart';
++import 'package:appflowy/workspace/application/tabs/tabs_bloc.dart';
++import 'package:appflowy/workspace/application/user/prelude.dart';
++import 'package:appflowy/workspace/application/view/prelude.dart';
++import 'package:appflowy/workspace/application/view/view_ext.dart';
++import 'package:appflowy/workspace/presentation/home/menu/sidebar/space/shared_widget.dart';
++import 'package:appflowy/workspace/presentation/home/menu/view/view_item.dart';
++import 'package:appflowy/workspace/presentation/widgets/dialogs.dart';
++import 'package:appflowy_backend/protobuf/flowy-folder/protobuf.dart';
++import 'package:appflowy_result/appflowy_result.dart';
++import 'package:easy_localization/easy_localization.dart';
++import 'package:flowy_infra/theme_extension.dart';
++import 'package:flowy_infra_ui/flowy_infra_ui.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_bloc/flutter_bloc.dart';
++import 'package:flutter_chat_core/flutter_chat_core.dart';
++
++import '../chat_input/select_sources_menu.dart';
++import '../layout_define.dart';
++import 'message_util.dart';
++
++class AIMessageActionBar extends StatelessWidget {
++  const AIMessageActionBar({
++    super.key,
++    required this.message,
++    required this.showDecoration,
++    this.onRegenerate,
++    this.onOverrideVisibility,
++  });
++
++  final Message message;
++  final bool showDecoration;
++  final void Function()? onRegenerate;
++  final void Function(bool)? onOverrideVisibility;
++
++  @override
++  Widget build(BuildContext context) {
++    final isLightMode = Theme.of(context).isLightMode;
++
++    final child = SeparatedRow(
++      mainAxisSize: MainAxisSize.min,
++      separatorBuilder: () =>
++          const HSpace(DesktopAIConvoSizes.actionBarIconSpacing),
++      children: _buildChildren(),
++    );
++
++    return showDecoration
++        ? Container(
++            padding: const EdgeInsets.all(2.0),
++            decoration: BoxDecoration(
++              borderRadius: DesktopAIConvoSizes.hoverActionBarRadius,
++              border: Border.all(
++                color: isLightMode
++                    ? const Color(0x1F1F2329)
++                    : Theme.of(context).dividerColor,
++              ),
++              color: Theme.of(context).cardColor,
++              boxShadow: [
++                BoxShadow(
++                  offset: const Offset(0, 1),
++                  blurRadius: 2,
++                  spreadRadius: -2,
++                  color: isLightMode
++                      ? const Color(0x051F2329)
++                      : Theme.of(context).shadowColor.withOpacity(0.02),
++                ),
++                BoxShadow(
++                  offset: const Offset(0, 2),
++                  blurRadius: 4,
++                  color: isLightMode
++                      ? const Color(0x051F2329)
++                      : Theme.of(context).shadowColor.withOpacity(0.02),
++                ),
++                BoxShadow(
++                  offset: const Offset(0, 2),
++                  blurRadius: 8,
++                  spreadRadius: 2,
++                  color: isLightMode
++                      ? const Color(0x051F2329)
++                      : Theme.of(context).shadowColor.withOpacity(0.02),
++                ),
++              ],
++            ),
++            child: child,
++          )
++        : child;
++  }
++
++  List<Widget> _buildChildren() {
++    return [
++      CopyButton(
++        isInHoverBar: showDecoration,
++        textMessage: message as TextMessage,
++      ),
++      RegenerateButton(
++        isInHoverBar: showDecoration,
++        onTap: () => onRegenerate?.call(),
++      ),
++      SaveToPageButton(
++        textMessage: message as TextMessage,
++        isInHoverBar: showDecoration,
++        onOverrideVisibility: onOverrideVisibility,
++      ),
++    ];
++  }
++}
++
++class CopyButton extends StatelessWidget {
++  const CopyButton({
++    super.key,
++    required this.isInHoverBar,
++    required this.textMessage,
++  });
++
++  final bool isInHoverBar;
++  final TextMessage textMessage;
++
++  @override
++  Widget build(BuildContext context) {
++    return FlowyTooltip(
++      message: LocaleKeys.settings_menu_clickToCopy.tr(),
++      child: FlowyIconButton(
++        width: DesktopAIConvoSizes.actionBarIconSize,
++        hoverColor: AFThemeExtension.of(context).lightGreyHover,
++        radius: isInHoverBar
++            ? DesktopAIConvoSizes.hoverActionBarIconRadius
++            : DesktopAIConvoSizes.actionBarIconRadius,
++        icon: FlowySvg(
++          FlowySvgs.copy_s,
++          color: Theme.of(context).hintColor,
++          size: const Size.square(16),
++        ),
++        onPressed: () async {
++          final document = customMarkdownToDocument(textMessage.text);
++          await getIt<ClipboardService>().setData(
++            ClipboardServiceData(
++              plainText: textMessage.text,
++              inAppJson: jsonEncode(document.toJson()),
++            ),
++          );
++          if (context.mounted) {
++            showToastNotification(
++              context,
++              message: LocaleKeys.grid_url_copiedNotification.tr(),
++            );
++          }
++        },
++      ),
++    );
++  }
++}
++
++class RegenerateButton extends StatelessWidget {
++  const RegenerateButton({
++    super.key,
++    required this.isInHoverBar,
++    required this.onTap,
++  });
++
++  final bool isInHoverBar;
++  final void Function() onTap;
++
++  @override
++  Widget build(BuildContext context) {
++    return FlowyTooltip(
++      message: LocaleKeys.chat_regenerate.tr(),
++      child: FlowyIconButton(
++        width: DesktopAIConvoSizes.actionBarIconSize,
++        hoverColor: AFThemeExtension.of(context).lightGreyHover,
++        radius: isInHoverBar
++            ? DesktopAIConvoSizes.hoverActionBarIconRadius
++            : DesktopAIConvoSizes.actionBarIconRadius,
++        icon: FlowySvg(
++          FlowySvgs.ai_undo_s,
++          color: Theme.of(context).hintColor,
++          size: const Size.square(16),
++        ),
++        onPressed: onTap,
++      ),
++    );
++  }
++}
++
++class SaveToPageButton extends StatefulWidget {
++  const SaveToPageButton({
++    super.key,
++    required this.textMessage,
++    required this.isInHoverBar,
++    this.onOverrideVisibility,
++  });
++
++  final TextMessage textMessage;
++  final bool isInHoverBar;
++  final void Function(bool)? onOverrideVisibility;
++
++  @override
++  State<SaveToPageButton> createState() => _SaveToPageButtonState();
++}
++
++class _SaveToPageButtonState extends State<SaveToPageButton> {
++  final popoverController = PopoverController();
++
++  @override
++  Widget build(BuildContext context) {
++    final userWorkspaceBloc = context.read<UserWorkspaceBloc>();
++    final userProfile = userWorkspaceBloc.userProfile;
++    final workspaceId =
++        userWorkspaceBloc.state.currentWorkspace?.workspaceId ?? '';
++
++    return MultiBlocProvider(
++      providers: [
++        BlocProvider(
++          create: (context) => SpaceBloc(
++            userProfile: userProfile,
++            workspaceId: workspaceId,
++          )..add(const SpaceEvent.initial(openFirstPage: false)),
++        ),
++        BlocProvider(
++          create: (context) => ChatSettingsCubit(),
++        ),
++      ],
++      child: BlocSelector<SpaceBloc, SpaceState, ViewPB?>(
++        selector: (state) => state.currentSpace,
++        builder: (context, spaceView) {
++          return AppFlowyPopover(
++            controller: popoverController,
++            triggerActions: PopoverTriggerFlags.none,
++            margin: EdgeInsets.zero,
++            offset: const Offset(8, 0),
++            direction: PopoverDirection.rightWithBottomAligned,
++            constraints: const BoxConstraints.tightFor(width: 300, height: 400),
++            onClose: () {
++              if (spaceView != null) {
++                context.read<ChatSettingsCubit>().refreshSources(spaceView);
++              }
++              widget.onOverrideVisibility?.call(false);
++            },
++            child: buildButton(context, spaceView),
++            popupBuilder: (_) => buildPopover(context),
++          );
++        },
++      ),
++    );
++  }
++
++  Widget buildButton(BuildContext context, ViewPB? spaceView) {
++    return FlowyTooltip(
++      message: LocaleKeys.chat_addToPageButton.tr(),
++      child: FlowyIconButton(
++        width: DesktopAIConvoSizes.actionBarIconSize,
++        hoverColor: AFThemeExtension.of(context).lightGreyHover,
++        radius: widget.isInHoverBar
++            ? DesktopAIConvoSizes.hoverActionBarIconRadius
++            : DesktopAIConvoSizes.actionBarIconRadius,
++        icon: FlowySvg(
++          FlowySvgs.ai_add_to_page_s,
++          color: Theme.of(context).hintColor,
++          size: const Size.square(16),
++        ),
++        onPressed: () async {
++          final documentId = getOpenedDocumentId();
++          if (documentId != null) {
++            await onAddToExistingPage(documentId);
++            DocumentBloc.findOpen(documentId)?.forceReloadDocumentState();
++          } else {
++            widget.onOverrideVisibility?.call(true);
++            if (spaceView != null) {
++              context.read<ChatSettingsCubit>().refreshSources(spaceView);
++            }
++            popoverController.show();
++          }
++        },
++      ),
++    );
++  }
++
++  Widget buildPopover(BuildContext context) {
++    return BlocProvider.value(
++      value: context.read<ChatSettingsCubit>(),
++      child: _SaveToPagePopoverContent(
++        onAddToNewPage: () {
++          addMessageToNewPage(context);
++          popoverController.close();
++        },
++        onAddToExistingPage: (documentId) async {
++          popoverController.close();
++          await onAddToExistingPage(documentId);
++          final view =
++              await ViewBackendService.getView(documentId).toNullable();
++          if (context.mounted) {
++            openPageFromMessage(context, view);
++          }
++        },
++      ),
++    );
++  }
++
++  Future<void> onAddToExistingPage(String documentId) async {
++    await ChatEditDocumentService.addMessageToPage(
++      documentId,
++      widget.textMessage,
++    );
++    await Future.delayed(const Duration(milliseconds: 500));
++  }
++
++  void addMessageToNewPage(BuildContext context) async {
++    final chatView = await ViewBackendService.getView(
++      context.read<ChatAIMessageBloc>().chatId,
++    ).toNullable();
++    if (chatView != null) {
++      final newView = await ChatEditDocumentService.saveMessagesToNewPage(
++        chatView.nameOrDefault,
++        chatView.parentViewId,
++        [widget.textMessage],
++      );
++      if (context.mounted) {
++        openPageFromMessage(context, newView);
++      }
++    }
++  }
++
++  String? getOpenedDocumentId() {
++    final pageManager = getIt<TabsBloc>().state.currentPageManager;
++    if (!pageManager.showSecondaryPluginNotifier.value) {
++      return null;
++    }
++    return pageManager.secondaryNotifier.plugin.id;
++  }
++}
++
++class _SaveToPagePopoverContent extends StatelessWidget {
++  const _SaveToPagePopoverContent({
++    required this.onAddToNewPage,
++    required this.onAddToExistingPage,
++  });
++
++  final void Function() onAddToNewPage;
++  final void Function(String) onAddToExistingPage;
++
++  @override
++  Widget build(BuildContext context) {
++    return BlocBuilder<ChatSettingsCubit, ChatSettingsState>(
++      builder: (context, state) {
++        return Column(
++          mainAxisSize: MainAxisSize.min,
++          children: [
++            Container(
++              height: 24,
++              margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
++              child: Align(
++                alignment: AlignmentDirectional.centerStart,
++                child: FlowyText(
++                  LocaleKeys.chat_addToPageTitle.tr(),
++                  fontSize: 12.0,
++                  color: Theme.of(context).hintColor,
++                ),
++              ),
++            ),
++            Padding(
++              padding: const EdgeInsets.only(left: 12, right: 12, bottom: 8),
++              child: SpaceSearchField(
++                width: 600,
++                onSearch: (context, value) =>
++                    context.read<ChatSettingsCubit>().updateFilter(value),
++              ),
++            ),
++            _buildDivider(),
++            Expanded(
++              child: ListView(
++                shrinkWrap: true,
++                padding: const EdgeInsets.fromLTRB(8, 4, 8, 12),
++                children: _buildVisibleSources(context, state).toList(),
++              ),
++            ),
++            _buildDivider(),
++            _addToNewPageButton(context),
++          ],
++        );
++      },
++    );
++  }
++
++  Widget _buildDivider() {
++    return const Divider(
++      height: 1.0,
++      thickness: 1.0,
++      indent: 12.0,
++      endIndent: 12.0,
++    );
++  }
++
++  Iterable<Widget> _buildVisibleSources(
++    BuildContext context,
++    ChatSettingsState state,
++  ) {
++    return state.visibleSources
++        .where((e) => e.ignoreStatus != IgnoreViewType.hide)
++        .map(
++          (e) => ChatSourceTreeItem(
++            key: ValueKey(
++              'save_to_page_tree_item_${e.view.id}',
++            ),
++            chatSource: e,
++            level: 0,
++            isDescendentOfSpace: e.view.isSpace,
++            isSelectedSection: false,
++            showCheckbox: false,
++            onSelected: (source) {
++              if (!source.view.isSpace) {
++                onAddToExistingPage(source.view.id);
++              }
++            },
++            height: 30.0,
++          ),
++        );
++  }
++
++  Widget _addToNewPageButton(BuildContext context) {
++    return Padding(
++      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
++      child: SizedBox(
++        height: 30,
++        child: FlowyButton(
++          iconPadding: 8,
++          onTap: onAddToNewPage,
++          text: FlowyText(
++            LocaleKeys.chat_addToNewPage.tr(),
++            figmaLineHeight: 20,
++          ),
++          leftIcon: FlowySvg(
++            FlowySvgs.add_m,
++            size: const Size.square(16),
++            color: Theme.of(context).hintColor,
++          ),
++        ),
++      ),
++    );
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_message_bubble.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_message_bubble.dart
+index 43647e1505e21..93f350b1c429c 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_message_bubble.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_message_bubble.dart
+@@ -4,20 +4,25 @@ import 'package:appflowy/generated/flowy_svgs.g.dart';
+ import 'package:appflowy/generated/locale_keys.g.dart';
+ import 'package:appflowy/mobile/presentation/bottom_sheet/bottom_sheet.dart';
+ import 'package:appflowy/mobile/presentation/widgets/flowy_mobile_quick_action_button.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_edit_document_service.dart';
++import 'package:appflowy/plugins/ai_chat/presentation/chat_input/chat_mention_page_bottom_sheet.dart';
+ import 'package:appflowy/plugins/document/presentation/editor_plugins/copy_and_paste/clipboard_service.dart';
+ import 'package:appflowy/shared/markdown_to_document.dart';
+ import 'package:appflowy/startup/startup.dart';
+-import 'package:appflowy/util/theme_extension.dart';
++import 'package:appflowy/workspace/application/view/view_ext.dart';
+ import 'package:appflowy/workspace/presentation/widgets/dialogs.dart';
+ import 'package:easy_localization/easy_localization.dart';
+ import 'package:flowy_infra/theme_extension.dart';
+ import 'package:flowy_infra_ui/flowy_infra_ui.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_chat_core/flutter_chat_core.dart';
++import 'package:go_router/go_router.dart';
+ import 'package:universal_platform/universal_platform.dart';
+ 
+ import '../chat_avatar.dart';
+ import '../layout_define.dart';
++import 'ai_message_action_bar.dart';
++import 'message_util.dart';
+ 
+ /// Wraps an AI response message with the avatar and actions. On desktop,
+ /// the actions will be displayed below the response if the response is the
+@@ -108,7 +113,7 @@ class ChatAIBottomInlineActions extends StatelessWidget {
+             start: DesktopAIConvoSizes.avatarSize +
+                 DesktopAIConvoSizes.avatarAndChatBubbleSpacing,
+           ),
+-          child: AIResponseActionBar(
++          child: AIMessageActionBar(
+             message: message,
+             showDecoration: false,
+             onRegenerate: onRegenerate,
+@@ -142,6 +147,7 @@ class _ChatAIMessageHoverState extends State<ChatAIMessageHover> {
+ 
+   bool hoverBubble = false;
+   bool hoverActionBar = false;
++  bool overrideVisibility = false;
+ 
+   ScrollPosition? scrollPosition;
+ 
+@@ -206,11 +212,14 @@ class _ChatAIMessageHoverState extends State<ChatAIMessageHover> {
+                         DesktopAIConvoSizes.hoverActionBarPadding.vertical,
+                   ),
+                   alignment: Alignment.topLeft,
+-                  child: hoverBubble || hoverActionBar
+-                      ? AIResponseActionBar(
++                  child: hoverBubble || hoverActionBar || overrideVisibility
++                      ? AIMessageActionBar(
+                           message: widget.message,
+                           showDecoration: true,
+                           onRegenerate: widget.onRegenerate,
++                          onOverrideVisibility: (visibility) {
++                            overrideVisibility = visibility;
++                          },
+                         )
+                       : null,
+                 ),
+@@ -259,7 +268,10 @@ class _ChatAIMessageHoverState extends State<ChatAIMessageHover> {
+     final messageOffset = messageRenderBox.localToGlobal(Offset.zero);
+     final messageHeight = messageRenderBox.size.height;
+ 
+-    return messageOffset.dy + messageHeight + 28 <=
++    return messageOffset.dy +
++            messageHeight +
++            DesktopAIConvoSizes.actionBarIconSize +
++            DesktopAIConvoSizes.hoverActionBarPadding.vertical <=
+         scrollableOffset.dy + scrollableHeight;
+   }
+ 
+@@ -270,161 +282,6 @@ class _ChatAIMessageHoverState extends State<ChatAIMessageHover> {
+   }
+ }
+ 
+-class AIResponseActionBar extends StatelessWidget {
+-  const AIResponseActionBar({
+-    super.key,
+-    required this.message,
+-    required this.showDecoration,
+-    this.onRegenerate,
+-  });
+-
+-  final Message message;
+-  final bool showDecoration;
+-  final void Function()? onRegenerate;
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    final isLightMode = Theme.of(context).isLightMode;
+-
+-    final child = SeparatedRow(
+-      mainAxisSize: MainAxisSize.min,
+-      separatorBuilder: () =>
+-          const HSpace(DesktopAIConvoSizes.actionBarIconSpacing),
+-      children: _buildChildren(),
+-    );
+-
+-    return showDecoration
+-        ? Container(
+-            padding: const EdgeInsets.all(2.0),
+-            decoration: BoxDecoration(
+-              borderRadius: DesktopAIConvoSizes.hoverActionBarRadius,
+-              border: Border.all(
+-                color: isLightMode
+-                    ? const Color(0x1F1F2329)
+-                    : Theme.of(context).dividerColor,
+-              ),
+-              color: Theme.of(context).cardColor,
+-              boxShadow: [
+-                BoxShadow(
+-                  offset: const Offset(0, 1),
+-                  blurRadius: 2,
+-                  spreadRadius: -2,
+-                  color: isLightMode
+-                      ? const Color(0x051F2329)
+-                      : Theme.of(context).shadowColor.withOpacity(0.02),
+-                ),
+-                BoxShadow(
+-                  offset: const Offset(0, 2),
+-                  blurRadius: 4,
+-                  color: isLightMode
+-                      ? const Color(0x051F2329)
+-                      : Theme.of(context).shadowColor.withOpacity(0.02),
+-                ),
+-                BoxShadow(
+-                  offset: const Offset(0, 2),
+-                  blurRadius: 8,
+-                  spreadRadius: 2,
+-                  color: isLightMode
+-                      ? const Color(0x051F2329)
+-                      : Theme.of(context).shadowColor.withOpacity(0.02),
+-                ),
+-              ],
+-            ),
+-            child: child,
+-          )
+-        : child;
+-  }
+-
+-  List<Widget> _buildChildren() {
+-    return [
+-      CopyButton(
+-        isInHoverBar: showDecoration,
+-        textMessage: message as TextMessage,
+-      ),
+-      RegenerateButton(
+-        isInHoverBar: showDecoration,
+-        onTap: () => onRegenerate?.call(),
+-      ),
+-    ];
+-  }
+-}
+-
+-class CopyButton extends StatelessWidget {
+-  const CopyButton({
+-    super.key,
+-    required this.isInHoverBar,
+-    required this.textMessage,
+-  });
+-
+-  final bool isInHoverBar;
+-  final TextMessage textMessage;
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    return FlowyTooltip(
+-      message: LocaleKeys.settings_menu_clickToCopy.tr(),
+-      child: FlowyIconButton(
+-        width: DesktopAIConvoSizes.actionBarIconSize,
+-        hoverColor: AFThemeExtension.of(context).lightGreyHover,
+-        radius: isInHoverBar
+-            ? DesktopAIConvoSizes.hoverActionBarIconRadius
+-            : DesktopAIConvoSizes.actionBarIconRadius,
+-        icon: FlowySvg(
+-          FlowySvgs.copy_s,
+-          color: Theme.of(context).hintColor,
+-          size: const Size.square(16),
+-        ),
+-        onPressed: () async {
+-          final document = customMarkdownToDocument(textMessage.text);
+-          await getIt<ClipboardService>().setData(
+-            ClipboardServiceData(
+-              plainText: textMessage.text,
+-              inAppJson: jsonEncode(document.toJson()),
+-            ),
+-          );
+-          if (context.mounted) {
+-            showToastNotification(
+-              context,
+-              message: LocaleKeys.grid_url_copiedNotification.tr(),
+-            );
+-          }
+-        },
+-      ),
+-    );
+-  }
+-}
+-
+-class RegenerateButton extends StatelessWidget {
+-  const RegenerateButton({
+-    super.key,
+-    required this.isInHoverBar,
+-    required this.onTap,
+-  });
+-
+-  final bool isInHoverBar;
+-  final void Function() onTap;
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    return FlowyTooltip(
+-      message: LocaleKeys.chat_regenerate.tr(),
+-      child: FlowyIconButton(
+-        width: DesktopAIConvoSizes.actionBarIconSize,
+-        hoverColor: AFThemeExtension.of(context).lightGreyHover,
+-        radius: isInHoverBar
+-            ? DesktopAIConvoSizes.hoverActionBarIconRadius
+-            : DesktopAIConvoSizes.actionBarIconRadius,
+-        icon: FlowySvg(
+-          FlowySvgs.ai_undo_s,
+-          color: Theme.of(context).hintColor,
+-          size: const Size.square(16),
+-        ),
+-        onPressed: onTap,
+-      ),
+-    );
+-  }
+-}
+-
+ class ChatAIMessagePopup extends StatelessWidget {
+   const ChatAIMessagePopup({
+     super.key,
+@@ -455,6 +312,8 @@ class ChatAIMessagePopup extends StatelessWidget {
+                 const Divider(height: 8.5, thickness: 0.5),
+                 _regenerateButton(context),
+                 const Divider(height: 8.5, thickness: 0.5),
++                _saveToPageButton(context),
++                const Divider(height: 8.5, thickness: 0.5),
+               ],
+             );
+           },
+@@ -505,4 +364,34 @@ class ChatAIMessagePopup extends StatelessWidget {
+       text: LocaleKeys.chat_regenerate.tr(),
+     );
+   }
++
++  Widget _saveToPageButton(BuildContext context) {
++    return MobileQuickActionButton(
++      onTap: () async {
++        final selectedView = await showPageSelectorSheet(
++          context,
++          filter: (view) =>
++              !view.isSpace &&
++              view.layout.isDocumentView &&
++              view.parentViewId != view.id,
++        );
++        if (selectedView == null) {
++          return;
++        }
++
++        await ChatEditDocumentService.addMessageToPage(
++          selectedView.id,
++          message as TextMessage,
++        );
++
++        if (context.mounted) {
++          context.pop();
++          openPageFromMessage(context, selectedView);
++        }
++      },
++      icon: FlowySvgs.ai_add_to_page_s,
++      iconSize: const Size.square(20),
++      text: LocaleKeys.chat_addToPageButton.tr(),
++    );
++  }
+ }
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/message_util.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/message_util.dart
+new file mode 100644
+index 0000000000000..4673b9def18cb
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/message_util.dart
+@@ -0,0 +1,24 @@
++import 'package:appflowy/mobile/application/mobile_router.dart';
++import 'package:appflowy/startup/startup.dart';
++import 'package:appflowy/workspace/application/tabs/tabs_bloc.dart';
++import 'package:appflowy/workspace/application/view/view_ext.dart';
++import 'package:appflowy_backend/protobuf/flowy-folder/protobuf.dart';
++import 'package:flutter/widgets.dart';
++import 'package:universal_platform/universal_platform.dart';
++
++/// Opens a message in the right hand sidebar on desktop, and push the page
++/// on mobile
++void openPageFromMessage(BuildContext context, ViewPB? view) {
++  if (view == null) {
++    return;
++  }
++  if (UniversalPlatform.isDesktop) {
++    getIt<TabsBloc>().add(
++      TabsEvent.openSecondaryPlugin(
++        plugin: view.plugin(),
++      ),
++    );
++  } else {
++    context.pushView(view);
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/document/application/document_bloc.dart b/frontend/appflowy_flutter/lib/plugins/document/application/document_bloc.dart
+index 78a0d8d981897..8a7d9ba47e9b5 100644
+--- a/frontend/appflowy_flutter/lib/plugins/document/application/document_bloc.dart
++++ b/frontend/appflowy_flutter/lib/plugins/document/application/document_bloc.dart
+@@ -40,12 +40,16 @@ part 'document_bloc.freezed.dart';
+ 
+ bool enableDocumentInternalLog = false;
+ 
++final Map<String, DocumentBloc> _documentBlocMap = {};
++
+ class DocumentBloc extends Bloc<DocumentEvent, DocumentState> {
+   DocumentBloc({
+     required this.documentId,
+     this.databaseViewId,
+     this.rowId,
+-  })  : _documentListener = DocumentListener(id: documentId),
++    bool saveToBlocMap = true,
++  })  : _saveToBlocMap = saveToBlocMap,
++        _documentListener = DocumentListener(id: documentId),
+         _syncStateListener = DocumentSyncStateListener(id: documentId),
+         super(DocumentState.initial()) {
+     _viewListener = databaseViewId == null && rowId == null
+@@ -54,12 +58,17 @@ class DocumentBloc extends Bloc<DocumentEvent, DocumentState> {
+     on<DocumentEvent>(_onDocumentEvent);
+   }
+ 
++  static DocumentBloc? findOpen(String documentId) =>
++      _documentBlocMap[documentId];
++
+   /// For a normal document, the document id is the same as the view id
+   final String documentId;
+ 
+   final String? databaseViewId;
+   final String? rowId;
+ 
++  final bool _saveToBlocMap;
++
+   final DocumentListener _documentListener;
+   final DocumentSyncStateListener _syncStateListener;
+   late final ViewListener? _viewListener;
+@@ -95,6 +104,9 @@ class DocumentBloc extends Bloc<DocumentEvent, DocumentState> {
+   @override
+   Future<void> close() async {
+     isClosing = true;
++    if (_saveToBlocMap) {
++      _documentBlocMap.remove(documentId);
++    }
+     await checkDocumentIntegrity();
+     await _cancelSubscriptions();
+     _clearEditorState();
+@@ -128,6 +140,9 @@ class DocumentBloc extends Bloc<DocumentEvent, DocumentState> {
+   ) async {
+     await event.when(
+       initial: () async {
++        if (_saveToBlocMap) {
++          _documentBlocMap[documentId] = this;
++        }
+         final result = await _fetchDocumentState();
+         _onViewChanged();
+         _onDocumentChanged();
+@@ -407,6 +422,10 @@ class DocumentBloc extends Bloc<DocumentEvent, DocumentState> {
+     );
+   }
+ 
++  void forceReloadDocumentState() {
++    _documentCollabAdapter.syncV3();
++  }
++
+   // this is only used for debug mode
+   Future<void> checkDocumentIntegrity() async {
+     if (!enableDocumentInternalLog) {
+diff --git a/frontend/appflowy_flutter/lib/plugins/document/application/editor_transaction_adapter.dart b/frontend/appflowy_flutter/lib/plugins/document/application/editor_transaction_adapter.dart
+index 736c9b7fa6e99..d66110d95042b 100644
+--- a/frontend/appflowy_flutter/lib/plugins/document/application/editor_transaction_adapter.dart
++++ b/frontend/appflowy_flutter/lib/plugins/document/application/editor_transaction_adapter.dart
+@@ -24,7 +24,7 @@ import 'package:appflowy_editor/appflowy_editor.dart'
+ import 'package:collection/collection.dart';
+ import 'package:nanoid/nanoid.dart';
+ 
+-const _kExternalTextType = 'text';
++const kExternalTextType = 'text';
+ 
+ /// Uses to adjust the data structure between the editor and the backend.
+ ///
+@@ -183,17 +183,16 @@ extension on InsertOperation {
+       final parentId = node.parent?.id ??
+           editorState.getNodeAtPath(currentPath.parent)?.id ??
+           '';
+-      var prevId = previousNode?.id;
++      assert(parentId.isNotEmpty);
++
++      String prevId = '';
+       // if the node is the first child of the parent, then its prevId should be empty.
+       final isFirstChild = currentPath.previous.equals(currentPath);
++
+       if (!isFirstChild) {
+-        prevId ??= editorState.getNodeAtPath(currentPath.previous)?.id ?? '';
+-      }
+-      prevId ??= '';
+-      assert(parentId.isNotEmpty);
+-      if (isFirstChild) {
+-        prevId = '';
+-      } else {
++        prevId = previousNode?.id ??
++            editorState.getNodeAtPath(currentPath.previous)?.id ??
++            '';
+         assert(prevId.isNotEmpty && prevId != node.id);
+       }
+ 
+@@ -213,7 +212,7 @@ extension on InsertOperation {
+         // sync the text id to the node
+         node.externalValues = ExternalValues(
+           externalId: textId,
+-          externalType: _kExternalTextType,
++          externalType: kExternalTextType,
+         );
+       }
+ 
+@@ -222,7 +221,7 @@ extension on InsertOperation {
+         ..block = node.toBlock(
+           childrenId: nanoid(6),
+           externalId: textId,
+-          externalType: textId != null ? _kExternalTextType : null,
++          externalType: textId != null ? kExternalTextType : null,
+           attributes: {...node.attributes}..remove(blockComponentDelta),
+         )
+         ..parentId = parentId
+@@ -323,7 +322,7 @@ extension on UpdateOperation {
+ 
+       node.externalValues = ExternalValues(
+         externalId: textId,
+-        externalType: _kExternalTextType,
++        externalType: kExternalTextType,
+       );
+ 
+       if (enableDocumentInternalLog) {
+@@ -333,7 +332,7 @@ extension on UpdateOperation {
+       // update the external text id and external type to the block
+       blockActionPB.payload.block
+         ..externalId = textId
+-        ..externalType = _kExternalTextType;
++        ..externalType = kExternalTextType;
+ 
+       actions.add(
+         BlockActionWrapper(
+@@ -358,7 +357,7 @@ extension on UpdateOperation {
+       // update the external text id and external type to the block
+       blockActionPB.payload.block
+         ..externalId = textId
+-        ..externalType = _kExternalTextType;
++        ..externalType = kExternalTextType;
+ 
+       actions.add(
+         BlockActionWrapper(
+diff --git a/frontend/appflowy_flutter/test/unit_test/editor/transaction_adapter_test.dart b/frontend/appflowy_flutter/test/unit_test/editor/transaction_adapter_test.dart
+index 2982b75c68643..4a7457a43bd85 100644
+--- a/frontend/appflowy_flutter/test/unit_test/editor/transaction_adapter_test.dart
++++ b/frontend/appflowy_flutter/test/unit_test/editor/transaction_adapter_test.dart
+@@ -208,7 +208,7 @@ void main() {
+               blockAction.payload.block.externalId,
+               textId,
+             );
+-            expect(blockAction.payload.block.externalType, 'text');
++            expect(blockAction.payload.block.externalType, kExternalTextType);
+           }
+         } else if (time == TransactionTime.after) {
+           completer.complete();
+@@ -278,7 +278,7 @@ void main() {
+               blockAction.payload.block.externalId,
+               textId,
+             );
+-            expect(blockAction.payload.block.externalType, 'text');
++            expect(blockAction.payload.block.externalType, kExternalTextType);
+           }
+         } else if (time == TransactionTime.after) {
+           completer.complete();
+diff --git a/frontend/resources/flowy_icons/16x/ai_add_to_page.svg b/frontend/resources/flowy_icons/16x/ai_add_to_page.svg
+new file mode 100644
+index 0000000000000..8895d9953d979
+--- /dev/null
++++ b/frontend/resources/flowy_icons/16x/ai_add_to_page.svg
+@@ -0,0 +1,5 @@
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++<path d="M7.02353 11.94L8.28027 10.66L7.02353 9.38L8.28027 10.66H4.28027" stroke="black" stroke-linecap="round" stroke-linejoin="round"/>
++<path d="M14.24 7.24V10.66C14.24 13.98 13.056 15.32 9.72 15.32H5.72C2.384 15.32 1.2 13.98 1.2 10.66V6.62C1.2 3.3 2.384 1.96 5.72 1.96H8.72" stroke="black" stroke-linecap="round" stroke-linejoin="round"/>
++<path d="M14.24 7.24H11.72C9.72 7.24 8.72 6.62 8.72 4.52V1.96L14.24 7.24Z" stroke="black" stroke-linecap="round" stroke-linejoin="round"/>
++</svg>
+diff --git a/frontend/resources/translations/en.json b/frontend/resources/translations/en.json
+index d0e6351fc4a45..41b8c30def00b 100644
+--- a/frontend/resources/translations/en.json
++++ b/frontend/resources/translations/en.json
+@@ -206,7 +206,13 @@
+     "indexingFile": "Indexing {}",
+     "generatingResponse": "Generating response",
+     "selectSources": "Select Sources",
+-    "regenerate": "Try again"
++    "sourcesLimitReached": "You can only select up to 3 top-level documents and its children",
++    "sourceUnsupported": "We don't support chatting with databases at this time",
++    "regenerate": "Try again",
++    "addToPageButton": "Add to page",
++    "addToPageTitle": "Add message to...",
++    "addToNewPage": "Add to a new page",
++    "addToNewPageName": "Messages extracted from \"{}\""
+   },
+   "trash": {
+     "text": "Trash",

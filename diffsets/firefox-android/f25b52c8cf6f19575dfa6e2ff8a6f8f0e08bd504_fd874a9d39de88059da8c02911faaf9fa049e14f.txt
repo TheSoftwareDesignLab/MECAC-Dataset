@@ -1,0 +1,297 @@
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/activity/IntentReceiverActivity.kt b/focus-android/app/src/main/java/org/mozilla/focus/activity/IntentReceiverActivity.kt
+index c7d7eff71ad9..bc9f79c819a2 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/activity/IntentReceiverActivity.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/activity/IntentReceiverActivity.kt
+@@ -7,7 +7,6 @@ package org.mozilla.focus.activity
+ import android.app.Activity
+ import android.content.Intent
+ import android.os.Bundle
+-import mozilla.components.browser.session.Session
+ import mozilla.components.support.utils.SafeIntent
+ import org.mozilla.focus.ext.components
+ import org.mozilla.focus.session.IntentProcessor
+@@ -17,7 +16,9 @@ import org.mozilla.focus.utils.SupportUtils
+  * This activity receives VIEW intents and either forwards them to MainActivity or CustomTabActivity.
+  */
+ class IntentReceiverActivity : Activity() {
+-    private val intentProcessor by lazy { IntentProcessor(this, components.sessionManager) }
++    private val intentProcessor by lazy {
++        IntentProcessor(this, components.tabsUseCases, components.customTabsUseCases)
++    }
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+@@ -29,10 +30,10 @@ class IntentReceiverActivity : Activity() {
+             return
+         }
+ 
+-        val session = intentProcessor.handleIntent(this, intent, savedInstanceState)
++        val result = intentProcessor.handleIntent(this, intent, savedInstanceState)
+ 
+-        if (session?.isCustomTabSession() == true) {
+-            dispatchCustomTabsIntent(session)
++        if (result is IntentProcessor.Result.CustomTab) {
++            dispatchCustomTabsIntent(result.id)
+         } else {
+             dispatchNormalIntent()
+         }
+@@ -40,14 +41,14 @@ class IntentReceiverActivity : Activity() {
+         finish()
+     }
+ 
+-    private fun dispatchCustomTabsIntent(session: Session) {
++    private fun dispatchCustomTabsIntent(tabId: String) {
+         val intent = Intent(intent)
+ 
+         intent.setClassName(applicationContext, CustomTabActivity::class.java.name)
+ 
+         // We are adding a generated custom tab ID to the intent here. CustomTabActivity will
+         // use this ID to later decide what session to display once it is created.
+-        intent.putExtra(CustomTabActivity.CUSTOM_TAB_ID, session.id)
++        intent.putExtra(CustomTabActivity.CUSTOM_TAB_ID, tabId)
+ 
+         startActivity(intent)
+     }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
+index 1cf76f5f91e9..ba66448cc4be 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
+@@ -41,7 +41,9 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+     protected open val currentTabForActivity: SessionState?
+         get() = components.store.state.selectedTab
+ 
+-    private val intentProcessor by lazy { IntentProcessor(this, components.sessionManager) }
++    private val intentProcessor by lazy {
++        IntentProcessor(this, components.tabsUseCases, components.customTabsUseCases)
++    }
+ 
+     private var previousSessionCount = 0
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/session/IntentProcessor.kt b/focus-android/app/src/main/java/org/mozilla/focus/session/IntentProcessor.kt
+index 57be13ecc55c..39e5d7a22b3d 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/session/IntentProcessor.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/session/IntentProcessor.kt
+@@ -8,19 +8,17 @@ import android.content.Context
+ import android.content.Intent
+ import android.os.Bundle
+ import android.text.TextUtils
+-import mozilla.components.browser.session.Session
+-import mozilla.components.browser.session.SessionManager
+-import mozilla.components.browser.state.action.ContentAction
+ import mozilla.components.browser.state.state.SessionState
+ import mozilla.components.feature.customtabs.createCustomTabConfigFromIntent
+ import mozilla.components.feature.customtabs.isCustomTabIntent
++import mozilla.components.feature.tabs.CustomTabsUseCases
++import mozilla.components.feature.tabs.TabsUseCases
+ import mozilla.components.support.utils.SafeIntent
+ import mozilla.components.support.utils.WebURLFinder
+ import org.mozilla.focus.activity.TextActionActivity
+ import org.mozilla.focus.ext.components
+ import org.mozilla.focus.shortcut.HomeScreen
+ import org.mozilla.focus.utils.UrlUtils
+-import org.mozilla.focus.utils.createTab
+ 
+ /**
+  * Implementation moved from Focus SessionManager. To be replaced with SessionIntentProcessor from feature-session
+@@ -28,23 +26,30 @@ import org.mozilla.focus.utils.createTab
+  */
+ class IntentProcessor(
+     private val context: Context,
+-    private val sessionManager: SessionManager
++    private val tabsUseCases: TabsUseCases,
++    private val customTabsUseCases: CustomTabsUseCases
+ ) {
++    sealed class Result {
++        object None : Result()
++        data class Tab(val id: String) : Result()
++        data class CustomTab(val id: String) : Result()
++    }
++
+     /**
+      * Handle this incoming intent (via onCreate()) and create a new session if required.
+      */
+-    fun handleIntent(context: Context, intent: SafeIntent, savedInstanceState: Bundle?): Session? {
++    fun handleIntent(context: Context, intent: SafeIntent, savedInstanceState: Bundle?): Result {
+         if ((intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) {
+             // This Intent was launched from history (recent apps). Android will redeliver the
+             // original Intent (which might be a VIEW intent). However if there's no active browsing
+             // session then we do not want to re-process the Intent and potentially re-open a website
+             // from a session that the user already "erased".
+-            return null
++            return Result.None
+         }
+ 
+         if (savedInstanceState != null) {
+             // We are restoring a previous session - No need to handle this Intent.
+-            return null
++            return Result.None
+         }
+ 
+         return createSessionFromIntent(context, intent)
+@@ -58,7 +63,7 @@ class IntentProcessor(
+     }
+ 
+     @Suppress("ComplexMethod", "ReturnCount")
+-    private fun createSessionFromIntent(context: Context, intent: SafeIntent): Session? {
++    private fun createSessionFromIntent(context: Context, intent: SafeIntent): Result {
+         val action = intent.action
+ 
+         when (action) {
+@@ -66,21 +71,21 @@ class IntentProcessor(
+                 val dataString = intent.dataString
+                 if (TextUtils.isEmpty(dataString)) {
+                     // If there's no URL in the Intent then we can't create a session.
+-                    return null
++                    return Result.None
+                 }
+ 
+                 return when {
+                     intent.hasExtra(HomeScreen.ADD_TO_HOMESCREEN_TAG) -> {
+-                        val blockingEnabled =
+-                            intent.getBooleanExtra(HomeScreen.BLOCKING_ENABLED, true)
+                         val requestDesktop =
+                             intent.getBooleanExtra(HomeScreen.REQUEST_DESKTOP, false)
+ 
++                        // Ignoring, because exception!
++                        // HomeScreen.BLOCKING_ENABLED
++
+                         createSession(
+                             SessionState.Source.HOME_SCREEN,
+                             intent,
+                             intent.dataString ?: "",
+-                            blockingEnabled,
+                             requestDesktop
+                         )
+                     }
+@@ -100,7 +105,7 @@ class IntentProcessor(
+             Intent.ACTION_SEND -> {
+                 val dataString = intent.getStringExtra(Intent.EXTRA_TEXT)
+                 if (TextUtils.isEmpty(dataString)) {
+-                    return null
++                    return Result.None
+                 }
+ 
+                 return if (!UrlUtils.isUrl(dataString)) {
+@@ -118,37 +123,39 @@ class IntentProcessor(
+                 }
+             }
+ 
+-            else -> return null
++            else -> return Result.None
+         }
+     }
+ 
+-    private fun createSession(source: SessionState.Source, url: String): Session {
+-        return createTab(url, source = source).apply {
+-            sessionManager.add(this, selected = true)
+-        }
++    private fun createSession(source: SessionState.Source, url: String): Result {
++        return Result.Tab(tabsUseCases.addPrivateTab(
++            url,
++            source = source,
++            selectTab = true
++        ))
+     }
+ 
+-    private fun createSearchSession(source: SessionState.Source, url: String, searchTerms: String): Session {
+-        return createTab(url, source = source).apply {
+-            sessionManager.add(this, selected = true)
+-
+-            context.components.store.dispatch(ContentAction.UpdateSearchTermsAction(
+-                id,
+-                searchTerms
+-            ))
+-        }
++    private fun createSearchSession(source: SessionState.Source, url: String, searchTerms: String): Result {
++        return Result.Tab(tabsUseCases.addPrivateTab(
++            url,
++            source = source,
++            searchTerms = searchTerms
++        ))
+     }
+ 
+-    private fun createSession(source: SessionState.Source, intent: SafeIntent, url: String): Session {
++    private fun createSession(source: SessionState.Source, intent: SafeIntent, url: String): Result {
+         return if (isCustomTabIntent(intent.unsafe)) {
+-            createTab(url, source = SessionState.Source.CUSTOM_TAB).apply {
+-                customTabConfig = createCustomTabConfigFromIntent(intent.unsafe, context.resources)
+-                sessionManager.add(this, selected = false)
+-            }
++            Result.CustomTab(customTabsUseCases.add(
++                url,
++                createCustomTabConfigFromIntent(intent.unsafe, context.resources),
++                private = true
++            ))
+         } else {
+-            createTab(url, source = source).apply {
+-                sessionManager.add(this, selected = true)
+-            }
++            Result.Tab(tabsUseCases.addPrivateTab(
++                url,
++                source = source,
++                selectTab = true
++            ))
+         }
+     }
+ 
+@@ -156,24 +163,27 @@ class IntentProcessor(
+         source: SessionState.Source,
+         intent: SafeIntent,
+         url: String,
+-        blockingEnabled: Boolean,
+         requestDesktop: Boolean
+-    ): Session {
+-        val session = if (isCustomTabIntent(intent)) {
+-            createTab(url, source = SessionState.Source.CUSTOM_TAB).apply {
+-                customTabConfig = createCustomTabConfigFromIntent(intent.unsafe, context.resources)
+-            }
++    ): Result {
++        val (result, tabId) = if (isCustomTabIntent(intent)) {
++            val tabId = customTabsUseCases.add(
++                url,
++                createCustomTabConfigFromIntent(intent.unsafe, context.resources),
++                private = true
++            )
++            Pair(Result.CustomTab(tabId), tabId)
+         } else {
+-            createTab(url, source = source)
++            val tabId = tabsUseCases.addPrivateTab(
++                url,
++                source = source
++            )
++            Pair(Result.Tab(tabId), tabId)
+         }
+-        session.trackerBlockingEnabled = blockingEnabled
+-
+-        sessionManager.add(session, selected = !session.isCustomTabSession())
+ 
+         if (requestDesktop) {
+-            context.components.sessionUseCases.requestDesktopSite(requestDesktop, session)
++            context.components.sessionUseCases.requestDesktopSite(requestDesktop, tabId)
+         }
+ 
+-        return session
++        return result
+     }
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/utils/TabUtils.kt b/focus-android/app/src/main/java/org/mozilla/focus/utils/TabUtils.kt
+deleted file mode 100644
+index 87da8005cdfa..000000000000
+--- a/focus-android/app/src/main/java/org/mozilla/focus/utils/TabUtils.kt
++++ /dev/null
+@@ -1,15 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-package org.mozilla.focus.utils
+-
+-import mozilla.components.browser.session.Session
+-import mozilla.components.browser.state.state.SessionState
+-
+-fun createTab(
+-    url: String,
+-    source: SessionState.Source = SessionState.Source.NONE
+-): Session {
+-    return Session(url, source = source, private = true)
+-}

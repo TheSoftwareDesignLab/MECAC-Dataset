@@ -1,0 +1,509 @@
+diff --git a/app/src/main/java/com/todoroo/astrid/activity/TaskListFragment.java b/app/src/main/java/com/todoroo/astrid/activity/TaskListFragment.java
+index 9ced83834c..60c7bd7420 100644
+--- a/app/src/main/java/com/todoroo/astrid/activity/TaskListFragment.java
++++ b/app/src/main/java/com/todoroo/astrid/activity/TaskListFragment.java
+@@ -652,18 +652,6 @@ public void onActivityResult(int requestCode, int resultCode, Intent data) {
+           finishActionMode();
+         }
+         break;
+-      case REQUEST_DUE_DATE:
+-        if (resultCode == RESULT_OK) {
+-          long taskId = data.getLongExtra(DateTimePicker.EXTRA_TASK, 0L);
+-          Task task = taskDao.fetch(taskId);
+-          long dueDate = data.getLongExtra(DateTimePicker.EXTRA_TIMESTAMP, 0L);
+-          if (newDateTime(dueDate).isAfterNow()) {
+-            notificationManager.cancel(task.getId());
+-          }
+-          task.setDueDateAdjustingHideUntil(dueDate);
+-          taskDao.save(task);
+-        }
+-        break;
+       default:
+         super.onActivityResult(requestCode, resultCode, data);
+     }
+@@ -815,8 +803,6 @@ public void showDateTimePicker(TaskContainer task) {
+     FragmentManager fragmentManager = getParentFragmentManager();
+     if (fragmentManager.findFragmentByTag(FRAG_TAG_DATE_TIME_PICKER) == null) {
+       DateTimePicker.Companion.newDateTimePicker(
+-              this,
+-              REQUEST_DUE_DATE,
+               task.getId(),
+               task.getDueDate(),
+               preferences.getBoolean(R.string.p_auto_dismiss_datetime_list_screen, false))
+diff --git a/app/src/main/java/org/tasks/dialogs/DateTimePicker.kt b/app/src/main/java/org/tasks/dialogs/DateTimePicker.kt
+index a3db1974e5..1f9702c3fa 100644
+--- a/app/src/main/java/org/tasks/dialogs/DateTimePicker.kt
++++ b/app/src/main/java/org/tasks/dialogs/DateTimePicker.kt
+@@ -21,6 +21,7 @@ import com.google.android.material.bottomsheet.BottomSheetDialog
+ import com.todoroo.andlib.utility.AndroidUtilities
+ import com.todoroo.andlib.utility.AndroidUtilities.atLeastMarshmallow
+ import com.todoroo.andlib.utility.DateUtilities
++import com.todoroo.astrid.dao.TaskDao
+ import com.todoroo.astrid.data.Task
+ import org.tasks.R
+ import org.tasks.databinding.DialogDateTimePickerBinding
+@@ -30,7 +31,9 @@ import org.tasks.dialogs.MyTimePickerDialog.newTimePicker
+ import org.tasks.injection.DialogFragmentComponent
+ import org.tasks.injection.InjectingBottomSheetDialogFragment
+ import org.tasks.locale.Locale
++import org.tasks.notifications.NotificationManager
+ import org.tasks.preferences.Preferences
++import org.tasks.themes.Theme
+ import org.tasks.time.DateTime
+ import org.threeten.bp.format.FormatStyle
+ import javax.inject.Inject
+@@ -40,6 +43,9 @@ class DateTimePicker : InjectingBottomSheetDialogFragment() {
+     @Inject lateinit var activity: Activity
+     @Inject lateinit var preferences: Preferences
+     @Inject lateinit var locale: Locale
++    @Inject lateinit var taskDao: TaskDao
++    @Inject lateinit var notificationManager: NotificationManager
++    @Inject lateinit var theme: Theme
+ 
+     lateinit var binding: DialogDateTimePickerBinding
+     private var customDate: DateTime? = null
+@@ -52,6 +58,11 @@ class DateTimePicker : InjectingBottomSheetDialogFragment() {
+     private var afternoon = 46801000
+     private var evening = 61201000
+     private var night = 72001000
++    private var onDismissHandler: OnDismissHandler? = null
++
++    interface OnDismissHandler {
++        fun onDismiss()
++    }
+ 
+     companion object {
+         const val EXTRA_TIMESTAMP = "extra_timestamp"
+@@ -63,20 +74,29 @@ class DateTimePicker : InjectingBottomSheetDialogFragment() {
+         private const val FRAG_TAG_TIME_PICKER = "frag_tag_time_picker"
+         private const val FRAG_TAG_DATE_PICKER = "frag_tag_date_picker"
+ 
+-        fun newDateTimePicker(target: Fragment, rc: Int, task: Long, current: Long, autoClose: Boolean): DateTimePicker {
++        fun newDateTimePicker(task: Long, current: Long, autoClose: Boolean): DateTimePicker {
+             val bundle = Bundle()
+             bundle.putLong(EXTRA_TASK, task)
+             bundle.putLong(EXTRA_TIMESTAMP, current)
+             bundle.putBoolean(EXTRA_AUTO_CLOSE, autoClose)
+             val fragment = DateTimePicker()
+             fragment.arguments = bundle
++            return fragment
++        }
++
++        fun newDateTimePicker(target: Fragment, rc: Int, current: Long, autoClose: Boolean): DateTimePicker {
++            val bundle = Bundle()
++            bundle.putLong(EXTRA_TIMESTAMP, current)
++            bundle.putBoolean(EXTRA_AUTO_CLOSE, autoClose)
++            val fragment = DateTimePicker()
++            fragment.arguments = bundle
+             fragment.setTargetFragment(target, rc)
+             return fragment
+         }
+     }
+ 
+     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
+-        binding = DialogDateTimePickerBinding.inflate(inflater)
++        binding = DialogDateTimePickerBinding.inflate(theme.getLayoutInflater(context))
+         if (AndroidUtilities.preMarshmallow()) {
+             binding.shortcuts.pickDateButton.visibility = View.VISIBLE
+         }
+@@ -110,6 +130,14 @@ class DateTimePicker : InjectingBottomSheetDialogFragment() {
+         return binding.root
+     }
+ 
++    override fun onAttach(activity: Activity) {
++        super.onAttach(activity)
++
++        if (activity is OnDismissHandler) {
++            onDismissHandler = activity
++        }
++    }
++
+     private fun closeAutomatically(): Boolean = arguments?.getBoolean(EXTRA_AUTO_CLOSE) ?: false
+ 
+     override fun onResume() {
+@@ -222,13 +250,31 @@ class DateTimePicker : InjectingBottomSheetDialogFragment() {
+     }
+ 
+     private fun sendSelected() {
+-        val intent = Intent()
+-        intent.putExtra(EXTRA_TIMESTAMP, selected?.millis ?: 0)
+-        intent.putExtra(EXTRA_TASK, arguments?.getLong(EXTRA_TASK) ?: 0)
+-        targetFragment?.onActivityResult(targetRequestCode, RESULT_OK, intent)
++        val taskId = arguments?.getLong(EXTRA_TASK) ?: 0
++        val dueDate = selected?.millis ?: 0
++        if (dueDate != arguments?.getLong(EXTRA_TIMESTAMP)) {
++            if (taskId > 0) {
++                val task: Task = taskDao.fetch(taskId)
++                if (newDateTime(dueDate).isAfterNow) {
++                    notificationManager.cancel(task.getId())
++                }
++                task.setDueDateAdjustingHideUntil(dueDate)
++                taskDao.save(task)
++            } else {
++                val intent = Intent()
++                intent.putExtra(EXTRA_TIMESTAMP, dueDate)
++                targetFragment?.onActivityResult(targetRequestCode, RESULT_OK, intent)
++            }
++        }
+         dismiss()
+     }
+ 
++    override fun onDismiss(dialog: DialogInterface) {
++        super.onDismiss(dialog)
++
++        onDismissHandler?.onDismiss()
++    }
++
+     override fun onCancel(dialog: DialogInterface) = sendSelected()
+ 
+     override fun onSaveInstanceState(outState: Bundle) {
+@@ -259,7 +305,7 @@ class DateTimePicker : InjectingBottomSheetDialogFragment() {
+                 .findViewById<CoordinatorLayout>(com.google.android.material.R.id.coordinator)
+         val containerLayout =
+                 dialog.findViewById<FrameLayout>(com.google.android.material.R.id.container)
+-        val buttons = dialog.layoutInflater.inflate(R.layout.dialog_date_time_picker_buttons, null)
++        val buttons = theme.getLayoutInflater(context).inflate(R.layout.dialog_date_time_picker_buttons, null)
+         buttons.findViewById<View>(R.id.cancel_button).setOnClickListener { dismiss() }
+         buttons.findViewById<View>(R.id.ok_button).setOnClickListener { sendSelected() }
+         buttons.layoutParams = FrameLayout.LayoutParams(
+diff --git a/app/src/main/java/org/tasks/preferences/fragments/ScrollableWidget.kt b/app/src/main/java/org/tasks/preferences/fragments/ScrollableWidget.kt
+index a3c9166220..6bd4b06ccd 100644
+--- a/app/src/main/java/org/tasks/preferences/fragments/ScrollableWidget.kt
++++ b/app/src/main/java/org/tasks/preferences/fragments/ScrollableWidget.kt
+@@ -81,6 +81,7 @@ class ScrollableWidget : InjectingPreferenceFragment() {
+         setupCheckbox(R.string.p_widget_show_full_description, false).dependency = showDescription.key
+         setupList(R.string.p_widget_spacing)
+         setupList(R.string.p_widget_footer_click)
++        setupList(R.string.p_widget_due_date_click)
+         setupList(R.string.p_widget_due_date_position, widgetPreferences.dueDatePosition.toString())
+         val showHeader = setupCheckbox(R.string.p_widget_show_header)
+         val showSettings = setupCheckbox(R.string.p_widget_show_settings)
+diff --git a/app/src/main/java/org/tasks/ui/DeadlineControlSet.java b/app/src/main/java/org/tasks/ui/DeadlineControlSet.java
+index 887f0a3ae9..95a67915d1 100644
+--- a/app/src/main/java/org/tasks/ui/DeadlineControlSet.java
++++ b/app/src/main/java/org/tasks/ui/DeadlineControlSet.java
+@@ -79,7 +79,6 @@ protected void onRowClick() {
+       DateTimePicker.Companion.newDateTimePicker(
+           this,
+           REQUEST_DATE,
+-          0,
+           getDueDateTime(),
+           preferences.getBoolean(R.string.p_auto_dismiss_datetime_edit_screen, false))
+           .show(fragmentManager, FRAG_TAG_DATE_PICKER);
+diff --git a/app/src/main/java/org/tasks/widget/ScrollableViewsFactory.java b/app/src/main/java/org/tasks/widget/ScrollableViewsFactory.java
+index 771bd7fb22..45a38f4bfb 100644
+--- a/app/src/main/java/org/tasks/widget/ScrollableViewsFactory.java
++++ b/app/src/main/java/org/tasks/widget/ScrollableViewsFactory.java
+@@ -211,12 +211,19 @@ private RemoteViews buildUpdate(int position) {
+       int hPad = (int) context.getResources().getDimension(R.dimen.widget_padding);
+       int vPad = widgetPreferences.getWidgetSpacing();
+       row.setViewPadding(R.id.widget_complete_box, hPad, vPad, hPad, vPad);
++      row.setViewPadding(R.id.widget_due_end, hPad, vPad, hPad, vPad);
+       if (showCheckboxes) {
+         row.setViewVisibility(R.id.widget_complete_box, View.VISIBLE);
+         Intent completeIntent = new Intent(WidgetClickActivity.COMPLETE_TASK);
+         completeIntent.putExtra(WidgetClickActivity.EXTRA_TASK, task);
+         row.setOnClickFillInIntent(R.id.widget_complete_box, completeIntent);
+         row.setViewPadding(R.id.start_padding, 0, 0, 0, 0);
++        row.setInt(
++            R.id.widget_complete_box,
++            "setBackgroundResource",
++            theme == 0
++                ? R.drawable.widget_ripple_circle_light
++                : R.drawable.widget_ripple_circle_dark);
+       } else {
+         row.setViewVisibility(R.id.widget_complete_box, View.GONE);
+         row.setViewPadding(R.id.start_padding, hPad, 0, 0, 0);
+@@ -306,6 +313,9 @@ private void formatDueDate(RemoteViews row, Task task) {
+     int dueDateRes = bottomDueDate ? R.id.widget_due_bottom : R.id.widget_due_end;
+     row.setViewVisibility(bottomDueDate ? R.id.widget_due_end : R.id.widget_due_bottom, View.GONE);
+     if (task.hasDueDate()) {
++      if (!bottomDueDate) {
++        row.setViewPadding(R.id.widget_text, 0, 0, 0, 0);
++      }
+       row.setViewVisibility(dueDateRes, View.VISIBLE);
+       row.setTextViewText(
+           dueDateRes,
+@@ -318,6 +328,17 @@ private void formatDueDate(RemoteViews row, Task task) {
+     } else {
+       row.setViewVisibility(dueDateRes, View.GONE);
+     }
++    if (widgetPreferences.rescheduleOnDueDateClick()) {
++      row.setInt(
++          dueDateRes,
++          "setBackgroundResource",
++          widgetPreferences.getThemeIndex() == 0
++              ? R.drawable.widget_ripple_circle_light
++              : R.drawable.widget_ripple_circle_dark);
++      Intent intent = new Intent(WidgetClickActivity.RESCHEDULE_TASK);
++      intent.putExtra(WidgetClickActivity.EXTRA_TASK, task);
++      row.setOnClickFillInIntent(dueDateRes, intent);
++    }
+   }
+ 
+   private void updateSettings() {
+diff --git a/app/src/main/java/org/tasks/widget/WidgetClickActivity.java b/app/src/main/java/org/tasks/widget/WidgetClickActivity.java
+index 7977828360..3ad82a101d 100644
+--- a/app/src/main/java/org/tasks/widget/WidgetClickActivity.java
++++ b/app/src/main/java/org/tasks/widget/WidgetClickActivity.java
+@@ -2,28 +2,36 @@
+ 
+ import android.content.Intent;
+ import android.os.Bundle;
++import androidx.fragment.app.FragmentManager;
+ import com.google.common.base.Strings;
+ import com.todoroo.astrid.dao.TaskDao;
+ import com.todoroo.astrid.data.Task;
+ import com.todoroo.astrid.service.TaskCompleter;
+ import javax.inject.Inject;
+ import org.tasks.LocalBroadcastManager;
++import org.tasks.R;
++import org.tasks.dialogs.DateTimePicker;
+ import org.tasks.injection.ActivityComponent;
+ import org.tasks.injection.InjectingAppCompatActivity;
+ import org.tasks.intents.TaskIntents;
++import org.tasks.preferences.Preferences;
+ 
+-public class WidgetClickActivity extends InjectingAppCompatActivity {
++public class WidgetClickActivity extends InjectingAppCompatActivity
++    implements DateTimePicker.OnDismissHandler {
+ 
+   public static final String COMPLETE_TASK = "COMPLETE_TASK";
+   public static final String EDIT_TASK = "EDIT_TASK";
+   public static final String TOGGLE_SUBTASKS = "TOGGLE_SUBTASKS";
++  public static final String RESCHEDULE_TASK = "RESCHEDULE_TASK";
+   public static final String EXTRA_FILTER = "extra_filter";
+   public static final String EXTRA_TASK = "extra_task"; // $NON-NLS-1$
+   public static final String EXTRA_COLLAPSED = "extra_collapsed";
++  private static final String FRAG_TAG_DATE_TIME_PICKER = "frag_tag_date_time_picker";
+ 
+   @Inject TaskCompleter taskCompleter;
+   @Inject TaskDao taskDao;
+   @Inject LocalBroadcastManager localBroadcastManager;
++  @Inject Preferences preferences;
+ 
+   @Override
+   protected void onCreate(Bundle savedInstanceState) {
+@@ -42,6 +50,7 @@ protected void onCreate(Bundle savedInstanceState) {
+     switch (action) {
+       case COMPLETE_TASK:
+         taskCompleter.setComplete(task, !task.isCompleted());
++        finish();
+         break;
+       case EDIT_TASK:
+         startActivity(
+@@ -49,18 +58,33 @@ protected void onCreate(Bundle savedInstanceState) {
+                 this,
+                 intent.getParcelableExtra(EXTRA_FILTER),
+                 intent.getParcelableExtra(EXTRA_TASK)));
++        finish();
+         break;
+       case TOGGLE_SUBTASKS:
+         taskDao.setCollapsed(task.getId(), intent.getBooleanExtra(EXTRA_COLLAPSED, false));
+         localBroadcastManager.broadcastRefresh();
++        finish();
++        break;
++      case RESCHEDULE_TASK:
++        FragmentManager fragmentManager = getSupportFragmentManager();
++        if (fragmentManager.findFragmentByTag(FRAG_TAG_DATE_TIME_PICKER) == null) {
++          DateTimePicker.Companion.newDateTimePicker(
++              task.getId(),
++              task.getDueDate(),
++              preferences.getBoolean(R.string.p_auto_dismiss_datetime_widget, false))
++              .show(fragmentManager, FRAG_TAG_DATE_TIME_PICKER);
++        }
+         break;
+     }
+-
+-    finish();
+   }
+ 
+   @Override
+   public void inject(ActivityComponent component) {
+     component.inject(this);
+   }
++
++  @Override
++  public void onDismiss() {
++    finish();
++  }
+ }
+diff --git a/app/src/main/java/org/tasks/widget/WidgetPreferences.java b/app/src/main/java/org/tasks/widget/WidgetPreferences.java
+index 6cb40677a0..b8a8b8036b 100644
+--- a/app/src/main/java/org/tasks/widget/WidgetPreferences.java
++++ b/app/src/main/java/org/tasks/widget/WidgetPreferences.java
+@@ -106,6 +106,10 @@ boolean openOnFooterClick() {
+     return getIntegerFromString(R.string.p_widget_footer_click, 0) == 1;
+   }
+ 
++  boolean rescheduleOnDueDateClick() {
++    return getIntegerFromString(R.string.p_widget_due_date_click, 0) == 0;
++  }
++
+   private int getAlphaValue(int resId) {
+     return (int) (getInt(resId, 100) / 100.0 * 255.0);
+   }
+diff --git a/app/src/main/res/drawable-v21/widget_ripple_circle_dark.xml b/app/src/main/res/drawable-v21/widget_ripple_circle_dark.xml
+new file mode 100644
+index 0000000000..267782c1e7
+--- /dev/null
++++ b/app/src/main/res/drawable-v21/widget_ripple_circle_dark.xml
+@@ -0,0 +1,3 @@
++<?xml version="1.0" encoding="utf-8"?>
++<ripple android:color="@color/ripple_material_dark"
++  xmlns:android="http://schemas.android.com/apk/res/android" />
+\ No newline at end of file
+diff --git a/app/src/main/res/drawable-v21/widget_ripple_circle_light.xml b/app/src/main/res/drawable-v21/widget_ripple_circle_light.xml
+new file mode 100644
+index 0000000000..4210d878fb
+--- /dev/null
++++ b/app/src/main/res/drawable-v21/widget_ripple_circle_light.xml
+@@ -0,0 +1,3 @@
++<?xml version="1.0" encoding="utf-8"?>
++<ripple android:color="@color/ripple_material_light"
++  xmlns:android="http://schemas.android.com/apk/res/android" />
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/widget_row.xml b/app/src/main/res/layout/widget_row.xml
+index 2baa667dc6..c7e7fddc4a 100644
+--- a/app/src/main/res/layout/widget_row.xml
++++ b/app/src/main/res/layout/widget_row.xml
+@@ -40,14 +40,13 @@
+     android:layout_height="wrap_content"
+     android:layout_alignBaseline="@id/widget_text"
+     android:layout_alignParentEnd="true"
+-    android:paddingStart="0dp"
+-    android:paddingEnd="@dimen/widget_padding"
+     android:ellipsize="end"
+     android:gravity="start|center_vertical"
+     android:singleLine="true"
+     android:textAlignment="viewStart"
+     android:textSize="14sp"
+-    tools:text="Tomorrow" />
++    tools:text="Tomorrow"
++    tools:paddingEnd="@dimen/widget_padding"/>
+ 
+   <ImageView
+     android:id="@+id/hidden_icon"
+diff --git a/app/src/main/res/values/keys.xml b/app/src/main/res/values/keys.xml
+index caf786325d..dd54f916d0 100644
+--- a/app/src/main/res/values/keys.xml
++++ b/app/src/main/res/values/keys.xml
+@@ -132,6 +132,16 @@
+     <item>1</item>
+   </string-array>
+ 
++  <string-array name="widget_due_date_click_titles">
++    <item>@string/widget_due_date_reschedule</item>
++    <item>@string/widget_do_nothing</item>
++  </string-array>
++
++  <string-array name="widget_due_date_click_values">
++    <item>0</item>
++    <item>1</item>
++  </string-array>
++
+   <string-array name="widget_due_date_position_values">
+     <item>0</item>
+     <item>1</item>
+@@ -302,6 +312,7 @@
+   <string name="p_widget_header_opacity">widget-header-opacity-</string>
+   <string name="p_widget_footer_opacity">widget-empty-space-opacity-</string>
+   <string name="p_widget_footer_click">widget-empty-space-click-</string>
++  <string name="p_widget_due_date_click">widget-due-date-click-</string>
+   <string name="p_widget_due_date_position">widget-due-date-position-</string>
+   <string name="p_widget_spacing">widget-spacing-</string>
+   <string name="p_dashclock_filter">dashclock_filter</string>
+@@ -346,5 +357,6 @@
+   <string name="p_collapse_locations">collapse_locations</string>
+   <string name="p_auto_dismiss_datetime_edit_screen">auto_dismiss_datetime_edit_screen</string>
+   <string name="p_auto_dismiss_datetime_list_screen">auto_dismiss_datetime_list_screen</string>
++  <string name="p_auto_dismiss_datetime_widget">auto_dismiss_datetime_widget</string>
+   <string name="p_hide_check_button">Hide check button</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index faf8f792ea..7f6a7bb174 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -415,9 +415,11 @@ File %1$s contained %2$s.\n\n
+   <string name="widget_header_settings">Header settings</string>
+   <string name="widget_row_settings">Row settings</string>
+   <string name="widget_footer_settings">Footer settings</string>
++  <string name="widget_footer">Footer</string>
+   <string name="widget_on_click">On click</string>
+   <string name="widget_do_nothing">Do nothing</string>
+   <string name="widget_open_list">Open list</string>
++  <string name="widget_due_date_reschedule">Reschedule task</string>
+   <string name="widget_due_date_after_title">After title</string>
+   <string name="widget_due_date_below_title">Below title</string>
+   <string name="widget_due_date_hidden">Hidden</string>
+@@ -588,8 +590,12 @@ File %1$s contained %2$s.\n\n
+   <string name="shortcut_pick_time">Pick time</string>
+   <string name="shortcut_pick_date">Pick date</string>
+   <string name="auto_dismiss_datetime">Autoclose date time picker</string>
+-  <string name="auto_dismiss_datetime_list">Autoclose from list screen</string>
+-  <string name="auto_dismiss_datetime_edit">Autoclose from edit screen</string>
++  <string name="auto_dismiss_datetime_list">Task list</string>
++  <string name="auto_dismiss_datetime_list_summary">Autoclose when picking from task list</string>
++  <string name="auto_dismiss_datetime_edit">Task edit</string>
++  <string name="auto_dismiss_datetime_edit_summary">Autoclose when picking from task edit</string>
++  <string name="auto_dismiss_datetime_widget">Widget</string>
++  <string name="auto_dismiss_datetime_widget_summary">Autoclose when picking from widget</string>
+   <string name="auto_dismiss_datetime_summary">Close date time picker after selecting a date or time</string>
+   <string name="calendar_event_created">Calendar event created for %s</string>
+   <string name="select_all">Select all</string>
+diff --git a/app/src/main/res/xml/preferences_date_and_time.xml b/app/src/main/res/xml/preferences_date_and_time.xml
+index 8e889ab807..d024d8aeaf 100644
+--- a/app/src/main/res/xml/preferences_date_and_time.xml
++++ b/app/src/main/res/xml/preferences_date_and_time.xml
+@@ -37,12 +37,20 @@
+         <SwitchPreferenceCompat
+           android:defaultValue="false"
+           android:key="@string/p_auto_dismiss_datetime_list_screen"
+-          android:title="@string/auto_dismiss_datetime_list" />
++          android:title="@string/auto_dismiss_datetime_list"
++          android:summary="@string/auto_dismiss_datetime_list_summary" />
+ 
+         <SwitchPreferenceCompat
+           android:defaultValue="false"
+           android:key="@string/p_auto_dismiss_datetime_edit_screen"
+-          android:title="@string/auto_dismiss_datetime_edit" />
++          android:title="@string/auto_dismiss_datetime_edit"
++          android:summary="@string/auto_dismiss_datetime_edit_summary" />
++
++        <SwitchPreferenceCompat
++          android:defaultValue="false"
++          android:key="@string/p_auto_dismiss_datetime_widget"
++          android:title="@string/auto_dismiss_datetime_widget"
++          android:summary="@string/auto_dismiss_datetime_widget_summary" />
+ 
+     </PreferenceCategory>
+ 
+diff --git a/app/src/main/res/xml/preferences_widget.xml b/app/src/main/res/xml/preferences_widget.xml
+index 67be6299ee..03379e693b 100644
+--- a/app/src/main/res/xml/preferences_widget.xml
++++ b/app/src/main/res/xml/preferences_widget.xml
+@@ -124,14 +124,22 @@
+ 
+   </PreferenceCategory>
+ 
+-  <PreferenceCategory android:title="@string/widget_footer_settings">
++  <PreferenceCategory android:title="@string/widget_on_click">
++
++    <ListPreference
++      android:defaultValue="0"
++      android:key="@string/p_widget_due_date_click"
++      android:entryValues="@array/widget_due_date_click_values"
++      android:entries="@array/widget_due_date_click_titles"
++      android:title="@string/due_date"
++      android:summary="%s" />
+ 
+     <ListPreference
+       android:defaultValue="0"
+       android:key="@string/p_widget_footer_click"
+       android:entryValues="@array/widget_empty_click_values"
+       android:entries="@array/widget_empty_click_titles"
+-      android:title="@string/widget_on_click"
++      android:title="@string/widget_footer"
+       android:summary="%s" />
+ 
+   </PreferenceCategory>

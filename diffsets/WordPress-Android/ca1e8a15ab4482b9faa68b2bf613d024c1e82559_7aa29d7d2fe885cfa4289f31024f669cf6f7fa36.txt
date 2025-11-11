@@ -1,0 +1,385 @@
+diff --git a/WordPress/src/main/java/org/wordpress/android/modules/ApplicationModule.java b/WordPress/src/main/java/org/wordpress/android/modules/ApplicationModule.java
+index 7ffc8b0a391c..2245fe71f341 100644
+--- a/WordPress/src/main/java/org/wordpress/android/modules/ApplicationModule.java
++++ b/WordPress/src/main/java/org/wordpress/android/modules/ApplicationModule.java
+@@ -6,6 +6,7 @@
+ import androidx.lifecycle.LiveData;
+ 
+ import org.wordpress.android.ui.CommentFullScreenDialogFragment;
++import org.wordpress.android.ui.accounts.signup.SettingsUsernameChangerFragment;
+ import org.wordpress.android.ui.accounts.signup.UsernameChangerFullScreenDialogFragment;
+ import org.wordpress.android.ui.domains.DomainRegistrationDetailsFragment.CountryPickerDialogFragment;
+ import org.wordpress.android.ui.domains.DomainRegistrationDetailsFragment.StatePickerDialogFragment;
+@@ -83,7 +84,10 @@ public static NewsService provideLocalNewsService(Context context) {
+     abstract CommentFullScreenDialogFragment contributecommentFullScreenDialogFragment();
+ 
+     @ContributesAndroidInjector
+-    abstract UsernameChangerFullScreenDialogFragment contributeUpUsernameChangerFullScreenDialogFragment();
++    abstract UsernameChangerFullScreenDialogFragment contributeUsernameChangerFullScreenDialogFragment();
++
++    @ContributesAndroidInjector
++    abstract SettingsUsernameChangerFragment contributeSettingsUsernameChangerFragment();
+ 
+     @Provides
+     public static WizardManager<SiteCreationStep> provideWizardManager(
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/accounts/signup/BaseUsernameChangerFullScreenDialogFragment.java b/WordPress/src/main/java/org/wordpress/android/ui/accounts/signup/BaseUsernameChangerFullScreenDialogFragment.java
+index 56fcfc4583f4..c6f8affd7aa9 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/accounts/signup/BaseUsernameChangerFullScreenDialogFragment.java
++++ b/WordPress/src/main/java/org/wordpress/android/ui/accounts/signup/BaseUsernameChangerFullScreenDialogFragment.java
+@@ -108,7 +108,7 @@ public abstract class BaseUsernameChangerFullScreenDialogFragment extends Dagger
+      */
+     abstract Spanned getHeaderText(String username, String display);
+ 
+-    protected static Bundle newBundle(String displayName, String username) {
++    public static Bundle newBundle(String displayName, String username) {
+         Bundle bundle = new Bundle();
+         bundle.putString(EXTRA_DISPLAY_NAME, displayName);
+         bundle.putString(EXTRA_USERNAME, username);
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/accounts/signup/SettingsUsernameChangerFragment.kt b/WordPress/src/main/java/org/wordpress/android/ui/accounts/signup/SettingsUsernameChangerFragment.kt
+new file mode 100644
+index 000000000000..62f3db200857
+--- /dev/null
++++ b/WordPress/src/main/java/org/wordpress/android/ui/accounts/signup/SettingsUsernameChangerFragment.kt
+@@ -0,0 +1,176 @@
++package org.wordpress.android.ui.accounts.signup
++
++import android.app.ProgressDialog
++import android.os.Bundle
++import android.text.Editable
++import android.text.SpannableStringBuilder
++import android.text.Spanned
++import android.text.TextWatcher
++import android.view.ContextThemeWrapper
++import android.view.WindowManager
++import android.widget.EditText
++import android.widget.TextView
++import androidx.appcompat.app.AlertDialog
++import androidx.core.text.HtmlCompat
++import org.greenrobot.eventbus.Subscribe
++import org.greenrobot.eventbus.ThreadMode
++import org.wordpress.android.R
++import org.wordpress.android.R.string
++import org.wordpress.android.R.style
++import org.wordpress.android.analytics.AnalyticsTracker
++import org.wordpress.android.analytics.AnalyticsTracker.Stat
++import org.wordpress.android.analytics.AnalyticsTracker.Stat.SIGNUP_EMAIL_EPILOGUE_UPDATE_USERNAME_FAILED
++import org.wordpress.android.analytics.AnalyticsTracker.Stat.SIGNUP_SOCIAL_EPILOGUE_USERNAME_SUGGESTIONS_FAILED
++import org.wordpress.android.fluxc.generated.AccountActionBuilder
++import org.wordpress.android.fluxc.store.AccountStore.AccountUsernameActionType.KEEP_OLD_SITE_AND_ADDRESS
++import org.wordpress.android.fluxc.store.AccountStore.OnUsernameChanged
++import org.wordpress.android.fluxc.store.AccountStore.PushUsernamePayload
++import org.wordpress.android.ui.FullScreenDialogFragment.FullScreenDialogController
++import org.wordpress.android.util.ActivityUtils
++import org.wordpress.android.util.AppLog
++import org.wordpress.android.util.AppLog.T
++import org.wordpress.android.util.ToastUtils
++
++/**
++ * Allows the user to change their username from the Account Settings screen.
++ */
++class SettingsUsernameChangerFragment : BaseUsernameChangerFullScreenDialogFragment() {
++    private lateinit var dialogController: FullScreenDialogController
++    private var progressDialog: ProgressDialog? = null
++
++    override fun getSuggestionsFailedStat() = SIGNUP_SOCIAL_EPILOGUE_USERNAME_SUGGESTIONS_FAILED
++    override fun canHeaderTextLiveUpdate() = false
++    override fun getHeaderText(username: String?, display: String?): Spanned = HtmlCompat.fromHtml(
++            String.format(
++                    getString(string.settings_username_changer_header),
++                    "<b>",
++                    username,
++                    "</b>"
++            ), HtmlCompat.FROM_HTML_MODE_LEGACY
++    )
++
++    override fun onViewCreated(controller: FullScreenDialogController) {
++        super.onViewCreated(controller)
++        dialogController = controller
++    }
++
++    override fun onConfirmClicked(controller: FullScreenDialogController?): Boolean {
++        ActivityUtils.hideKeyboard(activity)
++        if (mUsernamesAdapter != null && mUsernamesAdapter.mItems != null) {
++            // Confirmation dialog is only shown is a new username is selected.
++            // Otherwise the user is prompted to select one.
++            if (mUsernameSelectedIndex != 0) {
++                val username = mUsernamesAdapter.mItems[mUsernamesAdapter.selectedItem]
++                showUsernameConfirmationDialog(username)
++            } else {
++                ToastUtils.showToast(activity, string.settings_username_changer_toast_content_new_username)
++            }
++        } else {
++            controller?.dismiss()
++        }
++
++        return true
++    }
++
++    /**
++     * Shows a confirmation dialog that prompts the user to verify that they want to change the username
++     * by providing a field for the user to type the username. Once the username is typed correctly
++     * the "Change Username" button becomes enabled and they are able to save their username.
++     */
++    private fun showUsernameConfirmationDialog(username: String) {
++        // Created a custom layout that includes an EditText and TextView to replicate the confirmation
++        // dialog functionality on iOS.
++        val layout = layoutInflater.inflate(R.layout.settings_username_changer_confirm_dialog, null)
++        val content = layout.findViewById<TextView>(R.id.content)
++        val usernameControl = layout.findViewById<EditText>(R.id.username_edit)
++
++        content.text = HtmlCompat.fromHtml(
++                String.format(
++                        getString(string.settings_username_changer_confirm_dialog_content),
++                        "<b>",
++                        username,
++                        "</b>"
++                ), HtmlCompat.FROM_HTML_MODE_LEGACY
++        )
++
++        AlertDialog.Builder(ContextThemeWrapper(activity, style.Calypso_Dialog_Alert)).apply {
++            setTitle(string.settings_username_changer_confirm_dialog_title)
++            setView(layout)
++            setPositiveButton(
++                    string.settings_username_changer_confirm_dialog_positive_action
++            ) { _, _ -> saveUsername(username) }
++            setNegativeButton(android.R.string.cancel, null)
++            create()
++        }.show().also { alertDialog ->
++            // The change username button is disabled at start.
++            val changeUsernameButton = alertDialog.getButton(AlertDialog.BUTTON_POSITIVE).apply {
++                isEnabled = false
++            }
++
++            // Toggles the enabled property of the button based on the correctness of the username being typed.
++            usernameControl.addTextChangedListener(object : TextWatcher {
++                override fun afterTextChanged(editable: Editable?) {
++                    editable?.let {
++                        changeUsernameButton.isEnabled = (it.toString() == username)
++                    }
++                }
++
++                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {
++                }
++
++                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
++                }
++            })
++            usernameControl.requestFocus()
++        }
++    }
++
++    private fun saveUsername(username: String) {
++        showProgress()
++        val payload = PushUsernamePayload(
++                username, KEEP_OLD_SITE_AND_ADDRESS
++        )
++        mDispatcher.dispatch(AccountActionBuilder.newPushUsernameAction(payload))
++    }
++
++    @Subscribe(threadMode = ThreadMode.MAIN)
++    fun onUsernameChanged(event: OnUsernameChanged) {
++        if (event.isError) {
++            AnalyticsTracker.track(SIGNUP_EMAIL_EPILOGUE_UPDATE_USERNAME_FAILED)
++            AppLog.e(
++                    T.API, "SettingsUsernameChangerFragment.onUsernameChanged: " +
++                    event.error.type + " - " + event.error.message
++            )
++            endProgress()
++            showErrorDialog(SpannableStringBuilder(getString(string.signup_epilogue_error_generic)))
++        } else if (event.username != null) {
++            val result = Bundle().apply { putString(RESULT_USERNAME, event.username) }
++            dialogController.confirm(result)
++            AnalyticsTracker.track(Stat.SIGNUP_EMAIL_EPILOGUE_UPDATE_USERNAME_SUCCEEDED)
++        }
++    }
++
++    fun showProgress() {
++        if (progressDialog == null || progressDialog?.window == null || progressDialog?.isShowing == false) {
++            progressDialog = ProgressDialog(context).apply {
++                isIndeterminate = true
++                setCancelable(true)
++                setMessage(getString(string.settings_username_changer_progress_dialog))
++            }
++        }
++        try {
++            if (progressDialog?.isShowing == false) {
++                progressDialog?.show()
++            }
++        } catch (e: WindowManager.BadTokenException) {
++            AppLog.e(T.NUX, e)
++        }
++    }
++
++    private fun endProgress() {
++        if (progressDialog != null && progressDialog?.isShowing == true && progressDialog?.window != null) {
++            progressDialog?.dismiss()
++        }
++        progressDialog = null
++    }
++}
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/prefs/AccountSettingsFragment.java b/WordPress/src/main/java/org/wordpress/android/ui/prefs/AccountSettingsFragment.java
+index 80da04c6178c..b195c8da27ff 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/prefs/AccountSettingsFragment.java
++++ b/WordPress/src/main/java/org/wordpress/android/ui/prefs/AccountSettingsFragment.java
+@@ -4,6 +4,7 @@
+ import android.os.AsyncTask;
+ import android.os.Bundle;
+ import android.preference.Preference;
++import android.preference.Preference.OnPreferenceChangeListener;
+ import android.preference.PreferenceFragment;
+ import android.text.InputType;
+ import android.text.TextUtils;
+@@ -14,6 +15,8 @@
+ import android.widget.EditText;
+ import android.widget.TextView;
+ 
++import androidx.annotation.Nullable;
++import androidx.appcompat.app.AppCompatActivity;
+ import androidx.coordinatorlayout.widget.CoordinatorLayout;
+ 
+ import com.google.android.material.snackbar.Snackbar;
+@@ -30,6 +33,10 @@
+ import org.wordpress.android.fluxc.store.AccountStore.OnAccountChanged;
+ import org.wordpress.android.fluxc.store.AccountStore.PushAccountSettingsPayload;
+ import org.wordpress.android.fluxc.store.SiteStore;
++import org.wordpress.android.ui.FullScreenDialogFragment;
++import org.wordpress.android.ui.FullScreenDialogFragment.OnConfirmListener;
++import org.wordpress.android.ui.accounts.signup.BaseUsernameChangerFullScreenDialogFragment;
++import org.wordpress.android.ui.accounts.signup.SettingsUsernameChangerFragment;
+ import org.wordpress.android.util.AppLog;
+ import org.wordpress.android.util.AppLog.T;
+ import org.wordpress.android.util.NetworkUtils;
+@@ -43,7 +50,8 @@
+ import javax.inject.Inject;
+ 
+ @SuppressWarnings("deprecation")
+-public class AccountSettingsFragment extends PreferenceFragment implements Preference.OnPreferenceChangeListener {
++public class AccountSettingsFragment extends PreferenceFragment implements OnPreferenceChangeListener,
++        OnConfirmListener {
+     private Preference mUsernamePreference;
+     private EditTextPreferenceWithValidation mEmailPreference;
+     private DetailListPreference mPrimarySitePreference;
+@@ -190,6 +198,7 @@ private void refreshAccountDetails() {
+         mWebAddressPreference.setSummary(account.getWebAddress());
+         changePrimaryBlogPreference(account.getPrimarySiteId());
+         checkIfEmailChangeIsPending();
++        checkIfUsernameCanBeChanged();
+     }
+ 
+     private void checkIfEmailChangeIsPending() {
+@@ -328,6 +337,48 @@ public void onAccountChanged(OnAccountChanged event) {
+         }
+     }
+ 
++    /**
++     * If the username can be changed then the control can be clicked to open to the
++     * Username Changer screen.
++     */
++    private void checkIfUsernameCanBeChanged() {
++        AccountModel account = mAccountStore.getAccount();
++        mUsernamePreference.setEnabled(account.getUsernameCanBeChanged());
++        mUsernamePreference.setOnPreferenceClickListener(preference -> {
++            showUsernameChangerFragment(account);
++            return false;
++        });
++    }
++
++    private void showUsernameChangerFragment(AccountModel account) {
++        final Bundle bundle =
++                SettingsUsernameChangerFragment.newBundle(account.getDisplayName(), account.getUserName());
++
++        new FullScreenDialogFragment.Builder(getActivity())
++                .setTitle(R.string.username_changer_title)
++                .setAction(R.string.username_changer_action)
++                .setOnConfirmListener(this)
++                .setHideActivityBar(true)
++                .setOnDismissListener(null)
++                .setContent(SettingsUsernameChangerFragment.class, bundle)
++                .build()
++                .show(((AppCompatActivity) getActivity()).getSupportFragmentManager(), FullScreenDialogFragment.TAG);
++    }
++
++    @Override public void onConfirm(@Nullable Bundle result) {
++        if (result != null) {
++            String username = result.getString(BaseUsernameChangerFullScreenDialogFragment.RESULT_USERNAME);
++
++            if (username != null) {
++                ToastUtils.showToast(getActivity(),
++                        String.format(getString(R.string.settings_username_changer_toast_content), username),
++                        ToastUtils.Duration.LONG);
++
++                refreshAccountDetails();
++            }
++        }
++    }
++
+     public static String[] getSiteNamesFromSites(List<SiteModel> sites) {
+         List<String> blogNames = new ArrayList<>();
+         for (SiteModel site : sites) {
+diff --git a/WordPress/src/main/res/layout/settings_username_changer_confirm_dialog.xml b/WordPress/src/main/res/layout/settings_username_changer_confirm_dialog.xml
+new file mode 100644
+index 000000000000..4edb244d951d
+--- /dev/null
++++ b/WordPress/src/main/res/layout/settings_username_changer_confirm_dialog.xml
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:padding="@dimen/settings_username_changer_confirm_dialog_adding"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:orientation="vertical">
++    <TextView
++        android:id="@+id/content"
++        tools:text="You are about to change your username. Retype it to confirm your changes."
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content" />
++    <EditText
++        tools:text="johndoe876"
++        android:id="@+id/username_edit"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:inputType="text" />
++</LinearLayout>
+diff --git a/WordPress/src/main/res/values/dimens.xml b/WordPress/src/main/res/values/dimens.xml
+index d268135331cb..b8bf87437d7c 100644
+--- a/WordPress/src/main/res/values/dimens.xml
++++ b/WordPress/src/main/res/values/dimens.xml
+@@ -431,4 +431,7 @@
+     <dimen name="web_preview_mode_popup_width">161sp</dimen> <!-- SP works better with popup list menu  -->
+     <dimen name="web_preview_hint_label_corner_radius">6dp</dimen>
+ 
++    <!--settings username changer-->
++    <dimen name="settings_username_changer_confirm_dialog_adding">20dp</dimen>
++
+ </resources>
+diff --git a/WordPress/src/main/res/values/strings.xml b/WordPress/src/main/res/values/strings.xml
+index acbd80d5048b..2ec1a79cdb16 100644
+--- a/WordPress/src/main/res/values/strings.xml
++++ b/WordPress/src/main/res/values/strings.xml
+@@ -2303,6 +2303,14 @@
+     <string name="username_changer_hint">Type to get more suggestions</string>
+     <string name="username_changer_title">Change username</string>
+ 
++    <string name="settings_username_changer_header">You are about to change your username, which is currently %1$s%2$s%3$s.You will not be able to change your username back.</string>
++    <string name="settings_username_changer_confirm_dialog_title">Careful!</string>
++    <string name="settings_username_changer_confirm_dialog_content">You are changing your username to %1$s%2$s%3$s. Changing your username will also affect your Gravatar profile and Intense Debate profile addresses. Confirm your new username to continue.</string>
++    <string name="settings_username_changer_confirm_dialog_positive_action">Change Username</string>
++    <string name="settings_username_changer_progress_dialog">Saving username…</string>
++    <string name="settings_username_changer_toast_content">Your new username is %1$s</string>
++    <string name="settings_username_changer_toast_content_new_username">Select a new username.</string>
++
+     <string name="google_error_timeout">Google took too long to respond. You may need to wait until you have a stronger internet connection.</string>
+ 
+     <!-- Android O notification channels, these show in the Android app settings -->
+diff --git a/build.gradle b/build.gradle
+index bdd7f9b45da3..08fccc1b4142 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -106,5 +106,5 @@ buildScan {
+ 
+ ext {
+     daggerVersion = '2.22.1'
+-    fluxCVersion = '1.2.1-beta-2'
++    fluxCVersion = 'b2dff5b26c4c0b288f0ab788086dd28123a8447b'
+ }

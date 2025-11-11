@@ -1,0 +1,166 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/AnkiDroidApp.kt b/AnkiDroid/src/main/java/com/ichi2/anki/AnkiDroidApp.kt
+index b69136fc754e..e046ee86b2ea 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/AnkiDroidApp.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/AnkiDroidApp.kt
+@@ -37,6 +37,7 @@ import anki.collection.OpChanges
+ import com.ichi2.anki.CrashReportService.sendExceptionReport
+ import com.ichi2.anki.analytics.UsageAnalytics
+ import com.ichi2.anki.browser.SharedPreferencesLastDeckIdRepository
++import com.ichi2.anki.common.annotations.LegacyNotifications
+ import com.ichi2.anki.common.annotations.NeedsTest
+ import com.ichi2.anki.common.utils.annotation.KotlinCleanup
+ import com.ichi2.anki.common.utils.isRunningAsUnitTest
+@@ -52,8 +53,8 @@ import com.ichi2.anki.preferences.SharedPreferencesProvider
+ import com.ichi2.anki.preferences.sharedPrefs
+ import com.ichi2.anki.servicelayer.DebugInfoService
+ import com.ichi2.anki.servicelayer.ThrowableFilterService
+-import com.ichi2.anki.services.BootService
+ import com.ichi2.anki.services.NotificationService
++import com.ichi2.anki.settings.Prefs
+ import com.ichi2.anki.ui.dialogs.ActivityAgnosticDialogs
+ import com.ichi2.compat.CompatHelper
+ import com.ichi2.utils.AdaptionUtil
+@@ -79,6 +80,8 @@ open class AnkiDroidApp :
+     ChangeManager.Subscriber {
+     /** An exception if the WebView subsystem fails to load  */
+     private var webViewError: Throwable? = null
++
++    @LegacyNotifications("The widget triggers notifications by posting null to this, but we plan to stop relying on the widget")
+     private val notifications = MutableLiveData<Void?>()
+ 
+     lateinit var activityAgnosticDialogs: ActivityAgnosticDialogs
+@@ -202,11 +205,15 @@ open class AnkiDroidApp :
+                 }
+             }
+         }
+-        Timber.i("AnkiDroidApp: Starting Services")
+-        BootService().onReceive(this, Intent(this, BootService::class.java))
+ 
+-        // Register for notifications
+-        notifications.observeForever { NotificationService.triggerNotificationFor(this) }
++        if (Prefs.newReviewRemindersEnabled) {
++            Timber.i("Setting review reminder notifications if they have not already been set")
++            // TODO: GSoC 2025
++        } else {
++            // Register for notifications
++            Timber.i("AnkiDroidApp: Starting Services")
++            notifications.observeForever { NotificationService.triggerNotificationFor(this) }
++        }
+ 
+         // listen for day rollover: time + timezone changes
+         DayRolloverHandler.listenForRolloverEvents(this)
+@@ -276,6 +283,7 @@ open class AnkiDroidApp :
+         )
+     }
+ 
++    @LegacyNotifications("Only used by the widget to trigger notifications, we plan to stop relying on the widget")
+     fun scheduleNotification() {
+         notifications.postValue(null)
+     }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/NavigationDrawerActivity.kt b/AnkiDroid/src/main/java/com/ichi2/anki/NavigationDrawerActivity.kt
+index 68f44b541cec..0be434be76b1 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/NavigationDrawerActivity.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/NavigationDrawerActivity.kt
+@@ -275,6 +275,10 @@ abstract class NavigationDrawerActivity :
+                 REQUEST_PREFERENCES_UPDATE,
+                 result.resultCode,
+             )
++
++            // We trigger a notifications channel set-up since the user may have changed the locale set
++            // from within the app, which should cause the notification channel names to be reloaded to
++            // match the new locale
+             setupNotificationChannels(applicationContext)
+             // Restart the activity on preference change
+             // collection path hasn't been changed so just restart the current activity
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/preferences/ReviewingSettingsFragment.kt b/AnkiDroid/src/main/java/com/ichi2/anki/preferences/ReviewingSettingsFragment.kt
+index 10fa4d21a58b..79a5ce7f523b 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/preferences/ReviewingSettingsFragment.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/preferences/ReviewingSettingsFragment.kt
+@@ -25,6 +25,7 @@ import com.ichi2.anki.common.time.TimeManager
+ import com.ichi2.anki.launchCatchingTask
+ import com.ichi2.anki.observability.undoableOp
+ import com.ichi2.anki.services.BootService.Companion.scheduleNotification
++import com.ichi2.anki.settings.Prefs
+ import com.ichi2.anki.utils.CollectionPreferences
+ import com.ichi2.preferences.NumberRangePreferenceCompat
+ import com.ichi2.preferences.SliderPreference
+@@ -85,6 +86,6 @@ suspend fun setDayOffset(
+     undoableOp {
+         setPreferences(newPrefs)
+     }
+-    scheduleNotification(TimeManager.time, context)
++    if (!Prefs.newReviewRemindersEnabled) scheduleNotification(TimeManager.time, context)
+     Timber.i("set day offset: '%d'", hours)
+ }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/services/BootService.kt b/AnkiDroid/src/main/java/com/ichi2/anki/services/BootService.kt
+index 5a133451f11f..9890889119b1 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/services/BootService.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/services/BootService.kt
+@@ -40,6 +40,9 @@ import java.util.Calendar
+ /**
+  * BroadcastReceiver which listens to the Android system-level intent that fires when the device starts up.
+  * Schedules notifications for review reminders.
++ *
++ * Note that Android battery optimizations may potentially block us from receiving the [Intent.ACTION_BOOT_COMPLETED]
++ * intent, which could cause review reminders to not be scheduled.
+  */
+ @NeedsTest("Check on various Android versions that this can execute")
+ class BootService : BroadcastReceiver() {
+diff --git a/AnkiDroid/src/main/java/com/ichi2/widget/WidgetStatus.kt b/AnkiDroid/src/main/java/com/ichi2/widget/WidgetStatus.kt
+index 4b6219b79cc5..1239212f7bee 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/widget/WidgetStatus.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/widget/WidgetStatus.kt
+@@ -21,6 +21,7 @@ import com.ichi2.anki.MetaDB
+ import com.ichi2.anki.R
+ import com.ichi2.anki.libanki.sched.Counts
+ import com.ichi2.anki.preferences.sharedPrefs
++import com.ichi2.anki.settings.Prefs
+ import kotlinx.coroutines.DelicateCoroutinesApi
+ import kotlinx.coroutines.GlobalScope
+ import kotlinx.coroutines.Job
+@@ -52,16 +53,26 @@ object WidgetStatus {
+     fun updateInBackground(context: Context) {
+         val preferences = context.sharedPrefs()
+         smallWidgetEnabled = preferences.getBoolean("widgetSmallEnabled", false)
+-        val notificationEnabled =
+-            preferences
+-                .getString(context.getString(R.string.pref_notifications_minimum_cards_due_key), "1000001")!!
+-                .toInt() < 1000000
+         val canExecuteTask = smallWidgetUpdateJob == null || smallWidgetUpdateJob?.isActive == false
+-        if ((smallWidgetEnabled || notificationEnabled) && canExecuteTask) {
+-            Timber.d("WidgetStatus.update(): updating")
+-            smallWidgetUpdateJob = launchSmallWidgetUpdateJob(context)
++
++        if (Prefs.newReviewRemindersEnabled) {
++            if (smallWidgetEnabled && canExecuteTask) {
++                Timber.d("WidgetStatus.update(): updating")
++                smallWidgetUpdateJob = launchSmallWidgetUpdateJob(context)
++            } else {
++                Timber.d("WidgetStatus.update(): already running or not enabled")
++            }
+         } else {
+-            Timber.d("WidgetStatus.update(): already running or not enabled; enabled: %b", smallWidgetEnabled)
++            val notificationEnabled =
++                preferences
++                    .getString(context.getString(R.string.pref_notifications_minimum_cards_due_key), "1000001")!!
++                    .toInt() < 1000000
++            if ((smallWidgetEnabled || notificationEnabled) && canExecuteTask) {
++                Timber.d("WidgetStatus.update(): updating")
++                smallWidgetUpdateJob = launchSmallWidgetUpdateJob(context)
++            } else {
++                Timber.d("WidgetStatus.update(): already running or not enabled; enabled: %b", smallWidgetEnabled)
++            }
+         }
+     }
+ 
+@@ -87,7 +98,9 @@ object WidgetStatus {
+             Timber.i("triggering small widget UI update")
+             AnkiDroidWidgetSmall.UpdateService().doUpdate(context)
+         }
+-        (context.applicationContext as AnkiDroidApp).scheduleNotification()
++        if (!Prefs.newReviewRemindersEnabled) {
++            (context.applicationContext as AnkiDroidApp).scheduleNotification()
++        }
+     }
+ 
+     /** Returns the status of each of the decks.  */

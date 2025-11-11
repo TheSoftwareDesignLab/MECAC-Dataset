@@ -1,0 +1,971 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/reviewreminders/ReviewReminder.kt b/AnkiDroid/src/main/java/com/ichi2/anki/reviewreminders/ReviewReminder.kt
+index cf208bf93934..a358ed462ba4 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/reviewreminders/ReviewReminder.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/reviewreminders/ReviewReminder.kt
+@@ -151,14 +151,16 @@ sealed class ReviewReminderScope : Parcelable {
+  * stored review reminders on user devices will no longer be able to be read, as decoding them to the new
+  * [ReviewReminder] schema will cause a serialization exception.
+  * You must specify a schema migration mapping for users who already have review reminders set on their devices
+- * so that [ReviewRemindersDatabase.attemptSchemaMigration] can migrate their reminders to the new schema.
+- * Use an [OldReviewReminderSchema] to store the old schema and to define a method for migrating to the new schema.
+- * Your method will be called from [ScheduleReminders.catchDatabaseExceptions]. To inform [ScheduleReminders.catchDatabaseExceptions]
+- * that some users may have review reminders in the form of your old schema, add your [OldReviewReminderSchema]
+- * to [ScheduleReminders.oldReviewReminderSchemasForMigration]. We store a list of old schemas since there may be
+- * multiple old schemas, and users do not always update their app from
+- * version A -> B -> C but may sometimes jump from A -> C.
+- * [ScheduleReminders.catchDatabaseExceptions] will attempt to migrate from all old schemas present in the list.
++ * so that [ReviewRemindersDatabase.performSchemaMigration] can migrate their reminders to the new schema.
++ * Use a [ReviewReminderSchema] to store the old schema and to define a method for migrating to the new schema.
++ * Your method will be called from [ReviewRemindersDatabase.performSchemaMigration]. To inform [ReviewRemindersDatabase.performSchemaMigration]
++ * that some users may have review reminders in the form of your old schema, add your [ReviewReminderSchema]
++ * to [ReviewRemindersDatabase.oldReviewReminderSchemasForMigration] and update [ReviewRemindersDatabase.schemaVersion].
++ * [ReviewRemindersDatabase.oldReviewReminderSchemasForMigration] should contain a chain of versions, from 1 -> 2 -> 3 -> ...,
++ * and when a migration begins, it will happen step by step via the [ReviewReminderSchema.migrate] method, going from version 1 to version 2,
++ * from version 2 to version 3, and so on, until [ReviewRemindersDatabase.schemaVersion] is reached.
++ * Preferably, also add some unit tests to ensure your migration works properly on all user devices once your update is rolled out.
++ * See ReviewRemindersDatabaseTest for examples on how to do this.
+  *
+  * TODO: add remaining fields planned for GSoC 2025.
+  *
+@@ -172,12 +174,13 @@ sealed class ReviewReminderScope : Parcelable {
+ @Parcelize
+ @ConsistentCopyVisibility
+ data class ReviewReminder private constructor(
+-    val id: ReviewReminderId,
++    override val id: ReviewReminderId,
+     val time: ReviewReminderTime,
+     val cardTriggerThreshold: ReviewReminderCardTriggerThreshold,
+     val scope: ReviewReminderScope,
+     var enabled: Boolean,
+-) : Parcelable {
++) : Parcelable,
++    ReviewReminderSchema {
+     companion object {
+         /**
+          * Create a new review reminder. This will allocate a new ID for the reminder.
+@@ -197,4 +200,9 @@ data class ReviewReminder private constructor(
+             enabled,
+         )
+     }
++
++    /**
++     * This is the up-to-date schema, we cannot migrate to a newer version.
++     */
++    override fun migrate(): ReviewReminder = this
+ }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/reviewreminders/ReviewRemindersDatabase.kt b/AnkiDroid/src/main/java/com/ichi2/anki/reviewreminders/ReviewRemindersDatabase.kt
+index fd77f8777e53..154d45fc3754 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/reviewreminders/ReviewRemindersDatabase.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/reviewreminders/ReviewRemindersDatabase.kt
+@@ -22,11 +22,15 @@ import androidx.annotation.VisibleForTesting
+ import androidx.core.content.edit
+ import com.ichi2.anki.AnkiDroidApp
+ import com.ichi2.anki.libanki.DeckId
+-import kotlinx.serialization.KSerializer
++import com.ichi2.anki.reviewreminders.ReviewRemindersDatabase.StoredReviewRemindersMap
++import kotlinx.serialization.InternalSerializationApi
++import kotlinx.serialization.Serializable
+ import kotlinx.serialization.SerializationException
+ import kotlinx.serialization.builtins.MapSerializer
+ import kotlinx.serialization.json.Json
++import kotlinx.serialization.serializer
+ import timber.log.Timber
++import kotlin.reflect.KClass
+ 
+ /**
+  * Manages the storage and retrieval of [ReviewReminder]s in SharedPreferences.
+@@ -34,67 +38,195 @@ import timber.log.Timber
+  * [ReviewReminder]s can either be tied to a specific deck and trigger based on the number of cards
+  * due in that deck, or they can be app-wide reminders that trigger based on the total number
+  * of cards due across all decks. See [ReviewReminderScope].
+- *
+- * Calls to methods in this class should be wrapped by [ScheduleReminders.catchDatabaseExceptions].
+  */
+-class ReviewRemindersDatabase {
+-    companion object {
+-        /**
+-         * Profile ID for the review reminder SharedPreferences file key. Each profile for using AnkiDroid will have its own review reminders stored
+-         * in its own SharedPreferences file. This ID is appended onto the end of [SHARED_PREFS_FILE_KEY] to create a unique file name for each profile.
+-         *
+-         * Currently, this is hard-coded as 0. When multi-profile functionality is added to AnkiDroid, make sure this value is dynamically set
+-         * to the current profile ID. Also ensure that the entire review reminders system is updated to work with the multi-profile system.
+-         * For example, scheduled notifications may need to be cancelled and rescheduled when the user toggles between profiles.
+-         */
+-        private const val PROFILE_ID: Int = 0
+-
+-        /**
+-         * SharedPreferences file name key for review reminders. We store the review reminders separately from the default SharedPreferences.
+-         */
+-        private const val SHARED_PREFS_FILE_KEY = "com.ichi2.anki.REVIEW_REMINDERS_SHARED_PREFS_$PROFILE_ID"
+-
+-        /**
+-         * SharedPreferences file for review reminders. We store the review reminders separately from the default SharedPreferences.
+-         */
+-        @VisibleForTesting
+-        val remindersSharedPrefs: SharedPreferences =
+-            AnkiDroidApp.instance.getSharedPreferences(
+-                SHARED_PREFS_FILE_KEY,
+-                Context.MODE_PRIVATE,
+-            )
++object ReviewRemindersDatabase {
++    /**
++     * Profile ID for the review reminder SharedPreferences file key. Each profile for using AnkiDroid will have its own review reminders stored
++     * in its own SharedPreferences file. This ID is appended onto the end of [SHARED_PREFS_FILE_KEY] to create a unique file name for each profile.
++     *
++     * Currently, this is hard-coded as 0. When multi-profile functionality is added to AnkiDroid, make sure this value is dynamically set
++     * to the current profile ID. Also ensure that the entire review reminders system is updated to work with the multi-profile system.
++     * For example, scheduled notifications may need to be cancelled and rescheduled when the user toggles between profiles.
++     */
++    private const val PROFILE_ID: Int = 0
++
++    /**
++     * SharedPreferences file name key for review reminders. We store the review reminders separately from the default SharedPreferences.
++     */
++    private const val SHARED_PREFS_FILE_KEY = "com.ichi2.anki.REVIEW_REMINDERS_SHARED_PREFS_$PROFILE_ID"
++
++    /**
++     * SharedPreferences file for review reminders. We store the review reminders separately from the default SharedPreferences.
++     */
++    @VisibleForTesting
++    val remindersSharedPrefs: SharedPreferences =
++        AnkiDroidApp.instance.getSharedPreferences(
++            SHARED_PREFS_FILE_KEY,
++            Context.MODE_PRIVATE,
++        )
++
++    /**
++     * Key in SharedPreferences for retrieving deck-specific reminders.
++     * Should have deck ID appended to its end, ex. "deck_12345".
++     * Its value is a HashMap<[ReviewReminderId], [ReviewReminder]> serialized as a JSON String.
++     */
++    @VisibleForTesting
++    const val DECK_SPECIFIC_KEY = "deck_"
++
++    /**
++     * Key in SharedPreferences for retrieving app-wide reminders.
++     * Its value is a HashMap<[ReviewReminderId], [ReviewReminder]> serialized as a JSON String.
++     */
++    @VisibleForTesting
++    const val APP_WIDE_KEY = "app_wide"
++
++    /**
++     * The form in which HashMap<[ReviewReminderId], [ReviewReminder]> are actually written to SharedPreferences.
++     * This allows us to check the version of [ReviewReminder] stored before trying to deserialize the JSON string,
++     * allowing us to carefully handle schema migration. Otherwise, if an older version of [ReviewReminder] is encoded
++     * and we try to decode it into a newer form of [ReviewReminder], an error will be thrown.
++     *
++     * We assume that the version is accurate; e.x. if the version is 3, then the [ReviewReminder] stored is indeed
++     * of schema version 3. This should be safe to assume since writing this data class to SharedPreferences is an
++     * atomic operation.
++     */
++    @Serializable
++    @VisibleForTesting
++    data class StoredReviewRemindersMap(
++        val version: ReviewReminderSchemaVersion,
++        val remindersMapJson: String,
++    )
++
++    /**
++     * Current [ReviewReminder] schema version. Whenever [ReviewReminder] is modified, this integer MUST be incremented.
++     *
++     * Version 1: 3 August 2025
++     *
++     * @see [oldReviewReminderSchemasForMigration]
++     * @see [ReviewReminder]
++     */
++    @VisibleForTesting
++    var schemaVersion = ReviewReminderSchemaVersion(1)
++
++    /**
++     * A map of all old [ReviewReminderSchema]s that [ReviewRemindersDatabase.performSchemaMigration] will attempt to migrate old
++     * review reminders in SharedPreferences from. Migration occurs from version 1 to version 2, from version 2 to version 3, etc.
++     *
++     * When [ReviewReminder] is updated, you MUST add a new migration version and keep the old schema
++     * as a class that implements [ReviewReminderSchema]. Ensure the latest schema version in this map
++     * always maps to [ReviewReminder].
++     *
++     * @see [schemaVersion]
++     * @see [ReviewReminderSchema]
++     * @see [ReviewReminder]
++     */
++    @VisibleForTesting
++    var oldReviewReminderSchemasForMigration: Map<ReviewReminderSchemaVersion, KClass<out ReviewReminderSchema>> =
++        mapOf(
++            ReviewReminderSchemaVersion(1) to ReviewReminder::class, // Most up to date version
++        )
++
++    /**
++     * Schema update method for migrating old review reminders to new ones.
++     * This is run when [ReviewReminder] is updated and existing users who already have review reminders set up on their devices
++     * need to have their data ported to the new schema.
++     * Versions are declared in [oldReviewReminderSchemasForMigration].
++     *
++     * We need to opt into an experimental serialization API feature because we are determining classes to deserialize
++     * dynamically via [oldReviewReminderSchemasForMigration] rather than at compile-time.
++     * The possible schemas to deserialize from are inputted dynamically so that unit tests are possible.
++     *
++     * @param encodedReviewRemindersKey The key with which the [encodedReviewRemindersMap] is stored in SharedPreferences,
++     * used for writing the migrated map back into SharedPreferences.
++     * @param encodedReviewRemindersMap The encoded review reminders map to migrate.
++     * @param fromVersion The schema version of [encodedReviewRemindersMap].
++     * @param toVersion The schema version of the new review reminders map.
++     *
++     * @throws SerializationException If the [fromVersion] is less than 1 or greater than [schemaVersion], or if the
++     * [encodedReviewRemindersMap] is not a valid JSON string, or if the final result of migration is somehow not a [ReviewReminder].
++     * @throws IllegalArgumentException If the [encodedReviewRemindersMap] is not actually of version [fromVersion],
++     * or if the [fromVersion] is not in [oldReviewReminderSchemasForMigration].
++     *
++     * @see [ReviewReminder]
++     */
++    @OptIn(InternalSerializationApi::class)
++    private fun performSchemaMigration(
++        encodedReviewRemindersKey: String,
++        encodedReviewRemindersMap: String,
++        fromVersion: ReviewReminderSchemaVersion,
++        toVersion: ReviewReminderSchemaVersion = schemaVersion,
++    ): HashMap<ReviewReminderId, ReviewReminder> {
++        Timber.i("Beginning migration from $fromVersion to $toVersion")
++        if (fromVersion.value < 1 ||
++            fromVersion.value > toVersion.value
++        ) {
++            throw SerializationException("Invalid review reminder schema version: $fromVersion")
++        }
+ 
+-        /**
+-         * Key in SharedPreferences for retrieving deck-specific reminders.
+-         * Should have deck ID appended to its end, ex. "deck_12345".
+-         * Its value is a HashMap<[ReviewReminderId], [ReviewReminder]> serialized as a JSON String.
+-         */
+-        @VisibleForTesting
+-        const val DECK_SPECIFIC_KEY = "deck_"
+-
+-        /**
+-         * Key in SharedPreferences for retrieving app-wide reminders.
+-         * Its value is a HashMap<[ReviewReminderId], [ReviewReminder]> serialized as a JSON String.
+-         */
+-        @VisibleForTesting
+-        const val APP_WIDE_KEY = "app_wide"
++        // Deserialize from old schema
++        val oldSchema =
++            oldReviewReminderSchemasForMigration[fromVersion]
++                ?: throw IllegalArgumentException("Review reminder schema version not found: $fromVersion")
++        val mapDeserializer = MapSerializer(ReviewReminderId.serializer(), oldSchema.serializer())
++        val mapDecoded = Json.decodeFromString(mapDeserializer, encodedReviewRemindersMap)
++
++        // Migrate step by step
++        var currentMap = mapDecoded
++        var currentVersion = fromVersion.value
++        while (currentVersion < toVersion.value) {
++            Timber.i("Migrating from schema version $currentVersion to ${currentVersion + 1}")
++            currentMap =
++                currentMap
++                    .map { (_, value) ->
++                        val newValue: ReviewReminderSchema = value.migrate()
++                        newValue.id to newValue
++                    }.toMap()
++            currentVersion++
++        }
++
++        // Write to SharedPreferences, then return deserialized map
++        val finalMap =
++            currentMap.mapValues { (_, value) ->
++                value as? ReviewReminder ?: throw SerializationException("Expected ReviewReminder, got ${value::class.qualifiedName}")
++            }
++        val jsonString = encodeJson(finalMap)
++        remindersSharedPrefs.edit {
++            putString(encodedReviewRemindersKey, jsonString)
++        }
++        return HashMap(finalMap)
+     }
+ 
+     /**
+-     * Decode an encoded HashMap<[ReviewReminderId], [ReviewReminder]> JSON string.
++     * Decode an encoded HashMap<[ReviewReminderId], [ReviewReminder]> JSON string which has been stored as a [StoredReviewRemindersMap].
+      * @see Json.decodeFromString
+      * @throws SerializationException If the stored string is not a valid JSON string.
+-     * @throws IllegalArgumentException If the decoded reminders map is not a HashMap<[ReviewReminderId], [ReviewReminder]>.
++     * @throws IllegalArgumentException If the decoded reminders map is not a HashMap<[ReviewReminderId], [ReviewReminder]>,
++     * and no valid schema migrations exist.
+      */
+-    private fun decodeJson(jsonString: String): HashMap<ReviewReminderId, ReviewReminder> =
+-        Json.decodeFromString<HashMap<ReviewReminderId, ReviewReminder>>(jsonString)
++    private fun decodeJson(
++        jsonString: String,
++        deckKeyForMigrationPurposes: String,
++    ): HashMap<ReviewReminderId, ReviewReminder> {
++        val storedReviewRemindersMap = Json.decodeFromString<StoredReviewRemindersMap>(jsonString)
++        return if (storedReviewRemindersMap.version.value != schemaVersion.value) {
++            performSchemaMigration(
++                deckKeyForMigrationPurposes,
++                storedReviewRemindersMap.remindersMapJson,
++                storedReviewRemindersMap.version,
++                schemaVersion,
++            )
++        } else {
++            Json.decodeFromString<HashMap<ReviewReminderId, ReviewReminder>>(storedReviewRemindersMap.remindersMapJson)
++        }
++    }
+ 
+     /**
+-     * Encode a Map<[ReviewReminderId], [ReviewReminder]> as a JSON string.
++     * Encode a Map<[ReviewReminderId], [ReviewReminder]> as a [StoredReviewRemindersMap] JSON string.
+      * @see Json.encodeToString
+      * @throws SerializationException If the stored string is somehow not a valid JSON string, even though the input parameter is type-checked.
+      */
+-    private fun encodeJson(reminders: Map<ReviewReminderId, ReviewReminder>): String = Json.encodeToString(reminders)
++    private fun encodeJson(reminders: Map<ReviewReminderId, ReviewReminder>): String =
++        Json.encodeToString(StoredReviewRemindersMap.serializer(), StoredReviewRemindersMap(schemaVersion, Json.encodeToString(reminders)))
+ 
+     /**
+      * Get the [ReviewReminder]s for a specific key.
+@@ -103,7 +235,7 @@ class ReviewRemindersDatabase {
+      */
+     private fun getRemindersForKey(key: String): HashMap<ReviewReminderId, ReviewReminder> {
+         val jsonString = remindersSharedPrefs.getString(key, null) ?: return hashMapOf()
+-        return decodeJson(jsonString)
++        return decodeJson(jsonString, deckKeyForMigrationPurposes = key)
+     }
+ 
+     /**
+@@ -129,7 +261,7 @@ class ReviewRemindersDatabase {
+         remindersSharedPrefs
+             .all
+             .filterKeys { it.startsWith(DECK_SPECIFIC_KEY) }
+-            .flatMap { (_, value) -> decodeJson(value.toString()).entries }
++            .flatMap { (key, value) -> decodeJson(value.toString(), deckKeyForMigrationPurposes = key).entries }
+             .associateTo(hashMapOf()) { it.toPair() }
+ 
+     /**
+@@ -172,78 +304,46 @@ class ReviewRemindersDatabase {
+      */
+     fun editAllAppWideReminders(reminderEditor: (HashMap<ReviewReminderId, ReviewReminder>) -> Map<ReviewReminderId, ReviewReminder>) =
+         editRemindersForKey(APP_WIDE_KEY, reminderEditor)
++}
+ 
+-    /**
+-     * Helper method for getting all SharedPreferences that represent app-wide or deck-specific reminder HashMaps.
+-     * For example, may be used for constructing a backup of all review reminders pending a potentially-destructive migration operation.
+-     * Does not return the next-free-ID preference for review reminders used by [ReviewReminderId.getAndIncrementNextFreeReminderId].
+-     */
+-    fun getAllReviewReminderSharedPrefsAsMap(): Map<String, Any?> = remindersSharedPrefs.all
+-
+-    /**
+-     * Helper method for deleting all SharedPreferences that represent app-wide or deck-specific reminder HashMaps.
+-     * Note that this will only delete saved ReviewReminder objects, as they are stored in the review reminders SharedPreferences file managed by this class.
+-     * This method won't impact any meta information, such as the next free review reminder ID, which is stored in the default
+-     * SharedPreferences file and accessed via Prefs.reviewReminderNextFreeId.
+-     * such as the next-free-ID preference used by [ReviewReminderId.getAndIncrementNextFreeReminderId].
+-     *
+-     * For example, may be used when a potentially-destructive operation, like a failed migration, has been applied to all review reminders.
+-     * This method can be used to delete all potentially-corrupted review reminder shared preferences so that backed-up
+-     * review reminders can be restored.
+-     *
+-     * For developers debugging review reminder issues during development or writing tests:
+-     * call this when you need to hard-reset the review reminders database.
+-     */
+-    fun deleteAllReviewReminderSharedPrefs() {
+-        remindersSharedPrefs.edit { clear() }
+-    }
+-
+-    /**
+-     * Helper method for writing all SharedPreferences that represent app-wide or deck-specific reminder HashMaps.
+-     * Only writes preferences that represent reminders themselves, not any auxiliary preferences used by the review reminder system
+-     * such as the next-free-ID preference used by [ReviewReminderId.getAndIncrementNextFreeReminderId].
+-     *
+-     * For example, may be used when a potentially-destructive operation, like a failed migration, has been applied to all review reminders.
+-     * This method can be used to restore a backup of old review reminder shared preferences after all existing review reminders have been cleared.
+-     */
+-    fun writeAllReviewReminderSharedPrefsFromMap(map: Map<String, Any?>) {
+-        remindersSharedPrefs.edit { map.forEach { (key, value) -> putString(key, value.toString()) } }
+-    }
+-
+-    /**
+-     * Schema update method for migrating old review reminders to new ones.
+-     * Use when [ReviewReminder] is updated and existing users who already have review reminders set up on their devices
+-     * need to have their data ported to the new schema.
+-     * @param serializer The serializer for the old schema of type [T] implementing [OldReviewReminderSchema]
+-     * @see [OldReviewReminderSchema]
+-     * @throws SerializationException If the current reminders maps have not been stored in SharedPreferences as valid JSON strings.
+-     * @throws IllegalArgumentException If the decoded current reminders maps are not instances of HashMap<[ReviewReminderId], [T]>.
+-     */
+-    fun <T : OldReviewReminderSchema> attemptSchemaMigration(serializer: KSerializer<T>) {
+-        val mapSerializer = MapSerializer(ReviewReminderId.serializer(), serializer)
+-        remindersSharedPrefs.edit {
+-            remindersSharedPrefs.all.forEach { (key, value) ->
+-                val old: Map<ReviewReminderId, T> = Json.decodeFromString(mapSerializer, value.toString())
+-                val new =
+-                    old
+-                        .map { (_, value) ->
+-                            val updatedReminder = value.migrate()
+-                            updatedReminder.id to updatedReminder
+-                        }.toMap()
+-                putString(key, Json.encodeToString(new))
+-                Timber.d("Migrated review reminders from $key")
+-            }
+-        }
++/**
++ * Inline value class for review reminder schema versions.
++ * @see [StoredReviewRemindersMap]
++ * @see [ReviewReminder]
++ */
++@JvmInline
++@Serializable
++value class ReviewReminderSchemaVersion(
++    val value: Int,
++) {
++    init {
++        require(value >= 1) { "Review reminder schema version must be >= 1" }
++        // We do not check that it is <= SCHEMA_VERSION here because then declaring SCHEMA_VERSION would be circular
+     }
+ }
+ 
+ /**
+  * When [ReviewReminder] is updated by a developer, implement this interface in a new data class which
+  * has the same fields as the old version of [ReviewReminder], then implement the [migrate] method which
+- * transforms old [ReviewReminder]s to new [ReviewReminder]s. Data classes implementing this interface
+- * should be marked as @Serializable.
+- * @see [ReviewRemindersDatabase.attemptSchemaMigration].
++ * transforms old [ReviewReminder]s to new [ReviewReminder]s. Also ensure that the previous [ReviewReminderSchema]
++ * in the migration version chain ([ReviewRemindersDatabase.oldReviewReminderSchemasForMigration]) has its [migrate] method
++ * edited to return instances of the newly-created [ReviewReminderSchema]. Then, increment [ReviewRemindersDatabase.schemaVersion].
++ *
++ * Data classes implementing this interface should be marked as @Serializable. Any new types defined for ReviewReminderSchemas
++ * should also be marked as @Serializable.
++ *
++ * @see [ReviewRemindersDatabase.performSchemaMigration].
++ * @see [ReviewReminder]
+  */
+-interface OldReviewReminderSchema {
+-    fun migrate(): ReviewReminder
++interface ReviewReminderSchema {
++    /**
++     * All review reminders must have an identifying ID.
++     * This is necessary to facilitate migrations. See the implementation of [ReviewRemindersDatabase.performSchemaMigration] for details.
++     */
++    val id: ReviewReminderId
++
++    /**
++     * Transforms this [ReviewReminderSchema] to the next version of the [ReviewReminderSchema].
++     */
++    fun migrate(): ReviewReminderSchema
+ }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/reviewreminders/ScheduleReminders.kt b/AnkiDroid/src/main/java/com/ichi2/anki/reviewreminders/ScheduleReminders.kt
+index f099119408a1..e32423ea018f 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/reviewreminders/ScheduleReminders.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/reviewreminders/ScheduleReminders.kt
+@@ -59,7 +59,6 @@ class ScheduleReminders :
+         ) ?: ReviewReminderScope.Global
+     }
+ 
+-    private lateinit var database: ReviewRemindersDatabase
+     private lateinit var toolbar: MaterialToolbar
+     private lateinit var recyclerView: RecyclerView
+     private lateinit var adapter: ScheduleRemindersAdapter
+@@ -99,9 +98,6 @@ class ScheduleReminders :
+         recyclerView.layoutManager = layoutManager
+         recyclerView.addItemDecoration(DividerItemDecoration(requireContext(), layoutManager.orientation))
+ 
+-        // Set up database
+-        database = ReviewRemindersDatabase()
+-
+         // Set up adapter, pass functionality to it
+         adapter =
+             ScheduleRemindersAdapter(
+@@ -136,9 +132,9 @@ class ScheduleReminders :
+             catchDatabaseExceptions {
+                 when (val scope = scheduleRemindersScope) {
+                     is ReviewReminderScope.Global -> {
+-                        HashMap(database.getAllAppWideReminders() + database.getAllDeckSpecificReminders())
++                        HashMap(ReviewRemindersDatabase.getAllAppWideReminders() + ReviewRemindersDatabase.getAllDeckSpecificReminders())
+                     }
+-                    is ReviewReminderScope.DeckSpecific -> database.getRemindersForDeck(scope.did)
++                    is ReviewReminderScope.DeckSpecific -> ReviewRemindersDatabase.getRemindersForDeck(scope.did)
+                 }
+             } ?: hashMapOf()
+         triggerUIUpdate()
+@@ -188,8 +184,8 @@ class ScheduleReminders :
+         launchCatchingTask {
+             catchDatabaseExceptions {
+                 when (scope) {
+-                    is ReviewReminderScope.Global -> database.editAllAppWideReminders(performToggle)
+-                    is ReviewReminderScope.DeckSpecific -> database.editRemindersForDeck(scope.did, performToggle)
++                    is ReviewReminderScope.Global -> ReviewRemindersDatabase.editAllAppWideReminders(performToggle)
++                    is ReviewReminderScope.DeckSpecific -> ReviewRemindersDatabase.editRemindersForDeck(scope.did, performToggle)
+                 }
+             }
+         }
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/reviewreminders/ReviewRemindersDatabaseTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/reviewreminders/ReviewRemindersDatabaseTest.kt
+index 23a4f6156659..b78914053096 100644
+--- a/AnkiDroid/src/test/java/com/ichi2/anki/reviewreminders/ReviewRemindersDatabaseTest.kt
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/reviewreminders/ReviewRemindersDatabaseTest.kt
+@@ -19,20 +19,101 @@ package com.ichi2.anki.reviewreminders
+ import androidx.core.content.edit
+ import androidx.test.ext.junit.runners.AndroidJUnit4
+ import com.ichi2.anki.RobolectricTest
++import com.ichi2.anki.libanki.DeckId
++import kotlinx.serialization.Serializable
+ import kotlinx.serialization.SerializationException
+ import kotlinx.serialization.json.Json
++import org.hamcrest.CoreMatchers
++import org.hamcrest.Description
++import org.hamcrest.Matcher
+ import org.hamcrest.MatcherAssert.assertThat
+ import org.hamcrest.Matchers.anEmptyMap
+ import org.hamcrest.Matchers.equalTo
++import org.hamcrest.TypeSafeMatcher
+ import org.junit.After
+ import org.junit.Before
+ import org.junit.Test
+ import org.junit.runner.RunWith
++import kotlin.reflect.full.memberProperties
+ 
++/**
++ * Schema migration settings for testing purposes.
++ * Consult this as an example of how to save old schemas and define their [ReviewReminderSchema.migrate] methods.
++ */
++object TestingReviewReminderMigrationSettings {
++    /**
++     * A sample old review reminder schema. Perhaps this was how the [ReviewReminder] data class was originally implemented.
++     * We would like to test the code that checks if review reminders stored on the device adhere to an old, outdated schema.
++     * In particular, does the code correctly migrate the serialized data class strings to the updated, current version of [ReviewReminder]?
++     */
++    @Serializable
++    data class ReviewReminderSchemaVersionOne(
++        override val id: ReviewReminderId,
++        val hour: Int,
++        val minute: Int,
++        val cardTriggerThreshold: Int,
++        val did: DeckId,
++        val enabled: Boolean = true,
++    ) : ReviewReminderSchema {
++        override fun migrate(): ReviewReminderSchema =
++            ReviewReminderSchemaVersionTwo(
++                id = this.id,
++                time = VersionTwoDataClasses.ReviewReminderTime(hour, minute),
++                snoozeAmount = 1,
++                cardTriggerThreshold = this.cardTriggerThreshold,
++                did = this.did,
++                enabled = enabled,
++            )
++    }
++
++    /**
++     * Here's an example of how you can handle renamed fields in a data class stored as part of a [ReviewReminder].
++     * Otherwise, there's a namespace collision with [ReviewReminderTime].
++     *
++     * This class will be serialized into "ReviewReminderTime(timeHour=#, timeMinute=#)", which otherwise might conflict
++     * with the updated definition of [ReviewReminderTime], which is serialized as "ReviewReminderTime(hour=#, minute=#)".
++     * When we read the outdated schema from the disk, we need to tell the deserializer that it is reading a
++     * [VersionTwoDataClasses.ReviewReminderTime] rather than a [ReviewReminderTime], even though the names are the same.
++     *
++     * @see ReviewReminderSchemaVersionTwo
++     */
++    object VersionTwoDataClasses {
++        @Serializable
++        data class ReviewReminderTime(
++            val timeHour: Int,
++            val timeMinute: Int,
++        )
++    }
++
++    /**
++     * Another example of an old review reminder schema. See [ReviewReminderSchemaVersionOne] for more details.
++     */
++    @Serializable
++    data class ReviewReminderSchemaVersionTwo(
++        override val id: ReviewReminderId,
++        val time: VersionTwoDataClasses.ReviewReminderTime,
++        val snoozeAmount: Int,
++        val cardTriggerThreshold: Int,
++        val did: DeckId,
++        val enabled: Boolean = true,
++    ) : ReviewReminderSchema {
++        override fun migrate(): ReviewReminder =
++            ReviewReminder.createReviewReminder(
++                time = ReviewReminderTime(this.time.timeHour, this.time.timeMinute),
++                cardTriggerThreshold = ReviewReminderCardTriggerThreshold(this.cardTriggerThreshold),
++                scope = if (this.did == -1L) ReviewReminderScope.Global else ReviewReminderScope.DeckSpecific(this.did),
++                enabled = enabled,
++            )
++    }
++}
++
++/**
++ * If tests in this file have failed, it may be because you have updated [ReviewReminder]!
++ * Please read the documentation of [ReviewReminder] carefully and ensure you have implemented
++ * a proper migration method to the new schema. See [TestingReviewReminderMigrationSettings] for examples.
++ */
+ @RunWith(AndroidJUnit4::class)
+ class ReviewRemindersDatabaseTest : RobolectricTest() {
+-    private lateinit var reviewRemindersDatabase: ReviewRemindersDatabase
+-
+     private val did1 = 12345L
+     private val did2 = 67890L
+ 
+@@ -86,7 +167,6 @@ class ReviewRemindersDatabaseTest : RobolectricTest() {
+     override fun setUp() {
+         super.setUp()
+         ReviewRemindersDatabase.remindersSharedPrefs.edit { clear() }
+-        reviewRemindersDatabase = ReviewRemindersDatabase()
+     }
+ 
+     @After
+@@ -97,28 +177,28 @@ class ReviewRemindersDatabaseTest : RobolectricTest() {
+ 
+     @Test
+     fun `getRemindersForDeck should return empty map when no reminders exist`() {
+-        val reminders = reviewRemindersDatabase.getRemindersForDeck(did1)
++        val reminders = ReviewRemindersDatabase.getRemindersForDeck(did1)
+         assertThat(reminders, anEmptyMap())
+     }
+ 
+     @Test
+     fun `editRemindersForDeck and getRemindersForDeck should read and write reminders correctly`() {
+-        reviewRemindersDatabase.editRemindersForDeck(did1) { dummyDeckSpecificRemindersForDeckOne }
+-        val storedReminders = reviewRemindersDatabase.getRemindersForDeck(did1)
++        ReviewRemindersDatabase.editRemindersForDeck(did1) { dummyDeckSpecificRemindersForDeckOne }
++        val storedReminders = ReviewRemindersDatabase.getRemindersForDeck(did1)
+         assertThat(storedReminders, equalTo(dummyDeckSpecificRemindersForDeckOne))
+     }
+ 
+     @Test
+     fun `getAllDeckSpecificReminders should return empty map when no reminders exist`() {
+-        val reminders = reviewRemindersDatabase.getAllDeckSpecificReminders()
++        val reminders = ReviewRemindersDatabase.getAllDeckSpecificReminders()
+         assertThat(reminders, anEmptyMap())
+     }
+ 
+     @Test
+     fun `getAllDeckSpecificReminders should return all reminders across decks`() {
+-        reviewRemindersDatabase.editRemindersForDeck(did1) { dummyDeckSpecificRemindersForDeckOne }
+-        reviewRemindersDatabase.editRemindersForDeck(did2) { dummyDeckSpecificRemindersForDeckTwo }
+-        val allReminders = reviewRemindersDatabase.getAllDeckSpecificReminders()
++        ReviewRemindersDatabase.editRemindersForDeck(did1) { dummyDeckSpecificRemindersForDeckOne }
++        ReviewRemindersDatabase.editRemindersForDeck(did2) { dummyDeckSpecificRemindersForDeckTwo }
++        val allReminders = ReviewRemindersDatabase.getAllDeckSpecificReminders()
+         assertThat(
+             allReminders,
+             equalTo(dummyDeckSpecificRemindersForDeckOne + dummyDeckSpecificRemindersForDeckTwo),
+@@ -127,80 +207,296 @@ class ReviewRemindersDatabaseTest : RobolectricTest() {
+ 
+     @Test
+     fun `getAllAppWideReminders should return empty map when no reminders exist`() {
+-        val reminders = reviewRemindersDatabase.getAllAppWideReminders()
++        val reminders = ReviewRemindersDatabase.getAllAppWideReminders()
+         assertThat(reminders, anEmptyMap())
+     }
+ 
+     @Test
+     fun `editAllAppWideReminders and getAllAppWideReminders should read and write reminders correctly`() {
+-        reviewRemindersDatabase.editAllAppWideReminders { dummyAppWideReminders }
+-        val storedReminders = reviewRemindersDatabase.getAllAppWideReminders()
++        ReviewRemindersDatabase.editAllAppWideReminders { dummyAppWideReminders }
++        val storedReminders = ReviewRemindersDatabase.getAllAppWideReminders()
+         assertThat(storedReminders, equalTo(dummyAppWideReminders))
+     }
+ 
+     @Test(expected = SerializationException::class)
+-    fun `getRemindersForDeck should throw SerializationException if JSON string is corrupted`() {
++    fun `getRemindersForDeck should throw SerializationException if JSON string for StoredReviewReminder is corrupted`() {
+         ReviewRemindersDatabase.remindersSharedPrefs.edit {
+             putString(ReviewRemindersDatabase.DECK_SPECIFIC_KEY + did1, "corrupted_and_invalid_json_string")
+         }
+-        reviewRemindersDatabase.getRemindersForDeck(did1)
++        ReviewRemindersDatabase.getRemindersForDeck(did1)
+     }
+ 
+     @Test(expected = IllegalArgumentException::class)
+-    fun `getRemindersForDeck should throw IllegalArgumentException if JSON string is not a ReviewReminder`() {
++    fun `getRemindersForDeck should throw IllegalArgumentException if JSON string is not a StoredReviewReminder`() {
+         val randomObject = Pair("not a map of", "review reminders")
+         ReviewRemindersDatabase.remindersSharedPrefs.edit {
+             putString(ReviewRemindersDatabase.DECK_SPECIFIC_KEY + did1, Json.encodeToString(randomObject))
+         }
+-        reviewRemindersDatabase.getRemindersForDeck(did1)
++        ReviewRemindersDatabase.getRemindersForDeck(did1)
+     }
+ 
+     @Test(expected = SerializationException::class)
+-    fun `getAllAppWideReminders should throw SerializationException if JSON string is corrupted`() {
++    fun `getRemindersForDeck should throw SerializationException if JSON string for review reminder is corrupted`() {
++        val corruptedStoredReviewReminder =
++            ReviewRemindersDatabase.StoredReviewRemindersMap(
++                ReviewRemindersDatabase.schemaVersion,
++                "corrupted_and_invalid_json_string",
++            )
++        ReviewRemindersDatabase.remindersSharedPrefs.edit {
++            putString(ReviewRemindersDatabase.DECK_SPECIFIC_KEY + did1, Json.encodeToString(corruptedStoredReviewReminder))
++        }
++        ReviewRemindersDatabase.getRemindersForDeck(did1)
++    }
++
++    @Test(expected = SerializationException::class)
++    fun `getAllAppWideReminders should throw SerializationException if JSON string for StoredReviewReminder is corrupted`() {
+         ReviewRemindersDatabase.remindersSharedPrefs.edit {
+             putString(ReviewRemindersDatabase.APP_WIDE_KEY, "corrupted_and_invalid_json_string")
+         }
+-        reviewRemindersDatabase.getAllAppWideReminders()
++        ReviewRemindersDatabase.getAllAppWideReminders()
+     }
+ 
+     @Test(expected = IllegalArgumentException::class)
+-    fun `getAllAppWideReminders should throw IllegalArgumentException if JSON string is not a ReviewReminder`() {
++    fun `getAllAppWideReminders should throw IllegalArgumentException if JSON string is not a StoredReviewReminder`() {
+         val randomObject = Pair("not a map of", "review reminders")
+         ReviewRemindersDatabase.remindersSharedPrefs.edit {
+             putString(ReviewRemindersDatabase.APP_WIDE_KEY, Json.encodeToString(randomObject))
+         }
+-        reviewRemindersDatabase.getAllAppWideReminders()
++        ReviewRemindersDatabase.getAllAppWideReminders()
++    }
++
++    @Test(expected = SerializationException::class)
++    fun `getAllAppWideReminders should throw SerializationException if JSON string for review reminder is corrupted`() {
++        val corruptedStoredReviewReminder =
++            ReviewRemindersDatabase.StoredReviewRemindersMap(
++                ReviewRemindersDatabase.schemaVersion,
++                "corrupted_and_invalid_json_string",
++            )
++        ReviewRemindersDatabase.remindersSharedPrefs.edit {
++            putString(ReviewRemindersDatabase.APP_WIDE_KEY, Json.encodeToString(corruptedStoredReviewReminder))
++        }
++        ReviewRemindersDatabase.getAllAppWideReminders()
+     }
+ 
+     @Test(expected = SerializationException::class)
+-    fun `getAllDeckSpecificReminders should throw SerializationException if JSON string is corrupted`() {
++    fun `getAllDeckSpecificReminders should throw SerializationException if JSON string for StoredReviewReminder is corrupted`() {
+         ReviewRemindersDatabase.remindersSharedPrefs.edit {
+             putString(ReviewRemindersDatabase.DECK_SPECIFIC_KEY + did1, "corrupted_and_invalid_json_string")
+         }
+-        reviewRemindersDatabase.getAllDeckSpecificReminders()
++        ReviewRemindersDatabase.getAllDeckSpecificReminders()
+     }
+ 
+     @Test(expected = IllegalArgumentException::class)
+-    fun `getAllDeckSpecificReminders should throw IllegalArgumentException if JSON string is not a ReviewReminder`() {
++    fun `getAllDeckSpecificReminders should throw IllegalArgumentException if JSON string is not a StoredReviewReminder`() {
+         val randomObject = Pair("not a map of", "review reminders")
+         ReviewRemindersDatabase.remindersSharedPrefs.edit {
+             putString(ReviewRemindersDatabase.DECK_SPECIFIC_KEY + did1, Json.encodeToString(randomObject))
+         }
+-        reviewRemindersDatabase.getAllDeckSpecificReminders()
++        ReviewRemindersDatabase.getAllDeckSpecificReminders()
++    }
++
++    @Test(expected = SerializationException::class)
++    fun `getAllDeckSpecificReminders should throw SerializationException if JSON string for review reminder is corrupted`() {
++        val corruptedStoredReviewReminder =
++            ReviewRemindersDatabase.StoredReviewRemindersMap(
++                ReviewRemindersDatabase.schemaVersion,
++                "corrupted_and_invalid_json_string",
++            )
++        ReviewRemindersDatabase.remindersSharedPrefs.edit {
++            putString(ReviewRemindersDatabase.DECK_SPECIFIC_KEY + did1, Json.encodeToString(corruptedStoredReviewReminder))
++        }
++        ReviewRemindersDatabase.getAllDeckSpecificReminders()
++    }
++
++    /**
++     * When review reminders are migrated to the new schema, the reminders' IDs will be recreated from scratch.
++     * Thus, validation that our tests succeeded should ignore [ReviewReminder.id].
++     * This custom Hamcrest matcher performs this validation using reflection.
++     */
++    private fun containsEqualReviewRemindersInAnyOrderIgnoringId(expected: Collection<ReviewReminder>): Matcher<Iterable<ReviewReminder>> =
++        object : TypeSafeMatcher<Iterable<ReviewReminder>>() {
++            override fun describeTo(description: Description) {
++                description.appendValue(expected)
++            }
++
++            override fun matchesSafely(actual: Iterable<ReviewReminder>): Boolean {
++                val expectedSet =
++                    expected
++                        .map { e ->
++                            ReviewReminder::class
++                                .memberProperties
++                                .filterNot { it.name == "id" }
++                                .associateWith { it.get(e) }
++                        }.toSet()
++
++                val actualSet =
++                    actual
++                        .map { a ->
++                            ReviewReminder::class
++                                .memberProperties
++                                .filterNot { it.name == "id" }
++                                .associateWith { it.get(a) }
++                        }.toSet()
++
++                return expectedSet == actualSet
++            }
++        }
++
++    /**
++     * If this test has failed, please ensure the review reminder schema version and old schemas in the review reminder
++     * migration chain are set correctly.
++     */
++    @Test
++    fun `current schema version points to ReviewReminder`() {
++        assertThat(ReviewRemindersDatabase.schemaVersion.value, equalTo(1))
++        assertThat(
++            ReviewRemindersDatabase
++                .oldReviewReminderSchemasForMigration
++                .keys
++                .last()
++                .value,
++            equalTo(1),
++        )
++        assertThat(
++            ReviewRemindersDatabase
++                .oldReviewReminderSchemasForMigration
++                .values
++                .last(),
++            equalTo(ReviewReminder::class),
++        )
+     }
+ 
+     @Test
+-    fun `backup and restoration of review reminders should work correctly`() {
+-        with(reviewRemindersDatabase) {
+-            editRemindersForDeck(did1) { dummyDeckSpecificRemindersForDeckOne }
+-            editAllAppWideReminders { dummyAppWideReminders }
+-            val backupReminders = getAllReviewReminderSharedPrefsAsMap()
+-            editRemindersForDeck(did1) { dummyDeckSpecificRemindersForDeckTwo }
+-            editRemindersForDeck(did2) { dummyDeckSpecificRemindersForDeckTwo }
+-            deleteAllReviewReminderSharedPrefs()
+-            writeAllReviewReminderSharedPrefsFromMap(backupReminders)
+-            val restoredReminders = getAllReviewReminderSharedPrefsAsMap()
+-            assertThat(restoredReminders, equalTo(backupReminders))
++    fun `review reminder schema migration works`() {
++        // Save existing mocks
++        val savedOldReviewReminderSchemasForMigration = ReviewRemindersDatabase.oldReviewReminderSchemasForMigration
++        val savedSchemaVersion = ReviewRemindersDatabase.schemaVersion
++        // Inject mocks
++        ReviewRemindersDatabase.schemaVersion = ReviewReminderSchemaVersion(3)
++        ReviewRemindersDatabase.oldReviewReminderSchemasForMigration =
++            mapOf(
++                ReviewReminderSchemaVersion(1) to TestingReviewReminderMigrationSettings.ReviewReminderSchemaVersionOne::class,
++                ReviewReminderSchemaVersion(2) to TestingReviewReminderMigrationSettings.ReviewReminderSchemaVersionTwo::class,
++                ReviewReminderSchemaVersion(3) to ReviewReminder::class,
++            )
++        // To spice things up, some will be version one...
++        val versionOneDummyDeckSpecificRemindersForDeckOne =
++            mapOf(
++                ReviewReminderId(0) to
++                    TestingReviewReminderMigrationSettings.ReviewReminderSchemaVersionOne(
++                        ReviewReminderId(0),
++                        9,
++                        0,
++                        5,
++                        did1,
++                        false,
++                    ),
++                ReviewReminderId(1) to
++                    TestingReviewReminderMigrationSettings.ReviewReminderSchemaVersionOne(
++                        ReviewReminderId(1),
++                        10,
++                        30,
++                        10,
++                        did1,
++                    ),
++            )
++        // ...and some will be version two
++        val versionTwoDummyDeckSpecificRemindersForDeckTwo =
++            mapOf(
++                ReviewReminderId(2) to
++                    TestingReviewReminderMigrationSettings.ReviewReminderSchemaVersionTwo(
++                        ReviewReminderId(2),
++                        TestingReviewReminderMigrationSettings.VersionTwoDataClasses.ReviewReminderTime(10, 30),
++                        1,
++                        10,
++                        did2,
++                    ),
++                ReviewReminderId(3) to
++                    TestingReviewReminderMigrationSettings.ReviewReminderSchemaVersionTwo(
++                        ReviewReminderId(3),
++                        TestingReviewReminderMigrationSettings.VersionTwoDataClasses.ReviewReminderTime(12, 30),
++                        1,
++                        20,
++                        did2,
++                    ),
++            )
++        val versionOneDummyAppWideReminders =
++            mapOf(
++                ReviewReminderId(4) to
++                    TestingReviewReminderMigrationSettings.ReviewReminderSchemaVersionOne(
++                        ReviewReminderId(4),
++                        9,
++                        0,
++                        5,
++                        -1L,
++                    ),
++                ReviewReminderId(5) to
++                    TestingReviewReminderMigrationSettings.ReviewReminderSchemaVersionOne(
++                        ReviewReminderId(5),
++                        10,
++                        30,
++                        10,
++                        -1L,
++                    ),
++            )
++
++        val packagedDeckOneReminders =
++            ReviewRemindersDatabase.StoredReviewRemindersMap(
++                ReviewReminderSchemaVersion(1),
++                Json.encodeToString(versionOneDummyDeckSpecificRemindersForDeckOne),
++            )
++        val packagedDeckTwoReminders =
++            ReviewRemindersDatabase.StoredReviewRemindersMap(
++                ReviewReminderSchemaVersion(2),
++                Json.encodeToString(versionTwoDummyDeckSpecificRemindersForDeckTwo),
++            )
++        val packagedGlobalReminders =
++            ReviewRemindersDatabase.StoredReviewRemindersMap(
++                ReviewReminderSchemaVersion(1),
++                Json.encodeToString(versionOneDummyAppWideReminders),
++            )
++
++        ReviewRemindersDatabase.remindersSharedPrefs.edit(commit = true) {
++            putString(ReviewRemindersDatabase.DECK_SPECIFIC_KEY + did1, Json.encodeToString(packagedDeckOneReminders))
++            putString(ReviewRemindersDatabase.DECK_SPECIFIC_KEY + did2, Json.encodeToString(packagedDeckTwoReminders))
++            putString(ReviewRemindersDatabase.APP_WIDE_KEY, Json.encodeToString(packagedGlobalReminders))
+         }
++
++        val retrievedDeckOneReminders = ReviewRemindersDatabase.getRemindersForDeck(did1)
++        val retrievedDeckTwoReminders = ReviewRemindersDatabase.getRemindersForDeck(did2)
++        val retrievedGlobalReminders = ReviewRemindersDatabase.getAllAppWideReminders()
++
++        retrievedDeckOneReminders.forEach { (id, reminder) ->
++            assertThat(id, equalTo(reminder.id))
++        }
++        retrievedDeckTwoReminders.forEach { (id, reminder) ->
++            assertThat(id, equalTo(reminder.id))
++        }
++        retrievedGlobalReminders.forEach { (id, reminder) ->
++            assertThat(id, equalTo(reminder.id))
++        }
++
++        // We ignore ID because the migration process will generate new review reminders from scratch during the migration; ID is a private, inaccessible property
++        assertThat(
++            retrievedDeckOneReminders.values,
++            containsEqualReviewRemindersInAnyOrderIgnoringId(dummyDeckSpecificRemindersForDeckOne.values),
++        )
++        assertThat(
++            retrievedDeckTwoReminders.values,
++            containsEqualReviewRemindersInAnyOrderIgnoringId(dummyDeckSpecificRemindersForDeckTwo.values),
++        )
++        assertThat(
++            retrievedGlobalReminders.values,
++            containsEqualReviewRemindersInAnyOrderIgnoringId(dummyAppWideReminders.values),
++        )
++
++        // Shared Preferences should not contain any random corrupted keys after or due to the migration process
++        // There should be three: two for the specific decks, one for app-wide
++        val sharedPrefsSize = ReviewRemindersDatabase.remindersSharedPrefs.all.size
++        assertThat(sharedPrefsSize, CoreMatchers.equalTo(3))
++
++        // Reset mocks
++        ReviewRemindersDatabase.schemaVersion = savedSchemaVersion
++        ReviewRemindersDatabase.oldReviewReminderSchemasForMigration = savedOldReviewReminderSchemasForMigration
+     }
+ }

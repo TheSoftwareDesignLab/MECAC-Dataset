@@ -1,0 +1,262 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index d7654c8838..9242719b72 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -200,8 +200,6 @@
+       android:name=".widget.TasksWidget">
+       <intent-filter>
+         <action android:name="android.appwidget.action.APPWIDGET_UPDATE"/>
+-        <action android:name="com.todoroo.astrid.widget.TasksWidget.COMPLETE_TASK"/>
+-        <action android:name="com.todoroo.astrid.widget.TasksWidget.EDIT_TASK"/>
+       </intent-filter>
+ 
+       <meta-data
+@@ -505,6 +503,13 @@
+       android:name=".preferences.DebugPreferences"
+       android:theme="@style/Tasks"/>
+ 
++    <activity
++      android:name=".widget.WidgetClickActivity"
++      android:excludeFromRecents="true"
++      android:launchMode="singleTask"
++      android:taskAffinity=""
++      android:theme="@style/TranslucentDialog"/>
++
+     <!-- launcher icons -->
+ 
+     <activity-alias
+diff --git a/app/src/main/java/org/tasks/injection/ActivityComponent.java b/app/src/main/java/org/tasks/injection/ActivityComponent.java
+index 7067bbf619..2d7b9009ea 100644
+--- a/app/src/main/java/org/tasks/injection/ActivityComponent.java
++++ b/app/src/main/java/org/tasks/injection/ActivityComponent.java
+@@ -42,6 +42,7 @@
+ import org.tasks.ui.TaskListViewModel;
+ import org.tasks.voice.VoiceCommandActivity;
+ import org.tasks.widget.ShortcutConfigActivity;
++import org.tasks.widget.WidgetClickActivity;
+ import org.tasks.widget.WidgetConfigActivity;
+ 
+ @ActivityScope
+@@ -137,4 +138,6 @@ public interface ActivityComponent {
+   void inject(DebugPreferences debugPreferences);
+ 
+   void inject(TaskEditActivity taskEditActivity);
++
++  void inject(WidgetClickActivity widgetActivity);
+ }
+diff --git a/app/src/main/java/org/tasks/widget/ScrollableViewsFactory.java b/app/src/main/java/org/tasks/widget/ScrollableViewsFactory.java
+index 3a0ecc48b7..b21c9100af 100644
+--- a/app/src/main/java/org/tasks/widget/ScrollableViewsFactory.java
++++ b/app/src/main/java/org/tasks/widget/ScrollableViewsFactory.java
+@@ -49,7 +49,7 @@ class ScrollableViewsFactory implements RemoteViewsService.RemoteViewsFactory {
+   private boolean showCheckboxes;
+   private float textSize;
+   private float dueDateTextSize;
+-  private String filterId;
++  private Filter filter;
+   private int textColorPrimary;
+   private int textColorSecondary;
+ 
+@@ -173,16 +173,15 @@ private RemoteViews buildUpdate(int position) {
+       row.setTextColor(R.id.widget_text, textColorTitle);
+       row.setImageViewBitmap(R.id.widget_complete_box, getCheckbox(task));
+ 
+-      long taskId = task.getId();
+-      Intent editIntent = new Intent(TasksWidget.EDIT_TASK);
+-      editIntent.putExtra(TasksWidget.EXTRA_FILTER_ID, filterId);
+-      editIntent.putExtra(TasksWidget.EXTRA_ID, taskId);
++      Intent editIntent = new Intent(WidgetClickActivity.EDIT_TASK);
++      editIntent.putExtra(WidgetClickActivity.EXTRA_FILTER, filter);
++      editIntent.putExtra(WidgetClickActivity.EXTRA_TASK, task);
+       row.setOnClickFillInIntent(R.id.widget_row, editIntent);
+ 
+       if (showCheckboxes) {
+         row.setViewVisibility(R.id.widget_complete_box, View.VISIBLE);
+-        Intent completeIntent = new Intent(TasksWidget.COMPLETE_TASK);
+-        completeIntent.putExtra(TasksWidget.EXTRA_ID, taskId);
++        Intent completeIntent = new Intent(WidgetClickActivity.COMPLETE_TASK);
++        completeIntent.putExtra(WidgetClickActivity.EXTRA_TASK, task);
+         row.setOnClickFillInIntent(R.id.widget_complete_box, completeIntent);
+       } else {
+         row.setViewVisibility(R.id.widget_complete_box, View.GONE);
+@@ -203,7 +202,6 @@ private RemoteViews buildUpdate(int position) {
+ 
+   private Cursor getCursor() {
+     updateSettings();
+-    Filter filter = defaultFilterProvider.getFilterFromPreference(filterId);
+     return taskDao.getCursor(getQuery(filter), getProperties(filter));
+   }
+ 
+@@ -259,6 +257,6 @@ private void updateSettings() {
+     showCheckboxes = widgetPreferences.showCheckboxes();
+     textSize = widgetPreferences.getFontSize();
+     dueDateTextSize = Math.max(10, textSize - 2);
+-    filterId = widgetPreferences.getFilterId();
++    filter = defaultFilterProvider.getFilterFromPreference(widgetPreferences.getFilterId());
+   }
+ }
+diff --git a/app/src/main/java/org/tasks/widget/TasksWidget.java b/app/src/main/java/org/tasks/widget/TasksWidget.java
+index 19afa11405..b17257fbcb 100644
+--- a/app/src/main/java/org/tasks/widget/TasksWidget.java
++++ b/app/src/main/java/org/tasks/widget/TasksWidget.java
+@@ -15,14 +15,9 @@
+ import android.net.Uri;
+ import android.view.View;
+ import android.widget.RemoteViews;
+-import com.google.common.base.Strings;
+ import com.todoroo.astrid.activity.MainActivity;
+ import com.todoroo.astrid.api.Filter;
+ import com.todoroo.astrid.dao.TaskDao;
+-import io.reactivex.Single;
+-import io.reactivex.android.schedulers.AndroidSchedulers;
+-import io.reactivex.functions.Consumer;
+-import io.reactivex.schedulers.Schedulers;
+ import javax.inject.Inject;
+ import org.tasks.R;
+ import org.tasks.injection.BroadcastComponent;
+@@ -32,7 +27,6 @@
+ import org.tasks.locale.Locale;
+ import org.tasks.preferences.DefaultFilterProvider;
+ import org.tasks.preferences.Preferences;
+-import org.tasks.receivers.CompleteTaskReceiver;
+ import org.tasks.themes.ThemeCache;
+ import org.tasks.themes.ThemeColor;
+ import org.tasks.themes.WidgetTheme;
+@@ -40,10 +34,6 @@
+ 
+ public class TasksWidget extends InjectingAppWidgetProvider {
+ 
+-  public static final String COMPLETE_TASK = "COMPLETE_TASK";
+-  public static final String EDIT_TASK = "EDIT_TASK";
+-  public static final String EXTRA_FILTER_ID = "extra_filter_id";
+-  public static final String EXTRA_ID = "extra_id"; // $NON-NLS-1$
+   private static final int flags = FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TOP;
+   @Inject Preferences preferences;
+   @Inject DefaultFilterProvider defaultFilterProvider;
+@@ -58,41 +48,6 @@ private static Bitmap getSolidBackground(int bgColor) {
+     return bitmap;
+   }
+ 
+-  @Override
+-  public void onReceive(Context context, Intent intent) {
+-    super.onReceive(context, intent);
+-
+-    String action = intent.getAction();
+-
+-    if (Strings.isNullOrEmpty(action)) {
+-      return;
+-    }
+-
+-    long taskId = intent.getLongExtra(EXTRA_ID, 0);
+-
+-    switch (action) {
+-      case COMPLETE_TASK:
+-        Intent completionIntent = new Intent(context, CompleteTaskReceiver.class);
+-        completionIntent.putExtra(CompleteTaskReceiver.TASK_ID, taskId);
+-        completionIntent.putExtra(CompleteTaskReceiver.TOGGLE_STATE, true);
+-        context.sendBroadcast(completionIntent);
+-        break;
+-      case EDIT_TASK:
+-        //noinspection ResultOfMethodCallIgnored
+-        Single.fromCallable(
+-                () ->
+-                    TaskIntents.getEditTaskIntent(
+-                        context,
+-                        defaultFilterProvider.getFilterFromPreference(
+-                            intent.getStringExtra(EXTRA_FILTER_ID)),
+-                        taskDao.fetch(taskId)))
+-            .subscribeOn(Schedulers.io())
+-            .observeOn(AndroidSchedulers.mainThread())
+-            .subscribe((Consumer<Intent>) context::startActivity);
+-        break;
+-    }
+-  }
+-
+   @Override
+   protected void inject(BroadcastComponent component) {
+     component.inject(this);
+@@ -157,8 +112,8 @@ private RemoteViews createScrollableWidget(Context context, int id) {
+   }
+ 
+   private PendingIntent getPendingIntentTemplate(Context context) {
+-    Intent intent = new Intent(context, TasksWidget.class);
+-    return PendingIntent.getBroadcast(context, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT);
++    return PendingIntent.getActivity(
++        context, 0, new Intent(context, WidgetClickActivity.class), PendingIntent.FLAG_UPDATE_CURRENT);
+   }
+ 
+   private PendingIntent getOpenListIntent(Context context, Filter filter, int widgetId) {
+diff --git a/app/src/main/java/org/tasks/widget/WidgetClickActivity.java b/app/src/main/java/org/tasks/widget/WidgetClickActivity.java
+new file mode 100644
+index 0000000000..a2a136898f
+--- /dev/null
++++ b/app/src/main/java/org/tasks/widget/WidgetClickActivity.java
+@@ -0,0 +1,56 @@
++package org.tasks.widget;
++
++import android.content.Intent;
++import android.os.Bundle;
++import com.google.common.base.Strings;
++import com.todoroo.astrid.dao.TaskDao;
++import com.todoroo.astrid.data.Task;
++import javax.inject.Inject;
++import org.tasks.injection.ActivityComponent;
++import org.tasks.injection.InjectingAppCompatActivity;
++import org.tasks.intents.TaskIntents;
++
++public class WidgetClickActivity extends InjectingAppCompatActivity {
++
++  public static final String COMPLETE_TASK = "COMPLETE_TASK";
++  public static final String EDIT_TASK = "EDIT_TASK";
++  public static final String EXTRA_FILTER = "extra_filter";
++  public static final String EXTRA_TASK = "extra_task"; // $NON-NLS-1$
++
++  @Inject TaskDao taskDao;
++
++  @Override
++  protected void onCreate(Bundle savedInstanceState) {
++    super.onCreate(savedInstanceState);
++
++    Intent intent = getIntent();
++
++    String action = intent.getAction();
++
++    if (Strings.isNullOrEmpty(action)) {
++      return;
++    }
++
++    Task task = intent.getParcelableExtra(EXTRA_TASK);
++
++    switch (action) {
++      case COMPLETE_TASK:
++        taskDao.setComplete(task, !task.isCompleted());
++        break;
++      case EDIT_TASK:
++        startActivity(
++            TaskIntents.getEditTaskIntent(
++                this,
++                intent.getParcelableExtra(EXTRA_FILTER),
++                intent.getParcelableExtra(EXTRA_TASK)));
++        break;
++    }
++
++    finish();
++  }
++
++  @Override
++  public void inject(ActivityComponent component) {
++    component.inject(this);
++  }
++}
+diff --git a/app/src/main/res/values/styles.xml b/app/src/main/res/values/styles.xml
+index 5e4d20735d..77d1ac6fdb 100644
+--- a/app/src/main/res/values/styles.xml
++++ b/app/src/main/res/values/styles.xml
+@@ -15,6 +15,7 @@
+     <item name="android:windowBackground">@android:color/transparent</item>
+     <item name="android:colorBackgroundCacheHint">@null</item>
+     <item name="android:windowIsTranslucent">true</item>
++    <item name="android:windowCloseOnTouchOutside">false</item>
+   </style>
+ 
+   <style name="TaskListChip" parent="Base.Widget.MaterialComponents.Chip">

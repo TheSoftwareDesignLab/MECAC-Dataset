@@ -1,0 +1,1218 @@
+diff --git a/budget/lib/database/tables.dart b/budget/lib/database/tables.dart
+index 110f5e421..237a032bd 100644
+--- a/budget/lib/database/tables.dart
++++ b/budget/lib/database/tables.dart
+@@ -1,3 +1,5 @@
++import 'dart:developer';
++
+ import 'package:budget/functions.dart';
+ import 'package:budget/main.dart';
+ import 'package:budget/pages/addBudgetPage.dart';
+@@ -691,10 +693,16 @@ class FinanceDatabase extends _$FinanceDatabase {
+         end == null ? null : DateTime(end.year, end.month, end.day);
+ 
+     final query = selectOnly(transactions, distinct: true)
++      ..join([
++        leftOuterJoin(categories,
++            categories.categoryPk.equalsExp(transactions.categoryFk))
++      ])
+       ..orderBy(limit == null
+           ? [OrderingTerm.asc(transactions.dateCreated)]
+           : [OrderingTerm.desc(transactions.dateCreated)])
+-      ..where(onlyShowIfFollowsFilters(transactions,
++      ..where((categories.name.lower().like("%" + search.toLowerCase() + "%") |
++              transactions.name.like("%" + search + "%")) &
++          onlyShowIfFollowsFilters(transactions,
+               budgetTransactionFilters: budgetTransactionFilters,
+               memberTransactionFilters: memberTransactionFilters) &
+           onlyShowBasedOnTimeRange(transactions, startDate, endDate, budget) &
+@@ -2561,6 +2569,30 @@ class FinanceDatabase extends _$FinanceDatabase {
+     return (delete(wallets)..where((w) => w.walletPk.equals(walletPk))).go();
+   }
+ 
++  Future<bool> moveWalletTransactons(int walletPk, int toWalletPk) async {
++    List<Transaction> transactionsForMove = await (select(transactions)
++          ..where((tbl) {
++            return tbl.walletFk.equals(walletPk);
++          }))
++        .get();
++    List<Transaction> allTransactionsToUpdate = [];
++    for (Transaction transaction in transactionsForMove) {
++      allTransactionsToUpdate.add(transaction.copyWith(
++        amount: (amountRatioFromToCurrency(
++                    appStateSettings["cachedWalletCurrencies"]
++                        [walletPk.toString()],
++                    appStateSettings["cachedWalletCurrencies"]
++                        [toWalletPk.toString()]) ??
++                1) *
++            transaction.amount,
++        dateTimeModified: Value(DateTime.now()),
++        walletFk: toWalletPk,
++      ));
++    }
++    await createOrUpdateBatchTransactionsOnly(allTransactionsToUpdate);
++    return true;
++  }
++
+   Future deleteScannerTemplate(int scannerTemplatePk) async {
+     await createDeleteLog(DeleteLogType.ScannerTemplate, scannerTemplatePk);
+     return (delete(scannerTemplates)
+@@ -2609,6 +2641,7 @@ class FinanceDatabase extends _$FinanceDatabase {
+             total: item.total +
+                 (categoryTotals[item.category.categoryPk]?.total ?? 0),
+             transactionCount: item.transactionCount,
++            categoryBudgetLimit: item.categoryBudgetLimit,
+           );
+         }
+       }
+@@ -2962,8 +2995,7 @@ class FinanceDatabase extends _$FinanceDatabase {
+             categoryBudgetLimits,
+             categoryBudgetLimits.categoryFk.equalsExp(categories.categoryPk) &
+                 evaluateIfNull(
+-                    categoryBudgetLimits.categoryFk
+-                        .equals(budget?.budgetPk ?? 0),
++                    categoryBudgetLimits.budgetFk.equals(budget?.budgetPk ?? 0),
+                     budget,
+                     false))
+       ])
+@@ -2972,8 +3004,9 @@ class FinanceDatabase extends _$FinanceDatabase {
+             ..orderBy([OrderingTerm.asc(totalAmt)]))
+           .map((row) {
+         final TransactionCategory category = row.readTable(categories);
+-        final CategoryBudgetLimit categoryBudgetLimit =
+-            row.readTable(categoryBudgetLimits);
++        CategoryBudgetLimit? categoryBudgetLimit =
++            row.readTableOrNull(categoryBudgetLimits);
++
+         final double? total = (row.read(totalAmt) ?? 0) *
+             (amountRatioToPrimaryCurrency(wallet.currency) ?? 0);
+         final int? transactionCount = row.read(totalCount);
+@@ -2985,6 +3018,8 @@ class FinanceDatabase extends _$FinanceDatabase {
+       }).watch());
+     }
+ 
++    return totalCategoryTotalStream(mergedStreams);
++
+     // Stream<List<TransactionCategory>> allCategoriesWatched =
+     //     watchAllCategories();
+ 
+@@ -3005,8 +3040,6 @@ class FinanceDatabase extends _$FinanceDatabase {
+     //   });
+     //   return allCategoriesWithTotals;
+     // });
+-
+-    return totalCategoryTotalStream(mergedStreams);
+   }
+ 
+   Stream<double?> watchTotalOfWallet(int? walletPk, {bool? isIncome = null}) {
+diff --git a/budget/lib/functions.dart b/budget/lib/functions.dart
+index dfab976fe..c0e796ba7 100644
+--- a/budget/lib/functions.dart
++++ b/budget/lib/functions.dart
+@@ -681,10 +681,17 @@ String getMemberNickname(member) {
+   }
+ }
+ 
++bool isNumber(dynamic value) {
++  if (value == null) {
++    return false;
++  }
++  return num.tryParse(value.toString()) != null;
++}
++
+ Future<bool> getExchangeRates() async {
+   print("Getting exchange rates for current wallets");
+-  List<String?> uniqueCurrencies =
+-      await database.getUniqueCurrenciesFromWallets();
++  // List<String?> uniqueCurrencies =
++  //     await database.getUniqueCurrenciesFromWallets();
+   Map<dynamic, dynamic> cachedCurrencyExchange =
+       appStateSettings["cachedCurrencyExchange"];
+   try {
+@@ -730,6 +737,22 @@ double? amountRatioToPrimaryCurrency(String? walletCurrency) {
+   return exchangeRateFromUSDToTarget * exchangeRateFromCurrentToUSD;
+ }
+ 
++double? amountRatioFromToCurrency(
++    String walletCurrencyBefore, String walletCurrencyAfter) {
++  if (appStateSettings["cachedCurrencyExchange"][walletCurrencyBefore] ==
++          null ||
++      appStateSettings["cachedCurrencyExchange"][walletCurrencyAfter] == null) {
++    return null;
++  }
++  double exchangeRateFromUSDToTarget =
++      appStateSettings["cachedCurrencyExchange"][walletCurrencyAfter]
++          .toDouble();
++  double exchangeRateFromCurrentToUSD = 1 /
++      appStateSettings["cachedCurrencyExchange"][walletCurrencyBefore]
++          .toDouble();
++  return exchangeRateFromUSDToTarget * exchangeRateFromCurrentToUSD;
++}
++
+ bool getIsKeyboardOpen(context) {
+   return EdgeInsets.zero !=
+       EdgeInsets.fromViewPadding(
+diff --git a/budget/lib/pages/budgetPage.dart b/budget/lib/pages/budgetPage.dart
+index 3b46662e3..77605b51f 100644
+--- a/budget/lib/pages/budgetPage.dart
++++ b/budget/lib/pages/budgetPage.dart
+@@ -225,55 +225,45 @@ class _BudgetPageContentState extends State<_BudgetPageContent> {
+                             totalSpent = totalSpent.abs();
+                           });
+                           snapshot.data!.asMap().forEach((index, category) {
+-                            categoryEntries.add(
+-                              StreamBuilder<CategoryBudgetLimit>(
+-                                stream: database
+-                                    .getCategoryLimit(widget.budget.budgetPk,
+-                                        category.category.categoryPk)
+-                                    .$1,
+-                                builder: (context, snapshot) {
+-                                  return CategoryEntry(
+-                                    onLongPress: () {
+-                                      enterCategoryLimitPopup(
+-                                        context,
+-                                        category.category,
+-                                        snapshot.data,
+-                                        widget.budget.budgetPk,
+-                                        (p0) => null,
+-                                      );
+-                                    },
+-                                    categoryBudgetLimit: snapshot.data,
+-                                    budgetColorScheme: budgetColorScheme,
+-                                    category: category.category,
+-                                    totalSpent: totalSpent,
+-                                    transactionCount: category.transactionCount,
+-                                    categorySpent: category.total.abs(),
+-                                    onTap: () {
+-                                      if (selectedCategoryPk ==
+-                                          category.category.categoryPk) {
+-                                        setState(() {
+-                                          selectedCategoryPk = -1;
+-                                          selectedCategory = null;
+-                                        });
+-                                        _pieChartDisplayStateKey.currentState!
+-                                            .setTouchedIndex(-1);
+-                                      } else {
+-                                        setState(() {
+-                                          selectedCategoryPk =
+-                                              category.category.categoryPk;
+-                                          selectedCategory = category.category;
+-                                        });
+-                                        _pieChartDisplayStateKey.currentState!
+-                                            .setTouchedIndex(index);
+-                                      }
+-                                    },
+-                                    selected: selectedCategoryPk ==
+-                                        category.category.categoryPk,
+-                                    allSelected: selectedCategoryPk == -1,
+-                                  );
+-                                },
+-                              ),
+-                            );
++                            categoryEntries.add(CategoryEntry(
++                              onLongPress: () {
++                                enterCategoryLimitPopup(
++                                  context,
++                                  category.category,
++                                  category.categoryBudgetLimit,
++                                  widget.budget.budgetPk,
++                                  (p0) => null,
++                                );
++                              },
++                              categoryBudgetLimit: category.categoryBudgetLimit,
++                              budgetColorScheme: budgetColorScheme,
++                              category: category.category,
++                              totalSpent: totalSpent,
++                              transactionCount: category.transactionCount,
++                              categorySpent: category.total.abs(),
++                              onTap: () {
++                                if (selectedCategoryPk ==
++                                    category.category.categoryPk) {
++                                  setState(() {
++                                    selectedCategoryPk = -1;
++                                    selectedCategory = null;
++                                  });
++                                  _pieChartDisplayStateKey.currentState!
++                                      .setTouchedIndex(-1);
++                                } else {
++                                  setState(() {
++                                    selectedCategoryPk =
++                                        category.category.categoryPk;
++                                    selectedCategory = category.category;
++                                  });
++                                  _pieChartDisplayStateKey.currentState!
++                                      .setTouchedIndex(index);
++                                }
++                              },
++                              selected: selectedCategoryPk ==
++                                  category.category.categoryPk,
++                              allSelected: selectedCategoryPk == -1,
++                            ));
+                           });
+                           return SliverToBoxAdapter(
+                             child: Column(children: [
+@@ -357,26 +347,23 @@ class _BudgetPageContentState extends State<_BudgetPageContent> {
+                                   message:
+                                       "There are no transactions for this budget within the current dates.",
+                                 ),
+-                              Transform.translate(
+-                                offset: Offset(0, -10),
+-                                child: BudgetSpenderSummary(
+-                                  budget: widget.budget,
+-                                  budgetRange: budgetRange,
+-                                  budgetColorScheme: budgetColorScheme,
+-                                  setSelectedMember: (member) {
+-                                    setState(() {
+-                                      selectedMember = member;
+-                                      selectedCategory = null;
+-                                      selectedCategoryPk = -1;
+-                                    });
+-                                    _pieChartDisplayStateKey.currentState!
+-                                        .setTouchedIndex(-1);
+-                                  },
+-                                  wallets: wallets,
+-                                ),
++                              BudgetSpenderSummary(
++                                budget: widget.budget,
++                                budgetRange: budgetRange,
++                                budgetColorScheme: budgetColorScheme,
++                                setSelectedMember: (member) {
++                                  setState(() {
++                                    selectedMember = member;
++                                    selectedCategory = null;
++                                    selectedCategoryPk = -1;
++                                  });
++                                  _pieChartDisplayStateKey.currentState!
++                                      .setTouchedIndex(-1);
++                                },
++                                wallets: wallets,
+                               ),
+                               if (snapshot.data!.length > 0)
+-                                SizedBox(height: 20),
++                                SizedBox(height: 30),
+                               if (snapshot.data!.length > 0)
+                                 Container(
+                                   decoration: BoxDecoration(
+@@ -477,6 +464,7 @@ class _BudgetPageContentState extends State<_BudgetPageContent> {
+                 ),
+               ),
+               getTransactionsSlivers(
++                showNoResults: false,
+                 budgetRange.start,
+                 budgetRange.end,
+                 categoryFks: selectedCategoryPk != -1
+diff --git a/budget/lib/pages/editWalletsPage.dart b/budget/lib/pages/editWalletsPage.dart
+index d2fb3d426..23d240900 100644
+--- a/budget/lib/pages/editWalletsPage.dart
++++ b/budget/lib/pages/editWalletsPage.dart
+@@ -2,6 +2,7 @@ import 'package:budget/colors.dart';
+ import 'package:budget/database/tables.dart';
+ import 'package:budget/functions.dart';
+ import 'package:budget/main.dart';
++import 'package:budget/pages/addTransactionPage.dart';
+ import 'package:budget/pages/addWalletPage.dart';
+ import 'package:budget/struct/databaseGlobal.dart';
+ import 'package:budget/widgets/fab.dart';
+@@ -249,10 +250,73 @@ void deleteWalletPopup(context, TransactionWallet wallet,
+       Navigator.pop(context);
+     },
+     onCancelLabel: "Cancel",
++    onExtraLabel2: "Move Transactions To Another Wallet and Delete",
++    onExtra2: () async {
++      Navigator.pop(context);
++      var result = await openPopupCustom(
++        context,
++        title: "Select Wallet",
++        child: StreamBuilder<List<TransactionWallet>>(
++          stream: database.watchAllWallets(),
++          builder: (context, snapshot) {
++            if (snapshot.hasData) {
++              List<TransactionWallet> walletsWithoutOneDeleted = snapshot.data!;
++              walletsWithoutOneDeleted.removeWhere(
++                  (TransactionWallet w) => w.walletPk == wallet.walletPk);
++              return SelectChips(
++                wrapped: true,
++                items: walletsWithoutOneDeleted,
++                getLabel: (item) {
++                  return item.name;
++                },
++                onSelected: (item) {
++                  Navigator.pop(context, item.walletPk);
++                },
++                getSelected: (item) {
++                  return false;
++                },
++                getCustomBorderColor: (item) {
++                  return dynamicPastel(
++                    context,
++                    lightenPastel(
++                      HexColor(
++                        item?.colour,
++                        defaultColor: Colors.transparent,
++                      ),
++                      amount: 0.3,
++                    ),
++                    amount: 0.4,
++                  );
++                },
++              );
++            } else {
++              return SizedBox.shrink();
++            }
++          },
++        ),
++      );
++      if (isNumber(result)) {
++        await database.moveWalletTransactons(
++            wallet.walletPk, int.parse(result.toString()));
++        if (appStateSettings["selectedWallet"] == wallet.walletPk) {
++          updateSettings("selectedWallet", 0,
++              updateGlobalState: true, pagesNeedingRefresh: [0, 1, 2, 3]);
++          TransactionWallet defaultWallet = await database.getWalletInstance(0);
++          updateSettings("selectedWalletCurrency", defaultWallet.currency,
++              updateGlobalState: true, pagesNeedingRefresh: [0, 1, 2, 3]);
++          updateSettings("selectedWalletDecimals", defaultWallet.decimals,
++              updateGlobalState: true, pagesNeedingRefresh: [0, 1, 2, 3]);
++        }
++        database.deleteWallet(wallet.walletPk, wallet.order);
++        Navigator.pop(context);
++        openSnackbar(
++          SnackbarMessage(title: "Deleted " + wallet.name, icon: Icons.delete),
++        );
++        if (afterDelete != null) afterDelete();
++      } else {}
++    },
+     onSubmit: () async {
+-      database.deleteWallet(wallet.walletPk, wallet.order);
+-      database.deleteWalletsTransactions(wallet.walletPk);
+-
++      await database.deleteWalletsTransactions(wallet.walletPk);
+       // If we delete the selected wallet, set it back to the default
+       if (appStateSettings["selectedWallet"] == wallet.walletPk) {
+         updateSettings("selectedWallet", 0,
+@@ -263,6 +327,7 @@ void deleteWalletPopup(context, TransactionWallet wallet,
+         updateSettings("selectedWalletDecimals", defaultWallet.decimals,
+             updateGlobalState: true, pagesNeedingRefresh: [0, 1, 2, 3]);
+       }
++      database.deleteWallet(wallet.walletPk, wallet.order);
+       Navigator.pop(context);
+       openSnackbar(
+         SnackbarMessage(title: "Deleted " + wallet.name, icon: Icons.delete),
+diff --git a/budget/lib/pages/homePage.dart b/budget/lib/pages/homePage.dart
+index 51722b19b..bc0252f16 100644
+--- a/budget/lib/pages/homePage.dart
++++ b/budget/lib/pages/homePage.dart
+@@ -143,6 +143,7 @@ class HomePageState extends State<HomePage>
+         child: SizedBox(
+           key: ValueKey(selectedSlidingSelector),
+           child: getTransactionsSlivers(
++            showNoResults: false,
+             DateTime(
+               DateTime.now().year,
+               DateTime.now().month,
+@@ -306,21 +307,26 @@ class HomePageState extends State<HomePage>
+                                             ),
+                                           Stack(
+                                             children: [
+-                                              Visibility(
+-                                                maintainSize: true,
+-                                                maintainAnimation: true,
+-                                                maintainState: true,
+-                                                child: Opacity(
+-                                                  opacity: 0,
+-                                                  child: WalletEntry(
+-                                                    selected: appStateSettings[
+-                                                            "selectedWallet"] ==
+-                                                        snapshot.data![snapshot
+-                                                                .data!.length -
+-                                                            1],
+-                                                    wallet: snapshot.data![
+-                                                        snapshot.data!.length -
+-                                                            1],
++                                              SizedBox(
++                                                width: 130,
++                                                child: Visibility(
++                                                  maintainSize: true,
++                                                  maintainAnimation: true,
++                                                  maintainState: true,
++                                                  child: Opacity(
++                                                    opacity: 0,
++                                                    child: WalletEntry(
++                                                      selected: appStateSettings[
++                                                              "selectedWallet"] ==
++                                                          snapshot.data![
++                                                              snapshot.data!
++                                                                      .length -
++                                                                  1],
++                                                      wallet: snapshot.data![
++                                                          snapshot.data!
++                                                                  .length -
++                                                              1],
++                                                    ),
+                                                   ),
+                                                 ),
+                                               ),
+diff --git a/budget/lib/pages/transactionsListPage.dart b/budget/lib/pages/transactionsListPage.dart
+index c14e9b458..cab6bd7e0 100644
+--- a/budget/lib/pages/transactionsListPage.dart
++++ b/budget/lib/pages/transactionsListPage.dart
+@@ -1,4 +1,5 @@
+ import 'package:budget/widgets/navigationSidebar.dart';
++import 'package:budget/widgets/noResults.dart';
+ import 'package:budget/widgets/scrollbarWrap.dart';
+ import 'package:budget/database/tables.dart';
+ import 'package:budget/functions.dart';
+@@ -46,6 +47,7 @@ Widget getTransactionsSlivers(
+   Color? categoryTintColor,
+   bool useHorizontalPaddingConstrained = true,
+   int? limit,
++  bool showNoResults = true,
+ }) {
+   return StreamBuilder<List<DateTime?>>(
+     stream: database.getUniqueDates(
+@@ -65,6 +67,15 @@ Widget getTransactionsSlivers(
+     ),
+     builder: (context, snapshot) {
+       if (snapshot.hasData) {
++        if (snapshot.data!.length <= 0 && showNoResults == true) {
++          if (slivers) {
++            return SliverToBoxAdapter(
++                child:
++                    NoResults(message: "No transactions within time range."));
++          } else {
++            return NoResults(message: "No transactions within time range.");
++          }
++        }
+         List<Widget> transactionsWidgets = [];
+         // List<DateTime> dates = [];
+         // for (DateTime indexDay = startDay;
+@@ -690,21 +701,7 @@ class CashFlow extends StatelessWidget {
+               ),
+             );
+           }
+-          // return NoResults(
+-          //   message: "There are no transactions in this time range.",
+-          // );
+-          return Center(
+-            child: Padding(
+-              padding: const EdgeInsets.only(top: 85, right: 35, left: 35),
+-              child: TextFont(
+-                fontSize: 20,
+-                fontWeight: FontWeight.bold,
+-                text: "No transactions within time range.",
+-                maxLines: 3,
+-                textAlign: TextAlign.center,
+-              ),
+-            ),
+-          );
++          return SizedBox.shrink();
+         },
+       ),
+     );
+diff --git a/budget/lib/pages/transactionsSearchPage.dart b/budget/lib/pages/transactionsSearchPage.dart
+index f355654ae..34c0a4c9a 100644
+--- a/budget/lib/pages/transactionsSearchPage.dart
++++ b/budget/lib/pages/transactionsSearchPage.dart
+@@ -180,6 +180,44 @@ class TransactionsSearchPageState extends State<TransactionsSearchPage>
+                 return false;
+               },
+             ),
++            StreamBuilder<List<TransactionWallet>>(
++              stream: database.watchAllWallets(),
++              builder: (context, snapshot) {
++                if (snapshot.hasData) {
++                  return SelectChips(
++                    items: snapshot.data!,
++                    getLabel: (item) {
++                      return item?.name ?? "No Wallet";
++                    },
++                    onSelected: (item) {
++                      // setSelectedBudgetPk(
++                      //   item,
++                      //   isSharedBudget: item?.sharedKey != null,
++                      // );
++                    },
++                    getSelected: (item) {
++                      // return selectedBudgetPk == item?.budgetPk;
++                      return true;
++                    },
++                    getCustomBorderColor: (item) {
++                      return dynamicPastel(
++                        context,
++                        lightenPastel(
++                          HexColor(
++                            item?.colour,
++                            defaultColor: Colors.transparent,
++                          ),
++                          amount: 0.3,
++                        ),
++                        amount: 0.4,
++                      );
++                    },
++                  );
++                } else {
++                  return SizedBox.shrink();
++                }
++              },
++            ),
+             StreamBuilder<List<Budget>>(
+               stream: database.watchAllAddableBudgets(),
+               builder: (context, snapshot) {
+diff --git a/budget/lib/pages/walletDetailsPage.dart b/budget/lib/pages/walletDetailsPage.dart
+index a37c1c879..2f3d0a72a 100644
+--- a/budget/lib/pages/walletDetailsPage.dart
++++ b/budget/lib/pages/walletDetailsPage.dart
+@@ -142,6 +142,7 @@ class _WalletDetailsPageState extends State<WalletDetailsPage> {
+                 walletFks: walletPk == null ? [] : [walletPk],
+                 limit: selectedCategoryPk == -1 ? 0 : 10,
+                 listID: listID,
++                showNoResults: false,
+               ),
+               selectedCategoryPk == -1
+                   ? SliverToBoxAdapter(
+diff --git a/budget/lib/widgets/notificationsSettings.dart b/budget/lib/widgets/notificationsSettings.dart
+index a0e749b01..e1fef59d9 100644
+--- a/budget/lib/widgets/notificationsSettings.dart
++++ b/budget/lib/widgets/notificationsSettings.dart
+@@ -70,6 +70,54 @@ class _DailyNotificationsSettingsState
+                         initialTime: timeOfDay,
+                         initialEntryMode: TimePickerEntryMode.input,
+                         helpText: "",
++                        builder: (BuildContext context, Widget? child) {
++                          if (appStateSettings["materialYou"])
++                            return Theme(
++                              data: Theme.of(context).copyWith(
++                                colorScheme:
++                                    Theme.of(context).colorScheme.copyWith(
++                                          tertiaryContainer: Theme.of(context)
++                                              .colorScheme
++                                              .primaryContainer,
++                                          onTertiaryContainer: Theme.of(context)
++                                              .colorScheme
++                                              .onPrimaryContainer,
++                                        ),
++                                textTheme: TextTheme(
++                                  displayLarge: TextStyle(
++                                    fontSize: 65,
++                                    fontWeight: FontWeight.w300,
++                                  ),
++                                ),
++                              ),
++                              child: child ?? SizedBox.shrink(),
++                            );
++                          return Theme(
++                            data: Theme.of(context).brightness ==
++                                    Brightness.light
++                                ? ThemeData.light().copyWith(
++                                    primaryColor:
++                                        Theme.of(context).colorScheme.primary,
++                                    colorScheme: ColorScheme.light(
++                                        primary: Theme.of(context)
++                                            .colorScheme
++                                            .primary),
++                                    buttonTheme: ButtonThemeData(
++                                        textTheme: ButtonTextTheme.primary),
++                                  )
++                                : ThemeData.dark().copyWith(
++                                    primaryColor:
++                                        Theme.of(context).colorScheme.secondary,
++                                    colorScheme: ColorScheme.dark(
++                                        primary: Theme.of(context)
++                                            .colorScheme
++                                            .secondary),
++                                    buttonTheme: ButtonThemeData(
++                                        textTheme: ButtonTextTheme.primary),
++                                  ),
++                            child: child ?? SizedBox.shrink(),
++                          );
++                        },
+                       );
+                       if (newTime != null) {
+                         await initializeNotificationsPlatform();
+@@ -158,6 +206,54 @@ class _UpcomingTransactionsNotificationsSettingsState
+                         initialTime: timeOfDay,
+                         initialEntryMode: TimePickerEntryMode.input,
+                         helpText: "",
++                        builder: (BuildContext context, Widget? child) {
++                          if (appStateSettings["materialYou"])
++                            return Theme(
++                              data: Theme.of(context).copyWith(
++                                colorScheme:
++                                    Theme.of(context).colorScheme.copyWith(
++                                          tertiaryContainer: Theme.of(context)
++                                              .colorScheme
++                                              .primaryContainer,
++                                          onTertiaryContainer: Theme.of(context)
++                                              .colorScheme
++                                              .onPrimaryContainer,
++                                        ),
++                                textTheme: TextTheme(
++                                  displayLarge: TextStyle(
++                                    fontSize: 65,
++                                    fontWeight: FontWeight.w300,
++                                  ),
++                                ),
++                              ),
++                              child: child ?? SizedBox.shrink(),
++                            );
++                          return Theme(
++                            data: Theme.of(context).brightness ==
++                                    Brightness.light
++                                ? ThemeData.light().copyWith(
++                                    primaryColor:
++                                        Theme.of(context).colorScheme.primary,
++                                    colorScheme: ColorScheme.light(
++                                        primary: Theme.of(context)
++                                            .colorScheme
++                                            .primary),
++                                    buttonTheme: ButtonThemeData(
++                                        textTheme: ButtonTextTheme.primary),
++                                  )
++                                : ThemeData.dark().copyWith(
++                                    primaryColor:
++                                        Theme.of(context).colorScheme.secondary,
++                                    colorScheme: ColorScheme.dark(
++                                        primary: Theme.of(context)
++                                            .colorScheme
++                                            .secondary),
++                                    buttonTheme: ButtonThemeData(
++                                        textTheme: ButtonTextTheme.primary),
++                                  ),
++                            child: child ?? SizedBox.shrink(),
++                          );
++                        },
+                       );
+                       if (newTime != null) {
+                         await initializeNotificationsPlatform();
+diff --git a/budget/lib/widgets/openPopup.dart b/budget/lib/widgets/openPopup.dart
+index 0b5c0d659..9a664f8cd 100644
+--- a/budget/lib/widgets/openPopup.dart
++++ b/budget/lib/widgets/openPopup.dart
+@@ -52,16 +52,18 @@ import 'package:budget/widgets/textWidgets.dart';
+ // ),
+ 
+ Future<T?> openPopup<T extends Object?>(
+-  context, {
++  BuildContext context, {
+   IconData? icon,
+   String? title,
+   String? description,
+   String? onSubmitLabel,
+   String? onCancelLabel,
+   String? onExtraLabel,
++  String? onExtraLabel2,
+   VoidCallback? onSubmit,
+   VoidCallback? onCancel,
+   VoidCallback? onExtra,
++  VoidCallback? onExtra2,
+   bool barrierDismissible = true,
+ }) {
+   //Minimize keyboard when tap non interactive widget
+@@ -161,60 +163,68 @@ Future<T?> openPopup<T extends Object?>(
+                               alignment: WrapAlignment.center,
+                               runSpacing: 10,
+                               children: [
+-                                Row(
+-                                  mainAxisAlignment: MainAxisAlignment.center,
+-                                  mainAxisSize: MainAxisSize.min,
+-                                  children: [
+-                                    onCancelLabel != null
+-                                        ? Padding(
+-                                            padding: const EdgeInsets.symmetric(
+-                                                horizontal: 8.0),
+-                                            child: Button(
+-                                                color: Theme.of(context)
+-                                                    .colorScheme
+-                                                    .secondaryContainer,
+-                                                label: onCancelLabel,
+-                                                onTap: onCancel ?? () {}),
+-                                          )
+-                                        : SizedBox.shrink(),
+-                                  ],
+-                                ),
+-                                Row(
+-                                  mainAxisAlignment: MainAxisAlignment.center,
+-                                  mainAxisSize: MainAxisSize.min,
+-                                  children: [
+-                                    onExtraLabel != null
+-                                        ? Padding(
+-                                            padding: const EdgeInsets.symmetric(
+-                                                horizontal: 8.0),
+-                                            child: Button(
+-                                                color: Theme.of(context)
+-                                                    .colorScheme
+-                                                    .secondaryContainer,
+-                                                label: onExtraLabel,
+-                                                onTap: onExtra ?? () {}),
+-                                          )
+-                                        : SizedBox.shrink(),
+-                                  ],
+-                                ),
+-                                Row(
+-                                  mainAxisAlignment: MainAxisAlignment.center,
+-                                  mainAxisSize: MainAxisSize.min,
+-                                  children: [
+-                                    onSubmitLabel != null
+-                                        ? Padding(
+-                                            padding: const EdgeInsets.symmetric(
+-                                                horizontal: 8.0),
+-                                            child: Button(
+-                                                color: Theme.of(context)
+-                                                    .colorScheme
+-                                                    .tertiaryContainer,
+-                                                label: onSubmitLabel,
+-                                                onTap: onSubmit ?? () {}),
+-                                          )
+-                                        : SizedBox.shrink(),
+-                                  ],
+-                                ),
++                                onCancelLabel != null
++                                    ? IntrinsicWidth(
++                                        child: Padding(
++                                          padding: const EdgeInsets.symmetric(
++                                              horizontal: 8.0),
++                                          child: Button(
++                                            color: Theme.of(context)
++                                                .colorScheme
++                                                .secondaryContainer,
++                                            label: onCancelLabel,
++                                            onTap: onCancel ?? () {},
++                                          ),
++                                        ),
++                                      )
++                                    : SizedBox.shrink(),
++                                onExtraLabel != null
++                                    ? IntrinsicWidth(
++                                        child: Padding(
++                                          padding: const EdgeInsets.symmetric(
++                                              horizontal: 8.0),
++                                          child: Button(
++                                            expandedLayout: true,
++                                            color: Theme.of(context)
++                                                .colorScheme
++                                                .secondaryContainer,
++                                            label: onExtraLabel,
++                                            onTap: onExtra ?? () {},
++                                          ),
++                                        ),
++                                      )
++                                    : SizedBox.shrink(),
++                                onSubmitLabel != null
++                                    ? IntrinsicWidth(
++                                        child: Padding(
++                                          padding: const EdgeInsets.symmetric(
++                                              horizontal: 8.0),
++                                          child: Button(
++                                            color: Theme.of(context)
++                                                .colorScheme
++                                                .tertiaryContainer,
++                                            label: onSubmitLabel,
++                                            onTap: onSubmit ?? () {},
++                                          ),
++                                        ),
++                                      )
++                                    : SizedBox.shrink(),
++                                onExtraLabel2 != null
++                                    ? IntrinsicWidth(
++                                        child: Padding(
++                                          padding: const EdgeInsets.symmetric(
++                                              horizontal: 8.0),
++                                          child: Button(
++                                            expandedLayout: true,
++                                            color: Theme.of(context)
++                                                .colorScheme
++                                                .secondaryContainer,
++                                            label: onExtraLabel2,
++                                            onTap: onExtra2 ?? () {},
++                                          ),
++                                        ),
++                                      )
++                                    : SizedBox.shrink(),
+                               ],
+                             ),
+                           )
+@@ -232,7 +242,7 @@ Future<T?> openPopup<T extends Object?>(
+ }
+ 
+ Future<T?> openPopupCustom<T extends Object?>(
+-  context, {
++  BuildContext context, {
+   String? title,
+   bool barrierDismissible = true,
+   required Widget child,
+diff --git a/budget/lib/widgets/saveBottomButton.dart b/budget/lib/widgets/saveBottomButton.dart
+index e68f3be48..afdf736a4 100644
+--- a/budget/lib/widgets/saveBottomButton.dart
++++ b/budget/lib/widgets/saveBottomButton.dart
+@@ -51,7 +51,7 @@ class _SaveBottomButtonState extends State<SaveBottomButton>
+       curve: Curves.easeInOutCubic,
+       transform: Matrix4.translationValues(
+         0.0,
+-        isKeyboardOpen ? 100.0 : 0.0,
++        isKeyboardOpen ? getKeyboardHeight(context) : 0.0,
+         0.0,
+       ),
+       child: Column(
+diff --git a/budget/lib/widgets/selectAmount.dart b/budget/lib/widgets/selectAmount.dart
+index 3c81b6100..03945e134 100644
+--- a/budget/lib/widgets/selectAmount.dart
++++ b/budget/lib/widgets/selectAmount.dart
+@@ -4,6 +4,7 @@ import 'package:budget/main.dart';
+ import 'package:budget/pages/addCategoryPage.dart';
+ import 'package:budget/pages/addWalletPage.dart';
+ import 'package:budget/widgets/button.dart';
++import 'package:budget/widgets/openBottomSheet.dart';
+ import 'package:budget/widgets/tappable.dart';
+ import 'package:budget/widgets/textWidgets.dart';
+ import 'package:flutter/material.dart';
+@@ -199,7 +200,7 @@ class _SelectAmountState extends State<SelectAmount> {
+   }
+ 
+   addToAmount(String input) {
+-    // bottomSheetControllerGlobal.snapToExtent(0);
++    bottomSheetControllerGlobal.snapToExtent(0);
+     String amountClone = amount;
+     if (input == "." &&
+         !decimalCheck(operationsWithSpaces(amountClone + "."))) {
+@@ -251,6 +252,7 @@ class _SelectAmountState extends State<SelectAmount> {
+   }
+ 
+   void removeToAmount() {
++    bottomSheetControllerGlobal.snapToExtent(0);
+     setState(() {
+       if (amount.length > 0) {
+         amount = amount.substring(0, amount.length - 1);
+@@ -266,6 +268,7 @@ class _SelectAmountState extends State<SelectAmount> {
+   }
+ 
+   void removeAll() {
++    bottomSheetControllerGlobal.snapToExtent(0);
+     setState(() {
+       amount = "";
+     });
+@@ -276,6 +279,9 @@ class _SelectAmountState extends State<SelectAmount> {
+                 ? calculateResult(amount)
+                 : double.tryParse(amount) ?? 0),
+         amount);
++    Future.delayed(Duration(milliseconds: 100), () {
++      bottomSheetControllerGlobal.snapToExtent(0);
++    });
+   }
+ 
+   bool includesOperations(String input, bool includeDecimal) {
+@@ -411,33 +417,35 @@ class _SelectAmountState extends State<SelectAmount> {
+                         child: Row(
+                           mainAxisAlignment: MainAxisAlignment.end,
+                           children: [
+-                            Tappable(
+-                              onLongPress: () async {
+-                                copyToClipboard(amountConverted);
+-                              },
+-                              color: Colors.transparent,
+-                              borderRadius: 10,
+-                              onTap: () {},
+-                              child: Padding(
+-                                padding: const EdgeInsets.only(
+-                                  right: 8.0,
+-                                  bottom: 5,
+-                                  left: 5,
+-                                  top: 5,
+-                                ),
+-                                child: TextFont(
+-                                  autoSizeText: true,
+-                                  maxLines: 1,
+-                                  minFontSize: 16,
+-                                  walletPkForCurrency: walletPkForCurrency ??
+-                                      appStateSettings["selectedWallet"],
+-                                  onlyShowCurrencyIcon:
+-                                      widget.onlyShowCurrencyIcon,
+-                                  text: amountConverted,
+-                                  // text: amount,
+-                                  textAlign: TextAlign.right,
+-                                  fontSize: 35,
+-                                  fontWeight: FontWeight.bold,
++                            Flexible(
++                              child: Tappable(
++                                onLongPress: () async {
++                                  copyToClipboard(amountConverted);
++                                },
++                                color: Colors.transparent,
++                                borderRadius: 10,
++                                onTap: () {},
++                                child: Padding(
++                                  padding: const EdgeInsets.only(
++                                    right: 8.0,
++                                    bottom: 5,
++                                    left: 5,
++                                    top: 5,
++                                  ),
++                                  child: TextFont(
++                                    autoSizeText: true,
++                                    maxLines: 1,
++                                    minFontSize: 16,
++                                    walletPkForCurrency: walletPkForCurrency ??
++                                        appStateSettings["selectedWallet"],
++                                    onlyShowCurrencyIcon:
++                                        widget.onlyShowCurrencyIcon,
++                                    text: amountConverted,
++                                    // text: amount,
++                                    textAlign: TextAlign.right,
++                                    fontSize: 35,
++                                    fontWeight: FontWeight.bold,
++                                  ),
+                                 ),
+                               ),
+                             ),
+@@ -447,108 +455,125 @@ class _SelectAmountState extends State<SelectAmount> {
+                                             .length <=
+                                         1
+                                 ? SizedBox.shrink()
+-                                : AnimatedSize(
+-                                    duration: Duration(milliseconds: 600),
+-                                    curve: Curves.easeInOutCubicEmphasized,
+-                                    child: AnimatedSwitcher(
+-                                      duration: Duration(milliseconds: 200),
+-                                      child: selectedWallet?.walletPk ==
+-                                              appStateSettings["selectedWallet"]
+-                                          ? Container(
+-                                              key: ValueKey(1),
+-                                            )
+-                                          : Tappable(
+-                                              color: Theme.of(context)
+-                                                  .colorScheme
+-                                                  .secondaryContainer,
+-                                              borderRadius: 13,
+-                                              onTap: () {
+-                                                TransactionWallet?
+-                                                    walletBefore =
+-                                                    selectedWallet;
+-                                                // get the index of the primary wallet
+-                                                int index = 0;
+-                                                for (TransactionWallet wallet
+-                                                    in widget.allWallets ??
+-                                                        []) {
+-                                                  if (wallet.walletPk ==
++                                : MediaQuery(
++                                    child: Padding(
++                                      padding: const EdgeInsets.symmetric(
++                                          vertical: 3.0),
++                                      child: AnimatedSize(
++                                        duration: Duration(milliseconds: 600),
++                                        curve: Curves.easeInOutCubicEmphasized,
++                                        child: AnimatedSwitcher(
++                                          duration: Duration(milliseconds: 200),
++                                          child:
++                                              selectedWallet?.walletPk ==
+                                                       appStateSettings[
+-                                                          "selectedWallet"]) {
+-                                                    break;
+-                                                  }
+-                                                  index++;
+-                                                }
++                                                          "selectedWallet"]
++                                                  ? Container(
++                                                      key: ValueKey(1),
++                                                    )
++                                                  : Tappable(
++                                                      color: Theme.of(context)
++                                                          .colorScheme
++                                                          .secondaryContainer,
++                                                      borderRadius: 13,
++                                                      onTap: () {
++                                                        TransactionWallet?
++                                                            walletBefore =
++                                                            selectedWallet;
++                                                        // get the index of the primary wallet
++                                                        int index = 0;
++                                                        for (TransactionWallet wallet
++                                                            in widget
++                                                                    .allWallets ??
++                                                                []) {
++                                                          if (wallet.walletPk ==
++                                                              appStateSettings[
++                                                                  "selectedWallet"]) {
++                                                            break;
++                                                          }
++                                                          index++;
++                                                        }
+ 
+-                                                if (widget.setSelectedWallet !=
+-                                                    null)
+-                                                  widget.setSelectedWallet!(
+-                                                      widget
+-                                                          .allWallets![index]);
+-                                                setState(() {
+-                                                  selectedWallet =
+-                                                      widget.allWallets![index];
+-                                                  walletPkForCurrency = widget
+-                                                      .allWallets![index]
+-                                                      .walletPk;
+-                                                  numberDecimals = selectedWallet
+-                                                          ?.decimals ??
+-                                                      appStateSettings[
+-                                                          "selectedWalletDecimals"];
+-                                                  print((walletBefore == null
+-                                                      ? 1
+-                                                      : (amountRatioToPrimaryCurrencyGivenPk(
+-                                                              walletBefore
+-                                                                  .walletPk) ??
+-                                                          1)));
+-                                                  try {
+-                                                    amount = (double.parse(
+-                                                                amount) *
+-                                                            (walletBefore ==
+-                                                                    null
+-                                                                ? 1
+-                                                                : (amountRatioToPrimaryCurrencyGivenPk(
+-                                                                        walletBefore
+-                                                                            .walletPk) ??
+-                                                                    1)))
+-                                                        .toStringAsFixed(
+-                                                            numberDecimals);
+-                                                  } catch (e) {}
+-                                                  amount = removeTrailingZeroes(
+-                                                      amount);
+-                                                  addToAmount("");
+-                                                });
+-                                              },
+-                                              child: Padding(
+-                                                padding:
+-                                                    const EdgeInsets.symmetric(
+-                                                        horizontal: 8,
+-                                                        vertical: 7),
+-                                                child: Column(
+-                                                  crossAxisAlignment:
+-                                                      CrossAxisAlignment.center,
+-                                                  mainAxisAlignment:
+-                                                      MainAxisAlignment.center,
+-                                                  children: [
+-                                                    Icon(
+-                                                      Icons
+-                                                          .currency_exchange_rounded,
+-                                                      size: 16,
+-                                                    ),
+-                                                    SizedBox(height: 2),
+-                                                    TextFont(
+-                                                      text: appStateSettings[
+-                                                                  "cachedWalletCurrencies"]
+-                                                              [appStateSettings[
+-                                                                      "selectedWallet"]
+-                                                                  .toString()]
+-                                                          .toUpperCase(),
+-                                                      fontSize: 11,
++                                                        if (widget
++                                                                .setSelectedWallet !=
++                                                            null)
++                                                          widget.setSelectedWallet!(
++                                                              widget.allWallets![
++                                                                  index]);
++                                                        setState(() {
++                                                          selectedWallet =
++                                                              widget.allWallets![
++                                                                  index];
++                                                          walletPkForCurrency =
++                                                              widget
++                                                                  .allWallets![
++                                                                      index]
++                                                                  .walletPk;
++                                                          numberDecimals = selectedWallet
++                                                                  ?.decimals ??
++                                                              appStateSettings[
++                                                                  "selectedWalletDecimals"];
++                                                          print((walletBefore ==
++                                                                  null
++                                                              ? 1
++                                                              : (amountRatioToPrimaryCurrencyGivenPk(
++                                                                      walletBefore
++                                                                          .walletPk) ??
++                                                                  1)));
++                                                          try {
++                                                            amount = (double.parse(
++                                                                        amount) *
++                                                                    (walletBefore ==
++                                                                            null
++                                                                        ? 1
++                                                                        : (amountRatioToPrimaryCurrencyGivenPk(walletBefore.walletPk) ??
++                                                                            1)))
++                                                                .toStringAsFixed(
++                                                                    numberDecimals);
++                                                          } catch (e) {}
++                                                          amount =
++                                                              removeTrailingZeroes(
++                                                                  amount);
++                                                          addToAmount("");
++                                                        });
++                                                      },
++                                                      child: Padding(
++                                                        padding:
++                                                            const EdgeInsets
++                                                                    .symmetric(
++                                                                horizontal: 8,
++                                                                vertical: 7),
++                                                        child: Column(
++                                                          crossAxisAlignment:
++                                                              CrossAxisAlignment
++                                                                  .center,
++                                                          mainAxisAlignment:
++                                                              MainAxisAlignment
++                                                                  .center,
++                                                          children: [
++                                                            Icon(
++                                                              Icons
++                                                                  .currency_exchange_rounded,
++                                                              size: 16,
++                                                            ),
++                                                            SizedBox(height: 2),
++                                                            TextFont(
++                                                              text: appStateSettings[
++                                                                      "cachedWalletCurrencies"][appStateSettings[
++                                                                          "selectedWallet"]
++                                                                      .toString()]
++                                                                  .toUpperCase(),
++                                                              fontSize: 11,
++                                                            ),
++                                                          ],
++                                                        ),
++                                                      ),
+                                                     ),
+-                                                  ],
+-                                                ),
+-                                              ),
+-                                            ),
++                                        ),
++                                      ),
+                                     ),
++                                    data: MediaQuery.of(context)
++                                        .copyWith(textScaleFactor: 1.0),
+                                   ),
+                           ],
+                         ),
+diff --git a/budget/lib/widgets/showChangelog.dart b/budget/lib/widgets/showChangelog.dart
+index 76b81150d..4f685e277 100644
+--- a/budget/lib/widgets/showChangelog.dart
++++ b/budget/lib/widgets/showChangelog.dart
+@@ -8,6 +8,11 @@ import 'package:flutter/material.dart';
+ 
+ Future<void> showChangelog(context, {forceShow = false}) async {
+   String changelog = """
++    No results/search results found indication 
++    If deleting a wallet, can choose to transfer transactions to another wallet
++    Category Budget Limits merged with Category with Total
++    Select amount wrap fixes
++    Fixed time picker font size
+     Added web app link to sync page
+     Copy to clipboard on long press for AboutInfoBox links
+     Improved budget page and budget widget size and formatting
+diff --git a/budget/pubspec.yaml b/budget/pubspec.yaml
+index c15150e0d..925da1c26 100644
+--- a/budget/pubspec.yaml
++++ b/budget/pubspec.yaml
+@@ -36,7 +36,7 @@ dependencies:
+   path: ^1.8.3
+   math_expressions: ^2.2.0
+   share_plus: ^4.0.4
+-  google_sign_in: ^6.0.2
++  google_sign_in: ^6.1.3
+   googleapis: ^10.1.0
+   universal_html: ^2.0.8
+   flutter_charset_detector: ^1.0.2

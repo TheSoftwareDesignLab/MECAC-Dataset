@@ -1,0 +1,255 @@
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationViewController.m b/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
+index 1b5aff030d7..2021d4d8fe8 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
++++ b/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
+@@ -1998,6 +1998,62 @@ - (void)messageActionsReplyToItem:(ConversationViewItem *)conversationViewItem
+     [self populateReplyForViewItem:conversationViewItem];
+ }
+ 
++- (void)messageActions:(MessageActionsViewController *)messageActionsViewController
++    isPresentingWithVerticalFocusChange:(CGFloat)verticalChange
++{
++    UIEdgeInsets oldInset = self.collectionView.contentInset;
++    CGPoint oldOffset = self.collectionView.contentOffset;
++
++    UIEdgeInsets newInset = oldInset;
++    CGPoint newOffset = oldOffset;
++
++    // In case the message is at the very top or bottom edge of the conversation we have to have these additional
++    // insets to be sure we can sufficiently scroll the contentOffset.
++    newInset.top += verticalChange;
++    newInset.bottom -= verticalChange;
++    newOffset.y -= verticalChange;
++
++    DDLogDebug(@"%@ in %s verticalChange: %f, insets: %@ -> %@",
++        self.logTag,
++        __PRETTY_FUNCTION__,
++        verticalChange,
++        NSStringFromUIEdgeInsets(oldInset),
++        NSStringFromUIEdgeInsets(newInset));
++
++    // Because we're in the context of the frame-changing animation, these adjustments should happen
++    // in lockstep with the messageActions frame change.
++    self.collectionView.contentOffset = newOffset;
++    self.collectionView.contentInset = newInset;
++}
++
++- (void)messageActions:(MessageActionsViewController *)messageActionsViewController
++    isDismissingWithVerticalFocusChange:(CGFloat)verticalChange
++{
++    UIEdgeInsets oldInset = self.collectionView.contentInset;
++    CGPoint oldOffset = self.collectionView.contentOffset;
++
++    UIEdgeInsets newInset = oldInset;
++    CGPoint newOffset = oldOffset;
++
++    // In case the message is at the very top or bottom edge of the conversation we have to have these additional
++    // insets to be sure we can sufficiently scroll the contentOffset.
++    newInset.top -= verticalChange;
++    newInset.bottom += verticalChange;
++    newOffset.y += verticalChange;
++
++    DDLogDebug(@"%@ in %s verticalChange: %f, insets: %@ -> %@",
++        self.logTag,
++        __PRETTY_FUNCTION__,
++        verticalChange,
++        NSStringFromUIEdgeInsets(oldInset),
++        NSStringFromUIEdgeInsets(newInset));
++
++    // Because we're in the context of the frame-changing animation, these adjustments should happen
++    // in lockstep with the messageActions frame change.
++    self.collectionView.contentOffset = newOffset;
++    self.collectionView.contentInset = newInset;
++}
++
+ #pragma mark - ConversationViewCellDelegate
+ 
+ - (void)conversationCell:(ConversationViewCell *)cell didLongpressMediaViewItem:(ConversationViewItem *)viewItem
+@@ -2026,27 +2082,14 @@ - (void)conversationCell:(ConversationViewCell *)cell didLongpressSystemMessageV
+ 
+ - (void)presentMessageActions:(NSArray<MessageAction *> *)messageActions withFocusedCell:(ConversationViewCell *)cell
+ {
+-    // TODO Interpolate from 0->0.3 depending on distance to make visible.
+-    NSTimeInterval animationDuration = 0.3;
++    MessageActionsViewController *messageActionsViewController =
++        [[MessageActionsViewController alloc] initWithFocusedView:cell actions:messageActions];
+ 
+-    // Instead of animating manually we could use `scrollRectToVisible:animated:YES`, but then we'd need to juggle a
+-    // completion handler into scrollDidEnd
+-    [UIView animateWithDuration:animationDuration
+-        animations:^{
+-            [self.collectionView scrollRectToVisible:cell.frame animated:NO];
+-        }
+-        completion:^(BOOL finished) {
+-            // TODO pass in real actions
+-            
+-            MessageActionsViewController *messageActionsViewController =
+-                [[MessageActionsViewController alloc] initWithFocusedView:cell actions:messageActions];
+-
+-            messageActionsViewController.delegate = self;
++    messageActionsViewController.delegate = self;
+ 
+-            [[OWSWindowManager sharedManager] showMessageActionsWindow:messageActionsViewController];
++    [[OWSWindowManager sharedManager] showMessageActionsWindow:messageActionsViewController];
+ 
+-            [self updateShouldObserveDBModifications];
+-        }];
++    [self updateShouldObserveDBModifications];
+ }
+ 
+ - (NSAttributedString *)attributedContactOrProfileNameForPhoneIdentifier:(NSString *)recipientId
+diff --git a/Signal/src/ViewControllers/MessageActionsViewController.swift b/Signal/src/ViewControllers/MessageActionsViewController.swift
+index c7af6b7476a..cd089eb71bc 100644
+--- a/Signal/src/ViewControllers/MessageActionsViewController.swift
++++ b/Signal/src/ViewControllers/MessageActionsViewController.swift
+@@ -9,6 +9,8 @@ protocol MessageActionsDelegate: class {
+     func messageActionsDidHide(_ messageActionsViewController: MessageActionsViewController)
+     func messageActionsShowDetailsForItem(_ conversationViewItem: ConversationViewItem)
+     func messageActionsReplyToItem(_ conversationViewItem: ConversationViewItem)
++    func messageActions(_ messageActionsViewController: MessageActionsViewController, isPresentingWithVerticalFocusChange: CGFloat)
++    func messageActions(_ messageActionsViewController: MessageActionsViewController, isDismissingWithVerticalFocusChange: CGFloat)
+ }
+ 
+ struct MessageActionBuilder {
+@@ -159,8 +161,6 @@ class MessageActionsViewController: UIViewController, MessageActionSheetDelegate
+     override func loadView() {
+         self.view = UIView()
+ 
+-        highlightFocusedView()
+-
+         view.addSubview(actionSheetView)
+ 
+         actionSheetView.autoPinWidthToSuperview()
+@@ -172,6 +172,8 @@ class MessageActionsViewController: UIViewController, MessageActionSheetDelegate
+         self.view.addGestureRecognizer(tapGesture)
+     }
+ 
++    var snapshotView: UIView?
++
+     override func viewDidAppear(_ animated: Bool) {
+         super.viewDidAppear(true)
+ 
+@@ -182,39 +184,72 @@ class MessageActionsViewController: UIViewController, MessageActionSheetDelegate
+             return
+         }
+ 
++        guard let focusedViewSuperview = focusedView.superview else {
++            owsFail("\(self.logTag) in \(#function) focusedViewSuperview was unexpectedly nil")
++            return
++        }
++
+         // darken background
++        guard let snapshotView = addSnapshotFocusedView() else {
++            owsFail("\(self.logTag) in \(#function) snapshotView was unexpectedly nil")
++            return
++        }
++
++        self.snapshotView = snapshotView
++        snapshotView.superview?.layoutIfNeeded()
++
+         let backgroundDuration: TimeInterval = 0.1
+         UIView.animate(withDuration: backgroundDuration) {
+             self.view.backgroundColor = UIColor.black.withAlphaComponent(0.4)
+         }
+ 
+-        // present action sheet
+-        self.actionSheetView.superview?.layoutIfNeeded()
++        // layout actionsheet and snapshot view with initial frame
++        self.view.layoutIfNeeded()
++
++        let oldFocusFrame = self.view.convert(focusedView.frame, from: focusedViewSuperview)
+         NSLayoutConstraint.deactivate([actionSheetViewVerticalConstraint])
+         self.actionSheetViewVerticalConstraint = self.actionSheetView.autoPinEdge(toSuperviewEdge: .bottom)
+         UIView.animate(withDuration: 0.3,
+                        delay: backgroundDuration,
+                        options: .curveEaseOut,
+                        animations: {
+-                         self.actionSheetView.superview?.layoutIfNeeded()
+-                       },
++                        self.actionSheetView.superview?.layoutIfNeeded()
++                        let newSheetFrame = self.actionSheetView.frame
++
++                        var newFocusFrame = oldFocusFrame
++
++                        // Position focused item just over the action sheet.
++                        let padding: CGFloat = 10
++                        let overlap: CGFloat = (oldFocusFrame.maxY + padding) - newSheetFrame.minY
++                        newFocusFrame.origin.y = oldFocusFrame.origin.y - overlap
++
++                        snapshotView.frame = newFocusFrame
++
++                        let offset = -overlap
++                        self.presentationFocusOffset = offset
++                        self.delegate?.messageActions(self, isPresentingWithVerticalFocusChange: offset)
++        },
+                        completion: nil)
+     }
+ 
+-    private func highlightFocusedView() {
++    var presentationFocusOffset: CGFloat?
++
++    private func addSnapshotFocusedView() -> UIView? {
+         guard let snapshotView = self.focusedView.snapshotView(afterScreenUpdates: false) else {
+             owsFail("\(self.logTag) in \(#function) snapshotView was unexpectedly nil")
+-            return
++            return nil
+         }
+         view.addSubview(snapshotView)
+ 
+         guard let focusedViewSuperview = focusedView.superview else {
+             owsFail("\(self.logTag) in \(#function) focusedViewSuperview was unexpectedly nil")
+-            return
++            return nil
+         }
+ 
+         let convertedFrame = view.convert(focusedView.frame, from: focusedViewSuperview)
+         snapshotView.frame = convertedFrame
++
++        return snapshotView
+     }
+ 
+     @objc
+@@ -223,14 +258,27 @@ class MessageActionsViewController: UIViewController, MessageActionSheetDelegate
+     }
+ 
+     func animateDismiss(action: MessageAction?) {
+-        self.actionSheetView.superview?.layoutIfNeeded()
+-
+-        if let actionSheetViewVerticalConstraint = self.actionSheetViewVerticalConstraint {
+-            NSLayoutConstraint.deactivate([actionSheetViewVerticalConstraint])
+-        } else {
++        guard let actionSheetViewVerticalConstraint = self.actionSheetViewVerticalConstraint else {
+             owsFail("\(self.logTag) in \(#function) actionSheetVerticalConstraint was unexpectedly nil")
++            self.delegate?.messageActionsDidHide(self)
++            return
+         }
+ 
++        guard let snapshotView = self.snapshotView else {
++            owsFail("\(self.logTag) in \(#function) snapshotView was unexpectedly nil")
++            self.delegate?.messageActionsDidHide(self)
++            return
++        }
++
++        guard let presentationFocusOffset = self.presentationFocusOffset else {
++            owsFail("\(self.logTag) in \(#function) presentationFocusOffset was unexpectedly nil")
++            self.delegate?.messageActionsDidHide(self)
++            return
++        }
++
++        self.actionSheetView.superview?.layoutIfNeeded()
++        NSLayoutConstraint.deactivate([actionSheetViewVerticalConstraint])
++
+         let dismissDuration: TimeInterval = 0.2
+         self.actionSheetViewVerticalConstraint = self.actionSheetView.autoPinEdge(.top, to: .bottom, of: self.view)
+         UIView.animate(withDuration: dismissDuration,
+@@ -239,6 +287,10 @@ class MessageActionsViewController: UIViewController, MessageActionSheetDelegate
+                        animations: {
+                         self.view.backgroundColor = UIColor.clear
+                         self.actionSheetView.superview?.layoutIfNeeded()
++                        snapshotView.frame.origin.y -= presentationFocusOffset
++                        // this helps when focused view is above navbars, etc.
++                        snapshotView.alpha = 0
++                        self.delegate?.messageActions(self, isDismissingWithVerticalFocusChange: presentationFocusOffset)
+         },
+                        completion: { _ in
+                         self.view.isHidden = true

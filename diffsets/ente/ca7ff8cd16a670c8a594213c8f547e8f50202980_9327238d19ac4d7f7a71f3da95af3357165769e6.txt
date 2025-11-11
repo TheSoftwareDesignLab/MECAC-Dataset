@@ -1,0 +1,193 @@
+diff --git a/mobile/lib/app.dart b/mobile/lib/app.dart
+index a37648e9190..3b8e3346d8f 100644
+--- a/mobile/lib/app.dart
++++ b/mobile/lib/app.dart
+@@ -66,8 +66,7 @@ class _EnteAppState extends State<EnteApp> with WidgetsBindingObserver {
+     _memoriesChangedSubscription =
+         Bus.instance.on<MemoriesChangedEvent>().listen(
+       (event) async {
+-        await MemoryHomeWidgetService.instance.updateMemoryChanged(true);
+-        await MemoryHomeWidgetService.instance.initMemoryHW(true);
++        await MemoryHomeWidgetService.instance.memoryChanged();
+       },
+     );
+   }
+diff --git a/mobile/lib/services/memories_cache_service.dart b/mobile/lib/services/memories_cache_service.dart
+index 6175814cd6c..a65b7f0ab73 100644
+--- a/mobile/lib/services/memories_cache_service.dart
++++ b/mobile/lib/services/memories_cache_service.dart
+@@ -370,6 +370,10 @@ class MemoriesCacheService {
+     }
+   }
+ 
++  Future<List<SmartMemory>?> getCachedMemories() async {
++    return _cachedMemories;
++  }
++
+   Future<void> goToMemoryFromGeneratedFileID(
+     BuildContext context,
+     int generatedFileID,
+diff --git a/mobile/lib/services/memory_home_widget_service.dart b/mobile/lib/services/memory_home_widget_service.dart
+index c584a208e20..290c0b5f5f3 100644
+--- a/mobile/lib/services/memory_home_widget_service.dart
++++ b/mobile/lib/services/memory_home_widget_service.dart
+@@ -5,6 +5,7 @@ import "package:photos/models/file/file.dart";
+ import "package:photos/service_locator.dart";
+ import "package:photos/services/home_widget_service.dart";
+ import "package:shared_preferences/shared_preferences.dart";
++import "package:synchronized/synchronized.dart";
+ 
+ class MemoryHomeWidgetService {
+   final Logger _logger = Logger((MemoryHomeWidgetService).toString());
+@@ -16,6 +17,7 @@ class MemoryHomeWidgetService {
+ 
+   late final SharedPreferences _prefs;
+ 
++  final _memoryForceRefreshLock = Lock();
+   bool _hasSyncedMemory = false;
+ 
+   static const memoryChangedKey = "memoryChanged.widget";
+@@ -31,14 +33,6 @@ class MemoryHomeWidgetService {
+   }
+ 
+   Future<void> _memorySync() async {
+-    final total = await _getTotal();
+-    if (total == 0 || total == null) {
+-      _logger.warning(
+-        "sync stopped because no memory is cached yet, so nothing to sync",
+-      );
+-      return;
+-    }
+-
+     final homeWidgetCount = await HomeWidgetService.instance.countHomeWidgets();
+     if (homeWidgetCount == 0) {
+       _logger.warning("no home widget active");
+@@ -57,13 +51,20 @@ class MemoryHomeWidgetService {
+       return;
+     }
+ 
+-    forceFetchNewMemories ??= await getForceFetchCondition();
++    await _memoryForceRefreshLock.synchronized(() async {
++      final isTotalEmpty = await checkIfTotalEmpty();
++      forceFetchNewMemories ??= await getForceFetchCondition(isTotalEmpty);
+ 
+-    if (forceFetchNewMemories) {
+-      await _forceMemoryUpdate();
+-    } else {
+-      await _memorySync();
+-    }
++      _logger.warning(
++        "init memory hw: forceFetch: $forceFetchNewMemories, isTotalEmpty: $isTotalEmpty",
++      );
++
++      if (forceFetchNewMemories!) {
++        await _forceMemoryUpdate();
++      } else if (!isTotalEmpty) {
++        await _memorySync();
++      }
++    });
+   }
+ 
+   Future<void> clearWidget() async {
+@@ -84,19 +85,27 @@ class MemoryHomeWidgetService {
+     await _prefs.setBool(memoryChangedKey, value);
+   }
+ 
+-  Future<bool> getForceFetchCondition() async {
+-    final memoryChanged = _prefs.getBool(memoryChangedKey);
++  Future<bool> checkIfTotalEmpty() async {
+     final total = await _getTotal();
++    return total == 0 || total == null;
++  }
++
++  Future<bool> getForceFetchCondition(bool isTotalEmpty) async {
++    final memoryChanged = _prefs.getBool(memoryChangedKey);
++    if (memoryChanged == true) return true;
++
++    final cachedMemories = await memoriesCacheService.getCachedMemories();
+ 
+     final forceFetchNewMemories =
+-        memoryChanged == true || total == 0 || total == null;
++        isTotalEmpty && (cachedMemories?.isNotEmpty ?? false);
+     return forceFetchNewMemories;
+   }
+ 
+   Future<void> checkPendingMemorySync() async {
+     await Future.delayed(const Duration(seconds: 5), () {});
+ 
+-    final forceFetchNewMemories = await getForceFetchCondition();
++    final isTotalEmpty = await checkIfTotalEmpty();
++    final forceFetchNewMemories = await getForceFetchCondition(isTotalEmpty);
+ 
+     if (_hasSyncedMemory && !forceFetchNewMemories) {
+       _logger.info(">>> Memory already synced");
+@@ -141,6 +150,22 @@ class MemoryHomeWidgetService {
+     _logger.info(">>> Home Widget updated");
+   }
+ 
++  Future<void> memoryChanged() async {
++    final cachedMemories = await memoriesCacheService.getCachedMemories();
++    final currentTotal = cachedMemories?.length ?? 0;
++
++    final int total = await _getTotal() ?? 0;
++
++    if (total == currentTotal && total == 0) {
++      _logger.info(">>> Memories not changed, doing nothing");
++      return;
++    }
++
++    _logger.info(">>> Memories changed, updating widget");
++    await updateMemoryChanged(true);
++    await initMemoryHW(true);
++  }
++
+   Future<int?> _getTotal() async {
+     return HomeWidgetService.instance.getData<int>(totalSet);
+   }
+diff --git a/mobile/lib/ui/tabs/home_widget.dart b/mobile/lib/ui/tabs/home_widget.dart
+index db9de072b42..25cd5b0cbd3 100644
+--- a/mobile/lib/ui/tabs/home_widget.dart
++++ b/mobile/lib/ui/tabs/home_widget.dart
+@@ -124,7 +124,9 @@ class _HomeWidgetState extends State<HomeWidget> {
+     _logger.info("Building initstate");
+     super.initState();
+ 
+-    MemoryHomeWidgetService.instance.checkPendingMemorySync();
++    if (LocalSyncService.instance.hasCompletedFirstImport()) {
++      MemoryHomeWidgetService.instance.checkPendingMemorySync();
++    }
+     _tabChangedEventSubscription =
+         Bus.instance.on<TabChangedEvent>().listen((event) {
+       _selectedTabIndex = event.selectedIndex;
+@@ -184,13 +186,11 @@ class _HomeWidgetState extends State<HomeWidget> {
+         }
+         Future.delayed(
+           delayInRefresh,
+-          () => {
+-            if (mounted)
+-              {
+-                setState(
+-                  () {},
+-                ),
+-              },
++          () {
++            if (mounted) {
++              setState(() {});
++              MemoryHomeWidgetService.instance.checkPendingMemorySync();
++            }
+           },
+         );
+       }
+diff --git a/mobile/pubspec.yaml b/mobile/pubspec.yaml
+index 849ff89a36e..7daab83c5f6 100644
+--- a/mobile/pubspec.yaml
++++ b/mobile/pubspec.yaml
+@@ -189,7 +189,7 @@ dependencies:
+   styled_text: ^8.1.0
+   syncfusion_flutter_core: ^25.2.5
+   syncfusion_flutter_sliders: ^25.2.5
+-  synchronized: ^3.1.0
++  synchronized: ^3.3.0+3
+   system_info_plus: ^0.0.6
+   tuple: ^2.0.0
+   ua_client_hints: ^1.4.0

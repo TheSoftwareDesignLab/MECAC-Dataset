@@ -1,0 +1,290 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/search/SearchEngineFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/search/SearchEngineFragment.kt
+index 41d648b570ea..b519d9c5dbd1 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/search/SearchEngineFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/search/SearchEngineFragment.kt
+@@ -5,6 +5,7 @@
+ package org.mozilla.fenix.settings.search
+ 
+ import android.os.Bundle
++import androidx.core.content.edit
+ import androidx.navigation.fragment.findNavController
+ import androidx.preference.CheckBoxPreference
+ import androidx.preference.Preference
+@@ -18,6 +19,7 @@ import org.mozilla.fenix.ext.settings
+ import org.mozilla.fenix.ext.showToolbar
+ import org.mozilla.fenix.settings.SharedPreferenceUpdater
+ import org.mozilla.fenix.settings.requirePreference
++import org.mozilla.gecko.search.SearchWidgetProvider
+ 
+ class SearchEngineFragment : PreferenceFragmentCompat() {
+ 
+@@ -83,7 +85,16 @@ class SearchEngineFragment : PreferenceFragmentCompat() {
+         showSyncedTabsSuggestions.onPreferenceChangeListener = SharedPreferenceUpdater()
+         showClipboardSuggestions.onPreferenceChangeListener = SharedPreferenceUpdater()
+         searchSuggestionsInPrivatePreference.onPreferenceChangeListener = SharedPreferenceUpdater()
+-        showVoiceSearchPreference.onPreferenceChangeListener = SharedPreferenceUpdater()
++        showVoiceSearchPreference.onPreferenceChangeListener = object : Preference.OnPreferenceChangeListener {
++            override fun onPreferenceChange(preference: Preference, newValue: Any?): Boolean {
++                val newBooleanValue = newValue as? Boolean ?: return false
++                requireContext().settings().preferences.edit {
++                    putBoolean(preference.key, newBooleanValue)
++                }
++                SearchWidgetProvider.updateAllWidgets(requireContext())
++                return true
++            }
++        }
+         autocompleteURLsPreference.onPreferenceChangeListener = SharedPreferenceUpdater()
+ 
+         searchSuggestionsPreference.setOnPreferenceClickListener {
+diff --git a/fenix/app/src/main/java/org/mozilla/gecko/search/SearchWidgetProvider.kt b/fenix/app/src/main/java/org/mozilla/gecko/search/SearchWidgetProvider.kt
+index 57a62160d449..87d39ae32564 100644
+--- a/fenix/app/src/main/java/org/mozilla/gecko/search/SearchWidgetProvider.kt
++++ b/fenix/app/src/main/java/org/mozilla/gecko/search/SearchWidgetProvider.kt
+@@ -8,6 +8,7 @@ import android.app.PendingIntent
+ import android.appwidget.AppWidgetManager
+ import android.appwidget.AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH
+ import android.appwidget.AppWidgetProvider
++import android.content.ComponentName
+ import android.content.Context
+ import android.content.Intent
+ import android.os.Build
+@@ -98,7 +99,12 @@ class SearchWidgetProvider : AppWidgetProvider() {
+     /**
+      * Builds pending intent that starts a new voice search.
+      */
+-    private fun createVoiceSearchIntent(context: Context): PendingIntent? {
++    @VisibleForTesting
++    internal fun createVoiceSearchIntent(context: Context): PendingIntent? {
++        if (!context.settings().shouldShowVoiceSearch) {
++            return null
++        }
++
+         val voiceIntent = Intent(context, VoiceSearchActivity::class.java).apply {
+             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+             putExtra(SPEECH_PROCESSING, true)
+@@ -172,6 +178,20 @@ class SearchWidgetProvider : AppWidgetProvider() {
+         private const val REQUEST_CODE_NEW_TAB = 0
+         private const val REQUEST_CODE_VOICE = 1
+ 
++        fun updateAllWidgets(context: Context) {
++            val widgetManager = AppWidgetManager.getInstance(context)
++            val widgetIds = widgetManager.getAppWidgetIds(ComponentName(context, SearchWidgetProvider::class.java))
++
++            if (widgetIds.isNotEmpty()) {
++                context.sendBroadcast(
++                    Intent(context, SearchWidgetProvider::class.java).apply {
++                        action = AppWidgetManager.ACTION_APPWIDGET_UPDATE
++                        putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, widgetIds)
++                    }
++                )
++            }
++        }
++
+         @VisibleForTesting
+         internal fun getLayoutSize(@Dimension(unit = DP) dp: Int) = when {
+             dp >= DP_LARGE -> SearchWidgetProviderSize.LARGE
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/settings/search/SearchEngineFragmentTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/settings/search/SearchEngineFragmentTest.kt
+new file mode 100644
+index 000000000000..5710d2fab9e8
+--- /dev/null
++++ b/fenix/app/src/test/java/org/mozilla/fenix/settings/search/SearchEngineFragmentTest.kt
+@@ -0,0 +1,102 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.settings.search
++
++import android.content.SharedPreferences
++import androidx.preference.CheckBoxPreference
++import androidx.preference.SwitchPreference
++import io.mockk.every
++import io.mockk.mockk
++import io.mockk.mockkObject
++import io.mockk.spyk
++import io.mockk.unmockkObject
++import io.mockk.verify
++import mozilla.components.support.test.robolectric.testContext
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.mozilla.fenix.HomeActivity
++import org.mozilla.fenix.R
++import org.mozilla.fenix.ext.settings
++import org.mozilla.fenix.helpers.FenixRobolectricTestRunner
++import org.mozilla.gecko.search.SearchWidgetProvider
++
++@RunWith(FenixRobolectricTestRunner::class)
++class SearchEngineFragmentTest {
++    @Test
++    fun `GIVEN pref_key_show_voice_search setting WHEN it is modified THEN the value is persisted and widgets updated`() {
++        try {
++            mockkObject(SearchWidgetProvider.Companion)
++
++            val preferences: SharedPreferences = mockk()
++            val preferencesEditor: SharedPreferences.Editor = mockk(relaxed = true)
++            every { testContext.settings().preferences } returns preferences
++            every { preferences.edit() } returns preferencesEditor
++            val fragment = spyk(SearchEngineFragment()) {
++                every { context } returns testContext
++                every { isAdded } returns true
++                every { activity } returns mockk<HomeActivity>(relaxed = true)
++            }
++            val voiceSearchPreferenceKey = testContext.getString(R.string.pref_key_show_voice_search)
++            val voiceSearchPreference = spyk(SwitchPreference(testContext)) {
++                every { key } returns voiceSearchPreferenceKey
++            }
++            // The type needed for "fragment.findPreference" / "fragment.requirePreference" is erased at compile time.
++            // Hence we need individual mocks, specific for each preference's type.
++            every {
++                fragment.findPreference<SwitchPreference>(testContext.getString(R.string.pref_key_show_search_suggestions))
++            } returns mockk(relaxed = true) {
++                every { context } returns testContext
++            }
++            every {
++                fragment.findPreference<SwitchPreference>(testContext.getString(R.string.pref_key_enable_autocomplete_urls))
++            } returns mockk(relaxed = true) {
++                every { context } returns testContext
++            }
++            every {
++                fragment.findPreference<CheckBoxPreference>(testContext.getString(R.string.pref_key_show_search_suggestions_in_private))
++            } returns mockk(relaxed = true) {
++                every { context } returns testContext
++            }
++            every {
++                fragment.findPreference<SwitchPreference>(testContext.getString(R.string.pref_key_show_search_engine_shortcuts))
++            } returns mockk(relaxed = true) {
++                every { context } returns testContext
++            }
++            every {
++                fragment.findPreference<SwitchPreference>(testContext.getString(R.string.pref_key_search_browsing_history))
++            } returns mockk(relaxed = true) {
++                every { context } returns testContext
++            }
++            every {
++                fragment.findPreference<SwitchPreference>(testContext.getString(R.string.pref_key_search_bookmarks))
++            } returns mockk(relaxed = true) {
++                every { context } returns testContext
++            }
++            every {
++                fragment.findPreference<SwitchPreference>(testContext.getString(R.string.pref_key_search_synced_tabs))
++            } returns mockk(relaxed = true) {
++                every { context } returns testContext
++            }
++            every {
++                fragment.findPreference<SwitchPreference>(testContext.getString(R.string.pref_key_show_clipboard_suggestions))
++            } returns mockk(relaxed = true) {
++                every { context } returns testContext
++            }
++            // This preference is the sole purpose of this test
++            every {
++                fragment.findPreference<SwitchPreference>(voiceSearchPreferenceKey)
++            } returns voiceSearchPreference
++
++            // Trigger the preferences setup.
++            fragment.onResume()
++            voiceSearchPreference.callChangeListener(true)
++
++            verify { preferencesEditor.putBoolean(voiceSearchPreferenceKey, true) }
++            verify { SearchWidgetProvider.updateAllWidgets(testContext) }
++        } finally {
++            unmockkObject(SearchWidgetProvider.Companion)
++        }
++    }
++}
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/widget/SearchWidgetProviderTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/widget/SearchWidgetProviderTest.kt
+index 34ff21d767d5..6244dc55cf76 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/widget/SearchWidgetProviderTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/widget/SearchWidgetProviderTest.kt
+@@ -4,16 +4,29 @@
+ 
+ package org.mozilla.fenix.widget
+ 
++import android.appwidget.AppWidgetManager
++import android.content.ComponentName
+ import android.content.Context
++import android.content.Intent
++import io.mockk.Runs
+ import io.mockk.every
++import io.mockk.just
+ import io.mockk.mockk
++import io.mockk.mockkStatic
++import io.mockk.slot
++import io.mockk.unmockkStatic
++import io.mockk.verify
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertNull
+ import org.junit.Test
++import org.junit.runner.RunWith
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.ext.settings
++import org.mozilla.fenix.helpers.FenixRobolectricTestRunner
+ import org.mozilla.gecko.search.SearchWidgetProvider
+ import org.mozilla.gecko.search.SearchWidgetProviderSize
+ 
++@RunWith(FenixRobolectricTestRunner::class)
+ class SearchWidgetProviderTest {
+ 
+     @Test
+@@ -115,4 +128,62 @@ class SearchWidgetProviderTest {
+         assertNull(SearchWidgetProvider.getText(SearchWidgetProviderSize.EXTRA_SMALL_V1, context))
+         assertNull(SearchWidgetProvider.getText(SearchWidgetProviderSize.EXTRA_SMALL_V2, context))
+     }
++
++    @Test
++    fun `GIVEN voice search is disabled WHEN createVoiceSearchIntent is called THEN it returns null`() {
++        val widgetProvider = SearchWidgetProvider()
++        val context: Context = mockk {
++            every { settings().shouldShowVoiceSearch } returns false
++        }
++
++        val result = widgetProvider.createVoiceSearchIntent(context)
++
++        assertNull(result)
++    }
++
++    @Test
++    fun `GIVEN widgets set on screen shown WHEN updateAllWidgets is called THEN it sends a broadcast to update all widgets`() {
++        try {
++            mockkStatic(AppWidgetManager::class)
++            val widgetManager: AppWidgetManager = mockk()
++            every { AppWidgetManager.getInstance(any()) } returns widgetManager
++            val componentNameCaptor = slot<ComponentName>()
++            val widgetsToUpdate = intArrayOf(1, 2)
++            every { widgetManager.getAppWidgetIds(capture(componentNameCaptor)) } returns widgetsToUpdate
++            val context: Context = mockk(relaxed = true)
++            val intentCaptor = slot<Intent>()
++            every { context.sendBroadcast(capture(intentCaptor)) } just Runs
++
++            SearchWidgetProvider.updateAllWidgets(context)
++
++            verify { context.sendBroadcast(any()) }
++            assertEquals(SearchWidgetProvider::class.java.name, componentNameCaptor.captured.className)
++            assertEquals(SearchWidgetProvider::class.java.name, intentCaptor.captured.component!!.className)
++            assertEquals(AppWidgetManager.ACTION_APPWIDGET_UPDATE, intentCaptor.captured.action)
++            assertEquals(widgetsToUpdate, intentCaptor.captured.extras!!.get(AppWidgetManager.EXTRA_APPWIDGET_IDS))
++        } finally {
++            unmockkStatic(AppWidgetManager::class)
++        }
++    }
++
++    @Test
++    fun `GIVEN no widgets set shown WHEN updateAllWidgets is called THEN it does not try to update widgets`() {
++        try {
++            mockkStatic(AppWidgetManager::class)
++            val widgetManager: AppWidgetManager = mockk()
++            every { AppWidgetManager.getInstance(any()) } returns widgetManager
++            val componentNameCaptor = slot<ComponentName>()
++            val widgetsToUpdate = intArrayOf()
++            every { widgetManager.getAppWidgetIds(capture(componentNameCaptor)) } returns widgetsToUpdate
++            val context: Context = mockk(relaxed = true)
++            val intentCaptor = slot<Intent>()
++            every { context.sendBroadcast(capture(intentCaptor)) } just Runs
++
++            SearchWidgetProvider.updateAllWidgets(context)
++
++            verify(exactly = 0) { context.sendBroadcast(any()) }
++        } finally {
++            unmockkStatic(AppWidgetManager::class)
++        }
++    }
+ }

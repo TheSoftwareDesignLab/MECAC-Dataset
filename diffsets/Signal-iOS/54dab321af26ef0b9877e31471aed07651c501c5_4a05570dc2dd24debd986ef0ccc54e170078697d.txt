@@ -1,0 +1,202 @@
+diff --git a/Signal/src/AppDelegate.m b/Signal/src/AppDelegate.m
+index d021e5a4053..f58a8e5ee7e 100644
+--- a/Signal/src/AppDelegate.m
++++ b/Signal/src/AppDelegate.m
+@@ -62,6 +62,7 @@ typedef NS_ENUM(NSUInteger, LaunchFailure) {
+     LaunchFailure_CouldNotRestoreTransferredData,
+     LaunchFailure_DatabaseUnrecoverablyCorrupted,
+     LaunchFailure_LastAppLaunchCrashed,
++    LaunchFailure_LowStorageSpaceAvailable,
+ };
+ 
+ static NSString *NSStringForLaunchFailure(LaunchFailure launchFailure)
+@@ -79,6 +80,8 @@ typedef NS_ENUM(NSUInteger, LaunchFailure) {
+             return @"LaunchFailure_DatabaseUnrecoverablyCorrupted";
+         case LaunchFailure_LastAppLaunchCrashed:
+             return @"LaunchFailure_LastAppLaunchCrashed";
++        case LaunchFailure_LowStorageSpaceAvailable:
++            return @"LaunchFailure_NoDiskSpaceAvailable";
+     }
+ }
+ 
+@@ -119,6 +122,7 @@ @interface AppDelegate () <UNUserNotificationCenterDelegate>
+ 
+ @property (nonatomic) BOOL areVersionMigrationsComplete;
+ @property (nonatomic) BOOL didAppLaunchFail;
++@property (nonatomic) BOOL shouldKillAppWhenBackgrounded;
+ 
+ @end
+ 
+@@ -128,6 +132,25 @@ @implementation AppDelegate
+ 
+ @synthesize window = _window;
+ 
++- (BOOL)shouldKillAppWhenBackgrounded
++{
++    if (_shouldKillAppWhenBackgrounded) {
++        // Should only be killing app in the background if app launch failed
++        OWSAssertDebug(self.didAppLaunchFail);
++    }
++
++    return _shouldKillAppWhenBackgrounded;
++}
++
++- (void)setDidAppLaunchFail:(BOOL)didAppLaunchFail
++{
++    if (!didAppLaunchFail) {
++        self.shouldKillAppWhenBackgrounded = NO;
++    }
++
++    _didAppLaunchFail = didAppLaunchFail;
++}
++
+ #pragma mark -
+ 
+ - (void)applicationDidEnterBackground:(UIApplication *)application
+@@ -135,6 +158,10 @@ - (void)applicationDidEnterBackground:(UIApplication *)application
+     OWSLogInfo(@"applicationDidEnterBackground.");
+ 
+     OWSLogFlush();
++
++    if (self.shouldKillAppWhenBackgrounded) {
++        exit(0);
++    }
+ }
+ 
+ - (void)applicationWillEnterForeground:(UIApplication *)application
+@@ -219,7 +246,9 @@ - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
+     LaunchFailure launchFailure = LaunchFailure_None;
+     NSInteger launchAttemptFailureThreshold = SSKDebugFlags.betaLogging ? 2 : 3;
+ 
+-    if (deviceTransferRestoreFailed) {
++    if (![self checkSomeDiskSpaceAvailable]) {
++        launchFailure = LaunchFailure_LowStorageSpaceAvailable;
++    } else if (deviceTransferRestoreFailed) {
+         launchFailure = LaunchFailure_CouldNotRestoreTransferredData;
+     } else if (StorageCoordinator.hasInvalidDatabaseVersion) {
+         // Prevent:
+@@ -232,6 +261,7 @@ - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
+             >= launchAttemptFailureThreshold) {
+         launchFailure = LaunchFailure_LastAppLaunchCrashed;
+     }
++
+     if (launchFailure != LaunchFailure_None) {
+         [InstrumentsMonitor stopSpanWithCategory:@"appstart" hash:monitorId];
+         OWSLogInfo(@"application: didFinishLaunchingWithOptions failed.");
+@@ -244,6 +274,19 @@ - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
+     return YES;
+ }
+ 
++- (BOOL)checkSomeDiskSpaceAvailable
++{
++    NSString *tempDir = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID new].UUIDString];
++    BOOL succeededCreatingDir = [OWSFileSystem ensureDirectoryExists:tempDir];
++
++    // Best effort at deleting temp dir, which shouldn't ever fail
++    if (succeededCreatingDir && ![OWSFileSystem deleteFile:tempDir]) {
++        OWSFailDebug(@"Failed to delete temp dir used for checking disk space!");
++    }
++
++    return succeededCreatingDir;
++}
++
+ - (BOOL)launchToHomeScreen:(NSDictionary *_Nullable)launchOptions instrumentsMonitorId:(unsigned long long)monitorId
+ {
+     [self setupNSEInteroperation];
+@@ -424,6 +467,14 @@ - (void)showUIForLaunchFailure:(LaunchFailure)launchFailure
+             alertMessage = NSLocalizedString(@"APP_LAUNCH_FAILURE_LAST_LAUNCH_CRASHED_MESSAGE",
+                 @"Error indicating that the app crashed during the previous launch.");
+             break;
++        case LaunchFailure_LowStorageSpaceAvailable:
++            alertTitle = NSLocalizedString(@"APP_LAUNCH_FAILURE_LOW_STORAGE_SPACE_AVAILABLE_TITLE",
++                @"Error title indicating that the app crashed because there was low storage space available on the "
++                @"device.");
++            alertMessage = NSLocalizedString(@"APP_LAUNCH_FAILURE_LOW_STORAGE_SPACE_AVAILABLE_MESSAGE",
++                @"Error description indicating that the app crashed because there was low storage space available on "
++                @"the device.");
++            break;
+         case LaunchFailure_None:
+             OWSFailDebug(@"Unknown launch failure.");
+             alertTitle
+@@ -464,22 +515,27 @@ - (void)showUIForLaunchFailure:(LaunchFailure)launchFailure
+                                 }]];
+     }
+ 
+-    [actionSheet
+-        addAction:[[ActionSheetAction alloc]
+-                      initWithTitle:NSLocalizedString(@"SETTINGS_ADVANCED_SUBMIT_DEBUGLOG", nil)
+-                              style:ActionSheetActionStyleDefault
+-                            handler:^(ActionSheetAction *_Nonnull action) {
+-                                [Pastelog submitLogsWithSupportTag:NSStringForLaunchFailure(launchFailure)
+-                                                        completion:^{
+-                                                            if (launchFailure == LaunchFailure_LastAppLaunchCrashed) {
+-                                                                // Pretend we didn't fail!
+-                                                                self.didAppLaunchFail = NO;
+-                                                                [self launchToHomeScreen:nil instrumentsMonitorId:0];
+-                                                            } else {
+-                                                                OWSFail(@"exiting after sharing debug logs.");
+-                                                            }
+-                                                        }];
+-                            }]];
++    if (launchFailure == LaunchFailure_LowStorageSpaceAvailable) {
++        self.shouldKillAppWhenBackgrounded = YES;
++    } else {
++        [actionSheet
++            addAction:[[ActionSheetAction alloc]
++                          initWithTitle:NSLocalizedString(@"SETTINGS_ADVANCED_SUBMIT_DEBUGLOG", nil)
++                                  style:ActionSheetActionStyleDefault
++                                handler:^(ActionSheetAction *_Nonnull action) {
++                                    [Pastelog
++                                        submitLogsWithSupportTag:NSStringForLaunchFailure(launchFailure)
++                                                      completion:^{
++                                                          if (launchFailure == LaunchFailure_LastAppLaunchCrashed) {
++                                                              // Pretend we didn't fail!
++                                                              self.didAppLaunchFail = NO;
++                                                              [self launchToHomeScreen:nil instrumentsMonitorId:0];
++                                                          } else {
++                                                              OWSFail(@"exiting after sharing debug logs.");
++                                                          }
++                                                      }];
++                                }]];
++    }
+ 
+     if (launchFailure == LaunchFailure_LastAppLaunchCrashed) {
+         // Use a cancel-style button to draw attention.
+diff --git a/Signal/src/util/Device Transfer/DeviceTransferService.swift b/Signal/src/util/Device Transfer/DeviceTransferService.swift
+index 662619fae47..088a99bbdc3 100644
+--- a/Signal/src/util/Device Transfer/DeviceTransferService.swift	
++++ b/Signal/src/util/Device Transfer/DeviceTransferService.swift	
+@@ -260,7 +260,15 @@ class DeviceTransferService: NSObject {
+         session = nil
+         identity = nil
+ 
+-        tsAccountManager.isTransferInProgress = false
++        // It is possible that we get here because the app was backgrounded
++        // after a failed launch. In that case, `tsAccountManager` will not be
++        // available, and setting this will crash. It'd probably be safe to more
++        // simply return in the .idle case above since none of the values being
++        // reset should have values if we are idle, but I am scared of it.
++        if case .idle = transferState {} else {
++            tsAccountManager.isTransferInProgress = false
++        }
++
+         transferState = .idle
+ 
+         stopThroughputCalculation()
+diff --git a/Signal/translations/en.lproj/Localizable.strings b/Signal/translations/en.lproj/Localizable.strings
+index 30f4f9a8d71..6e4baf48c92 100644
+--- a/Signal/translations/en.lproj/Localizable.strings
++++ b/Signal/translations/en.lproj/Localizable.strings
+@@ -154,6 +154,12 @@
+ /* Error indicating that the app crashed during the previous launch. */
+ "APP_LAUNCH_FAILURE_LAST_LAUNCH_CRASHED_TITLE" = "Couldn’t Open Signal";
+ 
++/* Error description indicating that the app crashed because there was low storage space available on the device. */
++"APP_LAUNCH_FAILURE_LOW_STORAGE_SPACE_AVAILABLE_MESSAGE" = "Signal couldn’t open because your device is low on storage space. To use Signal, free up space by managing your storage in Settings.";
++
++/* Error title indicating that the app crashed because there was low storage space available on the device. */
++"APP_LAUNCH_FAILURE_LOW_STORAGE_SPACE_AVAILABLE_TITLE" = "Storage Space Low";
++
+ /* Error indicating that the app could not restore transferred data. */
+ "APP_LAUNCH_FAILURE_RESTORE_FAILED_MESSAGE" = "The data transferred from your old device could not be restored. Please send a debug log to support@signal.org so that we can troubleshoot this issue. If you re-install Signal your message history may be lost.";
+ 

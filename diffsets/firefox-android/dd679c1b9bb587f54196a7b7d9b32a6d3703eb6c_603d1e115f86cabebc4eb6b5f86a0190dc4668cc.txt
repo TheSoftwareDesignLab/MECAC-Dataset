@@ -1,0 +1,1573 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/FeatureFlags.kt b/fenix/app/src/main/java/org/mozilla/fenix/FeatureFlags.kt
+index a623c9c5c60e..11a563fc9bbd 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/FeatureFlags.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/FeatureFlags.kt
+@@ -43,4 +43,9 @@ object FeatureFlags {
+      * Enables recording of history metadata.
+      */
+     val historyMetadataFeature = Config.channel.isDebug
++
++    /**
++     * Enables the recently saved bookmarks feature in the home screen.
++     */
++    val recentBookmarksFeature = Config.channel.isNightlyOrDebug
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/bookmarks/BookmarksUseCase.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/bookmarks/BookmarksUseCase.kt
+index e381312fa2d6..a96c1ccc7128 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/bookmarks/BookmarksUseCase.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/bookmarks/BookmarksUseCase.kt
+@@ -6,10 +6,11 @@ package org.mozilla.fenix.components.bookmarks
+ 
+ import androidx.annotation.WorkerThread
+ import mozilla.appservices.places.BookmarkRoot
++import mozilla.components.concept.storage.BookmarkNode
+ import mozilla.components.concept.storage.BookmarksStorage
+ 
+ /**
+- * Use cases that allow for modifying bookmarks.
++ * Use cases that allow for modifying and retrieving bookmarks.
+  */
+ class BookmarksUseCase(storage: BookmarksStorage) {
+ 
+@@ -38,5 +39,22 @@ class BookmarksUseCase(storage: BookmarksStorage) {
+         }
+     }
+ 
++    class RetrieveRecentBookmarksUseCase internal constructor(
++        private val storage: BookmarksStorage
++    ) {
++        /**
++         * Retrieves a list of recently added bookmarks, if any, up to maximum.
++         */
++        @WorkerThread
++        suspend operator fun invoke(count: Int = DEFAULT_BOOKMARKS_TO_RETRIEVE): List<BookmarkNode> {
++            return storage.getRecentBookmarks(count)
++        }
++    }
++
+     val addBookmark by lazy { AddBookmarksUseCase(storage) }
++    val retrieveRecentBookmarks by lazy { RetrieveRecentBookmarksUseCase(storage) }
++
++    companion object {
++        const val DEFAULT_BOOKMARKS_TO_RETRIEVE = 4
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
+index 647120f693c7..610bd3c692c0 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
+@@ -113,6 +113,8 @@ import org.mozilla.fenix.ext.requireComponents
+ import org.mozilla.fenix.ext.runIfFragmentIsAttached
+ import org.mozilla.fenix.ext.settings
+ import org.mozilla.fenix.home.mozonline.showPrivacyPopWindow
++import org.mozilla.fenix.home.recentbookmarks.RecentBookmarksFeature
++import org.mozilla.fenix.home.recentbookmarks.controller.DefaultRecentBookmarksController
+ import org.mozilla.fenix.home.recenttabs.controller.DefaultRecentTabsController
+ import org.mozilla.fenix.home.sessioncontrol.DefaultSessionControlController
+ import org.mozilla.fenix.home.recenttabs.RecentTabsListFeature
+@@ -176,6 +178,7 @@ class HomeFragment : Fragment() {
+ 
+     private val topSitesFeature = ViewBoundFeatureWrapper<TopSitesFeature>()
+     private val recentTabsListFeature = ViewBoundFeatureWrapper<RecentTabsListFeature>()
++    private val recentBookmarksFeature = ViewBoundFeatureWrapper<RecentBookmarksFeature>()
+ 
+     @VisibleForTesting
+     internal var getMenuButton: () -> MenuButton? = { menuButton }
+@@ -232,6 +235,7 @@ class HomeFragment : Fragment() {
+                             )
+                         ).getTip()
+                     },
++                    recentBookmarks = emptyList(),
+                     showCollectionPlaceholder = components.settings.showCollectionsPlaceholderOnHome,
+                     showSetAsDefaultBrowserCard = components.settings.shouldShowSetAsDefaultBrowserCard(),
+                     recentTabs = components.core.store.state.asRecentTabs()
+@@ -260,6 +264,20 @@ class HomeFragment : Fragment() {
+             )
+         }
+ 
++        if (FeatureFlags.recentBookmarksFeature) {
++            recentBookmarksFeature.set(
++                feature = RecentBookmarksFeature(
++                    homeStore = homeFragmentStore,
++                    bookmarksUseCase = run {
++                        requireContext().components.useCases.bookmarksUseCases
++                    },
++                    scope = viewLifecycleOwner.lifecycleScope
++                ),
++                owner = viewLifecycleOwner,
++                view = view
++            )
++        }
++
+         _sessionControlInteractor = SessionControlInteractor(
+             controller = DefaultSessionControlController(
+                 activity = activity,
+@@ -284,6 +302,10 @@ class HomeFragment : Fragment() {
+             recentTabController = DefaultRecentTabsController(
+                 selectTabUseCase = components.useCases.tabsUseCases.selectTab,
+                 navController = findNavController()
++            ),
++            recentBookmarksController = DefaultRecentBookmarksController(
++                activity = activity,
++                navController = findNavController()
+             )
+         )
+ 
+@@ -600,7 +622,8 @@ class HomeFragment : Fragment() {
+                     ).getTip()
+                 },
+                 showCollectionPlaceholder = components.settings.showCollectionsPlaceholderOnHome,
+-                recentTabs = components.core.store.state.asRecentTabs()
++                recentTabs = components.core.store.state.asRecentTabs(),
++                recentBookmarks = emptyList()
+             )
+         )
+ 
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragmentStore.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragmentStore.kt
+index 45c6933c9c3b..6d0557ca1051 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragmentStore.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragmentStore.kt
+@@ -5,6 +5,7 @@
+ package org.mozilla.fenix.home
+ 
+ import android.graphics.Bitmap
++import mozilla.components.concept.storage.BookmarkNode
+ import mozilla.components.browser.state.state.TabSessionState
+ import mozilla.components.feature.tab.collections.TabCollection
+ import mozilla.components.feature.top.sites.TopSite
+@@ -45,6 +46,7 @@ data class Tab(
+  * @property tip The current [Tip] to show on the [HomeFragment].
+  * @property showCollectionPlaceholder If true, shows a placeholder when there are no collections.
+  * @property recentTabs The list of recent [TabSessionState] in the [HomeFragment].
++ * @property recentBookmarks The list of recently saved [BookmarkNode]s to show on the [HomeFragment].
+  */
+ data class HomeFragmentState(
+     val collections: List<TabCollection> = emptyList(),
+@@ -54,7 +56,8 @@ data class HomeFragmentState(
+     val tip: Tip? = null,
+     val showCollectionPlaceholder: Boolean = false,
+     val showSetAsDefaultBrowserCard: Boolean = false,
+-    val recentTabs: List<TabSessionState> = emptyList()
++    val recentTabs: List<TabSessionState> = emptyList(),
++    val recentBookmarks: List<BookmarkNode> = emptyList()
+ ) : State
+ 
+ sealed class HomeFragmentAction : Action {
+@@ -64,7 +67,8 @@ sealed class HomeFragmentAction : Action {
+         val collections: List<TabCollection>,
+         val tip: Tip? = null,
+         val showCollectionPlaceholder: Boolean,
+-        val recentTabs: List<TabSessionState>
++        val recentTabs: List<TabSessionState>,
++        val recentBookmarks: List<BookmarkNode>
+     ) :
+         HomeFragmentAction()
+ 
+@@ -76,6 +80,7 @@ sealed class HomeFragmentAction : Action {
+     data class TopSitesChange(val topSites: List<TopSite>) : HomeFragmentAction()
+     data class RemoveTip(val tip: Tip) : HomeFragmentAction()
+     data class RecentTabsChange(val recentTabs: List<TabSessionState>) : HomeFragmentAction()
++    data class RecentBookmarksChange(val recentBookmarks: List<BookmarkNode>) : HomeFragmentAction()
+     object RemoveCollectionsPlaceholder : HomeFragmentAction()
+     object RemoveSetDefaultBrowserCard : HomeFragmentAction()
+ }
+@@ -114,5 +119,6 @@ private fun homeFragmentStateReducer(
+         }
+         is HomeFragmentAction.RemoveSetDefaultBrowserCard -> state.copy(showSetAsDefaultBrowserCard = false)
+         is HomeFragmentAction.RecentTabsChange -> state.copy(recentTabs = action.recentTabs)
++        is HomeFragmentAction.RecentBookmarksChange -> state.copy(recentBookmarks = action.recentBookmarks)
+     }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/RecentBookmarksFeature.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/RecentBookmarksFeature.kt
+new file mode 100644
+index 000000000000..05ff153603bf
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/RecentBookmarksFeature.kt
+@@ -0,0 +1,44 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.home.recentbookmarks
++
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.launch
++import mozilla.components.concept.storage.BookmarkNode
++import mozilla.components.support.base.feature.LifecycleAwareFeature
++import org.mozilla.fenix.components.bookmarks.BookmarksUseCase
++import org.mozilla.fenix.home.HomeFragmentAction
++import org.mozilla.fenix.home.HomeFragmentStore
++
++/**
++ *  View-bound feature that retrieves a list of recently added [BookmarkNode]s and dispatches
++ *  updates to the [HomeFragmentStore].
++ *
++ *  @param homeStore the [HomeFragmentStore]
++ *  @param bookmarksUseCase the [BookmarksUseCase] for retrieving the list of recently saved
++*   bookmarks from storage.
++ *  @param scope the [CoroutineScope] used to fetch the bookmarks list
++ */
++class RecentBookmarksFeature(
++    private val homeStore: HomeFragmentStore,
++    private val bookmarksUseCase: BookmarksUseCase,
++    private val scope: CoroutineScope
++) : LifecycleAwareFeature {
++    internal var job: Job? = null
++
++    override fun start() {
++        job = scope.launch(Dispatchers.IO) {
++            val bookmarks = bookmarksUseCase.retrieveRecentBookmarks()
++
++            homeStore.dispatch(HomeFragmentAction.RecentBookmarksChange(bookmarks))
++        }
++    }
++
++    override fun stop() {
++        job?.cancel()
++    }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/RecentBookmarksItemAdapter.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/RecentBookmarksItemAdapter.kt
+new file mode 100644
+index 000000000000..1571f71270a9
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/RecentBookmarksItemAdapter.kt
+@@ -0,0 +1,44 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.home.recentbookmarks
++
++import android.view.LayoutInflater
++import android.view.ViewGroup
++import androidx.recyclerview.widget.DiffUtil
++import androidx.recyclerview.widget.ListAdapter
++import mozilla.components.concept.storage.BookmarkNode
++import org.mozilla.fenix.home.recentbookmarks.interactor.RecentBookmarksInteractor
++import org.mozilla.fenix.home.recentbookmarks.view.RecentBookmarkItemViewHolder
++
++/**
++ * Adapter for binding individual bookmark items for the homescreen.
++ *
++ * @param interactor The [RecentBookmarksInteractor] to be passed into the view.
++ */
++class RecentBookmarksItemAdapter(
++    private val interactor: RecentBookmarksInteractor
++) : ListAdapter<BookmarkNode, RecentBookmarkItemViewHolder>(RecentBookmarkItemDiffCallback) {
++
++    override fun onCreateViewHolder(
++        parent: ViewGroup,
++        viewType: Int
++    ): RecentBookmarkItemViewHolder {
++        val view = LayoutInflater.from(parent.context)
++            .inflate(RecentBookmarkItemViewHolder.LAYOUT_ID, parent, false)
++        return RecentBookmarkItemViewHolder(view, interactor)
++    }
++
++    override fun onBindViewHolder(holder: RecentBookmarkItemViewHolder, position: Int) {
++        holder.bind(getItem(position))
++    }
++
++    internal object RecentBookmarkItemDiffCallback : DiffUtil.ItemCallback<BookmarkNode>() {
++        override fun areItemsTheSame(oldItem: BookmarkNode, newItem: BookmarkNode) =
++            oldItem.guid == newItem.guid
++
++        override fun areContentsTheSame(oldItem: BookmarkNode, newItem: BookmarkNode) =
++            oldItem == newItem
++    }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/controller/RecentBookmarksController.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/controller/RecentBookmarksController.kt
+new file mode 100644
+index 000000000000..ebb788f73bbd
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/controller/RecentBookmarksController.kt
+@@ -0,0 +1,54 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.home.recentbookmarks.controller
++
++import androidx.navigation.NavController
++import mozilla.appservices.places.BookmarkRoot
++import mozilla.components.concept.storage.BookmarkNode
++import org.mozilla.fenix.BrowserDirection
++import org.mozilla.fenix.HomeActivity
++import org.mozilla.fenix.R
++import org.mozilla.fenix.ext.nav
++import org.mozilla.fenix.home.HomeFragmentDirections
++import org.mozilla.fenix.home.recentbookmarks.interactor.RecentBookmarksInteractor
++
++/**
++ * An interface that handles the view manipulation of the recently saved bookmarks on the
++ * Home screen.
++ */
++interface RecentBookmarksController {
++
++    /**
++     * @see [RecentBookmarksInteractor.onRecentBookmarkClicked]
++     */
++    fun handleBookmarkClicked(bookmark: BookmarkNode)
++
++    /**
++     * @see [RecentBookmarksInteractor.onShowAllBookmarksClicked]
++     */
++    fun handleShowAllBookmarksClicked()
++}
++
++/**
++ * The default implementation of [RecentBookmarksController].
++ */
++class DefaultRecentBookmarksController(
++    private val activity: HomeActivity,
++    private val navController: NavController
++) : RecentBookmarksController {
++
++    override fun handleBookmarkClicked(bookmark: BookmarkNode) {
++        activity.openToBrowserAndLoad(
++            searchTermOrURL = bookmark.url!!,
++            newTab = true,
++            from = BrowserDirection.FromHome
++        )
++    }
++
++    override fun handleShowAllBookmarksClicked() {
++        val directions = HomeFragmentDirections.actionGlobalBookmarkFragment(BookmarkRoot.Mobile.id)
++        navController.nav(R.id.homeFragment, directions)
++    }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/interactor/RecentBookmarksInteractor.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/interactor/RecentBookmarksInteractor.kt
+new file mode 100644
+index 000000000000..a27a143f2c46
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/interactor/RecentBookmarksInteractor.kt
+@@ -0,0 +1,28 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.home.recentbookmarks.interactor
++
++import mozilla.components.concept.storage.BookmarkNode
++import org.mozilla.fenix.home.sessioncontrol.SessionControlInteractor
++
++/**
++ * Interface for recently saved bookmark related actions in the [SessionControlInteractor].
++ */
++interface RecentBookmarksInteractor {
++
++    /**
++     * Opens the given bookmark in a new tab. Called when an user clicks on a recently saved
++     * bookmark on the home screen.
++     *
++     * @param bookmark The bookmark that will be opened.
++     */
++    fun onRecentBookmarkClicked(bookmark: BookmarkNode)
++
++    /**
++     * Navigates to bookmark list. Called when an user clicks on the "Show all" button for
++     * recently saved bookmarks on the home screen.
++     */
++    fun onShowAllBookmarksClicked()
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/view/RecentBookmarkItemViewHolder.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/view/RecentBookmarkItemViewHolder.kt
+new file mode 100644
+index 000000000000..ddc484ef6291
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/view/RecentBookmarkItemViewHolder.kt
+@@ -0,0 +1,41 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.home.recentbookmarks.view
++
++import android.view.View
++import kotlinx.android.synthetic.main.recent_bookmark_item.bookmark_title
++import kotlinx.android.synthetic.main.recent_bookmark_item.bookmark_subtitle
++import kotlinx.android.synthetic.main.recent_bookmark_item.bookmark_item
++import kotlinx.android.synthetic.main.recent_bookmark_item.favicon_image
++import mozilla.components.concept.storage.BookmarkNode
++import mozilla.components.support.ktx.kotlin.tryGetHostFromUrl
++import org.mozilla.fenix.R
++import org.mozilla.fenix.ext.components
++import org.mozilla.fenix.ext.loadIntoView
++import org.mozilla.fenix.home.recentbookmarks.interactor.RecentBookmarksInteractor
++import org.mozilla.fenix.utils.view.ViewHolder
++
++class RecentBookmarkItemViewHolder(
++    private val view: View,
++    private val interactor: RecentBookmarksInteractor
++) : ViewHolder(view) {
++
++    fun bind(bookmark: BookmarkNode) {
++        bookmark_title.text = bookmark.title ?: bookmark.url
++        bookmark_subtitle.text = bookmark.url?.tryGetHostFromUrl() ?: bookmark.title ?: ""
++
++        bookmark_item.setOnClickListener {
++            interactor.onRecentBookmarkClicked(bookmark)
++        }
++
++        bookmark.url?.let {
++            view.context.components.core.icons.loadIntoView(favicon_image, it)
++        }
++    }
++
++    companion object {
++        const val LAYOUT_ID = R.layout.recent_bookmark_item
++    }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/view/RecentBookmarksViewHolder.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/view/RecentBookmarksViewHolder.kt
+new file mode 100644
+index 000000000000..39a435321764
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/recentbookmarks/view/RecentBookmarksViewHolder.kt
+@@ -0,0 +1,45 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.home.recentbookmarks.view
++
++import android.view.View
++import androidx.recyclerview.widget.LinearLayoutManager
++import androidx.recyclerview.widget.LinearLayoutManager.HORIZONTAL
++import kotlinx.android.synthetic.main.component_recent_bookmarks.view.*
++import kotlinx.android.synthetic.main.recent_bookmarks_header.*
++import mozilla.components.concept.storage.BookmarkNode
++import org.mozilla.fenix.R
++import org.mozilla.fenix.home.recentbookmarks.RecentBookmarksItemAdapter
++import org.mozilla.fenix.home.recentbookmarks.interactor.RecentBookmarksInteractor
++import org.mozilla.fenix.utils.view.ViewHolder
++
++class RecentBookmarksViewHolder(
++    view: View,
++    val interactor: RecentBookmarksInteractor
++) : ViewHolder(view) {
++
++    private val recentBookmarksAdapter = RecentBookmarksItemAdapter(interactor)
++
++    init {
++        val linearLayoutManager = LinearLayoutManager(view.context, HORIZONTAL, false)
++
++        view.recent_bookmarks_list.apply {
++            adapter = recentBookmarksAdapter
++            layoutManager = linearLayoutManager
++        }
++
++        showAllBookmarksButton.setOnClickListener {
++            interactor.onShowAllBookmarksClicked()
++        }
++    }
++
++    fun bind(bookmarks: List<BookmarkNode>) {
++        recentBookmarksAdapter.submitList(bookmarks)
++    }
++
++    companion object {
++        const val LAYOUT_ID = R.layout.component_recent_bookmarks
++    }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlAdapter.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlAdapter.kt
+index f9a081ba256c..6ac4a9492969 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlAdapter.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlAdapter.kt
+@@ -13,6 +13,7 @@ import androidx.recyclerview.widget.DiffUtil
+ import androidx.recyclerview.widget.ListAdapter
+ import androidx.recyclerview.widget.RecyclerView
+ import mozilla.components.browser.state.state.TabSessionState
++import mozilla.components.concept.storage.BookmarkNode
+ import mozilla.components.feature.tab.collections.TabCollection
+ import mozilla.components.feature.top.sites.TopSite
+ import mozilla.components.ui.widgets.WidgetSiteItemView
+@@ -39,6 +40,7 @@ import org.mozilla.fenix.home.sessioncontrol.viewholders.onboarding.OnboardingTr
+ import org.mozilla.fenix.home.sessioncontrol.viewholders.onboarding.OnboardingWhatsNewViewHolder
+ import org.mozilla.fenix.home.recenttabs.view.RecentTabViewHolder
+ import org.mozilla.fenix.home.recenttabs.view.RecentTabsHeaderViewHolder
++import org.mozilla.fenix.home.recentbookmarks.view.RecentBookmarksViewHolder
+ import org.mozilla.fenix.home.tips.ButtonTipViewHolder
+ import mozilla.components.feature.tab.collections.Tab as ComponentTab
+ 
+@@ -151,6 +153,31 @@ sealed class AdapterItem(@LayoutRes val viewType: Int) {
+         }
+     }
+ 
++    data class RecentBookmarks(val recentBookmarks: List<BookmarkNode>) :
++        AdapterItem(RecentBookmarksViewHolder.LAYOUT_ID) {
++            override fun sameAs(other: AdapterItem): Boolean {
++                val newBookmarks = (other as? RecentBookmarks) ?: return false
++                if (newBookmarks.recentBookmarks.size != this.recentBookmarks.size) {
++                    return false
++                }
++
++                return recentBookmarks.zip(newBookmarks.recentBookmarks).all { (new, old) ->
++                    new.guid == old.guid
++                }
++            }
++
++            override fun contentsSameAs(other: AdapterItem): Boolean {
++                val newBookmarks = (other as? RecentBookmarks) ?: return false
++
++                val newBookmarksSequence = newBookmarks.recentBookmarks.asSequence()
++                val oldBookmarksList = this.recentBookmarks.asSequence()
++
++                return newBookmarksSequence.zip(oldBookmarksList).all { (new, old) ->
++                    new == old
++                }
++            }
++        }
++
+     /**
+      * True if this item represents the same value as other. Used by [AdapterItemDiffCallback].
+      */
+@@ -233,6 +260,10 @@ class SessionControlAdapter(
+             ExperimentDefaultBrowserCardViewHolder.LAYOUT_ID -> ExperimentDefaultBrowserCardViewHolder(view, interactor)
+             RecentTabsHeaderViewHolder.LAYOUT_ID -> RecentTabsHeaderViewHolder(view, interactor)
+             RecentTabViewHolder.LAYOUT_ID -> RecentTabViewHolder(view, interactor)
++            RecentBookmarksViewHolder.LAYOUT_ID -> {
++                RecentBookmarksViewHolder(view, interactor)
++            }
++
+             else -> throw IllegalStateException()
+         }
+     }
+@@ -287,6 +318,11 @@ class SessionControlAdapter(
+             is RecentTabViewHolder -> {
+                 holder.bindTab((item as AdapterItem.RecentTabItem).tab)
+             }
++            is RecentBookmarksViewHolder -> {
++                holder.bind(
++                    (item as AdapterItem.RecentBookmarks).recentBookmarks
++                )
++            }
+         }
+     }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlInteractor.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlInteractor.kt
+index a4a26cffb596..b46c0a0f5723 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlInteractor.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlInteractor.kt
+@@ -4,10 +4,13 @@
+ 
+ package org.mozilla.fenix.home.sessioncontrol
+ 
++import mozilla.components.concept.storage.BookmarkNode
+ import mozilla.components.feature.tab.collections.Tab
+ import mozilla.components.feature.tab.collections.TabCollection
+ import mozilla.components.feature.top.sites.TopSite
+ import org.mozilla.fenix.components.tips.Tip
++import org.mozilla.fenix.home.recentbookmarks.controller.RecentBookmarksController
++import org.mozilla.fenix.home.recentbookmarks.interactor.RecentBookmarksInteractor
+ import org.mozilla.fenix.home.recenttabs.controller.RecentTabController
+ import org.mozilla.fenix.home.recenttabs.interactor.RecentTabInteractor
+ 
+@@ -205,17 +208,19 @@ interface ExperimentCardInteractor {
+ }
+ 
+ /**
+- * Interactor for the Home screen.
+- * Provides implementations for the CollectionInteractor, OnboardingInteractor, TopSiteInteractor,
+- * TipInteractor, TabSessionInteractor, ToolbarInteractor, ExperimentCardInteractor, and
+- * RecentTabInteractor.
++ * Interactor for the Home screen. Provides implementations for the CollectionInteractor,
++ * OnboardingInteractor, TopSiteInteractor, TipInteractor, TabSessionInteractor,
++ * ToolbarInteractor, ExperimentCardInteractor, RecentTabInteractor, and RecentBookmarksInteractor.
+  */
+ @SuppressWarnings("TooManyFunctions")
+ class SessionControlInteractor(
+     private val controller: SessionControlController,
+-    private val recentTabController: RecentTabController
++    private val recentTabController: RecentTabController,
++    private val recentBookmarksController: RecentBookmarksController
+ ) : CollectionInteractor, OnboardingInteractor, TopSiteInteractor, TipInteractor,
+-    TabSessionInteractor, ToolbarInteractor, ExperimentCardInteractor, RecentTabInteractor {
++    TabSessionInteractor, ToolbarInteractor, ExperimentCardInteractor, RecentTabInteractor,
++    RecentBookmarksInteractor {
++
+     override fun onCollectionAddTabTapped(collection: TabCollection) {
+         controller.handleCollectionAddTabTapped(collection)
+     }
+@@ -327,4 +332,18 @@ class SessionControlInteractor(
+     override fun onRecentTabShowAllClicked() {
+         recentTabController.handleRecentTabShowAllClicked()
+     }
++
++    /**
++     * See [RecentBookmarksInteractor.onRecentBookmarkClicked].
++     */
++    override fun onRecentBookmarkClicked(bookmark: BookmarkNode) {
++        recentBookmarksController.handleBookmarkClicked(bookmark)
++    }
++
++    /**
++     * See [RecentBookmarksInteractor.onShowAllBookmarksClicked].
++     */
++    override fun onShowAllBookmarksClicked() {
++        recentBookmarksController.handleShowAllBookmarksClicked()
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlView.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlView.kt
+index aca15a662139..53697a2d09d2 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlView.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlView.kt
+@@ -10,6 +10,7 @@ import androidx.recyclerview.widget.ItemTouchHelper
+ import androidx.recyclerview.widget.LinearLayoutManager
+ import androidx.recyclerview.widget.RecyclerView
+ import kotlinx.android.extensions.LayoutContainer
++import mozilla.components.concept.storage.BookmarkNode
+ import mozilla.components.browser.state.state.TabSessionState
+ import mozilla.components.feature.tab.collections.TabCollection
+ import mozilla.components.feature.top.sites.TopSite
+@@ -28,6 +29,7 @@ private fun normalModeAdapterItems(
+     collections: List<TabCollection>,
+     expandedCollections: Set<Long>,
+     tip: Tip?,
++    recentBookmarks: List<BookmarkNode>,
+     showCollectionsPlaceholder: Boolean,
+     showSetAsDefaultBrowserCard: Boolean,
+     recentTabs: List<TabSessionState>
+@@ -48,6 +50,10 @@ private fun normalModeAdapterItems(
+         showRecentTabs(recentTabs, items)
+     }
+ 
++    if (recentBookmarks.isNotEmpty()) {
++        items.add(AdapterItem.RecentBookmarks(recentBookmarks))
++    }
++
+     if (collections.isEmpty()) {
+         if (showCollectionsPlaceholder) {
+             items.add(AdapterItem.NoCollectionsMessage)
+@@ -131,6 +137,7 @@ private fun HomeFragmentState.toAdapterList(): List<AdapterItem> = when (mode) {
+         collections,
+         expandedCollections,
+         tip,
++        recentBookmarks,
+         showCollectionPlaceholder,
+         showSetAsDefaultBrowserCard,
+         recentTabs
+@@ -174,7 +181,6 @@ class SessionControlView(
+     }
+ 
+     fun update(state: HomeFragmentState) {
+-
+         val stateAdapterList = state.toAdapterList()
+         if (homeScreenViewModel.shouldScrollToTopSites) {
+             sessionControlAdapter.submitList(stateAdapterList) {
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/viewholders/TabInCollectionViewHolder.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/viewholders/TabInCollectionViewHolder.kt
+index 319e87b57281..dd59e02f409c 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/viewholders/TabInCollectionViewHolder.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/viewholders/TabInCollectionViewHolder.kt
+@@ -44,7 +44,7 @@ class TabInCollectionViewHolder(
+         }
+ 
+         // This needs to match the elevation of the CollectionViewHolder for the shadow
+-        view.elevation = view.resources.getDimension(R.dimen.home_collection_elevation)
++        view.elevation = view.resources.getDimension(R.dimen.home_item_elevation)
+ 
+         view.setOnClickListener {
+             interactor.onCollectionOpenTabClicked(tab)
+diff --git a/fenix/app/src/main/res/color/primary_state_button_text_color.xml b/fenix/app/src/main/res/color/primary_state_button_text_color.xml
+deleted file mode 100644
+index 586da1d98e04..000000000000
+--- a/fenix/app/src/main/res/color/primary_state_button_text_color.xml
++++ /dev/null
+@@ -1,8 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!-- This Source Code Form is subject to the terms of the Mozilla Public
+-   - License, v. 2.0. If a copy of the MPL was not distributed with this
+-   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+-<selector xmlns:android="http://schemas.android.com/apk/res/android">
+-    <item android:state_checked="true" android:color="@color/photonDarkGrey05" />
+-    <item android:state_checked="false" android:color="@color/photonLightGrey50" />
+-</selector>
+diff --git a/fenix/app/src/main/res/color/primary_state_title_text_color.xml b/fenix/app/src/main/res/color/primary_state_title_text_color.xml
+deleted file mode 100644
+index b6de4eab5fd5..000000000000
+--- a/fenix/app/src/main/res/color/primary_state_title_text_color.xml
++++ /dev/null
+@@ -1,8 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!-- This Source Code Form is subject to the terms of the Mozilla Public
+-   - License, v. 2.0. If a copy of the MPL was not distributed with this
+-   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+-<selector xmlns:android="http://schemas.android.com/apk/res/android">
+-    <item android:state_checked="true" android:color="@color/photonDarkGrey05" />
+-    <item android:state_checked="false" android:color="@color/photonLightGrey05" />
+-</selector>
+diff --git a/fenix/app/src/main/res/color/recent_bookmark_item_text_color.xml b/fenix/app/src/main/res/color/recent_bookmark_item_text_color.xml
+deleted file mode 100644
+index f370ee77dfe3..000000000000
+--- a/fenix/app/src/main/res/color/recent_bookmark_item_text_color.xml
++++ /dev/null
+@@ -1,8 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!-- This Source Code Form is subject to the terms of the Mozilla Public
+-   - License, v. 2.0. If a copy of the MPL was not distributed with this
+-   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+-<selector xmlns:android="http://schemas.android.com/apk/res/android">
+-    <item android:state_checked="true" android:color="@color/photonDarkGrey90" />
+-    <item android:state_checked="false" android:color="@color/photonLightGrey30" />
+-</selector>
+diff --git a/fenix/app/src/main/res/layout/collection_home_list_row.xml b/fenix/app/src/main/res/layout/collection_home_list_row.xml
+index c6efdcba4f18..63e5afbbd15c 100644
+--- a/fenix/app/src/main/res/layout/collection_home_list_row.xml
++++ b/fenix/app/src/main/res/layout/collection_home_list_row.xml
+@@ -11,7 +11,7 @@
+     android:background="@drawable/home_list_row_background"
+     android:clickable="true"
+     android:clipToPadding="false"
+-    android:elevation="@dimen/home_collection_elevation"
++    android:elevation="@dimen/home_item_elevation"
+     android:focusable="true"
+     android:foreground="?android:attr/selectableItemBackground">
+ 
+diff --git a/fenix/app/src/main/res/layout/component_recent_bookmarks.xml b/fenix/app/src/main/res/layout/component_recent_bookmarks.xml
+index 12fd518ec95a..f5672105899c 100644
+--- a/fenix/app/src/main/res/layout/component_recent_bookmarks.xml
++++ b/fenix/app/src/main/res/layout/component_recent_bookmarks.xml
+@@ -3,28 +3,19 @@
+    - License, v. 2.0. If a copy of the MPL was not distributed with this
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+ 
+-<LinearLayout
+-    xmlns:android="http://schemas.android.com/apk/res/android"
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:tools="http://schemas.android.com/tools"
+     android:layout_width="match_parent"
+-    android:layout_height="match_parent"
+-    android:isScrollContainer="true"
+-    android:gravity="start">
++    android:layout_height="wrap_content"
++    android:orientation="vertical">
+ 
+     <include layout="@layout/recent_bookmarks_header" />
+ 
+     <androidx.recyclerview.widget.RecyclerView
+         android:id="@+id/recent_bookmarks_list"
+         android:layout_width="wrap_content"
+-        android:minWidth="448dp"
+-        android:layout_height="match_parent"
+-        android:layout_gravity="center_horizontal"
+-        android:layout_marginBottom="8dp"
+-        android:clipChildren="false"
+-        android:clipToPadding="false"
+-        android:overScrollMode="never"
+-        android:nestedScrollingEnabled="false"
++        android:layout_height="wrap_content"
+         tools:layoutManager="androidx.recyclerview.widget.LinearLayoutManager"
+-        tools:spanCount="4"
+-        tools:listitem="@layout/recent_bookmark_item" />
++        tools:listitem="@layout/recent_bookmark_item"
++        tools:spanCount="4" />
+ </LinearLayout>
+diff --git a/fenix/app/src/main/res/layout/recent_bookmark_item.xml b/fenix/app/src/main/res/layout/recent_bookmark_item.xml
+index 9371fe151416..5f0bc2ddd99e 100644
+--- a/fenix/app/src/main/res/layout/recent_bookmark_item.xml
++++ b/fenix/app/src/main/res/layout/recent_bookmark_item.xml
+@@ -2,56 +2,64 @@
+ <!-- This Source Code Form is subject to the terms of the Mozilla Public
+    - License, v. 2.0. If a copy of the MPL was not distributed with this
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+-<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+-    xmlns:app="http://schemas.android.com/apk/res-auto"
++<com.google.android.material.card.MaterialCardView
++    xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:tools="http://schemas.android.com/tools"
+     android:id="@+id/bookmark_item"
+     android:layout_width="@dimen/recent_bookmark_item_width"
+     android:layout_height="@dimen/recent_bookmark_item_height"
+-    android:orientation="vertical">
++    android:layout_marginEnd="8dp"
++    android:layout_marginBottom="16dp"
++    android:scrollbars="none"
++    android:nestedScrollingEnabled="false"
++    android:importantForAccessibility="no"
++    style="@style/RecentBookmarks.FaviconCard">
+ 
+-    <com.google.android.material.card.MaterialCardView
+-        android:id="@+id/favicon_card"
+-        style="@style/RecentBookmarks.FaviconCard"
+-        android:importantForAccessibility="noHideDescendants"
+-        app:layout_constraintStart_toStartOf="parent"
+-        app:layout_constraintEnd_toEndOf="parent"
+-        app:layout_constraintTop_toTopOf="parent"
+-        app:layout_constraintBottom_toBottomOf="parent" >
++    <com.google.android.material.imageview.ShapeableImageView
++        android:id="@+id/favicon_image"
++        style="@style/recentBookmarkFavicon"
++        android:layout_width="24dp"
++        android:layout_height="24dp"
++        android:layout_marginTop="24dp"
++        android:layout_gravity="center_horizontal" />
+ 
+-        <com.google.android.material.imageview.ShapeableImageView
+-            android:id="@+id/favicon_image"
+-            style="@style/recentBookmarkFavicon"
+-            app:layout_constraintTop_toTopOf="parent"
+-            app:layout_constraintStart_toStartOf="parent"
+-            app:layout_constraintEnd_toEndOf="parent" />
++    <View
++        android:layout_width="match_parent"
++        android:layout_height="1dp"
++        android:background="@color/tab_tray_item_divider_normal_theme"
++        android:importantForAccessibility="no"
++        android:layout_marginTop="72dp"
++        android:clickable="false"/>
+ 
+-        <TextView
+-            android:id="@+id/bookmark_title"
+-            android:layout_width="match_parent"
+-            android:layout_height="@dimen/recent_bookmark_item_title_height"
+-            android:maxHeight="@dimen/recent_bookmark_item_title_height"
+-            android:layout_marginTop="@dimen/recent_bookmark_item_favicon_height"
+-            android:paddingTop="@dimen/recent_bookmark_item_title_padding_top"
+-            android:paddingStart="@dimen/recent_bookmark_item_padding"
+-            android:paddingEnd="@dimen/recent_bookmark_item_padding"
+-            android:textAppearance="@style/recentBookmarkItemTitleText"
+-            app:layout_constraintStart_toStartOf="parent"
+-            app:layout_constraintEnd_toEndOf="parent"
+-            app:layout_constraintTop_toBottomOf="@id/favicon_image"
+-            tools:text="Recently Saved bookmark item" />
++    <TextView
++        android:id="@+id/bookmark_title"
++        android:layout_width="match_parent"
++        android:layout_height="30dp"
++        android:layout_marginTop="72dp"
++        android:maxHeight="30dp"
++        android:paddingStart="16dp"
++        android:paddingTop="7dp"
++        android:paddingEnd="16dp"
++        android:scrollbars="none"
++        android:ellipsize="end"
++        android:maxLines="1"
++        android:nestedScrollingEnabled="false"
++        android:importantForAccessibility="yes"
++        android:textAppearance="@style/recentBookmarkItemTitleText"
++        tools:text="Recently Saved bookmark item" />
+ 
+-        <TextView
+-            android:id="@+id/bookmark_subtitle"
+-            android:layout_width="match_parent"
+-            android:layout_height="@dimen/recent_bookmark_item_subtitle_height"
+-            android:layout_marginTop="@dimen/recent_bookmark_item_subtitle_margin_top"
+-            android:paddingStart="@dimen/recent_bookmark_item_padding"
+-            android:paddingEnd="@dimen/recent_bookmark_item_padding"
+-            android:textAppearance="@style/recentBookmarkItemSubTitleText"
+-            app:layout_constraintBottom_toBottomOf="@id/bookmark_title"
+-            app:layout_constraintStart_toStartOf="parent"
+-            app:layout_constraintEnd_toEndOf="parent"
+-            tools:text="Subtitle text" />
+-    </com.google.android.material.card.MaterialCardView>
+-</androidx.constraintlayout.widget.ConstraintLayout>
++    <TextView
++        android:id="@+id/bookmark_subtitle"
++        android:layout_width="match_parent"
++        android:layout_height="16dp"
++        android:layout_marginTop="105dp"
++        android:paddingStart="16dp"
++        android:paddingEnd="16dp"
++        android:ellipsize="end"
++        android:maxLines="1"
++        android:scrollbars="none"
++        android:nestedScrollingEnabled="false"
++        android:textAppearance="@style/recentBookmarkItemSubTitleText"
++        tools:text="Subtitle text"
++        android:textColor="@color/home_recent_bookmarks_item_url" />
++</com.google.android.material.card.MaterialCardView>
+diff --git a/fenix/app/src/main/res/layout/recent_bookmarks_header.xml b/fenix/app/src/main/res/layout/recent_bookmarks_header.xml
+index dcee371cb5a5..8614ebaaf990 100644
+--- a/fenix/app/src/main/res/layout/recent_bookmarks_header.xml
++++ b/fenix/app/src/main/res/layout/recent_bookmarks_header.xml
+@@ -1,39 +1,42 @@
+ <?xml version="1.0" encoding="utf-8"?>
++
+ <!-- This Source Code Form is subject to the terms of the Mozilla Public
+    - License, v. 2.0. If a copy of the MPL was not distributed with this
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++
+ <androidx.constraintlayout.widget.ConstraintLayout
+     xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:app="http://schemas.android.com/apk/res-auto"
+     android:layout_width="match_parent"
+-    android:layout_height="wrap_content" >
++    android:layout_height="wrap_content"
++    android:layout_marginTop="40dp">
+ 
+     <androidx.appcompat.widget.AppCompatTextView
+-        style="@style/Header20TextStyle"
+         android:id="@+id/recentlySavedBookmarksHeader"
++        style="@style/Header20TextStyle"
+         android:layout_width="wrap_content"
+         android:layout_height="wrap_content"
+         android:contentDescription="@string/recently_saved_bookmarks_content_description"
++        android:maxLines="1"
++        android:paddingTop="16dp"
++        android:paddingBottom="16dp"
+         android:text="@string/recently_saved_bookmarks"
+-        android:layout_marginTop="@dimen/home_recently_saved_padding_top"
+-        android:paddingStart="@dimen/home_recently_saved_padding_start"
+-        android:paddingBottom="@dimen/home_recently_saved_padding_bottom"
+-        android:maxLines="2"
+         app:layout_constraintStart_toStartOf="parent"
+         app:layout_constraintTop_toTopOf="parent" />
+ 
+     <com.google.android.material.button.MaterialButton
+         android:id="@+id/showAllBookmarksButton"
++        style="@style/Button12TextStyle"
+         android:layout_width="wrap_content"
+         android:layout_height="wrap_content"
+-        style="@style/Button12TextStyle"
+-        android:contentDescription="@string/recently_saved_show_all_content_description"
+         android:background="?android:attr/selectableItemBackground"
++        android:contentDescription="@string/recently_saved_show_all_content_description"
++        android:padding="16dp"
+         android:text="@string/recently_saved_show_all"
+-        android:paddingStart="@dimen/home_recently_saved_padding_start"
+-        android:paddingEnd="@dimen/home_recently_saved_padding_end"
+-        android:paddingTop="@dimen/home_show_all_padding_top"
+-        android:paddingBottom="@dimen/home_show_all_padding_bottom"
+-        app:layout_constraintEnd_toEndOf="parent"
+-        app:layout_constraintBottom_toBottomOf="@id/recentlySavedBookmarksHeader" />
++        android:textColor="@color/home_show_all_button_text"
++        android:maxLines="1"
++        android:scrollbars="none"
++        android:nestedScrollingEnabled="false"
++        app:layout_constraintBottom_toBottomOf="@id/recentlySavedBookmarksHeader"
++        app:layout_constraintEnd_toEndOf="parent" />
+ </androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/fenix/app/src/main/res/layout/recent_tabs_list_row.xml b/fenix/app/src/main/res/layout/recent_tabs_list_row.xml
+index 82cc850c7755..a9cb925c024b 100644
+--- a/fenix/app/src/main/res/layout/recent_tabs_list_row.xml
++++ b/fenix/app/src/main/res/layout/recent_tabs_list_row.xml
+@@ -10,7 +10,7 @@
+     android:layout_height="48dp"
+     android:background="@drawable/home_list_row_background"
+     android:clipToPadding="false"
+-    android:elevation="@dimen/home_collection_elevation"
++    android:elevation="@dimen/home_item_elevation"
+     android:foreground="?android:attr/selectableItemBackground">
+ 
+     <ImageView
+diff --git a/fenix/app/src/main/res/values-night/colors.xml b/fenix/app/src/main/res/values-night/colors.xml
+index 2e0e53da4d84..8cfe04538647 100644
+--- a/fenix/app/src/main/res/values-night/colors.xml
++++ b/fenix/app/src/main/res/values-night/colors.xml
+@@ -97,6 +97,7 @@
+ 
+     <!-- Home screen -->
+     <color name="home_show_all_button_text">@color/photonLightGrey50</color>
++    <color name="home_recent_bookmarks_item_url">@color/photonLightGrey50</color>
+ 
+     <!-- Search Widget -->
+     <color name="search_widget_background">@color/inset_dark_theme</color>
+diff --git a/fenix/app/src/main/res/values/colors.xml b/fenix/app/src/main/res/values/colors.xml
+index e2f1eb277826..97b0b12e5ec5 100644
+--- a/fenix/app/src/main/res/values/colors.xml
++++ b/fenix/app/src/main/res/values/colors.xml
+@@ -302,6 +302,7 @@
+ 
+     <!-- Home screen -->
+     <color name="home_show_all_button_text">@color/photonDarkGrey05</color>
++    <color name="home_recent_bookmarks_item_url">@color/photonDarkGrey05</color>
+ 
+     <!-- Library buttons -->
+     <color name="library_sessions_icon_background">#B9F0FD</color>
+diff --git a/fenix/app/src/main/res/values/dimens.xml b/fenix/app/src/main/res/values/dimens.xml
+index 7ed07966cf83..d88e22c4458e 100644
+--- a/fenix/app/src/main/res/values/dimens.xml
++++ b/fenix/app/src/main/res/values/dimens.xml
+@@ -95,26 +95,12 @@
+ 
+     <!-- Home Fragment -->
+     <dimen name="home_fragment_top_toolbar_header_margin">60dp</dimen>
+-    <dimen name="home_collection_elevation">5dp</dimen>
+-    <dimen name="home_recently_saved_padding_top">40dp</dimen>
+-    <dimen name="home_recently_saved_padding_bottom">16dp</dimen>
+-    <dimen name="home_recently_saved_padding_start">16dp</dimen>
+-    <dimen name="home_recently_saved_padding_end">16dp</dimen>
+-    <dimen name="home_show_all_padding_top">16dp</dimen>
+-    <dimen name="home_show_all_padding_bottom">16dp</dimen>
++    <dimen name="home_item_elevation">5dp</dimen>
+ 
+     <!-- Home - Recently saved bookmarks -->
+     <dimen name="recent_bookmark_item_height">128dp</dimen>
+     <dimen name="recent_bookmark_item_width">152dp</dimen>
+-    <dimen name="recent_bookmark_item_padding">16dp</dimen>
+-    <dimen name="recent_bookmark_item_card_radius">8dp</dimen>
+-    <dimen name="recent_bookmark_item_card_elevation">1dp</dimen>
+     <dimen name="recent_bookmark_item_favicon_height">72dp</dimen>
+-    <dimen name="recent_bookmark_item_favicon_corner_size">4dp</dimen>
+-    <dimen name="recent_bookmark_item_title_height">30dp</dimen>
+-    <dimen name="recent_bookmark_item_title_padding_top">7dp</dimen>
+-    <dimen name="recent_bookmark_item_subtitle_height">16dp</dimen>
+-    <dimen name="recent_bookmark_item_subtitle_margin_top">105dp</dimen>
+ 
+     <!-- Browser Fragment -->
+     <!--The size of the gap between the tab preview and content layout.-->
+diff --git a/fenix/app/src/main/res/values/styles.xml b/fenix/app/src/main/res/values/styles.xml
+index ddb4c42b0fa7..190c473e0c98 100644
+--- a/fenix/app/src/main/res/values/styles.xml
++++ b/fenix/app/src/main/res/values/styles.xml
+@@ -404,13 +404,12 @@
+     </style>
+ 
+     <style name="Body12TextStyle" parent="TextAppearance.MaterialComponents.Body1">
+-        <item name="android:textColor">@color/primary_state_title_text_color</item>
++        <item name="android:textColor">?primaryText</item>
+         <item name="android:textSize">12sp</item>
+         <item name="android:textAllCaps">false</item>
+     </style>
+ 
+     <style name="Button12TextStyle" parent="TextAppearance.MaterialComponents.Button">
+-        <item name="android:textColor">@color/primary_state_button_text_color</item>
+         <item name="android:textSize">12sp</item>
+         <item name="fontFamily">@font/metropolis</item>
+         <item name="android:textAllCaps">false</item>
+@@ -656,10 +655,10 @@
+     <style name="RecentBookmarks.FaviconCard" parent="Mozac.Widgets.Favicon">
+         <item name="android:layout_width">@dimen/recent_bookmark_item_width</item>
+         <item name="android:layout_height">@dimen/recent_bookmark_item_height</item>
+-        <item name="android:padding">@dimen/recent_bookmark_item_padding</item>
++        <item name="android:padding">16dp</item>
+         <item name="cardBackgroundColor">?mozac_widget_favicon_background_color</item>
+-        <item name="cardCornerRadius">@dimen/recent_bookmark_item_card_radius</item>
+-        <item name="cardElevation">@dimen/recent_bookmark_item_card_elevation</item>
++        <item name="cardCornerRadius">8dp</item>
++        <item name="cardElevation">@dimen/home_item_elevation</item>
+     </style>
+ 
+     <style name="recentBookmarkFavicon">
+@@ -672,21 +671,22 @@
+ 
+     <style name="recentBookmarkFaviconShape">
+         <item name="cornerFamily">rounded</item>
+-        <item name="elevation">@dimen/recent_bookmark_item_card_elevation</item>
+-        <item name="cornerSize">@dimen/recent_bookmark_item_favicon_corner_size</item>
++        <item name="elevation">1dp</item>
++        <item name="cornerSize">4dp</item>
+     </style>
+ 
+     <style name="recentBookmarkItemTitleText" parent="Body16TextStyle">
+         <item name="android:gravity">start</item>
+         <item name="android:textAlignment">gravity</item>
+         <item name="android:singleLine">true</item>
+-        <item name="android:textColor">@color/recent_bookmark_item_text_color</item>
++        <item name="android:textColor">?primaryText</item>
+         <item name="android:ellipsize">end</item>
+         <item name="android:maxLines">1</item>
+     </style>
+ 
+     <style name="recentBookmarkItemSubTitleText" parent="Body12TextStyle">
+         <item name="android:gravity">start</item>
++        <item name="android:textColor">?primaryText</item>
+         <item name="android:textAlignment">gravity</item>
+         <item name="android:singleLine">true</item>
+         <item name="android:ellipsize">end</item>
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/components/bookmarks/BookmarksUseCaseTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/components/bookmarks/BookmarksUseCaseTest.kt
+index 57619a395d7a..fcbd336753d8 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/components/bookmarks/BookmarksUseCaseTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/components/bookmarks/BookmarksUseCaseTest.kt
+@@ -13,6 +13,7 @@ import kotlinx.coroutines.test.runBlockingTest
+ import mozilla.appservices.places.BookmarkRoot
+ import mozilla.components.concept.storage.BookmarkNode
+ import mozilla.components.concept.storage.BookmarksStorage
++import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+@@ -47,4 +48,33 @@ class BookmarksUseCaseTest {
+ 
+         coVerify { storage.addItem(BookmarkRoot.Mobile.id, "https://mozilla.org", "Mozilla", null) }
+     }
++
++    @Test
++    fun `WHEN recently saved bookmarks exist THEN retrieve the list from storage`() = runBlockingTest {
++        val storage = mockk<BookmarksStorage>(relaxed = true)
++        val useCase = BookmarksUseCase(storage)
++        val bookmarkNode = mockk<BookmarkNode>()
++
++        coEvery { storage.getRecentBookmarks(any()) }.coAnswers { listOf(bookmarkNode) }
++
++        val result = useCase.retrieveRecentBookmarks()
++
++        assertEquals(listOf(bookmarkNode), result)
++
++        coVerify { storage.getRecentBookmarks(BookmarksUseCase.DEFAULT_BOOKMARKS_TO_RETRIEVE) }
++    }
++
++    @Test
++    fun `WHEN there are no recently saved bookmarks THEN retrieve the empty list from storage`() = runBlockingTest {
++        val storage = mockk<BookmarksStorage>(relaxed = true)
++        val useCase = BookmarksUseCase(storage)
++
++        coEvery { storage.getRecentBookmarks(any()) }.coAnswers { listOf() }
++
++        val result = useCase.retrieveRecentBookmarks()
++
++        assertEquals(listOf<BookmarkNode>(), result)
++
++        coVerify { storage.getRecentBookmarks(BookmarksUseCase.DEFAULT_BOOKMARKS_TO_RETRIEVE) }
++    }
+ }
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/home/DefaultSessionControlControllerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/home/DefaultSessionControlControllerTest.kt
+index cbb1b997c745..2884db198a41 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/home/DefaultSessionControlControllerTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/home/DefaultSessionControlControllerTest.kt
+@@ -130,7 +130,8 @@ class DefaultSessionControlControllerTest {
+             topSites = emptyList(),
+             showCollectionPlaceholder = true,
+             showSetAsDefaultBrowserCard = true,
+-            recentTabs = emptyList()
++            recentTabs = emptyList(),
++            recentBookmarks = emptyList()
+         )
+ 
+         every { navController.currentDestination } returns mockk {
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/home/HomeFragmentStoreTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/home/HomeFragmentStoreTest.kt
+index 704170be378c..c7f462591824 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/home/HomeFragmentStoreTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/home/HomeFragmentStoreTest.kt
+@@ -153,7 +153,8 @@ class HomeFragmentStoreTest {
+                     mode = Mode.Private,
+                     topSites = topSites,
+                     showCollectionPlaceholder = true,
+-                    recentTabs = recentTabs
++                    recentTabs = recentTabs,
++                    recentBookmarks = emptyList()
+                 )
+             ).join()
+ 
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/home/SessionControlInteractorTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/home/SessionControlInteractorTest.kt
+index 4dc05de85446..59224dc3ebdb 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/home/SessionControlInteractorTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/home/SessionControlInteractorTest.kt
+@@ -6,10 +6,13 @@ package org.mozilla.fenix.home
+ 
+ import io.mockk.mockk
+ import io.mockk.verify
++import mozilla.components.concept.storage.BookmarkNode
++import mozilla.components.concept.storage.BookmarkNodeType
+ import mozilla.components.feature.tab.collections.Tab
+ import mozilla.components.feature.tab.collections.TabCollection
+ import org.junit.Before
+ import org.junit.Test
++import org.mozilla.fenix.home.recentbookmarks.controller.RecentBookmarksController
+ import org.mozilla.fenix.home.recenttabs.controller.RecentTabController
+ import org.mozilla.fenix.home.sessioncontrol.DefaultSessionControlController
+ import org.mozilla.fenix.home.sessioncontrol.SessionControlInteractor
+@@ -18,12 +21,17 @@ class SessionControlInteractorTest {
+ 
+     private val controller: DefaultSessionControlController = mockk(relaxed = true)
+     private val recentTabController: RecentTabController = mockk(relaxed = true)
++    private val recentBookmarksController: RecentBookmarksController = mockk(relaxed = true)
+ 
+     private lateinit var interactor: SessionControlInteractor
+ 
+     @Before
+     fun setup() {
+-        interactor = SessionControlInteractor(controller, recentTabController)
++        interactor = SessionControlInteractor(
++            controller,
++            recentTabController,
++            recentBookmarksController
++        )
+     }
+ 
+     @Test
+@@ -143,4 +151,26 @@ class SessionControlInteractorTest {
+         interactor.onRecentTabShowAllClicked()
+         verify { recentTabController.handleRecentTabShowAllClicked() }
+     }
++
++    @Test
++    fun `WHEN a recently saved bookmark is clicked THEN the selected bookmark is handled`() {
++        val bookmark = BookmarkNode(
++            type = BookmarkNodeType.ITEM,
++            guid = "guid#${Math.random() * 1000}",
++            parentGuid = null,
++            position = null,
++            title = null,
++            url = null,
++            children = null
++        )
++
++        interactor.onRecentBookmarkClicked(bookmark)
++        verify { recentBookmarksController.handleBookmarkClicked(bookmark) }
++    }
++
++    @Test
++    fun `WHEN Show All recently saved bookmarks button is clicked THEN the click is handled`() {
++        interactor.onShowAllBookmarksClicked()
++        verify { recentBookmarksController.handleShowAllBookmarksClicked() }
++    }
+ }
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/home/recentbookmarks/DefaultRecentBookmarksControllerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/home/recentbookmarks/DefaultRecentBookmarksControllerTest.kt
+new file mode 100644
+index 000000000000..156048532fce
+--- /dev/null
++++ b/fenix/app/src/test/java/org/mozilla/fenix/home/recentbookmarks/DefaultRecentBookmarksControllerTest.kt
+@@ -0,0 +1,91 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.home.recentbookmarks
++
++import androidx.navigation.NavController
++import androidx.navigation.NavOptions
++import io.mockk.Runs
++import io.mockk.every
++import io.mockk.just
++import io.mockk.mockk
++import io.mockk.spyk
++import io.mockk.verify
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.test.TestCoroutineDispatcher
++import mozilla.appservices.places.BookmarkRoot
++import mozilla.components.concept.storage.BookmarkNode
++import mozilla.components.concept.storage.BookmarkNodeType
++import mozilla.components.support.test.rule.MainCoroutineRule
++import org.junit.After
++import org.junit.Before
++import org.junit.Rule
++import org.junit.Test
++import org.mozilla.fenix.BrowserDirection
++import org.mozilla.fenix.HomeActivity
++import org.mozilla.fenix.R
++import org.mozilla.fenix.home.HomeFragmentDirections
++import org.mozilla.fenix.home.recentbookmarks.controller.DefaultRecentBookmarksController
++
++@OptIn(ExperimentalCoroutinesApi::class)
++class DefaultRecentBookmarksControllerTest {
++
++    private val testDispatcher = TestCoroutineDispatcher()
++
++    @get:Rule
++    val coroutinesTestRule = MainCoroutineRule(testDispatcher)
++
++    private val activity: HomeActivity = mockk(relaxed = true)
++    private val navController: NavController = mockk(relaxUnitFun = true)
++    private lateinit var controller: DefaultRecentBookmarksController
++
++    @Before
++    fun setup() {
++        every { activity.openToBrowserAndLoad(any(), any(), any()) } just Runs
++        every { navController.currentDestination } returns mockk {
++            every { id } returns R.id.homeFragment
++        }
++
++        controller = spyk(DefaultRecentBookmarksController(
++            activity = activity,
++            navController = navController
++        ))
++    }
++
++    @After
++    fun cleanUp() {
++        testDispatcher.cleanupTestCoroutines()
++    }
++
++    @Test
++    fun `WHEN a recently saved bookmark is clicked THEN the selected bookmark is opened`() {
++        val bookmark = BookmarkNode(
++            type = BookmarkNodeType.ITEM,
++            guid = "guid#${Math.random() * 1000}",
++            parentGuid = null,
++            position = null,
++            title = null,
++            url = "https://www.example.com",
++            children = null
++        )
++
++        controller.handleBookmarkClicked(bookmark)
++
++        verify {
++            activity.openToBrowserAndLoad(
++                searchTermOrURL = bookmark.url!!,
++                newTab = true,
++                from = BrowserDirection.FromHome
++            )
++        }
++    }
++
++    @Test
++    fun `WHEN show all recently saved bookmark is clicked THEN the bookmarks root is opened`() {
++        controller.handleShowAllBookmarksClicked()
++
++        val directions = HomeFragmentDirections.actionGlobalBookmarkFragment(BookmarkRoot.Mobile.id)
++        verify { navController.navigate(directions, any<NavOptions>()) }
++    }
++}
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/home/recentbookmarks/RecentBookmarksFeatureTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/home/recentbookmarks/RecentBookmarksFeatureTest.kt
+new file mode 100644
+index 000000000000..92a507081457
+--- /dev/null
++++ b/fenix/app/src/test/java/org/mozilla/fenix/home/recentbookmarks/RecentBookmarksFeatureTest.kt
+@@ -0,0 +1,108 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.home.recentbookmarks
++
++import io.mockk.coEvery
++import io.mockk.coVerify
++import io.mockk.mockk
++import io.mockk.spyk
++import io.mockk.verify
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.test.TestCoroutineDispatcher
++import kotlinx.coroutines.test.TestCoroutineScope
++import kotlinx.coroutines.test.runBlockingTest
++import mozilla.components.concept.storage.BookmarkNode
++import mozilla.components.concept.storage.BookmarkNodeType
++import mozilla.components.support.test.libstate.ext.waitUntilIdle
++import mozilla.components.support.test.middleware.CaptureActionsMiddleware
++import mozilla.components.support.test.rule.MainCoroutineRule
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Before
++import org.junit.Rule
++import org.junit.Test
++import org.mozilla.fenix.components.bookmarks.BookmarksUseCase
++import org.mozilla.fenix.home.HomeFragmentAction
++import org.mozilla.fenix.home.HomeFragmentState
++import org.mozilla.fenix.home.HomeFragmentStore
++
++@OptIn(ExperimentalCoroutinesApi::class)
++class RecentBookmarksFeatureTest {
++
++    private val middleware = CaptureActionsMiddleware<HomeFragmentState, HomeFragmentAction>()
++    private val homeStore = HomeFragmentStore(middlewares = listOf(middleware))
++    private val bookmarksUseCases: BookmarksUseCase = mockk(relaxed = true)
++    private val scope = TestCoroutineScope()
++    private val testDispatcher = TestCoroutineDispatcher()
++    private val bookmark = BookmarkNode(
++        type = BookmarkNodeType.ITEM,
++        guid = "guid#${Math.random() * 1000}",
++        parentGuid = null,
++        position = null,
++        title = null,
++        url = "https://www.example.com",
++        children = null
++    )
++
++    @get:Rule
++    val coroutinesTestRule = MainCoroutineRule(testDispatcher)
++
++    @Before
++    fun setup() {
++        coEvery { bookmarksUseCases.retrieveRecentBookmarks() }.coAnswers { listOf(bookmark) }
++    }
++
++    @After
++    fun cleanUp() {
++        scope.cleanupTestCoroutines()
++        testDispatcher.cleanupTestCoroutines()
++    }
++
++    @Test
++    fun `GIVEN no recent bookmarks WHEN feature starts THEN fetch bookmarks and notify store`() =
++        testDispatcher.runBlockingTest {
++            val feature = RecentBookmarksFeature(
++                homeStore,
++                bookmarksUseCases,
++                scope
++            )
++
++            feature.start()
++
++            assertEquals(emptyList<BookmarkNode>(), homeStore.state.recentBookmarks)
++
++            testDispatcher.advanceUntilIdle()
++            homeStore.waitUntilIdle()
++
++            coVerify {
++                bookmarksUseCases.retrieveRecentBookmarks()
++            }
++
++            middleware.assertLastAction(HomeFragmentAction.RecentBookmarksChange::class) {
++                assertEquals(listOf(bookmark), it.recentBookmarks)
++            }
++        }
++
++    @Test
++    fun `WHEN the feature is destroyed THEN the job is cancelled`() {
++        val feature = spyk(RecentBookmarksFeature(
++            homeStore,
++            bookmarksUseCases,
++            scope
++        ))
++
++        assertNull(feature.job)
++
++        feature.start()
++
++        assertNotNull(feature.job)
++
++        feature.stop()
++
++        verify(exactly = 1) { feature.stop() }
++    }
++}
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/home/recentbookmarks/view/RecentBookmarkItemViewHolderTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/home/recentbookmarks/view/RecentBookmarkItemViewHolderTest.kt
+new file mode 100644
+index 000000000000..11b95144e7a7
+--- /dev/null
++++ b/fenix/app/src/test/java/org/mozilla/fenix/home/recentbookmarks/view/RecentBookmarkItemViewHolderTest.kt
+@@ -0,0 +1,93 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.home.recentbookmarks.view
++
++import android.view.LayoutInflater
++import android.view.View
++import io.mockk.mockk
++import kotlinx.android.synthetic.main.recent_bookmark_item.view.*
++import mozilla.components.concept.storage.BookmarkNode
++import mozilla.components.concept.storage.BookmarkNodeType
++import mozilla.components.support.ktx.kotlin.tryGetHostFromUrl
++import mozilla.components.support.test.robolectric.testContext
++import org.junit.Assert
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.mozilla.fenix.helpers.FenixRobolectricTestRunner
++import org.mozilla.fenix.home.sessioncontrol.SessionControlInteractor
++
++@RunWith(FenixRobolectricTestRunner::class)
++class RecentBookmarkItemViewHolderTest {
++
++    private lateinit var view: View
++    private lateinit var interactor: SessionControlInteractor
++
++    private val bookmarkNoUrl = BookmarkNode(
++        type = BookmarkNodeType.ITEM,
++        guid = "guid#${Math.random() * 1000}",
++        parentGuid = null,
++        position = null,
++        title = "Bookmark Title",
++        url = null,
++        children = null
++    )
++
++    private val bookmarkWithUrl = BookmarkNode(
++        type = BookmarkNodeType.ITEM,
++        guid = "guid#${Math.random() * 1000}",
++        parentGuid = null,
++        position = null,
++        title = "Other Bookmark Title",
++        url = "https://www.example.com",
++        children = null
++    )
++
++    private val bookmarkNoTitle = BookmarkNode(
++        type = BookmarkNodeType.ITEM,
++        guid = "guid#${Math.random() * 1000}",
++        parentGuid = null,
++        position = null,
++        title = null,
++        url = "https://www.github.com",
++        children = null
++    )
++
++    @Before
++    fun setup() {
++        view = LayoutInflater.from(testContext)
++            .inflate(RecentBookmarkItemViewHolder.LAYOUT_ID, null)
++
++        interactor = mockk(relaxed = true)
++    }
++
++    @Test
++    fun `GIVEN a bookmark exists in the list THEN set the title text and subtitle from item`() {
++        RecentBookmarkItemViewHolder(view, interactor).bind(bookmarkWithUrl)
++
++        val hostFromUrl = bookmarkWithUrl.url?.tryGetHostFromUrl()
++
++        Assert.assertEquals(bookmarkWithUrl.title, view.bookmark_title.text)
++        Assert.assertEquals(hostFromUrl, view.bookmark_subtitle.text)
++    }
++
++    @Test
++    fun `WHEN there is no url for the bookmark THEN do not load an icon `() {
++        val viewHolder = RecentBookmarkItemViewHolder(view, interactor)
++
++        Assert.assertNull(view.favicon_image.drawable)
++
++        viewHolder.bind(bookmarkNoUrl)
++
++        Assert.assertNull(view.favicon_image.drawable)
++    }
++
++    @Test
++    fun `WHEN a bookmark does not have a title THEN show the url`() {
++        RecentBookmarkItemViewHolder(view, interactor).bind(bookmarkNoTitle)
++
++        Assert.assertEquals(bookmarkNoTitle.url, view.bookmark_title.text)
++    }
++}
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/home/recentbookmarks/view/RecentBookmarksViewHolderTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/home/recentbookmarks/view/RecentBookmarksViewHolderTest.kt
+new file mode 100644
+index 000000000000..7f1556c200dd
+--- /dev/null
++++ b/fenix/app/src/test/java/org/mozilla/fenix/home/recentbookmarks/view/RecentBookmarksViewHolderTest.kt
+@@ -0,0 +1,52 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.home.recentbookmarks.view
++
++import android.view.LayoutInflater
++import android.view.View
++import io.mockk.mockk
++import io.mockk.verify
++import kotlinx.android.synthetic.main.recent_bookmarks_header.view.*
++import mozilla.components.concept.storage.BookmarkNode
++import mozilla.components.concept.storage.BookmarkNodeType
++import mozilla.components.support.test.robolectric.testContext
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.mozilla.fenix.helpers.FenixRobolectricTestRunner
++import org.mozilla.fenix.home.sessioncontrol.SessionControlInteractor
++
++@RunWith(FenixRobolectricTestRunner::class)
++class RecentBookmarksViewHolderTest {
++
++    private lateinit var view: View
++    private lateinit var interactor: SessionControlInteractor
++
++    private val bookmark = BookmarkNode(
++        type = BookmarkNodeType.ITEM,
++        guid = "guid#${Math.random() * 1000}",
++        parentGuid = null,
++        position = null,
++        title = null,
++        url = null,
++        children = null
++    )
++
++    @Before
++    fun setup() {
++        view = LayoutInflater.from(testContext)
++            .inflate(RecentBookmarksViewHolder.LAYOUT_ID, null)
++
++        interactor = mockk(relaxed = true)
++    }
++
++    @Test
++    fun `WHEN show all bookmarks button is clicked THEN interactor is called`() {
++        RecentBookmarksViewHolder(view, interactor).bind(listOf(bookmark))
++        view.showAllBookmarksButton.performClick()
++
++        verify { interactor.onShowAllBookmarksClicked() }
++    }
++}

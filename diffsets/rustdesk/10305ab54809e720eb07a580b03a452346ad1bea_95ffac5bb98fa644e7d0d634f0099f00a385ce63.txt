@@ -1,0 +1,489 @@
+diff --git a/src/client.rs b/src/client.rs
+index 77221bdb268..97012e5168e 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -3,7 +3,7 @@ use std::{
+     net::SocketAddr,
+     ops::{Deref, Not},
+     str::FromStr,
+-    sync::{atomic::AtomicBool, mpsc, Arc, Mutex, RwLock},
++    sync::{mpsc, Arc, Mutex, RwLock},
+ };
+ 
+ pub use async_trait::async_trait;
+@@ -34,7 +34,7 @@ use hbb_common::{
+     socket_client,
+     sodiumoxide::crypto::{box_, secretbox, sign},
+     timeout,
+-    tokio::time::Duration,
++    tokio::{sync::mpsc::UnboundedSender, time::Duration},
+     AddrMangle, ResultType, Stream,
+ };
+ pub use helper::LatencyController;
+@@ -50,21 +50,30 @@ use crate::{
+     server::video_service::{SCRAP_X11_REF_URL, SCRAP_X11_REQUIRED},
+ };
+ 
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++use crate::{
++    common::{check_clipboard, ClipboardContext, CLIPBOARD_INTERVAL},
++    ui_session_interface::SessionPermissionConfig,
++};
++
+ pub use super::lang::*;
+ 
+ pub mod file_trait;
+ pub mod helper;
+ pub mod io_loop;
+ 
+-pub static SERVER_KEYBOARD_ENABLED: AtomicBool = AtomicBool::new(true);
+-pub static SERVER_FILE_TRANSFER_ENABLED: AtomicBool = AtomicBool::new(true);
+-pub static SERVER_CLIPBOARD_ENABLED: AtomicBool = AtomicBool::new(true);
+ pub const MILLI1: Duration = Duration::from_millis(1);
+ pub const SEC30: Duration = Duration::from_secs(30);
+ 
+ /// Client of the remote desktop.
+ pub struct Client;
+ 
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++struct TextClipboardState {
++    is_required: bool,
++    running: bool,
++}
++
+ #[cfg(not(any(target_os = "android", target_os = "linux")))]
+ lazy_static::lazy_static! {
+     static ref AUDIO_HOST: Host = cpal::default_host();
+@@ -73,6 +82,8 @@ lazy_static::lazy_static! {
+ #[cfg(not(any(target_os = "android", target_os = "ios")))]
+ lazy_static::lazy_static! {
+     static ref ENIGO: Arc<Mutex<enigo::Enigo>> = Arc::new(Mutex::new(enigo::Enigo::new()));
++    static ref OLD_CLIPBOARD_TEXT: Arc<Mutex<String>> = Default::default();
++    static ref TEXT_CLIPBOARD_STATE: Arc<Mutex<TextClipboardState>> = Arc::new(Mutex::new(TextClipboardState::new()));
+ }
+ 
+ #[cfg(not(any(target_os = "android", target_os = "ios")))]
+@@ -598,6 +609,86 @@ impl Client {
+         conn.send(&msg_out).await?;
+         Ok(conn)
+     }
++
++    #[inline]
++    #[cfg(feature = "flutter")]
++    #[cfg(not(any(target_os = "android", target_os = "ios")))]
++    pub fn set_is_text_clipboard_required(b: bool) {
++        TEXT_CLIPBOARD_STATE.lock().unwrap().is_required = b;
++    }
++
++    #[cfg(not(any(target_os = "android", target_os = "ios")))]
++    fn try_stop_clipboard(_self_id: &str) {
++        #[cfg(feature = "flutter")]
++        if crate::flutter::other_sessions_running(_self_id) {
++            return;
++        }
++        TEXT_CLIPBOARD_STATE.lock().unwrap().running = false;
++    }
++
++    #[cfg(not(any(target_os = "android", target_os = "ios")))]
++    fn try_start_clipboard(_conf_tx: Option<(SessionPermissionConfig, UnboundedSender<Data>)>) {
++        let mut clipboard_lock = TEXT_CLIPBOARD_STATE.lock().unwrap();
++        if clipboard_lock.running {
++            return;
++        }
++
++        match ClipboardContext::new() {
++            Ok(mut ctx) => {
++                clipboard_lock.running = true;
++                // ignore clipboard update before service start
++                check_clipboard(&mut ctx, Some(&OLD_CLIPBOARD_TEXT));
++                std::thread::spawn(move || {
++                    log::info!("Start text clipboard loop");
++                    loop {
++                        std::thread::sleep(Duration::from_millis(CLIPBOARD_INTERVAL));
++                        if !TEXT_CLIPBOARD_STATE.lock().unwrap().running {
++                            break;
++                        }
++
++                        if !TEXT_CLIPBOARD_STATE.lock().unwrap().is_required {
++                            continue;
++                        }
++
++                        if let Some(msg) = check_clipboard(&mut ctx, Some(&OLD_CLIPBOARD_TEXT)) {
++                            #[cfg(feature = "flutter")]
++                            crate::flutter::send_text_clipboard_msg(msg);
++                            #[cfg(not(feature = "flutter"))]
++                            if let Some((cfg, tx)) = &_conf_tx {
++                                if cfg.is_text_clipboard_required() {
++                                    let _ = tx.send(Data::Message(msg));
++                                }
++                            }
++                        }
++                    }
++                    log::info!("Stop text clipboard loop");
++                });
++            }
++            Err(err) => {
++                log::error!("Failed to start clipboard service of client: {}", err);
++            }
++        }
++    }
++
++    #[cfg(not(any(target_os = "android", target_os = "ios")))]
++    fn get_current_text_clipboard_msg() -> Option<Message> {
++        let txt = &*OLD_CLIPBOARD_TEXT.lock().unwrap();
++        if txt.is_empty() {
++            None
++        } else {
++            Some(crate::create_clipboard_msg(txt.clone()))
++        }
++    }
++}
++
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++impl TextClipboardState {
++    fn new() -> Self {
++        Self {
++            is_required: true,
++            running: false,
++        }
++    }
+ }
+ 
+ /// Audio handler for the [`Client`].
+@@ -1148,6 +1239,10 @@ impl LoginConfigHandler {
+         if !name.contains("block-input") {
+             self.save_config(config);
+         }
++        #[cfg(feature = "flutter")]
++        if name == "disable-clipboard" {
++            crate::flutter::update_text_clipboard_required();
++        }
+         let mut misc = Misc::new();
+         misc.set_option(option);
+         let mut msg_out = Message::new();
+diff --git a/src/client/io_loop.rs b/src/client/io_loop.rs
+index de91b091d05..427d0a72a45 100644
+--- a/src/client/io_loop.rs
++++ b/src/client/io_loop.rs
+@@ -26,10 +26,10 @@ use hbb_common::{fs, log, Stream};
+ 
+ use crate::client::{
+     new_voice_call_request, Client, CodecFormat, MediaData, MediaSender, QualityStatus, MILLI1,
+-    SEC30, SERVER_CLIPBOARD_ENABLED, SERVER_FILE_TRANSFER_ENABLED, SERVER_KEYBOARD_ENABLED,
++    SEC30,
+ };
+ #[cfg(not(any(target_os = "android", target_os = "ios")))]
+-use crate::common::{check_clipboard, update_clipboard, ClipboardContext, CLIPBOARD_INTERVAL};
++use crate::common::update_clipboard;
+ use crate::common::{get_default_sound_input, set_sound_input};
+ use crate::ui_session_interface::{InvokeUiSession, Session};
+ use crate::{audio_service, common, ConnInner, CLIENT_SERVER};
+@@ -91,7 +91,6 @@ impl<T: InvokeUiSession> Remote<T> {
+     }
+ 
+     pub async fn io_loop(&mut self, key: &str, token: &str) {
+-        let stop_clipboard = self.start_clipboard();
+         let mut last_recv_time = Instant::now();
+         let mut received = false;
+         let conn_type = if self.handler.is_file_transfer() {
+@@ -110,9 +109,6 @@ impl<T: InvokeUiSession> Remote<T> {
+         .await
+         {
+             Ok((mut peer, direct)) => {
+-                SERVER_KEYBOARD_ENABLED.store(true, Ordering::SeqCst);
+-                SERVER_CLIPBOARD_ENABLED.store(true, Ordering::SeqCst);
+-                SERVER_FILE_TRANSFER_ENABLED.store(true, Ordering::SeqCst);
+                 self.handler.set_connection_type(peer.is_secured(), direct); // flutter -> connection_ready
+                 self.handler.set_connection_info(direct, false);
+ 
+@@ -237,12 +233,7 @@ impl<T: InvokeUiSession> Remote<T> {
+                     .msgbox("error", "Connection Error", &err.to_string(), "");
+             }
+         }
+-        if let Some(stop) = stop_clipboard {
+-            stop.send(()).ok();
+-        }
+-        SERVER_KEYBOARD_ENABLED.store(false, Ordering::SeqCst);
+-        SERVER_CLIPBOARD_ENABLED.store(false, Ordering::SeqCst);
+-        SERVER_FILE_TRANSFER_ENABLED.store(false, Ordering::SeqCst);
++        Client::try_stop_clipboard(&self.handler.id);
+     }
+ 
+     fn handle_job_status(&mut self, id: i32, file_num: i32, err: Option<String>) {
+@@ -347,46 +338,6 @@ impl<T: InvokeUiSession> Remote<T> {
+         Some(tx)
+     }
+ 
+-    fn start_clipboard(&mut self) -> Option<std::sync::mpsc::Sender<()>> {
+-        if self.handler.is_file_transfer() || self.handler.is_port_forward() {
+-            return None;
+-        }
+-        let (tx, rx) = std::sync::mpsc::channel();
+-        let old_clipboard = self.old_clipboard.clone();
+-        let tx_protobuf = self.sender.clone();
+-        let lc = self.handler.lc.clone();
+-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+-        match ClipboardContext::new() {
+-            Ok(mut ctx) => {
+-                // ignore clipboard update before service start
+-                check_clipboard(&mut ctx, Some(&old_clipboard));
+-                std::thread::spawn(move || loop {
+-                    std::thread::sleep(Duration::from_millis(CLIPBOARD_INTERVAL));
+-                    match rx.try_recv() {
+-                        Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+-                            log::debug!("Exit clipboard service of client");
+-                            break;
+-                        }
+-                        _ => {}
+-                    }
+-                    if !SERVER_CLIPBOARD_ENABLED.load(Ordering::SeqCst)
+-                        || !SERVER_KEYBOARD_ENABLED.load(Ordering::SeqCst)
+-                        || lc.read().unwrap().disable_clipboard.v
+-                    {
+-                        continue;
+-                    }
+-                    if let Some(msg) = check_clipboard(&mut ctx, Some(&old_clipboard)) {
+-                        tx_protobuf.send(Data::Message(msg)).ok();
+-                    }
+-                });
+-            }
+-            Err(err) => {
+-                log::error!("Failed to start clipboard service of client: {}", err);
+-            }
+-        }
+-        Some(tx)
+-    }
+-
+     async fn handle_msg_from_ui(&mut self, data: Data, peer: &mut Stream) -> bool {
+         match data {
+             Data::Close => {
+@@ -885,22 +836,28 @@ impl<T: InvokeUiSession> Remote<T> {
+                     Some(login_response::Union::PeerInfo(pi)) => {
+                         self.handler.handle_peer_info(pi);
+                         self.check_clipboard_file_context();
+-                        if !(self.handler.is_file_transfer()
+-                            || self.handler.is_port_forward()
+-                            || !SERVER_CLIPBOARD_ENABLED.load(Ordering::SeqCst)
+-                            || !SERVER_KEYBOARD_ENABLED.load(Ordering::SeqCst)
+-                            || self.handler.lc.read().unwrap().disable_clipboard.v)
+-                        {
+-                            let txt = self.old_clipboard.lock().unwrap().clone();
+-                            if !txt.is_empty() {
+-                                let msg_out = crate::create_clipboard_msg(txt);
+-                                let sender = self.sender.clone();
+-                                tokio::spawn(async move {
+-                                    // due to clipboard service interval time
+-                                    sleep(common::CLIPBOARD_INTERVAL as f32 / 1_000.).await;
+-                                    sender.send(Data::Message(msg_out)).ok();
+-                                });
+-                            }
++                        if !(self.handler.is_file_transfer() || self.handler.is_port_forward()) {
++                            let sender = self.sender.clone();
++                            let permission_config = self.handler.get_permission_config();
++
++                            #[cfg(feature = "flutter")]
++                            Client::try_start_clipboard(None);
++                            #[cfg(not(feature = "flutter"))]
++                            Client::try_start_clipboard(Some((
++                                permission_config.clone(),
++                                sender.clone(),
++                            )));
++
++                            tokio::spawn(async move {
++                                // due to clipboard service interval time
++                                sleep(common::CLIPBOARD_INTERVAL as f32 / 1_000.).await;
++                                if permission_config.is_text_clipboard_required() {
++                                    if let Some(msg_out) = Client::get_current_text_clipboard_msg()
++                                    {
++                                        sender.send(Data::Message(msg_out)).ok();
++                                    }
++                                }
++                            });
+                         }
+ 
+                         if self.handler.is_file_transfer() {
+@@ -1092,18 +1049,23 @@ impl<T: InvokeUiSession> Remote<T> {
+                         log::info!("Change permission {:?} -> {}", p.permission, p.enabled);
+                         match p.permission.enum_value_or_default() {
+                             Permission::Keyboard => {
+-                                SERVER_KEYBOARD_ENABLED.store(p.enabled, Ordering::SeqCst);
++                                #[cfg(feature = "flutter")]
++                                crate::flutter::update_text_clipboard_required();
++                                *self.handler.server_keyboard_enabled.write().unwrap() = p.enabled;
+                                 self.handler.set_permission("keyboard", p.enabled);
+                             }
+                             Permission::Clipboard => {
+-                                SERVER_CLIPBOARD_ENABLED.store(p.enabled, Ordering::SeqCst);
++                                #[cfg(feature = "flutter")]
++                                crate::flutter::update_text_clipboard_required();
++                                *self.handler.server_clipboard_enabled.write().unwrap() = p.enabled;
+                                 self.handler.set_permission("clipboard", p.enabled);
+                             }
+                             Permission::Audio => {
+                                 self.handler.set_permission("audio", p.enabled);
+                             }
+                             Permission::File => {
+-                                SERVER_FILE_TRANSFER_ENABLED.store(p.enabled, Ordering::SeqCst);
++                                *self.handler.server_file_transfer_enabled.write().unwrap() =
++                                    p.enabled;
+                                 if !p.enabled && self.handler.is_file_transfer() {
+                                     return true;
+                                 }
+@@ -1416,7 +1378,7 @@ impl<T: InvokeUiSession> Remote<T> {
+     fn check_clipboard_file_context(&self) {
+         #[cfg(windows)]
+         {
+-            let enabled = SERVER_FILE_TRANSFER_ENABLED.load(Ordering::SeqCst)
++            let enabled = *self.handler.server_file_transfer_enabled.read().unwrap()
+                 && self.handler.lc.read().unwrap().enable_file_transfer.v;
+             ContextSend::enable(enabled);
+         }
+diff --git a/src/flutter.rs b/src/flutter.rs
+index bd1f4f1af5e..c8f875da52e 100644
+--- a/src/flutter.rs
++++ b/src/flutter.rs
+@@ -464,6 +464,9 @@ pub fn session_add(
+ 
+     let session: Session<FlutterHandler> = Session {
+         id: session_id.clone(),
++        server_keyboard_enabled: Arc::new(RwLock::new(true)),
++        server_file_transfer_enabled: Arc::new(RwLock::new(true)),
++        server_clipboard_enabled: Arc::new(RwLock::new(true)),
+         ..Default::default()
+     };
+ 
+@@ -514,6 +517,31 @@ pub fn session_start_(id: &str, event_stream: StreamSink<EventToUI>) -> ResultTy
+     }
+ }
+ 
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++pub fn update_text_clipboard_required() {
++    let is_required = SESSIONS
++        .read()
++        .unwrap()
++        .iter()
++        .any(|(_id, session)| session.is_text_clipboard_required());
++    Client::set_is_text_clipboard_required(is_required);
++}
++
++#[inline]
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++pub fn other_sessions_running(id: &str) -> bool {
++    SESSIONS.read().unwrap().keys().filter(|k| *k != id).count() != 0
++}
++
++#[cfg(not(any(target_os = "android", target_os = "ios")))]
++pub fn send_text_clipboard_msg(msg: Message) {
++    for (_id, session) in SESSIONS.read().unwrap().iter() {
++        if session.is_text_clipboard_required() {
++            session.send(Data::Message(msg.clone()));
++        }
++    }
++}
++
+ // Server Side
+ #[cfg(not(any(target_os = "ios")))]
+ pub mod connection_manager {
+diff --git a/src/ui/remote.rs b/src/ui/remote.rs
+index 1725a8f41b9..a86f07d0f85 100644
+--- a/src/ui/remote.rs
++++ b/src/ui/remote.rs
+@@ -1,7 +1,7 @@
+ use std::{
+     collections::HashMap,
+     ops::{Deref, DerefMut},
+-    sync::{Arc, Mutex},
++    sync::{Arc, Mutex, RwLock},
+ };
+ 
+ use sciter::{
+@@ -454,6 +454,9 @@ impl SciterSession {
+             id: id.clone(),
+             password: password.clone(),
+             args,
++            server_keyboard_enabled: Arc::new(RwLock::new(true)),
++            server_file_transfer_enabled: Arc::new(RwLock::new(true)),
++            server_clipboard_enabled: Arc::new(RwLock::new(true)),
+             ..Default::default()
+         };
+ 
+diff --git a/src/ui_session_interface.rs b/src/ui_session_interface.rs
+index 97db904d4ce..947f8fb6fcb 100644
+--- a/src/ui_session_interface.rs
++++ b/src/ui_session_interface.rs
+@@ -1,9 +1,11 @@
+ use std::collections::HashMap;
+ use std::ops::{Deref, DerefMut};
+ use std::str::FromStr;
+-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+-use std::sync::{Arc, Mutex, RwLock};
+-use std::time::Duration;
++use std::sync::{
++    atomic::{AtomicBool, AtomicUsize, Ordering},
++    Arc, Mutex, RwLock,
++};
++use std::time::{Duration, SystemTime};
+ 
+ use async_trait::async_trait;
+ use bytes::Bytes;
+@@ -37,9 +39,38 @@ pub struct Session<T: InvokeUiSession> {
+     pub sender: Arc<RwLock<Option<mpsc::UnboundedSender<Data>>>>,
+     pub thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+     pub ui_handler: T,
++    pub server_keyboard_enabled: Arc<RwLock<bool>>,
++    pub server_file_transfer_enabled: Arc<RwLock<bool>>,
++    pub server_clipboard_enabled: Arc<RwLock<bool>>,
++}
++
++#[derive(Clone)]
++pub struct SessionPermissionConfig {
++    pub lc: Arc<RwLock<LoginConfigHandler>>,
++    pub server_keyboard_enabled: Arc<RwLock<bool>>,
++    pub server_file_transfer_enabled: Arc<RwLock<bool>>,
++    pub server_clipboard_enabled: Arc<RwLock<bool>>,
++}
++
++impl SessionPermissionConfig {
++    pub fn is_text_clipboard_required(&self) -> bool {
++        println!("REMOVE ME ==================== is_text_clipboard_required {} -{}-{}", *self.server_clipboard_enabled.read().unwrap(), *self.server_keyboard_enabled.read().unwrap(), !self.lc.read().unwrap().disable_clipboard.v);
++        *self.server_clipboard_enabled.read().unwrap()
++            && *self.server_keyboard_enabled.read().unwrap()
++            && !self.lc.read().unwrap().disable_clipboard.v
++    }
+ }
+ 
+ impl<T: InvokeUiSession> Session<T> {
++    pub fn get_permission_config(&self) -> SessionPermissionConfig {
++        SessionPermissionConfig {
++            lc: self.lc.clone(),
++            server_keyboard_enabled: self.server_keyboard_enabled.clone(),
++            server_file_transfer_enabled: self.server_file_transfer_enabled.clone(),
++            server_clipboard_enabled: self.server_clipboard_enabled.clone(),
++        }
++    }
++
+     pub fn is_file_transfer(&self) -> bool {
+         self.lc
+             .read()
+@@ -128,6 +159,12 @@ impl<T: InvokeUiSession> Session<T> {
+         self.lc.read().unwrap().is_privacy_mode_supported()
+     }
+ 
++    pub fn is_text_clipboard_required(&self) -> bool {
++        *self.server_clipboard_enabled.read().unwrap()
++            && *self.server_keyboard_enabled.read().unwrap()
++            && !self.lc.read().unwrap().disable_clipboard.v
++    }
++
+     pub fn refresh_video(&self) {
+         self.send(Data::Message(LoginConfigHandler::refresh()));
+     }
+@@ -445,7 +482,7 @@ impl<T: InvokeUiSession> Session<T> {
+             KeyRelease(key)
+         };
+         let event = Event {
+-            time: std::time::SystemTime::now(),
++            time: SystemTime::now(),
+             unicode: None,
+             code: keycode as _,
+             scan_code: scancode as _,

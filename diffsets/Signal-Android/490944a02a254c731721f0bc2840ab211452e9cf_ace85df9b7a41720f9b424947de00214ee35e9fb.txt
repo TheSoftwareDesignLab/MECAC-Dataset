@@ -1,0 +1,981 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/backup/FullBackupExporter.java b/app/src/main/java/org/thoughtcrime/securesms/backup/FullBackupExporter.java
+index 4b819c1be65..fa5eabefec4 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/backup/FullBackupExporter.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/backup/FullBackupExporter.java
+@@ -37,6 +37,7 @@
+ import org.thoughtcrime.securesms.profiles.AvatarHelper;
+ import org.thoughtcrime.securesms.util.SetUtil;
+ import org.thoughtcrime.securesms.util.Stopwatch;
++import org.thoughtcrime.securesms.util.TextSecurePreferences;
+ import org.thoughtcrime.securesms.util.Util;
+ import org.whispersystems.libsignal.kdf.HKDFv3;
+ import org.whispersystems.libsignal.util.ByteUtil;
+@@ -154,6 +155,12 @@ private static void internalExport(@NonNull Context context,
+         EventBus.getDefault().post(new BackupEvent(BackupEvent.Type.PROGRESS, ++count));
+         outputStream.write(preference);
+       }
++      
++      for (BackupProtos.SharedPreference preference : TextSecurePreferences.getPreferencesToSaveToBackup(context)) {
++        throwIfCanceled(cancellationSignal);
++        EventBus.getDefault().post(new BackupEvent(BackupEvent.Type.PROGRESS, ++count));
++        outputStream.write(preference);
++      }
+ 
+       stopwatch.split("prefs");
+ 
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/backup/FullBackupImporter.java b/app/src/main/java/org/thoughtcrime/securesms/backup/FullBackupImporter.java
+index 494472f8f9d..070089f7ce4 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/backup/FullBackupImporter.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/backup/FullBackupImporter.java
+@@ -45,6 +45,7 @@
+ import java.security.InvalidKeyException;
+ import java.security.MessageDigest;
+ import java.security.NoSuchAlgorithmException;
++import java.util.HashSet;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Objects;
+@@ -213,7 +214,14 @@ private static void processAvatar(@NonNull Context context, @NonNull SQLiteDatab
+   @SuppressLint("ApplySharedPref")
+   private static void processPreference(@NonNull Context context, SharedPreference preference) {
+     SharedPreferences preferences = context.getSharedPreferences(preference.getFile(), 0);
+-    preferences.edit().putString(preference.getKey(), preference.getValue()).commit();
++
++    if (preference.hasValue()) {
++      preferences.edit().putString(preference.getKey(), preference.getValue()).commit();
++    } else if (preference.hasBooleanValue()) {
++      preferences.edit().putBoolean(preference.getKey(), preference.getBooleanValue()).commit();
++    } else if (preference.hasIsStringSetValue() && preference.getIsStringSetValue()) {
++      preferences.edit().putStringSet(preference.getKey(), new HashSet<>(preference.getStringSetValueList())).commit();
++    }
+   }
+ 
+   private static void dropAllTables(@NonNull SQLiteDatabase db) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/DeviceTransferSetupFragment.java b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/DeviceTransferSetupFragment.java
+index 375d55f8538..e1504ed284d 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/DeviceTransferSetupFragment.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/DeviceTransferSetupFragment.java
+@@ -73,7 +73,8 @@ public DeviceTransferSetupFragment() {
+   public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
+     Group          progressGroup   = view.findViewById(R.id.device_transfer_setup_fragment_progress_group);
+     Group          errorGroup      = view.findViewById(R.id.device_transfer_setup_fragment_error_group);
+-    Group          verifyGroup     = view.findViewById(R.id.device_transfer_setup_fragment_verify_group);
++    View           verifyGroup     = view.findViewById(R.id.device_transfer_setup_fragment_verify);
++    View           waitingGroup    = view.findViewById(R.id.device_transfer_setup_fragment_waiting);
+     View           troubleshooting = view.findViewById(R.id.device_transfer_setup_fragment_troubleshooting);
+     TextView       status          = view.findViewById(R.id.device_transfer_setup_fragment_status);
+     TextView       error           = view.findViewById(R.id.device_transfer_setup_fragment_error);
+@@ -90,6 +91,7 @@ public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceStat
+       progressGroup.setVisibility(step.isProgress() ? View.VISIBLE : View.GONE);
+       errorGroup.setVisibility(step.isError() ? View.VISIBLE : View.GONE);
+       verifyGroup.setVisibility(step == SetupStep.VERIFY ? View.VISIBLE : View.GONE);
++      waitingGroup.setVisibility(step == SetupStep.WAITING_FOR_OTHER_TO_VERIFY ? View.VISIBLE : View.GONE);
+       troubleshooting.setVisibility(step == SetupStep.TROUBLESHOOTING ? View.VISIBLE : View.GONE);
+ 
+       Log.i(TAG, "Handling step: " + step.name());
+@@ -166,8 +168,7 @@ public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceStat
+             viewModel.onVerified();
+           });
+           break;
+-        case CONNECTING:
+-          status.setText(getStatusTextForStep(step, false));
++        case WAITING_FOR_OTHER_TO_VERIFY:
+           break;
+         case CONNECTED:
+           Log.d(TAG, "Connected! isNotShutdown: " + viewModel.isNotShutdown());
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/DeviceTransferSetupViewModel.java b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/DeviceTransferSetupViewModel.java
+index 6f12ae1a68e..e240b539bc4 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/DeviceTransferSetupViewModel.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/DeviceTransferSetupViewModel.java
+@@ -59,6 +59,7 @@ public void onTransferEvent(@NonNull TransferStatus event) {
+       case SERVICE_CONNECTED:
+         store.update(s -> s.updateStep(SetupStep.CONNECTED));
+         break;
++      case SHUTDOWN:
+       case FAILED:
+         store.update(s -> s.updateStep(SetupStep.ERROR));
+         break;
+@@ -116,7 +117,7 @@ public void onWifiDirectAvailable() {
+   }
+ 
+   public void onVerified() {
+-    store.update(s -> s.updateStep(SetupStep.CONNECTING));
++    store.update(s -> s.updateStep(SetupStep.WAITING_FOR_OTHER_TO_VERIFY));
+   }
+ 
+   public void onResume() {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/SetupStep.java b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/SetupStep.java
+index 09dc274ef91..7c76c17b076 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/SetupStep.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/SetupStep.java
+@@ -18,7 +18,7 @@ public enum SetupStep {
+   SETTING_UP(true, false),
+   WAITING(true, false),
+   VERIFY(false, false),
+-  CONNECTING(true, false),
++  WAITING_FOR_OTHER_TO_VERIFY(false, false),
+   CONNECTED(true, false),
+   TROUBLESHOOTING(false, false),
+   ERROR(false, true);
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/newdevice/NewDeviceTransferSetupFragment.java b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/newdevice/NewDeviceTransferSetupFragment.java
+index 519efc91160..1296f13e0cf 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/newdevice/NewDeviceTransferSetupFragment.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/newdevice/NewDeviceTransferSetupFragment.java
+@@ -67,8 +67,6 @@ protected void navigateToTransferConnected() {
+                                    : R.string.NewDeviceTransferSetup__preparing_to_connect_to_old_android_device;
+       case WAITING:
+         return R.string.NewDeviceTransferSetup__waiting_for_old_device_to_connect;
+-      case CONNECTING:
+-        return R.string.NewDeviceTransferSetup__connecting_to_old_android_device;
+       case ERROR:
+         return R.string.NewDeviceTransferSetup__an_unexpected_error_occurred_while_attempting_to_connect_to_your_old_device;
+       case TROUBLESHOOTING:
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/newdevice/TransferOrRestoreFragment.java b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/newdevice/TransferOrRestoreFragment.java
+index 13e1ade30dd..f5c5620a4af 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/newdevice/TransferOrRestoreFragment.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/newdevice/TransferOrRestoreFragment.java
+@@ -29,8 +29,8 @@ public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceStat
+     view.findViewById(R.id.transfer_or_restore_fragment_restore)
+         .setOnClickListener(v -> Navigation.findNavController(v).navigate(R.id.action_choose_backup));
+ 
+-    String description = getString(R.string.TransferOrRestoreFragment__transfer_your_account_and_message_history_from_your_old_android_device);
+-    String toBold      = getString(R.string.TransferOrRestoreFragment__you_must_have_access_to_your_old_device);
++    String description = getString(R.string.TransferOrRestoreFragment__transfer_your_account_and_messages_from_your_old_android_device);
++    String toBold      = getString(R.string.TransferOrRestoreFragment__you_need_access_to_your_old_device);
+ 
+     TextView transferDescriptionView = view.findViewById(R.id.transfer_or_restore_fragment_transfer_description);
+     transferDescriptionView.setText(SpanUtil.boldSubstring(description, toBold));
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/olddevice/OldDeviceExitActivity.java b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/olddevice/OldDeviceExitActivity.java
+index 67e825b0b6a..78ade870e46 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/olddevice/OldDeviceExitActivity.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/olddevice/OldDeviceExitActivity.java
+@@ -1,9 +1,12 @@
+ package org.thoughtcrime.securesms.devicetransfer.olddevice;
+ 
++import android.app.Activity;
+ import android.content.Context;
+ import android.content.Intent;
++import android.os.Build;
+ import android.os.Bundle;
+ 
++import androidx.annotation.NonNull;
+ import androidx.appcompat.app.AppCompatActivity;
+ 
+ public class OldDeviceExitActivity extends AppCompatActivity {
+@@ -11,14 +14,23 @@ public class OldDeviceExitActivity extends AppCompatActivity {
+   @Override
+   protected void onCreate(Bundle savedInstanceState) {
+     super.onCreate(savedInstanceState);
+-    finish();
++    finishAll(this);
+   }
+ 
+-  public static void exit(Context context) {
+-    Intent intent = new Intent(context, OldDeviceExitActivity.class);
++  public static void exit(@NonNull Activity activity) {
++    Intent intent = new Intent(activity, OldDeviceExitActivity.class);
+     intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);
+     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+     intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK);
+-    context.startActivity(intent);
++    activity.startActivity(intent);
++    finishAll(activity);
++  }
++
++  private static void finishAll(@NonNull Activity activity) {
++    if (Build.VERSION.SDK_INT < 21) {
++      activity.finishAffinity();
++    } else {
++      activity.finishAndRemoveTask();
++    }
+   }
+ }
+\ No newline at end of file
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/olddevice/OldDeviceTransferCompleteFragment.java b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/olddevice/OldDeviceTransferCompleteFragment.java
+index 42b61ce76ca..60a4301a443 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/olddevice/OldDeviceTransferCompleteFragment.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/olddevice/OldDeviceTransferCompleteFragment.java
+@@ -36,6 +36,6 @@ public void handleOnBackPressed() {
+   }
+ 
+   private void close() {
+-    OldDeviceExitActivity.exit(requireContext());
++    OldDeviceExitActivity.exit(requireActivity());
+   }
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/olddevice/OldDeviceTransferSetupFragment.java b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/olddevice/OldDeviceTransferSetupFragment.java
+index 277e5191e1e..eaf2fd3fec6 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/olddevice/OldDeviceTransferSetupFragment.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/devicetransfer/olddevice/OldDeviceTransferSetupFragment.java
+@@ -93,8 +93,6 @@ protected void startTransfer() {
+       case SETTING_UP:
+       case WAITING:
+         return R.string.OldDeviceTransferSetup__searching_for_your_new_android_device;
+-      case CONNECTING:
+-        return R.string.OldDeviceTransferSetup__connecting_to_new_android_device;
+       case ERROR:
+         return R.string.OldDeviceTransferSetup__an_unexpected_error_occurred_while_attempting_to_connect_to_your_old_device;
+       case TROUBLESHOOTING:
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/util/TextSecurePreferences.java b/app/src/main/java/org/thoughtcrime/securesms/util/TextSecurePreferences.java
+index 70e3e24d8cf..386bf833b42 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/util/TextSecurePreferences.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/util/TextSecurePreferences.java
+@@ -16,6 +16,7 @@
+ import org.greenrobot.eventbus.EventBus;
+ import org.signal.core.util.logging.Log;
+ import org.thoughtcrime.securesms.R;
++import org.thoughtcrime.securesms.backup.BackupProtos;
+ import org.thoughtcrime.securesms.jobmanager.impl.SqlCipherMigrationConstraintObserver;
+ import org.thoughtcrime.securesms.keyvalue.SettingsValues;
+ import org.thoughtcrime.securesms.lock.RegistrationLockReminders;
+@@ -25,9 +26,11 @@
+ 
+ import java.io.IOException;
+ import java.security.SecureRandom;
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.HashSet;
++import java.util.List;
+ import java.util.Set;
+ import java.util.UUID;
+ 
+@@ -209,6 +212,74 @@ public class TextSecurePreferences {
+ 
+   private static final String ARGON2_TESTED = "argon2_tested";
+ 
++  private static final String[] booleanPreferencesToBackup = {SCREEN_SECURITY_PREF,
++                                                              INCOGNITO_KEYBORAD_PREF,
++                                                              ALWAYS_RELAY_CALLS_PREF,
++                                                              READ_RECEIPTS_PREF,
++                                                              TYPING_INDICATORS,
++                                                              SHOW_UNIDENTIFIED_DELIVERY_INDICATORS,
++                                                              UNIVERSAL_UNIDENTIFIED_ACCESS,
++                                                              NOTIFICATION_PREF,
++                                                              VIBRATE_PREF,
++                                                              IN_THREAD_NOTIFICATION_PREF,
++                                                              CALL_NOTIFICATIONS_PREF,
++                                                              CALL_VIBRATE_PREF,
++                                                              NEW_CONTACTS_NOTIFICATIONS,
++                                                              SHOW_INVITE_REMINDER_PREF,
++                                                              SYSTEM_EMOJI_PREF,
++                                                              ENTER_SENDS_PREF};
++
++  private static final String[] stringPreferencesToBackup = {LED_COLOR_PREF,
++                                                             LED_BLINK_PREF,
++                                                             REPEAT_ALERTS_PREF,
++                                                             NOTIFICATION_PRIVACY_PREF,
++                                                             THEME_PREF,
++                                                             LANGUAGE_PREF,
++                                                             MESSAGE_BODY_TEXT_SIZE_PREF};
++
++  private static final String[] stringSetPreferencesToBackup = {MEDIA_DOWNLOAD_MOBILE_PREF,
++                                                                MEDIA_DOWNLOAD_WIFI_PREF,
++                                                                MEDIA_DOWNLOAD_ROAMING_PREF};
++
++  public static List<BackupProtos.SharedPreference> getPreferencesToSaveToBackup(@NonNull Context context) {
++    SharedPreferences                   preferences  = PreferenceManager.getDefaultSharedPreferences(context);
++    List<BackupProtos.SharedPreference> backupProtos = new ArrayList<>();
++    String                              defaultFile  = context.getPackageName() + "_preferences";
++
++    for (String booleanPreference : booleanPreferencesToBackup) {
++      if (preferences.contains(booleanPreference)) {
++        backupProtos.add(BackupProtos.SharedPreference.newBuilder()
++                                                      .setFile(defaultFile)
++                                                      .setKey(booleanPreference)
++                                                      .setBooleanValue(preferences.getBoolean(booleanPreference, false))
++                                                      .build());
++      }
++    }
++
++    for (String stringPreference : stringPreferencesToBackup) {
++      if (preferences.contains(stringPreference)) {
++        backupProtos.add(BackupProtos.SharedPreference.newBuilder()
++                                                      .setFile(defaultFile)
++                                                      .setKey(stringPreference)
++                                                      .setValue(preferences.getString(stringPreference, null))
++                                                      .build());
++      }
++    }
++
++    for (String stringSetPreference : stringSetPreferencesToBackup) {
++      if (preferences.contains(stringSetPreference)) {
++        backupProtos.add(BackupProtos.SharedPreference.newBuilder()
++                                                      .setFile(defaultFile)
++                                                      .setKey(stringSetPreference)
++                                                      .setIsStringSetValue(true)
++                                                      .addAllStringSetValue(preferences.getStringSet(stringSetPreference, Collections.emptySet()))
++                                                      .build());
++      }
++    }
++
++    return backupProtos;
++  }
++
+   public static boolean isScreenLockEnabled(@NonNull Context context) {
+     return getBooleanPreference(context, SCREEN_LOCK, false);
+   }
+diff --git a/app/src/main/proto/Backups.proto b/app/src/main/proto/Backups.proto
+index 925ea2677a8..3b44d5d1fdb 100644
+--- a/app/src/main/proto/Backups.proto
++++ b/app/src/main/proto/Backups.proto
+@@ -25,9 +25,12 @@ message SqlStatement {
+ }
+ 
+ message SharedPreference {
+-    optional string file  = 1;
+-    optional string key   = 2;
+-    optional string value = 3;
++    optional string file             = 1;
++    optional string key              = 2;
++    optional string value            = 3;
++    optional bool   booleanValue     = 4;
++    repeated string stringSetValue   = 5;
++    optional bool   isStringSetValue = 6;
+ }
+ 
+ message Attachment {
+diff --git a/app/src/main/res/layout/device_transfer_setup_fragment.xml b/app/src/main/res/layout/device_transfer_setup_fragment.xml
+index 2f59813f51c..fc8e446fbac 100644
+--- a/app/src/main/res/layout/device_transfer_setup_fragment.xml
++++ b/app/src/main/res/layout/device_transfer_setup_fragment.xml
+@@ -65,67 +65,32 @@
+         <!-- endregion -->
+ 
+         <!-- region Verify code -->
+-        <TextView
+-            android:id="@+id/device_transfer_setup_fragment_verify_code_title"
++        <include
++            android:id="@+id/device_transfer_setup_fragment_verify"
++            layout="@layout/device_transfer_setup_verify_layout"
+             android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:gravity="center"
+-            android:text="@string/DeviceTransferSetup__verify_code"
+-            android:textAppearance="@style/Signal.Text.Headline.Registration"
++            android:layout_height="match_parent"
++            android:visibility="gone"
++            app:layout_constraintBottom_toBottomOf="parent"
+             app:layout_constraintEnd_toEndOf="parent"
+             app:layout_constraintStart_toStartOf="parent"
+             app:layout_constraintTop_toTopOf="parent" />
++        <!-- endregion -->
+ 
+-        <TextView
+-            android:id="@+id/device_transfer_setup_fragment_verify_description"
++        <!-- region Waiting for other continue -->
++        <include
++            android:id="@+id/device_transfer_setup_fragment_waiting"
++            layout="@layout/device_transfer_setup_waiting_for_other_verify_layout"
+             android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:layout_marginTop="16dp"
+-            android:gravity="center"
+-            android:text="@string/DeviceTransferSetup__verify_that_the_code_below_matches_on_both_of_your_devices"
+-            android:textAppearance="@style/TextAppearance.Signal.Body1"
+-            app:layout_constraintEnd_toEndOf="parent"
+-            app:layout_constraintStart_toStartOf="parent"
+-            app:layout_constraintTop_toBottomOf="@+id/device_transfer_setup_fragment_verify_code_title" />
+-
+-        <TextView
+-            android:id="@+id/device_transfer_setup_fragment_sas_verify_code"
+-            android:layout_width="wrap_content"
+-            android:layout_height="wrap_content"
+-            android:letterSpacing=".4"
+-            android:textSize="40sp"
++            android:layout_height="match_parent"
++            android:visibility="gone"
+             app:layout_constraintBottom_toBottomOf="parent"
+             app:layout_constraintEnd_toEndOf="parent"
+             app:layout_constraintStart_toStartOf="parent"
+-            app:layout_constraintTop_toTopOf="parent"
+-            tools:ignore="UnusedAttribute"
+-            tools:text="1234567" />
+-
+-        <com.google.android.material.button.MaterialButton
+-            android:id="@+id/device_transfer_setup_fragment_sas_verify_yes"
+-            style="@style/Signal.Widget.Button.Large.Primary"
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:layout_marginBottom="16dp"
+-            android:text="@string/DeviceTransferSetup__continue"
+-            app:layout_constraintBottom_toTopOf="@+id/device_transfer_setup_fragment_sas_verify_no"
+-            app:layout_constraintEnd_toEndOf="parent"
+-            app:layout_constraintStart_toStartOf="parent" />
+-
+-        <com.google.android.material.button.MaterialButton
+-            android:id="@+id/device_transfer_setup_fragment_sas_verify_no"
+-            style="@style/Signal.Widget.Button.Medium.Secondary"
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:text="@string/DeviceTransferSetup__the_numbers_do_not_match"
+-            android:textColor="@color/signal_alert_primary"
+-            app:layout_constraintBottom_toBottomOf="parent"
+-            app:layout_constraintEnd_toEndOf="parent"
+-            app:layout_constraintStart_toStartOf="parent" />
++            app:layout_constraintTop_toTopOf="parent" />
+         <!-- endregion -->
+ 
+         <!-- region Troubleshooting -->
+-
+         <include
+             android:id="@+id/device_transfer_setup_fragment_troubleshooting"
+             layout="@layout/device_transfer_setup_troubleshooting_layout"
+@@ -137,7 +102,6 @@
+             app:layout_constraintEnd_toEndOf="parent"
+             app:layout_constraintStart_toStartOf="parent"
+             app:layout_constraintTop_toTopOf="parent" />
+-
+         <!-- endregion -->
+ 
+         <!-- region Groups -->
+@@ -145,6 +109,7 @@
+             android:id="@+id/device_transfer_setup_fragment_progress_group"
+             android:layout_width="wrap_content"
+             android:layout_height="wrap_content"
++            android:visibility="gone"
+             app:constraint_referenced_ids="device_transfer_setup_fragment_progress,device_transfer_setup_fragment_status" />
+ 
+         <androidx.constraintlayout.widget.Group
+@@ -153,13 +118,6 @@
+             android:layout_height="wrap_content"
+             android:visibility="gone"
+             app:constraint_referenced_ids="device_transfer_setup_fragment_error,device_transfer_setup_fragment_error_resolve" />
+-
+-        <androidx.constraintlayout.widget.Group
+-            android:id="@+id/device_transfer_setup_fragment_verify_group"
+-            android:layout_width="wrap_content"
+-            android:layout_height="wrap_content"
+-            android:visibility="gone"
+-            app:constraint_referenced_ids="device_transfer_setup_fragment_verify_code_title,device_transfer_setup_fragment_verify_description,device_transfer_setup_fragment_sas_verify_code,device_transfer_setup_fragment_sas_verify_no,device_transfer_setup_fragment_sas_verify_yes" />
+         <!-- endregion -->
+ 
+     </androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/app/src/main/res/layout/device_transfer_setup_verify_layout.xml b/app/src/main/res/layout/device_transfer_setup_verify_layout.xml
+new file mode 100644
+index 00000000000..85da00d338e
+--- /dev/null
++++ b/app/src/main/res/layout/device_transfer_setup_verify_layout.xml
+@@ -0,0 +1,67 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:orientation="vertical">
++
++    <TextView
++        android:id="@+id/device_transfer_setup_fragment_verify_code_title"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:gravity="center"
++        android:text="@string/DeviceTransferSetup__verify_code"
++        android:textAppearance="@style/Signal.Text.Headline.Registration" />
++
++    <TextView
++        android:id="@+id/device_transfer_setup_fragment_verify_description"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="16dp"
++        android:gravity="center"
++        android:text="@string/DeviceTransferSetup__verify_that_the_code_below_matches_on_both_of_your_devices"
++        android:textAppearance="@style/TextAppearance.Signal.Body1" />
++
++    <Space
++        android:layout_width="match_parent"
++        android:layout_height="0dp"
++        android:layout_weight="1" />
++
++    <androidx.appcompat.widget.AppCompatTextView
++        android:id="@+id/device_transfer_setup_fragment_sas_verify_code"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:fontFamily="monospace"
++        android:gravity="center"
++        android:letterSpacing=".3"
++        android:lines="1"
++        android:minHeight="48dp"
++        app:autoSizeMaxTextSize="48sp"
++        app:autoSizeMinTextSize="12sp"
++        app:autoSizeTextType="uniform"
++        tools:ignore="UnusedAttribute"
++        tools:text="1234567" />
++
++    <Space
++        android:layout_width="match_parent"
++        android:layout_height="0dp"
++        android:layout_weight="1" />
++
++    <com.google.android.material.button.MaterialButton
++        android:id="@+id/device_transfer_setup_fragment_sas_verify_yes"
++        style="@style/Signal.Widget.Button.Large.Primary"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginBottom="16dp"
++        android:text="@string/DeviceTransferSetup__continue" />
++
++    <com.google.android.material.button.MaterialButton
++        android:id="@+id/device_transfer_setup_fragment_sas_verify_no"
++        style="@style/Signal.Widget.Button.Medium.Secondary"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:text="@string/DeviceTransferSetup__the_numbers_do_not_match"
++        android:textColor="@color/signal_alert_primary" />
++
++</LinearLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/device_transfer_setup_waiting_for_other_verify_layout.xml b/app/src/main/res/layout/device_transfer_setup_waiting_for_other_verify_layout.xml
+new file mode 100644
+index 00000000000..190762d4271
+--- /dev/null
++++ b/app/src/main/res/layout/device_transfer_setup_waiting_for_other_verify_layout.xml
+@@ -0,0 +1,46 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:orientation="vertical">
++
++    <TextView
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:gravity="center"
++        android:text="@string/DeviceTransferSetup__waiting_for_other_device"
++        android:textAppearance="@style/Signal.Text.Headline.Registration" />
++
++    <TextView
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="16dp"
++        android:gravity="center"
++        android:text="@string/DeviceTransferSetup__tap_continue_on_your_other_device_to_start_the_transfer"
++        android:textAppearance="@style/TextAppearance.Signal.Body1" />
++
++    <Space
++        android:layout_width="match_parent"
++        android:layout_height="0dp"
++        android:layout_weight="1" />
++
++    <ProgressBar
++        style="?android:attr/progressBarStyleLarge"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_gravity="center_horizontal" />
++
++    <TextView
++        android:id="@+id/device_transfer_setup_fragment_sas_verify_code"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:gravity="center"
++        android:text="@string/DeviceTransferSetup__tap_continue_on_your_other_device"
++        android:textAppearance="@style/TextAppearance.Signal.Body1" />
++
++    <Space
++        android:layout_width="match_parent"
++        android:layout_height="0dp"
++        android:layout_weight="1.2" />
++
++</LinearLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/layout/fragment_transfer_restore.xml b/app/src/main/res/layout/fragment_transfer_restore.xml
+index f5a944c9d85..606d88d8ada 100644
+--- a/app/src/main/res/layout/fragment_transfer_restore.xml
++++ b/app/src/main/res/layout/fragment_transfer_restore.xml
+@@ -72,7 +72,7 @@
+                 app:layout_constraintHorizontal_bias="0"
+                 app:layout_constraintStart_toStartOf="@+id/transfer_or_restore_fragment_transfer_header"
+                 app:layout_constraintTop_toBottomOf="@+id/transfer_or_restore_fragment_transfer_header"
+-                tools:text="@string/TransferOrRestoreFragment__transfer_your_account_and_message_history_from_your_old_android_device" />
++                tools:text="@string/TransferOrRestoreFragment__transfer_your_account_and_messages_from_your_old_android_device" />
+ 
+         </androidx.constraintlayout.widget.ConstraintLayout>
+ 
+@@ -112,7 +112,7 @@
+                 android:id="@+id/transfer_or_restore_fragment_restore_description"
+                 android:layout_width="0dp"
+                 android:layout_height="wrap_content"
+-                android:text="@string/TransferOrRestoreFragment__restore_your_messages_and_media_from_a_local_backup"
++                android:text="@string/TransferOrRestoreFragment__restore_your_messages_from_a_local_backup"
+                 android:textColor="@color/signal_text_secondary"
+                 app:layout_constraintBottom_toBottomOf="parent"
+                 app:layout_constraintEnd_toEndOf="parent"
+diff --git a/app/src/main/res/layout/old_device_transfer_complete_fragment.xml b/app/src/main/res/layout/old_device_transfer_complete_fragment.xml
+index 042ca08402c..28c104b90b8 100644
+--- a/app/src/main/res/layout/old_device_transfer_complete_fragment.xml
++++ b/app/src/main/res/layout/old_device_transfer_complete_fragment.xml
+@@ -21,14 +21,19 @@
+         app:layout_constraintStart_toStartOf="parent"
+         app:layout_constraintTop_toTopOf="parent" />
+ 
+-    <TextView
++    <androidx.appcompat.widget.AppCompatTextView
+         android:id="@+id/old_device_trasnfer_complete_fragment_subtitle"
+         android:layout_width="match_parent"
+-        android:layout_height="wrap_content"
++        android:layout_height="0dp"
+         android:layout_marginTop="@dimen/transfer_item_spacing"
+-        android:gravity="center"
++        android:layout_marginBottom="8dp"
++        android:gravity="top|center"
+         android:text="@string/OldDeviceTransferComplete__your_signal_data_has_Been_transferred_to_your_new_device"
+         android:textAppearance="@style/TextAppearance.Signal.Body1"
++        app:autoSizeMaxTextSize="16sp"
++        app:autoSizeMinTextSize="12sp"
++        app:autoSizeTextType="uniform"
++        app:layout_constraintBottom_toTopOf="@+id/old_device_trasnfer_complete_fragment_success"
+         app:layout_constraintEnd_toEndOf="parent"
+         app:layout_constraintStart_toStartOf="parent"
+         app:layout_constraintTop_toBottomOf="@+id/old_device_transfer_complete_fragment_title" />
+diff --git a/app/src/main/res/layout/old_device_transfer_instructions_fragment.xml b/app/src/main/res/layout/old_device_transfer_instructions_fragment.xml
+index 4f31145aea9..7f84309de2f 100644
+--- a/app/src/main/res/layout/old_device_transfer_instructions_fragment.xml
++++ b/app/src/main/res/layout/old_device_transfer_instructions_fragment.xml
+@@ -1,10 +1,10 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
+     android:layout_width="match_parent"
+     android:layout_height="match_parent"
+-    android:orientation="vertical"
+-    android:paddingBottom="16dp">
++    android:orientation="vertical">
+ 
+     <androidx.appcompat.widget.Toolbar
+         android:id="@+id/old_device_transfer_instructions_fragment_toolbar"
+@@ -13,89 +13,111 @@
+         app:layout_constraintTop_toTopOf="parent"
+         app:navigationIcon="@drawable/ic_arrow_left_24" />
+ 
+-    <androidx.appcompat.widget.AppCompatImageView
+-        android:layout_width="wrap_content"
+-        android:layout_height="wrap_content"
+-        android:layout_gravity="center"
+-        android:layout_marginTop="16dp"
+-        android:layout_marginBottom="16dp"
+-        android:scaleX="@integer/image_scale_flip"
+-        app:srcCompat="@drawable/ic_transfer_account" />
+-
+-    <TextView
+-        android:layout_width="match_parent"
+-        android:layout_height="wrap_content"
+-        android:layout_marginStart="32dp"
+-        android:layout_marginEnd="32dp"
+-        android:gravity="center"
+-        android:text="@string/OldDeviceTransferInstructions__transfer_account"
+-        android:textAppearance="@style/Signal.Text.Headline" />
+-
+-    <androidx.gridlayout.widget.GridLayout
++    <ScrollView
+         android:layout_width="match_parent"
+-        android:layout_height="0dp"
+-        android:layout_marginStart="32dp"
+-        android:layout_marginTop="16dp"
+-        android:layout_marginEnd="32dp"
+-        android:layout_marginBottom="16dp"
+-        android:layout_weight="1"
+-        app:alignmentMode="alignBounds"
+-        app:columnCount="2">
+-
+-        <TextView
+-            android:layout_width="wrap_content"
+-            android:layout_height="wrap_content"
+-            android:layout_marginEnd="8dp"
+-            android:text="@string/OldDeviceTransferInstructions__first_bullet"
+-            android:textAppearance="@style/TextAppearance.Signal.Body1" />
++        android:layout_height="match_parent"
++        android:clipToPadding="false"
++        android:fillViewport="true"
++        android:scrollIndicators="bottom"
++        tools:ignore="UnusedAttribute">
+ 
+-        <TextView
+-            android:layout_width="0dp"
++        <LinearLayout
++            android:layout_width="match_parent"
+             android:layout_height="wrap_content"
+-            android:layout_marginBottom="24dp"
+-            android:text="@string/OldDeviceTransferInstructions__download_signal_on_your_new_android_device"
+-            android:textAlignment="viewStart"
+-            android:textAppearance="@style/TextAppearance.Signal.Body1"
+-            app:layout_columnWeight="1" />
+-
+-        <TextView
+-            android:layout_width="wrap_content"
+-            android:layout_height="wrap_content"
+-            android:text="@string/OldDeviceTransferInstructions__second_bullet"
+-            android:textAppearance="@style/TextAppearance.Signal.Body1" />
++            android:orientation="vertical"
++            android:paddingBottom="16dp">
+ 
+-        <TextView
+-            android:layout_width="0dp"
+-            android:layout_height="wrap_content"
+-            android:layout_marginBottom="24dp"
+-            android:text="@string/OldDeviceTransferInstructions__tap_on_transfer_or_restore_account"
+-            android:textAlignment="viewStart"
+-            android:textAppearance="@style/TextAppearance.Signal.Body1"
+-            app:layout_columnWeight="1" />
+-
+-        <TextView
+-            android:layout_width="wrap_content"
+-            android:layout_height="wrap_content"
+-            android:text="@string/OldDeviceTransferInstructions__third_bullet"
+-            android:textAppearance="@style/TextAppearance.Signal.Body1" />
++            <androidx.appcompat.widget.AppCompatImageView
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:layout_gravity="center"
++                android:layout_marginTop="8dp"
++                android:layout_marginBottom="16dp"
++                android:scaleX="@integer/image_scale_flip"
++                app:srcCompat="@drawable/ic_transfer_account" />
+ 
+-        <TextView
+-            android:layout_width="0dp"
+-            android:layout_height="wrap_content"
+-            android:text="@string/OldDeviceTransferInstructions__select_transfer_from_android_device_when_prompted_and_then_continue"
+-            android:textAlignment="viewStart"
+-            android:textAppearance="@style/TextAppearance.Signal.Body1"
+-            app:layout_columnWeight="1" />
++            <androidx.appcompat.widget.AppCompatTextView
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:layout_marginStart="32dp"
++                android:layout_marginEnd="32dp"
++                android:gravity="center"
++                android:lines="1"
++                android:text="@string/OldDeviceTransferInstructions__transfer_account"
++                android:textAppearance="@style/Signal.Text.Headline"
++                app:autoSizeMaxTextSize="28sp"
++                app:autoSizeMinTextSize="14sp"
++                app:autoSizeTextType="uniform" />
+ 
+-    </androidx.gridlayout.widget.GridLayout>
++            <androidx.gridlayout.widget.GridLayout
++                android:layout_width="match_parent"
++                android:layout_height="0dp"
++                android:layout_marginStart="32dp"
++                android:layout_marginTop="16dp"
++                android:layout_marginEnd="32dp"
++                android:layout_marginBottom="16dp"
++                android:layout_weight="1"
++                app:alignmentMode="alignBounds"
++                app:columnCount="2">
+ 
+-    <com.google.android.material.button.MaterialButton
+-        android:id="@+id/old_device_transfer_instructions_fragment_continue"
+-        style="@style/Signal.Widget.Button.Large.Primary"
+-        android:layout_width="match_parent"
+-        android:layout_height="wrap_content"
+-        android:layout_marginStart="32dp"
+-        android:layout_marginEnd="32dp"
+-        android:text="@string/OldDeviceTransferInstructions__continue" />
++                <TextView
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:layout_marginEnd="8dp"
++                    android:text="@string/OldDeviceTransferInstructions__first_bullet"
++                    android:textAppearance="@style/TextAppearance.Signal.Body1" />
++
++                <TextView
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_marginBottom="24dp"
++                    android:text="@string/OldDeviceTransferInstructions__download_signal_on_your_new_android_device"
++                    android:textAlignment="viewStart"
++                    android:textAppearance="@style/TextAppearance.Signal.Body1"
++                    app:layout_columnWeight="1" />
++
++                <TextView
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:text="@string/OldDeviceTransferInstructions__second_bullet"
++                    android:textAppearance="@style/TextAppearance.Signal.Body1" />
++
++                <TextView
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_marginBottom="24dp"
++                    android:text="@string/OldDeviceTransferInstructions__tap_on_transfer_or_restore_account"
++                    android:textAlignment="viewStart"
++                    android:textAppearance="@style/TextAppearance.Signal.Body1"
++                    app:layout_columnWeight="1" />
++
++                <TextView
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:text="@string/OldDeviceTransferInstructions__third_bullet"
++                    android:textAppearance="@style/TextAppearance.Signal.Body1" />
++
++                <TextView
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:text="@string/OldDeviceTransferInstructions__select_transfer_from_android_device_when_prompted_and_then_continue"
++                    android:textAlignment="viewStart"
++                    android:textAppearance="@style/TextAppearance.Signal.Body1"
++                    app:layout_columnWeight="1" />
++
++            </androidx.gridlayout.widget.GridLayout>
++
++            <com.google.android.material.button.MaterialButton
++                android:id="@+id/old_device_transfer_instructions_fragment_continue"
++                style="@style/Signal.Widget.Button.Large.Primary"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:layout_marginStart="32dp"
++                android:layout_marginEnd="32dp"
++                android:text="@string/OldDeviceTransferInstructions__continue" />
++
++        </LinearLayout>
++
++    </ScrollView>
+ 
+ </LinearLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index cb925a6de85..e4d2dac1a6e 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2760,10 +2760,10 @@
+     <string name="TransferOrRestoreFragment__transfer_or_restore_account">Transfer or restore account</string>
+     <string name="TransferOrRestoreFragment__if_you_have_previously_registered_a_signal_account">If you have previously registered a Signal account, you can transfer or restore your account and messages</string>
+     <string name="TransferOrRestoreFragment__transfer_from_android_device">Transfer from Android device</string>
+-    <string name="TransferOrRestoreFragment__transfer_your_account_and_message_history_from_your_old_android_device">Transfer your account and message history from your old Android device. You must have access to your old device.</string>
+-    <string name="TransferOrRestoreFragment__you_must_have_access_to_your_old_device">You must have access to your old device.</string>
++    <string name="TransferOrRestoreFragment__transfer_your_account_and_messages_from_your_old_android_device">Transfer your account and messages from your old Android device. You need access to your old device.</string>
++    <string name="TransferOrRestoreFragment__you_need_access_to_your_old_device">You need access to your old device.</string>
+     <string name="TransferOrRestoreFragment__restore_from_backup">Restore from backup</string>
+-    <string name="TransferOrRestoreFragment__restore_your_messages_and_media_from_a_local_backup">Restore your messages and media from a local backup. If you don\'t restore now, you wouldn\'t be able to restore later.</string>
++    <string name="TransferOrRestoreFragment__restore_your_messages_from_a_local_backup">Restore your messages from a local backup. If you don’t restore now, you won\'t be able to restore later.</string>
+ 
+     <!-- NewDeviceTransferInstructionsFragment -->
+     <string name="NewDeviceTransferInstructions__open_signal_on_your_old_android_phone">Open Signal on your old Android phone</string>
+@@ -2779,7 +2779,6 @@
+     <string name="NewDeviceTransferSetup__preparing_to_connect_to_old_android_device">Preparing to connect to old Android device…</string>
+     <string name="NewDeviceTransferSetup__take_a_moment_should_be_ready_soon">Taking a moment, should be ready soon</string>
+     <string name="NewDeviceTransferSetup__waiting_for_old_device_to_connect">Waiting for old Android device to connect…</string>
+-    <string name="NewDeviceTransferSetup__connecting_to_old_android_device">Connecting to old Android device…</string>
+     <string name="NewDeviceTransferSetup__signal_needs_the_location_permission_to_discover_and_connect_with_your_old_device">Signal needs the location permission to discover and connect to your old Android device.</string>
+     <string name="NewDeviceTransferSetup__signal_needs_location_services_enabled_to_discover_and_connect_with_your_old_device">Signal needs location services enabled to discover and connect with your old Android device.</string>
+     <string name="NewDeviceTransferSetup__signal_needs_wifi_on_to_discover_and_connect_with_your_old_device">Signal needs Wi-Fi on to discover and connect with your old Android device. Wi-Fi needs to be on but it does not have to be connected to a Wi-Fi network.</string>
+@@ -2789,7 +2788,6 @@
+ 
+     <!-- OldDeviceTransferSetupFragment -->
+     <string name="OldDeviceTransferSetup__searching_for_your_new_android_device">Searching for your new Android device…</string>
+-    <string name="OldDeviceTransferSetup__connecting_to_new_android_device">Connecting to new Android device…</string>
+     <string name="OldDeviceTransferSetup__signal_needs_the_location_permission_to_discover_and_connect_with_your_new_device">Signal needs the location permission to discover and connect to your new Android device.</string>
+     <string name="OldDeviceTransferSetup__signal_needs_location_services_enabled_to_discover_and_connect_with_your_new_device">Signal needs location services enabled to discover and connect with your new Android device.</string>
+     <string name="OldDeviceTransferSetup__signal_needs_wifi_on_to_discover_and_connect_with_your_new_device">Signal needs Wi-Fi on to discover and connect with your new Android device. Wi-Fi needs to be on but it does not have to be connected to a Wi-Fi network.</string>
+@@ -2825,6 +2823,9 @@
+     <string name="DeviceTransferSetup__make_sure_both_devices_are_in_transfer_mode">Make sure both devices are in transfer mode.</string>
+     <string name="DeviceTransferSetup__go_to_support_page">Go to support page</string>
+     <string name="DeviceTransferSetup__try_again">Try again</string>
++    <string name="DeviceTransferSetup__waiting_for_other_device">Waiting for other device</string>
++    <string name="DeviceTransferSetup__tap_continue_on_your_other_device_to_start_the_transfer">Tap Continue on your other device to start the transfer.</string>
++    <string name="DeviceTransferSetup__tap_continue_on_your_other_device">Tap Continue on your other device…</string>
+ 
+     <!-- NewDeviceTransferFragment -->
+     <string name="NewDeviceTransfer__cannot_transfer_from_a_newer_version_of_signal">Cannot transfer from a newer versions of Signal</string>
+diff --git a/device-transfer/lib/src/main/java/org/signal/devicetransfer/DeviceTransferClient.java b/device-transfer/lib/src/main/java/org/signal/devicetransfer/DeviceTransferClient.java
+index 1ee105e754d..5d9079a6388 100644
+--- a/device-transfer/lib/src/main/java/org/signal/devicetransfer/DeviceTransferClient.java
++++ b/device-transfer/lib/src/main/java/org/signal/devicetransfer/DeviceTransferClient.java
+@@ -181,6 +181,7 @@ public boolean handleMessage(@NonNull Message message) {
+         update(TransferStatus.networkConnected());
+         break;
+       case NetworkClientThread.NETWORK_CLIENT_STOPPED:
++        update(TransferStatus.shutdown());
+         internalShutdown();
+         break;
+       default:
+diff --git a/device-transfer/lib/src/main/java/org/signal/devicetransfer/DeviceTransferServer.java b/device-transfer/lib/src/main/java/org/signal/devicetransfer/DeviceTransferServer.java
+index 33c0f8c674a..82d561e6bd6 100644
+--- a/device-transfer/lib/src/main/java/org/signal/devicetransfer/DeviceTransferServer.java
++++ b/device-transfer/lib/src/main/java/org/signal/devicetransfer/DeviceTransferServer.java
+@@ -146,6 +146,7 @@ public boolean handleMessage(@NonNull Message message) {
+         startWifiDirect(message.arg1);
+         break;
+       case NetworkServerThread.NETWORK_SERVER_STOPPED:
++        update(TransferStatus.shutdown());
+         internalShutdown();
+         break;
+       case NetworkServerThread.NETWORK_CLIENT_CONNECTED:
+diff --git a/device-transfer/lib/src/main/java/org/signal/devicetransfer/NetworkClientThread.java b/device-transfer/lib/src/main/java/org/signal/devicetransfer/NetworkClientThread.java
+index 5868a54ab87..e3e703684d4 100644
+--- a/device-transfer/lib/src/main/java/org/signal/devicetransfer/NetworkClientThread.java
++++ b/device-transfer/lib/src/main/java/org/signal/devicetransfer/NetworkClientThread.java
+@@ -92,8 +92,18 @@ public void run() {
+           Log.i(TAG, "Waiting for user to verify sas");
+           awaitAuthenticationCodeVerification();
+           Log.d(TAG, "Waiting for server to tell us they also verified");
+-          //noinspection ResultOfMethodCallIgnored
+-          inputStream.read();
++          outputStream.write(0x43);
++          outputStream.flush();
++          try {
++            int result = inputStream.read();
++            if (result == -1) {
++              Log.w(TAG, "Something happened waiting for server to verify");
++              throw new DeviceTransferAuthentication.DeviceTransferAuthenticationException("server disconnected while we waited");
++            }
++          } catch (IOException e) {
++            Log.w(TAG, "Something happened waiting for server to verify", e);
++            throw new DeviceTransferAuthentication.DeviceTransferAuthenticationException(e);
++          }
+ 
+           handler.sendEmptyMessage(NETWORK_CLIENT_CONNECTED);
+           clientTask.run(context, outputStream);
+diff --git a/device-transfer/lib/src/main/java/org/signal/devicetransfer/NetworkServerThread.java b/device-transfer/lib/src/main/java/org/signal/devicetransfer/NetworkServerThread.java
+index 7eb74f297fb..63362a7d7ac 100644
+--- a/device-transfer/lib/src/main/java/org/signal/devicetransfer/NetworkServerThread.java
++++ b/device-transfer/lib/src/main/java/org/signal/devicetransfer/NetworkServerThread.java
+@@ -73,10 +73,21 @@ public void run() {
+ 
+           Log.i(TAG, "Waiting for user to verify sas");
+           awaitAuthenticationCodeVerification();
+-
+-          handler.sendEmptyMessage(NETWORK_CLIENT_CONNECTED);
++          Log.d(TAG, "Waiting for client to tell us they also verified");
+           outputStream.write(0x43);
+           outputStream.flush();
++          try {
++            int result = inputStream.read();
++            if (result == -1) {
++              Log.w(TAG, "Something happened waiting for client to verify");
++              throw new DeviceTransferAuthentication.DeviceTransferAuthenticationException("client disconnected while we waited");
++            }
++          } catch (IOException e) {
++            Log.w(TAG, "Something happened waiting for client to verify", e);
++            throw new DeviceTransferAuthentication.DeviceTransferAuthenticationException(e);
++          }
++
++          handler.sendEmptyMessage(NETWORK_CLIENT_CONNECTED);
+           serverTask.run(context, inputStream);
+ 
+           outputStream.write(0x53);
+diff --git a/device-transfer/lib/src/main/java/org/signal/devicetransfer/TransferStatus.java b/device-transfer/lib/src/main/java/org/signal/devicetransfer/TransferStatus.java
+index 581c4b23c8e..6a14ba0b2f6 100644
+--- a/device-transfer/lib/src/main/java/org/signal/devicetransfer/TransferStatus.java
++++ b/device-transfer/lib/src/main/java/org/signal/devicetransfer/TransferStatus.java
+@@ -59,6 +59,10 @@ public int getAuthenticationCode() {
+     return new TransferStatus(TransferMode.UNAVAILABLE);
+   }
+ 
++  public static @NonNull TransferStatus shutdown() {
++    return new TransferStatus(TransferMode.SHUTDOWN);
++  }
++
+   public static @NonNull TransferStatus failed() {
+     return new TransferStatus(TransferMode.FAILED);
+   }
+@@ -72,6 +76,7 @@ public enum TransferMode {
+     NETWORK_CONNECTED,
+     VERIFICATION_REQUIRED,
+     SERVICE_CONNECTED,
+-    SERVICE_DISCONNECTED
++    SERVICE_DISCONNECTED,
++    SHUTDOWN
+   }
+ }

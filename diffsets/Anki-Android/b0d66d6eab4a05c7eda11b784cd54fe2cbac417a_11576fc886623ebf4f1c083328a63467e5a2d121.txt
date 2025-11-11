@@ -1,0 +1,639 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/NoteEditor.kt b/AnkiDroid/src/main/java/com/ichi2/anki/NoteEditor.kt
+index 3b8e47678576..cf83e6f34393 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/NoteEditor.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/NoteEditor.kt
+@@ -20,6 +20,8 @@ package com.ichi2.anki
+ 
+ import android.annotation.SuppressLint
+ import android.content.BroadcastReceiver
++import android.content.ClipData
++import android.content.ClipboardManager
+ import android.content.Context
+ import android.content.Intent
+ import android.content.IntentFilter
+@@ -49,11 +51,13 @@ import androidx.core.content.edit
+ import androidx.core.content.res.ResourcesCompat
+ import androidx.core.text.HtmlCompat
+ import anki.config.ConfigKey
++import anki.notetypes.StockNotetype
+ import com.google.android.material.color.MaterialColors
+ import com.google.android.material.snackbar.Snackbar
+ import com.ichi2.anim.ActivityTransitionAnimation
+ import com.ichi2.anim.ActivityTransitionAnimation.Direction.*
+ import com.ichi2.anki.CollectionManager.TR
++import com.ichi2.anki.CollectionManager.withCol
+ import com.ichi2.anki.dialogs.ConfirmationDialog
+ import com.ichi2.anki.dialogs.DeckSelectionDialog.DeckSelectionListener
+ import com.ichi2.anki.dialogs.DeckSelectionDialog.SelectableDeck
+@@ -74,6 +78,7 @@ import com.ichi2.anki.noteeditor.FieldState.FieldChangeType
+ import com.ichi2.anki.noteeditor.Toolbar
+ import com.ichi2.anki.noteeditor.Toolbar.TextFormatListener
+ import com.ichi2.anki.noteeditor.Toolbar.TextWrapper
++import com.ichi2.anki.pages.ImageOcclusion
+ import com.ichi2.anki.preferences.sharedPrefs
+ import com.ichi2.anki.receiver.SdCardReceiver
+ import com.ichi2.anki.servicelayer.LanguageHintService
+@@ -94,6 +99,7 @@ import com.ichi2.libanki.Notetypes.Companion.NOT_FOUND_NOTE_TYPE
+ import com.ichi2.utils.*
+ import com.ichi2.widget.WidgetStatus
+ import org.json.JSONArray
++import org.json.JSONException
+ import org.json.JSONObject
+ import timber.log.Timber
+ import java.util.*
+@@ -133,6 +139,10 @@ class NoteEditor : AnkiActivity(), DeckSelectionListener, SubtitleListener, Tags
+     private var mCardsButton: AppCompatButton? = null
+     private var mNoteTypeSpinner: Spinner? = null
+     private var mDeckSpinnerSelection: DeckSpinnerSelection? = null
++    private var imageOcclusionButtonsContainer: LinearLayout? = null
++    private var selectImageForOcclusionButton: Button? = null
++    private var editOcclusionsButton: Button? = null
++    private var pasteOcclusionImageButton: Button? = null
+ 
+     // non-null after onCollectionLoaded
+     private var mEditorNote: Note? = null
+@@ -169,6 +179,8 @@ class NoteEditor : AnkiActivity(), DeckSelectionListener, SubtitleListener, Tags
+     private var mToggleStickyText: HashMap<Int, String?> = HashMap()
+     private val mOnboarding = Onboarding.NoteEditor(this)
+ 
++    var clipboard: ClipboardManager? = null
++
+     private val requestAddLauncher = registerForActivityResult(
+         ActivityResultContracts.StartActivityForResult(),
+         NoteEditorActivityResultCallback {
+@@ -239,6 +251,29 @@ class NoteEditor : AnkiActivity(), DeckSelectionListener, SubtitleListener, Tags
+         }
+     )
+ 
++    private val ioEditorLauncher = registerForActivityResult(
++        ActivityResultContracts.GetContent()
++    ) { uri ->
++        if (uri != null) {
++            ImportUtils.getFileCachedCopy(this@NoteEditor, uri)?.let { path ->
++                setupImageOcclusionEditor(path)
++            }
++        }
++    }
++
++    private val requestIOEditorCloser = registerForActivityResult(
++        ActivityResultContracts.StartActivityForResult(),
++        NoteEditorActivityResultCallback { result ->
++            if (result.resultCode != RESULT_CANCELED) {
++                changed = true
++                if (!addNote) {
++                    mReloadRequired = true
++                    closeNoteEditor(RESULT_UPDATED_IO_NOTE, null)
++                }
++            }
++        }
++    )
++
+     private inner class NoteEditorActivityResultCallback(private val callback: (result: ActivityResult) -> Unit) : ActivityResultCallback<ActivityResult> {
+         override fun onActivityResult(result: ActivityResult) {
+             Timber.d("onActivityResult() with result: %s", result.resultCode)
+@@ -402,6 +437,17 @@ class NoteEditor : AnkiActivity(), DeckSelectionListener, SubtitleListener, Tags
+             Timber.i("NoteEditor:: Cards button pressed. Opening template editor")
+             showCardTemplateEditor()
+         }
++        imageOcclusionButtonsContainer = findViewById(R.id.ImageOcclusionButtonsLayout)
++        editOcclusionsButton = findViewById(R.id.EditOcclusionsButton)
++        selectImageForOcclusionButton = findViewById(R.id.SelectImageForOcclusionButton)
++        pasteOcclusionImageButton = findViewById(R.id.PasteImageForOcclusionButton)
++
++        try {
++            clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
++        } catch (e: Exception) {
++            Timber.w(e)
++        }
++
+         aedictIntent = false
+         mCurrentEditedCard = null
+         when (caller) {
+@@ -446,6 +492,44 @@ class NoteEditor : AnkiActivity(), DeckSelectionListener, SubtitleListener, Tags
+             else -> {}
+         }
+ 
++        launchCatchingTask {
++            withCol {
++                addImageOcclusionNotetype()
++            }
++        }
++
++        if (addNote) {
++            editOcclusionsButton?.visibility = View.GONE
++            selectImageForOcclusionButton?.setOnClickListener {
++                ioEditorLauncher.launch("image/*")
++            }
++            pasteOcclusionImageButton?.text = TR.notetypesIoPasteImageFromClipboard()
++            pasteOcclusionImageButton?.setOnClickListener {
++                // TODO: Support all extensions
++                //  See https://github.com/ankitects/anki/blob/6f3550464d37aee1b8b784e431cbfce8382d3ce7/rslib/src/image_occlusion/imagedata.rs#L154
++                if (ClipboardUtil.hasImage(clipboard)) {
++                    val uri = ClipboardUtil.getImageUri(clipboard)
++                    val i = Intent().apply {
++                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
++                        clipData = ClipData.newUri(contentResolver, uri.toString(), uri)
++                    }
++                    ImportUtils.getFileCachedCopy(this, i)?.let { path ->
++                        setupImageOcclusionEditor(path)
++                    }
++                } else {
++                    showSnackbar(TR.editingNoImageFoundOnClipboard())
++                }
++            }
++        } else {
++            selectImageForOcclusionButton?.visibility = View.GONE
++            pasteOcclusionImageButton?.visibility = View.GONE
++            editOcclusionsButton?.visibility = View.VISIBLE
++            editOcclusionsButton?.text = resources.getString(R.string.edit_occlusions)
++            editOcclusionsButton?.setOnClickListener {
++                setupImageOcclusionEditor()
++            }
++        }
++
+         // Note type Selector
+         mNoteTypeSpinner = findViewById(R.id.note_type_spinner)
+         mAllModelIds = setupNoteTypeSpinner(this, mNoteTypeSpinner!!, col)
+@@ -845,19 +929,21 @@ class NoteEditor : AnkiActivity(), DeckSelectionListener, SubtitleListener, Tags
+                 mCurrentEditedCard!!.did = deckId
+                 modified = true
+             }
+-            // now load any changes to the fields from the form
+-            for (f in mEditFields!!) {
+-                modified = modified or updateField(f)
+-            }
+-            // added tag?
+-            for (t in mSelectedTags!!) {
+-                modified = modified || !mEditorNote!!.hasTag(t)
+-            }
+-            // removed tag?
+-            modified = modified || mEditorNote!!.tags.size > mSelectedTags!!.size
+-            if (modified) {
+-                mEditorNote!!.setTagsFromStr(tagsAsString(mSelectedTags!!))
+-                changed = true
++            if (!currentNotetypeIsImageOcclusion()) {
++                // now load any changes to the fields from the form
++                for (f in mEditFields!!) {
++                    modified = modified or updateField(f)
++                }
++                // added tag?
++                for (t in mSelectedTags!!) {
++                    modified = modified || !mEditorNote!!.hasTag(t)
++                }
++                // removed tag?
++                modified = modified || mEditorNote!!.tags.size > mSelectedTags!!.size
++                if (modified) {
++                    mEditorNote!!.setTagsFromStr(tagsAsString(mSelectedTags!!))
++                    changed = true
++                }
+             }
+             closeNoteEditor()
+         }
+@@ -1224,6 +1310,14 @@ class NoteEditor : AnkiActivity(), DeckSelectionListener, SubtitleListener, Tags
+         val editLines = mFieldState.loadFieldEditLines(type)
+         mFieldsLayoutContainer!!.removeAllViews()
+         mCustomViewIds.clear()
++        if (currentNotetypeIsImageOcclusion()) {
++            setImageOcclusionButton()
++            return
++        } else {
++            imageOcclusionButtonsContainer?.visibility = View.GONE
++            mFieldsLayoutContainer?.visibility = View.VISIBLE
++        }
++
+         mEditFields = LinkedList()
+ 
+         var previous: FieldEditLine? = null
+@@ -1897,6 +1991,33 @@ class NoteEditor : AnkiActivity(), DeckSelectionListener, SubtitleListener, Tags
+     val fieldsFromSelectedNote: Array<Array<String>>
+         get() = mEditorNote!!.items()
+ 
++    private fun currentNotetypeIsImageOcclusion(): Boolean {
++        try {
++            return currentlySelectedNotetype?.getInt("originalStockKind") == StockNotetype.OriginalStockKind.ORIGINAL_STOCK_KIND_IMAGE_OCCLUSION_VALUE
++        } catch (j: JSONException) {
++            return false
++        }
++    }
++
++    private fun setImageOcclusionButton() {
++        imageOcclusionButtonsContainer?.visibility = View.VISIBLE
++        mFieldsLayoutContainer?.visibility = View.GONE
++    }
++
++    private fun setupImageOcclusionEditor(imagePath: String = "") {
++        val kind: String
++        val id: Long
++        if (addNote) {
++            kind = "add"
++            id = 0
++        } else {
++            kind = "edit"
++            id = mEditorNote?.id!!
++        }
++        val intent = ImageOcclusion.getIntent(this@NoteEditor, kind, id, imagePath)
++        requestIOEditorCloser.launch(intent)
++    }
++
+     // ----------------------------------------------------------------------------
+     // INNER CLASSES
+     // ----------------------------------------------------------------------------
+@@ -2163,6 +2284,8 @@ class NoteEditor : AnkiActivity(), DeckSelectionListener, SubtitleListener, Tags
+         const val CALLER_NOTEEDITOR = 8
+         const val CALLER_NOTEEDITOR_INTENT_ADD = 10
+ 
++        const val RESULT_UPDATED_IO_NOTE = 11
++
+         // preferences keys
+         const val PREF_NOTE_EDITOR_SCROLL_TOOLBAR = "noteEditorScrollToolbar"
+         private const val PREF_NOTE_EDITOR_SHOW_TOOLBAR = "noteEditorShowToolbar"
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/pages/AnkiPackageImporterFragment.kt b/AnkiDroid/src/main/java/com/ichi2/anki/pages/AnkiPackageImporterFragment.kt
+index 77ebffaae727..8ddc50134d68 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/pages/AnkiPackageImporterFragment.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/pages/AnkiPackageImporterFragment.kt
+@@ -24,8 +24,8 @@ import com.ichi2.anki.R
+ import com.ichi2.anki.hideShowButtonCss
+ 
+ class AnkiPackageImporterFragment : PageFragment() {
+-    override val title: Int
+-        get() = R.string.menu_import
++    override val title: String
++        get() = resources.getString(R.string.menu_import)
+     override val pageName: String
+         get() = "import-page"
+     override lateinit var webViewClient: PageWebViewClient
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/pages/AnkiServer.kt b/AnkiDroid/src/main/java/com/ichi2/anki/pages/AnkiServer.kt
+index b45b3da77440..4e87344d98cb 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/pages/AnkiServer.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/pages/AnkiServer.kt
+@@ -17,11 +17,15 @@
+ 
+ package com.ichi2.anki.pages
+ 
++import android.app.Activity
+ import androidx.fragment.app.FragmentActivity
++import anki.collection.OpChanges
+ import com.ichi2.anki.CollectionManager
+ import com.ichi2.anki.CollectionManager.withCol
++import com.ichi2.anki.NoteEditor
+ import com.ichi2.anki.importCsvRaw
+ import com.ichi2.anki.importJsonFileRaw
++import com.ichi2.anki.launchCatchingTask
+ import com.ichi2.anki.searchInBrowser
+ import com.ichi2.libanki.*
+ import com.ichi2.libanki.sched.computeFsrsWeightsRaw
+@@ -30,6 +34,7 @@ import com.ichi2.libanki.sched.evaluateWeightsRaw
+ import com.ichi2.libanki.stats.*
+ import fi.iki.elonen.NanoHTTPD
+ import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.delay
+ import kotlinx.coroutines.runBlocking
+ import timber.log.Timber
+ import java.io.ByteArrayInputStream
+@@ -93,6 +98,35 @@ open class AnkiServer(
+             "setWantsAbort" -> CollectionManager.getBackend().setWantsAbortRaw(bytes)
+             "evaluateWeights" -> withCol { evaluateWeightsRaw(bytes) }
+             "latestProgress" -> CollectionManager.getBackend().latestProgressRaw(bytes)
++            "getImageForOcclusion" -> withCol { getImageForOcclusionRaw(bytes) }
++            "getImageOcclusionNote" -> withCol { getImageOcclusionNoteRaw(bytes) }
++            "getImageForOcclusionFields" -> withCol { getImageOcclusionFieldsRaw(bytes) }
++            "addImageOcclusionNote" -> {
++                val data = withCol {
++                    addImageOcclusionNoteRaw(bytes)
++                }
++                undoableOp { OpChanges.parseFrom(data) }
++                activity.launchCatchingTask {
++                    // Allow time for toast message to appear before closing editor
++                    delay(1000)
++                    activity.setResult(Activity.RESULT_OK)
++                    activity.finish()
++                }
++                data
++            }
++            "updateImageOcclusionNote" -> {
++                val data = withCol {
++                    updateImageOcclusionNoteRaw(bytes)
++                }
++                undoableOp { OpChanges.parseFrom(data) }
++                activity.launchCatchingTask {
++                    // Allow time for toast message to appear before closing editor
++                    delay(1000)
++                    activity.setResult(NoteEditor.RESULT_UPDATED_IO_NOTE)
++                    activity.finish()
++                }
++                data
++            }
+             "congratsInfo" -> withCol { congratsInfoRaw(bytes) }
+             else -> { throw Exception("unhandled request: $methodName") }
+         }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/pages/CardInfo.kt b/AnkiDroid/src/main/java/com/ichi2/anki/pages/CardInfo.kt
+index 9a257e4bd784..cda27a57071d 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/pages/CardInfo.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/pages/CardInfo.kt
+@@ -24,7 +24,9 @@ import com.ichi2.anki.R
+ import com.ichi2.libanki.CardId
+ 
+ class CardInfo : PageFragment() {
+-    override val title = R.string.card_info_title
++    override val title: String
++        get() = resources.getString(R.string.card_info_title)
++
+     override val pageName = "card-info"
+     override lateinit var webViewClient: PageWebViewClient
+     override var webChromeClient = PageChromeClient()
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/pages/CongratsPage.kt b/AnkiDroid/src/main/java/com/ichi2/anki/pages/CongratsPage.kt
+index 10835b6e5043..09e4fe3b5115 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/pages/CongratsPage.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/pages/CongratsPage.kt
+@@ -19,7 +19,7 @@ import android.content.Context
+ import android.content.Intent
+ 
+ class CongratsPage : PageFragment() {
+-    override val title: Int? = null
++    override val title: String = ""
+     override val pageName = "congrats"
+     override var webViewClient: PageWebViewClient = PageWebViewClient()
+     override var webChromeClient: PageChromeClient = PageChromeClient()
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/pages/CsvImporter.kt b/AnkiDroid/src/main/java/com/ichi2/anki/pages/CsvImporter.kt
+index cf7c7fd117f5..35f4e8fb422b 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/pages/CsvImporter.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/pages/CsvImporter.kt
+@@ -25,7 +25,9 @@ import com.ichi2.anki.R
+  * Anki page used to import text/csv files
+  */
+ class CsvImporter : PageFragment() {
+-    override val title = R.string.menu_import
++    override val title: String
++        get() = resources.getString(R.string.menu_import)
++
+     override val pageName = "import-csv"
+     override lateinit var webViewClient: PageWebViewClient
+     override var webChromeClient = PageChromeClient()
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/pages/DeckOptions.kt b/AnkiDroid/src/main/java/com/ichi2/anki/pages/DeckOptions.kt
+index b9b2a30f8950..852cb2fd49b8 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/pages/DeckOptions.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/pages/DeckOptions.kt
+@@ -29,7 +29,8 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.withContext
+ 
+ class DeckOptions : PageFragment() {
+-    override val title = R.string.menu__deck_options
++    override val title: String
++        get() = resources.getString(R.string.menu__deck_options)
+     override val pageName = "deck-options"
+     override lateinit var webViewClient: PageWebViewClient
+     override var webChromeClient = PageChromeClient()
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/pages/ImageOcclusion.kt b/AnkiDroid/src/main/java/com/ichi2/anki/pages/ImageOcclusion.kt
+new file mode 100644
+index 000000000000..6779bbd74992
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/pages/ImageOcclusion.kt
+@@ -0,0 +1,68 @@
++/*
++ *  Copyright (c) 2023 Abdo <abdo@abdnh.net>
++ *
++ *  This program is free software; you can redistribute it and/or modify it under
++ *  the terms of the GNU General Public License as published by the Free Software
++ *  Foundation; either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++ *  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with
++ *  this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++package com.ichi2.anki.pages
++
++import android.content.Context
++import android.content.Intent
++import android.os.Bundle
++import android.webkit.WebView
++import androidx.core.os.bundleOf
++import com.ichi2.anki.CollectionManager.TR
++import org.json.JSONObject
++
++class ImageOcclusion : PageFragment() {
++
++    override val title: String
++        get() = TR.notetypesImageOcclusionName()
++    override val pageName = "image-occlusion"
++    override lateinit var webViewClient: PageWebViewClient
++    override var webChromeClient = PageChromeClient()
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        val kind = arguments?.getString(ARG_KEY_KIND) ?: throw Exception("missing kind")
++        val id = arguments?.getLong(ARG_KEY_ID) ?: throw Exception("missing ID")
++        val path = arguments?.getString(ARG_KEY_PATH) ?: if (kind == "add") throw Exception("missing path") else ""
++        webViewClient = ImageOcclusionWebViewClient(kind, id, path)
++        super.onCreate(savedInstanceState)
++    }
++
++    class ImageOcclusionWebViewClient(val kind: String, private val noteOrNotetypeId: Long, private val path: String?) : PageWebViewClient() {
++        override fun onPageFinished(view: WebView?, url: String?) {
++            val options = JSONObject()
++            options.put("kind", kind)
++            options.put("imagePath", path)
++            if (kind == "add") {
++                options.put("notetypeId", noteOrNotetypeId)
++            } else {
++                options.put("noteId", noteOrNotetypeId)
++            }
++            view!!.evaluateJavascript("anki.setupImageOcclusion($options);") {
++                super.onPageFinished(view, url)
++            }
++        }
++    }
++
++    companion object {
++        private const val ARG_KEY_KIND = "kind"
++        private const val ARG_KEY_ID = "id"
++        private const val ARG_KEY_PATH = "path"
++
++        fun getIntent(context: Context, kind: String, noteOrNotetypeId: Long, imagePath: String?): Intent {
++            val arguments = bundleOf(ARG_KEY_KIND to kind, ARG_KEY_ID to noteOrNotetypeId, ARG_KEY_PATH to imagePath)
++            return PagesActivity.getIntent(context, ImageOcclusion::class, arguments)
++        }
++    }
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/pages/PageFragment.kt b/AnkiDroid/src/main/java/com/ichi2/anki/pages/PageFragment.kt
+index e43d79cef566..dad67dc41351 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/pages/PageFragment.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/pages/PageFragment.kt
+@@ -20,7 +20,6 @@ import android.view.LayoutInflater
+ import android.view.View
+ import android.view.ViewGroup
+ import android.webkit.WebView
+-import androidx.annotation.StringRes
+ import androidx.fragment.app.Fragment
+ import com.ichi2.anki.R
+ import com.ichi2.themes.Themes
+@@ -30,9 +29,7 @@ import timber.log.Timber
+  * Base class for displaying Anki HTML pages
+  */
+ abstract class PageFragment : Fragment() {
+-    @get:StringRes
+-    /** Title string resource of the page */
+-    abstract val title: Int?
++    abstract val title: String
+     abstract val pageName: String
+     abstract var webViewClient: PageWebViewClient
+     abstract var webChromeClient: PageChromeClient
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/pages/PagesActivity.kt b/AnkiDroid/src/main/java/com/ichi2/anki/pages/PagesActivity.kt
+index 174080db1622..2d9430dec5e5 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/pages/PagesActivity.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/pages/PagesActivity.kt
+@@ -64,7 +64,7 @@ class PagesActivity : AnkiActivity() {
+         supportFragmentManager.commit {
+             replace(R.id.page_container, pageFragment)
+         }
+-        setTitle(pageFragment.title ?: R.string.empty_string)
++        title = pageFragment.title
+     }
+ 
+     override fun onDestroy() {
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/pages/Statistics.kt b/AnkiDroid/src/main/java/com/ichi2/anki/pages/Statistics.kt
+index 14076c30f75e..28acc8e0c056 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/pages/Statistics.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/pages/Statistics.kt
+@@ -34,7 +34,9 @@ import com.ichi2.anki.utils.getTimestamp
+ import com.ichi2.libanki.utils.TimeManager
+ 
+ class Statistics : PageFragment() {
+-    override val title = R.string.statistics
++    override val title: String
++        get() = resources.getString(R.string.statistics)
++
+     override val pageName = "graphs"
+     override var webViewClient = PageWebViewClient()
+     override var webChromeClient = PageChromeClient()
+diff --git a/AnkiDroid/src/main/java/com/ichi2/libanki/Collection.kt b/AnkiDroid/src/main/java/com/ichi2/libanki/Collection.kt
+index a20e703c9e2e..704d808ab3c9 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/libanki/Collection.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/libanki/Collection.kt
+@@ -716,6 +716,27 @@ open class Collection(
+         return backend.clozeNumbersInNote(n.toBackendNote())
+             .sorted()
+     }
++    fun addImageOcclusionNotetype() {
++        backend.addImageOcclusionNotetype()
++    }
++
++    fun getImageForOcclusionRaw(input: ByteArray): ByteArray {
++        return backend.getImageForOcclusionRaw(input = input)
++    }
++
++    fun getImageOcclusionNoteRaw(input: ByteArray): ByteArray {
++        return backend.getImageOcclusionNoteRaw(input = input)
++    }
++    fun getImageOcclusionFieldsRaw(input: ByteArray): ByteArray {
++        return backend.getImageOcclusionFieldsRaw(input = input)
++    }
++    fun addImageOcclusionNoteRaw(input: ByteArray): ByteArray {
++        return backend.addImageOcclusionNoteRaw(input = input)
++    }
++
++    fun updateImageOcclusionNoteRaw(input: ByteArray): ByteArray {
++        return backend.updateImageOcclusionNoteRaw(input = input)
++    }
+ 
+     // TODO either support bridgeCommand here
+     //   or replace it with POST requests in Anki Desktop (preferable)
+diff --git a/AnkiDroid/src/main/java/com/ichi2/utils/ImportUtils.kt b/AnkiDroid/src/main/java/com/ichi2/utils/ImportUtils.kt
+index aea574b92aa3..f8af8101aaad 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/utils/ImportUtils.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/utils/ImportUtils.kt
+@@ -63,6 +63,10 @@ object ImportUtils {
+         return FileImporter().getFileCachedCopy(context, intent)
+     }
+ 
++    fun getFileCachedCopy(context: Context, uri: Uri): String? {
++        return FileImporter().getFileCachedCopy(context, uri)
++    }
++
+     fun showImportUnsuccessfulDialog(activity: Activity, errorMessage: String?, exitActivity: Boolean) {
+         FileImporter().showImportUnsuccessfulDialog(activity, errorMessage, exitActivity)
+     }
+@@ -122,11 +126,7 @@ object ImportUtils {
+             }
+         }
+ 
+-        /**
+-         * Makes a cached copy of the file selected on [intent] and returns its path
+-         */
+-        fun getFileCachedCopy(context: Context, intent: Intent): String? {
+-            val uri = getDataUri(intent) ?: return null
++        fun getFileCachedCopy(context: Context, uri: Uri): String? {
+             val filename = ensureValidLength(getFileNameFromContentProvider(context, uri) ?: return null)
+             val tempPath = Uri.fromFile(File(context.cacheDir, filename)).encodedPath!!
+             return if (copyFileToCache(context, uri, tempPath)) {
+@@ -136,6 +136,14 @@ object ImportUtils {
+             }
+         }
+ 
++        /**
++         * Makes a cached copy of the file selected on [intent] and returns its path
++         */
++        fun getFileCachedCopy(context: Context, intent: Intent): String? {
++            val uri = getDataUri(intent) ?: return null
++            return getFileCachedCopy(context, uri)
++        }
++
+         private fun handleContentProviderFile(
+             context: Context,
+             intent: Intent,
+diff --git a/AnkiDroid/src/main/res/layout/note_editor.xml b/AnkiDroid/src/main/res/layout/note_editor.xml
+index f0f2d0606d4f..1202075fbef5 100644
+--- a/AnkiDroid/src/main/res/layout/note_editor.xml
++++ b/AnkiDroid/src/main/res/layout/note_editor.xml
+@@ -85,7 +85,35 @@
+                     android:animateLayoutChanges="true"
+                     android:paddingVertical="@dimen/keyline_1"
+                     android:paddingHorizontal="6dip" />
+-                    <androidx.appcompat.widget.AppCompatButton
++
++                <LinearLayout
++                    android:id="@+id/ImageOcclusionButtonsLayout"
++                    android:layout_width="match_parent"
++                    android:layout_height="match_parent"
++                    android:orientation="vertical"
++                    android:paddingBottom="8dp">
++
++                    <Button
++                        android:id="@+id/EditOcclusionsButton"
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:text="@string/edit_occlusions" />
++
++                    <Button
++                        android:id="@+id/SelectImageForOcclusionButton"
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        android:text="@string/choose_an_image" />
++
++                    <Button
++                        android:id="@+id/PasteImageForOcclusionButton"
++                        android:layout_width="match_parent"
++                        android:layout_height="wrap_content"
++                        tools:text="Paste Image from Clipboard" />
++
++                </LinearLayout>
++
++                <androidx.appcompat.widget.AppCompatButton
+                         android:id="@+id/CardEditorTagButton"
+                         android:layout_width="match_parent"
+                         android:layout_height="wrap_content"
+diff --git a/AnkiDroid/src/main/res/values/02-strings.xml b/AnkiDroid/src/main/res/values/02-strings.xml
+index 4f46a6af24ed..9422588378c4 100644
+--- a/AnkiDroid/src/main/res/values/02-strings.xml
++++ b/AnkiDroid/src/main/res/values/02-strings.xml
+@@ -28,6 +28,8 @@
+     <string name="CardEditorModel">Type:</string>
+     <string name="CardEditorTags">Tags: %1$s</string>
+     <string name="CardEditorCards">Cards: %1$s</string>
++    <string name="edit_occlusions">Edit Occlusions</string>
++
+     <string name="tag_name">Tag name</string>
+     <string name="add_new_filter_tags">Add/filter tags</string>
+     <string name="add_tag">Add tag</string>

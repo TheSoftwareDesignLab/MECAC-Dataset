@@ -1,0 +1,238 @@
+diff --git a/focus-android/.gitignore b/focus-android/.gitignore
+index a88b01868ce7..d16c40c0737f 100644
+--- a/focus-android/.gitignore
++++ b/focus-android/.gitignore
+@@ -58,3 +58,6 @@ Screengrabfile
+ # Adjust token file
+ .adjust_token
+ 
++# Sentry token file
++.sentry_token
++
+diff --git a/focus-android/.taskcluster.yml b/focus-android/.taskcluster.yml
+index bf8cfd013f5d..b5074cbe161e 100644
+--- a/focus-android/.taskcluster.yml
++++ b/focus-android/.taskcluster.yml
+@@ -100,8 +100,8 @@ tasks:
+ #
+ # Triggered when a new tag or release is published (in any branch)
+ #
+-# - Build (unsigned) release versions of the app with release translations and
+-#   adjust token.
++# - Build (unsigned) release versions of the app with release translations,
++#   adjust token, and sentry token.
+ ###############################################################################
+   - provisionerId: '{{ taskcluster.docker.provisionerId }}'
+     workerType: '{{ taskcluster.docker.workerType }}'
+@@ -124,6 +124,7 @@ tasks:
+           && git config advice.detachedHead false
+           && git checkout {{ event.version }}
+           && python tools/taskcluster/get-adjust-token.py
++          && python tools/taskcluster/get-sentry-token.py
+           && python tools/l10n/filter-release-translations.py
+           && ./gradlew --no-daemon clean test assembleRelease
+       artifacts:
+diff --git a/focus-android/app/build.gradle b/focus-android/app/build.gradle
+index 95b5801789a7..9381f7e86a89 100644
+--- a/focus-android/app/build.gradle
++++ b/focus-android/app/build.gradle
+@@ -29,6 +29,10 @@ android {
+         preDexLibraries true
+     }
+ 
++    lintOptions {
++        lintConfig file("lint.xml")
++    }
++
+     // We have a three dimensional build configuration:
+     // BUILD TYPE (debug, beta, release) X PRODUCT FLAVOR (focus, klar) X ENGINE FLAVOR (webview, gecko)
+ 
+@@ -334,6 +338,7 @@ dependencies {
+     implementation "com.android.support:design:$support_libraries_version"
+     implementation "com.android.support:cardview-v7:$support_libraries_version"
+     implementation "com.android.support:recyclerview-v7:$support_libraries_version"
++    implementation 'io.sentry:sentry-android:1.7.3'
+ 
+     implementation "android.arch.lifecycle:extensions:$architecture_components_version"
+ 
+@@ -475,6 +480,22 @@ android.applicationVariants.all { variant ->
+     }
+ }
+ 
++// -------------------------------------------------------------------------------------------------
++// Sentry: Read token from locale file if it exists (Only release builds)
++// -------------------------------------------------------------------------------------------------
++
++android.applicationVariants.all {
++    print("Sentry token: ")
++    try {
++        def token = new File("${rootDir}/.sentry_token").text.trim()
++        buildConfigField 'String', 'SENTRY_TOKEN', '"' + token + '"'
++        println "(Added from .sentry_token file)"
++    } catch (java.io.FileNotFoundException e) {
++        buildConfigField 'String', 'SENTRY_TOKEN', 'null'
++        println("X_X")
++    }
++}
++
+ // -------------------------------------------------------------------------------------------------
+ // L10N: Generate list of locales
+ // Focus provides its own (Android independent) locale switcher. That switcher requires a list
+diff --git a/focus-android/app/lint.xml b/focus-android/app/lint.xml
+index 61f5a3294152..7abeea675c3d 100644
+--- a/focus-android/app/lint.xml
++++ b/focus-android/app/lint.xml
+@@ -20,4 +20,11 @@
+     <issue id="IconLauncherFormat">
+         <ignore path="**/res/mipmap-anydpi-v26/ic_launcher.xml" />
+     </issue>
++
++    <issue id="InvalidPackage">
++        <!-- Sentry: it uses one SDK for desktop apps and Android apps so I assume it's
++        calling functions from desktop apps and silently ignoring those calls when
++        the functions are not available on Android. -->
++        <ignore path="**/sentry*.jar" />
++    </issue>
+ </lint>
+diff --git a/focus-android/app/proguard-rules.pro b/focus-android/app/proguard-rules.pro
+index 7d0114da8c20..7042d9a98c20 100644
+--- a/focus-android/app/proguard-rules.pro
++++ b/focus-android/app/proguard-rules.pro
+@@ -1,5 +1,6 @@
+ 
+ # We do not want to obfuscate - It's just painful to debug without the right mapping file.
++# If we update this, we'll have to update our Sentry config to upload ProGuard mappings.
+ -dontobfuscate
+ 
+ 
+@@ -71,6 +72,23 @@
+     java.util.Locale get(int);
+ }
+ 
++####################################################################################################
++# Sentry
++####################################################################################################
++
++# Recommended config via https://docs.sentry.io/clients/java/modules/android/#manual-integration
++# Since we don't obfuscate, we don't need to use their Gradle plugin to upload ProGuard mappings.
++-keepattributes LineNumberTable,SourceFile
++-dontwarn org.slf4j.**
++-dontwarn javax.**
++
++# Our addition: this class is saved to disk via Serializable, which ProGuard doesn't like.
++# If we exclude this, upload silently fails (Sentry swallows a NPE so we don't crash).
++# I filed https://github.com/getsentry/sentry-java/issues/572
++#
++# If Sentry ever mysteriously stops working after we upgrade it, this could be why.
++-keep class io.sentry.event.Event { *; }
++
+ ####################################################################################################
+ # Android architecture components
+ ####################################################################################################
+diff --git a/focus-android/app/src/main/AndroidManifest.xml b/focus-android/app/src/main/AndroidManifest.xml
+index 213dee26bc86..235a04402240 100644
+--- a/focus-android/app/src/main/AndroidManifest.xml
++++ b/focus-android/app/src/main/AndroidManifest.xml
+@@ -8,6 +8,7 @@
+ 
+     <uses-permission android:name="android.permission.INTERNET" />
+     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
++    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" /> <!-- Used by sentry. -->
+     <uses-permission android:name="com.android.launcher.permission.INSTALL_SHORTCUT" />
+ 
+     <application
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.java b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.java
+index c0a91fee63f3..a692e5173e72 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.java
++++ b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.java
+@@ -24,6 +24,7 @@
+ import org.mozilla.focus.session.Session;
+ import org.mozilla.focus.session.SessionManager;
+ import org.mozilla.focus.session.ui.SessionsSheetFragment;
++import org.mozilla.focus.telemetry.SentryWrapper;
+ import org.mozilla.focus.telemetry.TelemetryWrapper;
+ import org.mozilla.focus.utils.Settings;
+ import org.mozilla.focus.utils.ViewUtils;
+@@ -53,6 +54,8 @@ public MainActivity() {
+     protected void onCreate(Bundle savedInstanceState) {
+         super.onCreate(savedInstanceState);
+ 
++        SentryWrapper.INSTANCE.init(this);
++
+         if (Settings.getInstance(this).shouldUseSecureMode()) {
+             getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+         }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/SentryWrapper.kt b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/SentryWrapper.kt
+new file mode 100644
+index 000000000000..4b01e7f68095
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/SentryWrapper.kt
+@@ -0,0 +1,39 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++package org.mozilla.focus.telemetry
++
++import android.content.Context
++import io.sentry.Sentry
++import io.sentry.android.AndroidSentryClientFactory
++import org.mozilla.focus.BuildConfig
++
++/**
++ * An interface to the Sentry crash reporting SDK. All code that touches the Sentry APIs
++ * directly should go in here (like TelemetryWrapper).
++ *
++ * With the current implementation, to enable Sentry on Beta/Release builds, add a
++ * <project-dir>/.sentry_dsn_release file with your key. To enable Sentry on Debug
++ * builds, add a .sentry_dsn_debug key and replace the [DataUploadPreference.isEnabled]
++ * value with true (upload is disabled by default in dev builds).
++ */
++object SentryWrapper {
++
++    fun init(context: Context) {
++        onIsEnabledChanged(context, TelemetryWrapper.isTelemetryEnabled(context))
++    }
++
++    internal fun onIsEnabledChanged(context: Context, isEnabled: Boolean) {
++        // The BuildConfig value is populated from a file at compile time.
++        // If the file did not exist, the value will be null.
++        //
++        // If you provide a null DSN to Sentry, it will disable upload and buffering to disk:
++        // https://github.com/getsentry/sentry-java/issues/574#issuecomment-378298484
++        //
++        // In the current implementation, each time `init` is called, it will overwrite the
++        // stored client and DSN, thus calling it with a null DSN will have the affect of
++        // disabling the client: https://github.com/getsentry/sentry-java/issues/574#issuecomment-378406105
++        val sentryDsn = if (isEnabled) BuildConfig.SENTRY_TOKEN else null
++        Sentry.init(sentryDsn, AndroidSentryClientFactory(context.applicationContext))
++    }
++}
+diff --git a/focus-android/tools/taskcluster/get-sentry-token.py b/focus-android/tools/taskcluster/get-sentry-token.py
+new file mode 100644
+index 000000000000..c2c7cde27ada
+--- /dev/null
++++ b/focus-android/tools/taskcluster/get-sentry-token.py
+@@ -0,0 +1,22 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++"""
++This script talks to the taskcluster secrets service to obtain the
++Sentry token and write it to the .sentry_token file in the root
++directory.
++"""
++
++import os
++import taskcluster
++
++# Get JSON data from taskcluster secrets service
++secrets = taskcluster.Secrets({'baseUrl': 'http://taskcluster/secrets/v1'})
++data = secrets.get('project/focus/tokens')
++
++token_file_path = os.path.join(os.path.dirname(__file__), '../../.sentry_token')
++with open(token_file_path, 'w') as token_file:
++    token_file.write(data['secret']['sentryToken'])
++
++print("Imported sentry token from secrets service")
+\ No newline at end of file

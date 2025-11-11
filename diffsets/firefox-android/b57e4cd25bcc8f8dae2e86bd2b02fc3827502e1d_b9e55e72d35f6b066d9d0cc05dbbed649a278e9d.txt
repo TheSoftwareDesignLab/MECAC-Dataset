@@ -1,0 +1,237 @@
+diff --git a/focus-android/app/src/gecko/java/org/mozilla/focus/web/WebViewProvider.java b/focus-android/app/src/gecko/java/org/mozilla/focus/web/WebViewProvider.java
+index 6dafbd33295c..c463ca8fc185 100644
+--- a/focus-android/app/src/gecko/java/org/mozilla/focus/web/WebViewProvider.java
++++ b/focus-android/app/src/gecko/java/org/mozilla/focus/web/WebViewProvider.java
+@@ -16,18 +16,25 @@
+ import android.util.Log;
+ import android.view.View;
+ 
++import org.json.JSONException;
++import org.json.JSONObject;
+ import org.mozilla.focus.browser.LocalizedContent;
+ import org.mozilla.focus.session.Session;
++import org.mozilla.focus.telemetry.TelemetryWrapper;
+ import org.mozilla.focus.utils.AppConstants;
+ import org.mozilla.focus.utils.IntentUtils;
+ import org.mozilla.focus.utils.Settings;
+ import org.mozilla.focus.utils.UrlUtils;
++import org.mozilla.gecko.util.GeckoBundle;
++import org.mozilla.gecko.util.ThreadUtils;
+ import org.mozilla.geckoview.GeckoResponse;
+ import org.mozilla.geckoview.GeckoRuntime;
+ import org.mozilla.geckoview.GeckoRuntimeSettings;
+ import org.mozilla.geckoview.GeckoSession;
+ import org.mozilla.geckoview.GeckoSessionSettings;
+ 
++import java.util.concurrent.CountDownLatch;
++
+ import kotlin.text.Charsets;
+ 
+ /**
+@@ -482,6 +489,31 @@ public void loadData(String baseURL, String data, String mimeType, String encodi
+             geckoSession.loadData(data.getBytes(Charsets.UTF_8), mimeType, baseURL);
+         }
+ 
++        @Override
++        public void uploadData(final CountDownLatch latch) {
++            ThreadUtils.postToBackgroundThread(new Runnable() {
++                @Override
++                public void run() {
++                    final GeckoResponse<GeckoBundle> response = new GeckoResponse<GeckoBundle>() {
++                        @Override
++                        public void respond(GeckoBundle value) {
++                            if (value != null) {
++                                try {
++                                    final JSONObject jsonData = value.toJSONObject();
++                                    TelemetryWrapper.addMobileMetricsPing(jsonData);
++                                } catch (JSONException e) {
++                                    e.printStackTrace();
++                                }
++                            }
++                            latch.countDown();
++                        }
++                    };
++
++                    geckoRuntime.getTelemetry().getSnapshots(true, response);
++                }
++            });
++        }
++
+         @Override
+         public void onDetachedFromWindow() {
+             PreferenceManager.getDefaultSharedPreferences(getContext()).unregisterOnSharedPreferenceChangeListener(this);
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/fragment/WebFragment.java b/focus-android/app/src/main/java/org/mozilla/focus/fragment/WebFragment.java
+index dfca142c9de7..1253c3a0b0fb 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/fragment/WebFragment.java
++++ b/focus-android/app/src/main/java/org/mozilla/focus/fragment/WebFragment.java
+@@ -9,9 +9,11 @@
+ import android.content.res.Configuration;
+ import android.content.res.Resources;
+ import android.os.Bundle;
++import android.preference.PreferenceManager;
+ import android.support.annotation.NonNull;
+ import android.support.annotation.Nullable;
+ import android.text.TextUtils;
++import android.util.Log;
+ import android.view.LayoutInflater;
+ import android.view.View;
+ import android.view.ViewGroup;
+@@ -21,9 +23,12 @@
+ import org.mozilla.focus.locale.LocaleAwareFragment;
+ import org.mozilla.focus.locale.LocaleManager;
+ import org.mozilla.focus.session.Session;
++import org.mozilla.focus.utils.AppConstants;
+ import org.mozilla.focus.web.IWebView;
+ 
++import java.util.Date;
+ import java.util.Locale;
++import java.util.concurrent.CountDownLatch;
+ 
+ /**
+  * Base implementation for fragments that use an IWebView instance. Based on Android's WebViewFragment.
+@@ -107,11 +112,29 @@ public void onPause() {
+             webView.saveWebViewState(session);
+         }
+ 
++        if (AppConstants.isGeckoBuild() && midnightCrossed()) {
++            // Record new edited date
++            PreferenceManager.getDefaultSharedPreferences(getContext()).edit().putLong("lastPing", System.currentTimeMillis()).apply();
++            final CountDownLatch latch = new CountDownLatch(1);
++            webView.uploadData(latch);
++        }
++
+         webView.onPause();
+ 
+         super.onPause();
+     }
+ 
++
++    private boolean midnightCrossed() {
++        // Get last time that we uploaded data
++        final long lastPing = PreferenceManager.getDefaultSharedPreferences(getContext()).getLong("lastPing", 0);
++        final Date lastDate = new Date(lastPing);
++        // Get Current time
++        final Date currentDate = new Date();
++        // Make sure currentDate is after lastDate
++        return currentDate.after(lastDate);
++    }
++
+     @Override
+     public void onResume() {
+         webView.onResume();
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
+index 203b2bad1acd..4f6956a64e54 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
+@@ -19,6 +19,7 @@ import org.mozilla.focus.R
+ import org.mozilla.focus.session.SessionManager
+ import org.mozilla.focus.utils.AppConstants
+ import mozilla.components.ui.autocomplete.InlineAutocompleteEditText.AutocompleteResult
++import org.json.JSONObject
+ import org.mozilla.focus.Components
+ import org.mozilla.focus.search.CustomSearchEngineStore
+ import org.mozilla.focus.utils.Settings
+@@ -31,6 +32,7 @@ import org.mozilla.telemetry.measurement.SearchesMeasurement
+ import org.mozilla.telemetry.net.HttpURLConnectionTelemetryClient
+ import org.mozilla.telemetry.ping.TelemetryCorePingBuilder
+ import org.mozilla.telemetry.ping.TelemetryEventPingBuilder
++import org.mozilla.telemetry.ping.TelemetryMobileMetricsPingBuilder
+ import org.mozilla.telemetry.schedule.jobscheduler.JobSchedulerTelemetryScheduler
+ import org.mozilla.telemetry.serialize.JSONPingSerializer
+ import org.mozilla.telemetry.storage.FileTelemetryStorage
+@@ -291,6 +293,14 @@ object TelemetryWrapper {
+         averageTime = 0.0
+     }
+ 
++    private var shouldSendMobileMetrics: Boolean = false
++
++    @JvmStatic
++    fun addMobileMetricsPing(mobileMetrics: JSONObject) {
++        TelemetryHolder.get().addPingBuilder(TelemetryMobileMetricsPingBuilder(mobileMetrics, TelemetryHolder.get().configuration))
++        shouldSendMobileMetrics = true
++    }
++
+     @JvmStatic
+     fun stopSession() {
+         TelemetryHolder.get().recordSessionEnd()
+@@ -306,10 +316,18 @@ object TelemetryWrapper {
+ 
+     @JvmStatic
+     fun stopMainActivity() {
+-        TelemetryHolder.get()
+-                .queuePing(TelemetryCorePingBuilder.TYPE)
+-                .queuePing(TelemetryEventPingBuilder.TYPE)
+-                .scheduleUpload()
++        if (shouldSendMobileMetrics) {
++            TelemetryHolder.get()
++                    .queuePing(TelemetryCorePingBuilder.TYPE)
++                    .queuePing(TelemetryEventPingBuilder.TYPE)
++                    .queuePing(TelemetryMobileMetricsPingBuilder.TYPE)
++                    .scheduleUpload()
++        } else {
++            TelemetryHolder.get()
++                    .queuePing(TelemetryCorePingBuilder.TYPE)
++                    .queuePing(TelemetryEventPingBuilder.TYPE)
++                    .scheduleUpload()
++        }
+     }
+ 
+     @JvmStatic
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/web/IWebView.java b/focus-android/app/src/main/java/org/mozilla/focus/web/IWebView.java
+index 27291ebe42c9..c18a5022d0aa 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/web/IWebView.java
++++ b/focus-android/app/src/main/java/org/mozilla/focus/web/IWebView.java
+@@ -11,6 +11,8 @@
+ 
+ import org.mozilla.focus.session.Session;
+ 
++import java.util.concurrent.CountDownLatch;
++
+ public interface IWebView {
+     class HitTarget {
+         public final boolean isLink;
+@@ -140,6 +142,7 @@ interface HttpAuthCallback {
+ 
+     void loadData(String baseURL, String data, String mimeType, String encoding, String historyURL);
+ 
++    void uploadData(CountDownLatch latch);
+     /**
+      * Get the title of the currently displayed website.
+      */
+diff --git a/focus-android/app/src/webview/java/org/mozilla/focus/webview/SystemWebView.java b/focus-android/app/src/webview/java/org/mozilla/focus/webview/SystemWebView.java
+index e2a55276d561..b0551897ee95 100644
+--- a/focus-android/app/src/webview/java/org/mozilla/focus/webview/SystemWebView.java
++++ b/focus-android/app/src/webview/java/org/mozilla/focus/webview/SystemWebView.java
+@@ -43,6 +43,7 @@
+ 
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.concurrent.CountDownLatch;
+ 
+ import mozilla.components.support.utils.ThreadUtils;
+ 
+@@ -229,6 +230,11 @@ public void loadData(String baseURL, String data, String mimeType, String encodi
+         loadDataWithBaseURL(baseURL, data, mimeType, encoding, historyURL);
+     }
+ 
++    @Override
++    public void uploadData(CountDownLatch latch) {
++        // Do nothing, for GeckoView
++    }
++
+     @Override
+     public void destroy() {
+         super.destroy();
+diff --git a/focus-android/build.gradle b/focus-android/build.gradle
+index 54b460804f6b..61c398fc74ad 100644
+--- a/focus-android/build.gradle
++++ b/focus-android/build.gradle
+@@ -9,7 +9,7 @@ buildscript {
+     ext.geckoview_revision = '0344af5522398276a98629b66df90cca6f395245'
+     ext.geckoview_nightly_version = '62.0.20180613100557'
+     ext.spotbugs_version = '3.1.2'
+-    ext.mozilla_components_version = '0.5.1'
++    ext.mozilla_components_version = '0.8'
+ 
+     repositories {
+         google()

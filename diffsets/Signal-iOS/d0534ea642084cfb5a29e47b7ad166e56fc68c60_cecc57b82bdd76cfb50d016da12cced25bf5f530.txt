@@ -1,0 +1,772 @@
+diff --git a/Scripts/sds_codegen/sds_config/sds-property_order.json b/Scripts/sds_codegen/sds_config/sds-property_order.json
+index 2fa875c9b1d..1a72fe6d1c7 100644
+--- a/Scripts/sds_codegen/sds_config/sds-property_order.json
++++ b/Scripts/sds_codegen/sds_config/sds-property_order.json
+@@ -174,6 +174,8 @@
+     "ThreadRecord.isArchived": 3, 
+     "ThreadRecord.isMarkedUnread": 12, 
+     "ThreadRecord.lastInteractionRowId": 4, 
++    "ThreadRecord.lastVisibleSortId": 14, 
++    "ThreadRecord.lastVisibleSortIdOnScreenPercentage": 13, 
+     "ThreadRecord.messageDraft": 5, 
+     "ThreadRecord.mutedUntilDate": 6, 
+     "ThreadRecord.shouldThreadBeVisible": 7, 
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationViewController.m b/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
+index 40e40bc4cd8..fd1705dcb04 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
++++ b/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
+@@ -224,6 +224,12 @@ - (instancetype)initWithThreadViewModel:(ThreadViewModel *)threadViewModel
+ {
+     self = [super init];
+ 
++    // If we're not scrolling to a specific message AND we don't have
++    // any unread messages, try and focus on the last visible interaction
++    if (focusMessageId == nil && !threadViewModel.hasUnreadMessages) {
++        focusMessageId = threadViewModel.lastVisibleInteraction.uniqueId;
++    }
++
+     _contactsViewHelper = [[ContactsViewHelper alloc] initWithDelegate:self];
+     _contactShareViewHelper = [[ContactShareViewHelper alloc] initWithContactsManager:self.contactsManager];
+     _contactShareViewHelper.delegate = self;
+@@ -742,6 +748,7 @@ - (void)applicationWillResignActive:(NSNotification *)notification
+     [self.cellMediaCache removeAllObjects];
+     [self cancelReadTimer];
+     [self dismissPresentedViewControllerIfNecessary];
++    [self saveLastVisibleSortId];
+ 
+     [self dismissKeyBoard];
+ }
+@@ -841,6 +848,10 @@ - (void)scrollToDefaultPosition:(BOOL)isAnimated
+         return;
+     }
+ 
++    BOOL isScrollingToLastVisibleInteraction =
++        [NSObject isNullableObject:self.conversationViewModel.focusMessageIdOnOpen
++                           equalTo:self.threadViewModel.lastVisibleInteraction.uniqueId];
++
+     NSIndexPath *_Nullable indexPath = [self indexPathOfFocusMessage];
+ 
+     if (!indexPath) {
+@@ -850,6 +861,8 @@ - (void)scrollToDefaultPosition:(BOOL)isAnimated
+     if (indexPath) {
+         if (indexPath.section == 0 && indexPath.row == 0) {
+             [self.collectionView setContentOffset:CGPointZero animated:isAnimated];
++        } else if (isScrollingToLastVisibleInteraction) {
++            [self scrollToLastVisibleInteractionAnimated:isAnimated];
+         } else {
+             [self.collectionView scrollToItemAtIndexPath:indexPath
+                                         atScrollPosition:UICollectionViewScrollPositionTop
+@@ -860,22 +873,38 @@ - (void)scrollToDefaultPosition:(BOOL)isAnimated
+     }
+ }
+ 
+-- (void)scrollToUnreadIndicatorAnimated
++- (void)scrollToLastVisibleInteractionAnimated:(BOOL)isAnimated
+ {
+     if (self.isUserScrolling) {
+         return;
+     }
+ 
+-    NSIndexPath *_Nullable indexPath = [self indexPathOfUnreadMessagesIndicator];
+-    if (indexPath) {
+-        if (indexPath.section == 0 && indexPath.row == 0) {
+-            [self.collectionView setContentOffset:CGPointZero animated:YES];
+-        } else {
+-            [self.collectionView scrollToItemAtIndexPath:indexPath
+-                                        atScrollPosition:UICollectionViewScrollPositionTop
+-                                                animated:YES];
+-        }
++    TSInteraction *_Nullable interaction = self.threadViewModel.lastVisibleInteraction;
++    NSIndexPath *_Nullable indexPath = [self.conversationViewModel indexPathForInteractionId:interaction.uniqueId];
++    if (interaction == nil || indexPath == nil) {
++        OWSFailDebug(@"Unexpectedly missing last visible interaction");
++        [self scrollToBottomAnimated:isAnimated];
++        return;
+     }
++
++    [self.view layoutIfNeeded];
++
++    // Restore positioning.
++    UICollectionViewLayoutAttributes *attributes = [self.layout layoutAttributesForItemAtIndexPath:indexPath];
++    CGRect adjustedFrame = attributes.frame;
++
++    // Adjust the view's frame to compensate for the previous on screen percentage.
++    adjustedFrame.origin.y += attributes.frame.size.height * self.thread.lastVisibleSortIdOnScreenPercentage;
++
++    CGFloat bottomInset = -self.collectionView.adjustedContentInset.bottom;
++    CGFloat topInset = -self.collectionView.adjustedContentInset.top;
++    CGFloat collectionViewUnobscuredHeight = self.collectionView.height + bottomInset;
++
++    CGFloat dstY = self.safeContentHeight < self.collectionView.height
++        ? topInset
++        : adjustedFrame.origin.y - collectionViewUnobscuredHeight;
++
++    [self.collectionView setContentOffset:CGPointMake(0, dstY) animated:isAnimated];
+ }
+ 
+ - (void)resetContentAndLayoutWithSneakyTransaction
+@@ -3546,7 +3575,14 @@ - (nullable NSIndexPath *)lastVisibleIndexPath
+     NSIndexPath *_Nullable lastVisibleIndexPath = nil;
+     for (NSIndexPath *indexPath in [self.collectionView indexPathsForVisibleItems]) {
+         if (!lastVisibleIndexPath || indexPath.row > lastVisibleIndexPath.row) {
+-            lastVisibleIndexPath = indexPath;
++            UICollectionViewLayoutAttributes *layoutAttributes =
++                [self.layout layoutAttributesForItemAtIndexPath:indexPath];
++
++            // Don't consider an index path visible if its origin is behind the bottom bar
++            CGPoint origin = [self.view convertPoint:layoutAttributes.frame.origin fromView:self.collectionView];
++            if (self.collectionView.height - origin.y > self.collectionView.adjustedContentInset.bottom) {
++                lastVisibleIndexPath = indexPath;
++            }
+         }
+     }
+     if (lastVisibleIndexPath && lastVisibleIndexPath.row >= (NSInteger)self.viewItems.count) {
+@@ -3580,6 +3616,52 @@ - (uint64_t)lastVisibleSortId
+     return lastVisibleIndexPath ? [self mostRecentSortIdForItemAtIndex:lastVisibleIndexPath.row] : 0;
+ }
+ 
++- (void)saveLastVisibleSortId
++{
++    OWSAssertIsOnMainThread();
++
++    NSInteger lastVisibleRow = self.lastVisibleIndexPath.row;
++
++    // Find the first non-dynamic index path that's visible, since dynamic index paths
++    // can't have their scroll position saved.
++    TSInteraction *_Nullable interaction = [self viewItemForIndex:lastVisibleRow].interaction;
++    while (interaction.isDynamicInteraction && lastVisibleRow > 0) {
++        lastVisibleRow -= 1;
++        interaction = [self viewItemForIndex:lastVisibleRow].interaction;
++    }
++
++    uint64_t lastVisibleSortId = 0;
++    double onScreenPercentage = 0;
++
++    // If we found a non-dynamic interaction, save its sortId. Otherwise, save
++    // a sortId of zero to "clear" the lastVisibleSortId on the thread.
++    if (interaction != nil) {
++        lastVisibleSortId = interaction.sortId;
++
++        // Calculate how much of the view is on screen so we can restore the scroll position precisely
++        UICollectionViewLayoutAttributes *attributes =
++            [self.layout layoutAttributesForItemAtIndexPath:[NSIndexPath indexPathForRow:lastVisibleRow inSection:0]];
++
++        CGPoint origin = [self.view convertPoint:attributes.frame.origin fromView:self.collectionView];
++
++        CGFloat heightAboveBottom
++            = self.collectionView.height - origin.y - self.collectionView.adjustedContentInset.bottom;
++        onScreenPercentage = CGFloatClamp01(heightAboveBottom / attributes.frame.size.height);
++    }
++
++    // Skip the transaction if nothing has changed.
++    if (self.thread.lastVisibleSortId == lastVisibleSortId
++        && fabs(self.thread.lastVisibleSortIdOnScreenPercentage - onScreenPercentage) <= DBL_EPSILON) {
++        return;
++    }
++
++    DatabaseStorageAsyncWrite(self.databaseStorage, ^(SDSAnyWriteTransaction *transaction) {
++        [self.thread updateWithLastVisibileSortId:lastVisibleSortId
++                               onScreenPercentage:onScreenPercentage
++                                      transaction:transaction];
++    });
++}
++
+ - (uint64_t)lastSortId
+ {
+     NSInteger lastItemIndex = (NSInteger)self.viewItems.count - 1;
+@@ -4045,6 +4127,7 @@ - (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL
+         self.isWaitingForDeceleration = willDecelerate;
+     } else {
+         [self scheduleAutoLoadMore];
++        [self saveLastVisibleSortId];
+     }
+ }
+ 
+@@ -4057,6 +4140,7 @@ - (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView
+     self.isWaitingForDeceleration = NO;
+ 
+     [self scheduleAutoLoadMore];
++    [self saveLastVisibleSortId];
+ }
+ 
+ #pragma mark - ConversationSettingsViewDelegate
+@@ -5177,17 +5261,10 @@ - (void)viewWillTransitionToSize:(CGSize)size
+     [self dismissMessageActionsAnimated:NO];
+     [self dismissReactionsDetailSheetAnimated:NO];
+ 
+-    // Snapshot the "last visible row".
+-    NSIndexPath *_Nullable lastVisibleIndexPath = self.lastVisibleIndexPath;
+-
+     __weak ConversationViewController *weakSelf = self;
+     [coordinator
+         animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext> context) {
+-            if (lastVisibleIndexPath) {
+-                [self.collectionView scrollToItemAtIndexPath:lastVisibleIndexPath
+-                                            atScrollPosition:UICollectionViewScrollPositionBottom
+-                                                    animated:NO];
+-            }
++            [self scrollToLastVisibleInteractionAnimated:NO];
+         }
+         completion:^(id<UIViewControllerTransitionCoordinatorContext> context) {
+             ConversationViewController *strongSelf = weakSelf;
+@@ -5201,11 +5278,7 @@ - (void)viewWillTransitionToSize:(CGSize)size
+ 
+             [strongSelf updateInputToolbarLayout];
+ 
+-            if (lastVisibleIndexPath) {
+-                [strongSelf.collectionView scrollToItemAtIndexPath:lastVisibleIndexPath
+-                                                  atScrollPosition:UICollectionViewScrollPositionBottom
+-                                                          animated:NO];
+-            }
++            [self scrollToLastVisibleInteractionAnimated:NO];
+         }];
+ }
+ 
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationViewModel.h b/Signal/src/ViewControllers/ConversationView/ConversationViewModel.h
+index 0d7612b467b..92a2ebb2f4a 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationViewModel.h
++++ b/Signal/src/ViewControllers/ConversationView/ConversationViewModel.h
+@@ -112,6 +112,7 @@ typedef NS_ENUM(NSUInteger, ConversationUpdateItemType) {
+ - (void)clearUnreadMessagesIndicator;
+ 
+ - (nullable NSIndexPath *)indexPathForViewItem:(id<ConversationViewItem>)viewItem;
++- (nullable NSIndexPath *)indexPathForInteractionId:(NSString *)interactionId;
+ 
+ - (void)viewDidResetContentAndLayoutWithTransaction:(SDSAnyReadTransaction *)transaction;
+ 
+diff --git a/SignalMessaging/ViewModels/ThreadViewModel.swift b/SignalMessaging/ViewModels/ThreadViewModel.swift
+index 805fa9186e1..f9b187c240f 100644
+--- a/SignalMessaging/ViewModels/ThreadViewModel.swift
++++ b/SignalMessaging/ViewModels/ThreadViewModel.swift
+@@ -25,6 +25,8 @@ public class ThreadViewModel: NSObject {
+     @objc public let lastMessageText: String?
+     @objc public let lastMessageForInbox: TSInteraction?
+ 
++    @objc public let lastVisibleInteraction: TSInteraction?
++
+     @objc
+     public init(thread: TSThread, transaction: SDSAnyReadTransaction) {
+         self.threadRecord = thread
+@@ -62,6 +64,8 @@ public class ThreadViewModel: NSObject {
+         }
+ 
+         self.draftText = thread.currentDraft(with: transaction)
++
++        self.lastVisibleInteraction = thread.firstInteraction(atOrBeforeSortId: thread.lastVisibleSortId, transaction: transaction)
+     }
+ 
+     @objc
+diff --git a/SignalServiceKit/Resources/schema.sql b/SignalServiceKit/Resources/schema.sql
+index 61e358d5968..f792a7316dd 100644
+--- a/SignalServiceKit/Resources/schema.sql
++++ b/SignalServiceKit/Resources/schema.sql
+@@ -30,6 +30,8 @@ CREATE
+             ,"groupModel" BLOB
+             ,"hasDismissedOffers" INTEGER
+             ,"isMarkedUnread" BOOLEAN NOT NULL DEFAULT 0
++            ,"lastVisibleSortIdOnScreenPercentage" DOUBLE NOT NULL DEFAULT 0
++            ,"lastVisibleSortId" INTEGER NOT NULL DEFAULT 0
+         )
+ ;
+ 
+diff --git a/SignalServiceKit/src/Contacts/TSThread+SDS.swift b/SignalServiceKit/src/Contacts/TSThread+SDS.swift
+index 5f18740c2fc..f03c53e1a3d 100644
+--- a/SignalServiceKit/src/Contacts/TSThread+SDS.swift
++++ b/SignalServiceKit/src/Contacts/TSThread+SDS.swift
+@@ -40,6 +40,8 @@ public struct ThreadRecord: SDSRecord {
+     public let groupModel: Data?
+     public let hasDismissedOffers: Bool?
+     public let isMarkedUnread: Bool
++    public let lastVisibleSortIdOnScreenPercentage: Double
++    public let lastVisibleSortId: UInt64
+ 
+     public enum CodingKeys: String, CodingKey, ColumnExpression, CaseIterable {
+         case id
+@@ -57,6 +59,8 @@ public struct ThreadRecord: SDSRecord {
+         case groupModel
+         case hasDismissedOffers
+         case isMarkedUnread
++        case lastVisibleSortIdOnScreenPercentage
++        case lastVisibleSortId
+     }
+ 
+     public static func columnName(_ column: ThreadRecord.CodingKeys, fullyQualified: Bool = false) -> String {
+@@ -95,6 +99,8 @@ public extension ThreadRecord {
+         groupModel = row[12]
+         hasDismissedOffers = row[13]
+         isMarkedUnread = row[14]
++        lastVisibleSortIdOnScreenPercentage = row[15]
++        lastVisibleSortId = row[16]
+     }
+ }
+ 
+@@ -132,6 +138,8 @@ extension TSThread {
+             let isArchived: Bool = record.isArchived
+             let isMarkedUnread: Bool = record.isMarkedUnread
+             let lastInteractionRowId: Int64 = record.lastInteractionRowId
++            let lastVisibleSortId: UInt64 = record.lastVisibleSortId
++            let lastVisibleSortIdOnScreenPercentage: Double = record.lastVisibleSortIdOnScreenPercentage
+             let messageDraft: String? = record.messageDraft
+             let mutedUntilDateInterval: Double? = record.mutedUntilDate
+             let mutedUntilDate: Date? = SDSDeserialization.optionalDoubleAsDate(mutedUntilDateInterval, name: "mutedUntilDate")
+@@ -147,6 +155,8 @@ extension TSThread {
+                                    isArchived: isArchived,
+                                    isMarkedUnread: isMarkedUnread,
+                                    lastInteractionRowId: lastInteractionRowId,
++                                   lastVisibleSortId: lastVisibleSortId,
++                                   lastVisibleSortIdOnScreenPercentage: lastVisibleSortIdOnScreenPercentage,
+                                    messageDraft: messageDraft,
+                                    mutedUntilDate: mutedUntilDate,
+                                    shouldThreadBeVisible: shouldThreadBeVisible,
+@@ -163,6 +173,8 @@ extension TSThread {
+             let isArchived: Bool = record.isArchived
+             let isMarkedUnread: Bool = record.isMarkedUnread
+             let lastInteractionRowId: Int64 = record.lastInteractionRowId
++            let lastVisibleSortId: UInt64 = record.lastVisibleSortId
++            let lastVisibleSortIdOnScreenPercentage: Double = record.lastVisibleSortIdOnScreenPercentage
+             let messageDraft: String? = record.messageDraft
+             let mutedUntilDateInterval: Double? = record.mutedUntilDate
+             let mutedUntilDate: Date? = SDSDeserialization.optionalDoubleAsDate(mutedUntilDateInterval, name: "mutedUntilDate")
+@@ -177,6 +189,8 @@ extension TSThread {
+                                  isArchived: isArchived,
+                                  isMarkedUnread: isMarkedUnread,
+                                  lastInteractionRowId: lastInteractionRowId,
++                                 lastVisibleSortId: lastVisibleSortId,
++                                 lastVisibleSortIdOnScreenPercentage: lastVisibleSortIdOnScreenPercentage,
+                                  messageDraft: messageDraft,
+                                  mutedUntilDate: mutedUntilDate,
+                                  shouldThreadBeVisible: shouldThreadBeVisible,
+@@ -191,6 +205,8 @@ extension TSThread {
+             let isArchived: Bool = record.isArchived
+             let isMarkedUnread: Bool = record.isMarkedUnread
+             let lastInteractionRowId: Int64 = record.lastInteractionRowId
++            let lastVisibleSortId: UInt64 = record.lastVisibleSortId
++            let lastVisibleSortIdOnScreenPercentage: Double = record.lastVisibleSortIdOnScreenPercentage
+             let messageDraft: String? = record.messageDraft
+             let mutedUntilDateInterval: Double? = record.mutedUntilDate
+             let mutedUntilDate: Date? = SDSDeserialization.optionalDoubleAsDate(mutedUntilDateInterval, name: "mutedUntilDate")
+@@ -203,6 +219,8 @@ extension TSThread {
+                             isArchived: isArchived,
+                             isMarkedUnread: isMarkedUnread,
+                             lastInteractionRowId: lastInteractionRowId,
++                            lastVisibleSortId: lastVisibleSortId,
++                            lastVisibleSortIdOnScreenPercentage: lastVisibleSortIdOnScreenPercentage,
+                             messageDraft: messageDraft,
+                             mutedUntilDate: mutedUntilDate,
+                             shouldThreadBeVisible: shouldThreadBeVisible)
+@@ -366,6 +384,8 @@ extension TSThreadSerializer {
+     static let groupModelColumn = SDSColumnMetadata(columnName: "groupModel", columnType: .blob, isOptional: true)
+     static let hasDismissedOffersColumn = SDSColumnMetadata(columnName: "hasDismissedOffers", columnType: .int, isOptional: true)
+     static let isMarkedUnreadColumn = SDSColumnMetadata(columnName: "isMarkedUnread", columnType: .int)
++    static let lastVisibleSortIdOnScreenPercentageColumn = SDSColumnMetadata(columnName: "lastVisibleSortIdOnScreenPercentage", columnType: .double)
++    static let lastVisibleSortIdColumn = SDSColumnMetadata(columnName: "lastVisibleSortId", columnType: .int64)
+ 
+     // TODO: We should decide on a naming convention for
+     //       tables that store models.
+@@ -386,7 +406,9 @@ extension TSThreadSerializer {
+         contactUUIDColumn,
+         groupModelColumn,
+         hasDismissedOffersColumn,
+-        isMarkedUnreadColumn
++        isMarkedUnreadColumn,
++        lastVisibleSortIdOnScreenPercentageColumn,
++        lastVisibleSortIdColumn
+         ])
+ }
+ 
+@@ -828,8 +850,10 @@ class TSThreadSerializer: SDSSerializer {
+         let groupModel: Data? = nil
+         let hasDismissedOffers: Bool? = nil
+         let isMarkedUnread: Bool = model.isMarkedUnread
++        let lastVisibleSortIdOnScreenPercentage: Double = model.lastVisibleSortIdOnScreenPercentage
++        let lastVisibleSortId: UInt64 = model.lastVisibleSortId
+ 
+-        return ThreadRecord(delegate: model, id: id, recordType: recordType, uniqueId: uniqueId, conversationColorName: conversationColorName, creationDate: creationDate, isArchived: isArchived, lastInteractionRowId: lastInteractionRowId, messageDraft: messageDraft, mutedUntilDate: mutedUntilDate, shouldThreadBeVisible: shouldThreadBeVisible, contactPhoneNumber: contactPhoneNumber, contactUUID: contactUUID, groupModel: groupModel, hasDismissedOffers: hasDismissedOffers, isMarkedUnread: isMarkedUnread)
++        return ThreadRecord(delegate: model, id: id, recordType: recordType, uniqueId: uniqueId, conversationColorName: conversationColorName, creationDate: creationDate, isArchived: isArchived, lastInteractionRowId: lastInteractionRowId, messageDraft: messageDraft, mutedUntilDate: mutedUntilDate, shouldThreadBeVisible: shouldThreadBeVisible, contactPhoneNumber: contactPhoneNumber, contactUUID: contactUUID, groupModel: groupModel, hasDismissedOffers: hasDismissedOffers, isMarkedUnread: isMarkedUnread, lastVisibleSortIdOnScreenPercentage: lastVisibleSortIdOnScreenPercentage, lastVisibleSortId: lastVisibleSortId)
+     }
+ }
+ 
+diff --git a/SignalServiceKit/src/Contacts/TSThread.h b/SignalServiceKit/src/Contacts/TSThread.h
+index da592bf96b6..d63fbd93353 100644
+--- a/SignalServiceKit/src/Contacts/TSThread.h
++++ b/SignalServiceKit/src/Contacts/TSThread.h
+@@ -44,6 +44,18 @@ extern ConversationColorName const ConversationColorNameDefault;
+ @property (nonatomic, readonly) BOOL isArchived;
+ @property (nonatomic, readonly) BOOL isMarkedUnread;
+ 
++// This maintains the row Id that was at the bottom of the conversation
++// the last time the user viewed this thread so we can restore their
++// scroll position.
++//
++// If the referenced message is deleted, this value is
++// updated to point to the previous message in the conversation.
++//
++// If a new message is inserted into the conversation, this value
++// is cleared. We only restore this state if there are no unread messages.
++@property (nonatomic, readonly) uint64_t lastVisibleSortId;
++@property (nonatomic, readonly) double lastVisibleSortIdOnScreenPercentage;
++
+ // zero if thread has never had an interaction.
+ // The corresponding interaction may have been deleted.
+ @property (nonatomic, readonly) int64_t lastInteractionRowId;
+@@ -66,10 +78,12 @@ extern ConversationColorName const ConversationColorNameDefault;
+                       isArchived:(BOOL)isArchived
+                   isMarkedUnread:(BOOL)isMarkedUnread
+             lastInteractionRowId:(int64_t)lastInteractionRowId
++               lastVisibleSortId:(uint64_t)lastVisibleSortId
++lastVisibleSortIdOnScreenPercentage:(double)lastVisibleSortIdOnScreenPercentage
+                     messageDraft:(nullable NSString *)messageDraft
+                   mutedUntilDate:(nullable NSDate *)mutedUntilDate
+            shouldThreadBeVisible:(BOOL)shouldThreadBeVisible
+-NS_DESIGNATED_INITIALIZER NS_SWIFT_NAME(init(grdbId:uniqueId:conversationColorName:creationDate:isArchived:isMarkedUnread:lastInteractionRowId:messageDraft:mutedUntilDate:shouldThreadBeVisible:));
++NS_DESIGNATED_INITIALIZER NS_SWIFT_NAME(init(grdbId:uniqueId:conversationColorName:creationDate:isArchived:isMarkedUnread:lastInteractionRowId:lastVisibleSortId:lastVisibleSortIdOnScreenPercentage:messageDraft:mutedUntilDate:shouldThreadBeVisible:));
+ 
+ // clang-format on
+ 
+@@ -128,6 +142,10 @@ NS_DESIGNATED_INITIALIZER NS_SWIFT_NAME(init(grdbId:uniqueId:conversationColorNa
+ - (nullable TSInteraction *)lastInteractionForInboxWithTransaction:(SDSAnyReadTransaction *)transaction
+     NS_SWIFT_NAME(lastInteractionForInbox(transaction:));
+ 
++- (nullable TSInteraction *)firstInteractionAtOrBeforeSortId:(uint64_t)sortId
++                                                 transaction:(SDSAnyReadTransaction *)transaction
++    NS_SWIFT_NAME(firstInteraction(atOrBeforeSortId:transaction:));
++
+ /**
+  *  Updates the thread's caches of the latest interaction.
+  *
+@@ -198,6 +216,10 @@ NS_DESIGNATED_INITIALIZER NS_SWIFT_NAME(init(grdbId:uniqueId:conversationColorNa
+ 
+ #pragma mark - Update With... Methods
+ 
++- (void)updateWithLastVisibileSortId:(uint64_t)lastVisibleSortId
++                  onScreenPercentage:(double)onScreenPercentage
++                         transaction:(SDSAnyWriteTransaction *)transaction;
++
+ - (void)updateWithMutedUntilDate:(nullable NSDate *)mutedUntilDate transaction:(SDSAnyWriteTransaction *)transaction;
+ 
+ + (BOOL)shouldInteractionAppearInInbox:(TSInteraction *)interaction;
+diff --git a/SignalServiceKit/src/Contacts/TSThread.m b/SignalServiceKit/src/Contacts/TSThread.m
+index 3e6538a5e26..8349b4f8908 100644
+--- a/SignalServiceKit/src/Contacts/TSThread.m
++++ b/SignalServiceKit/src/Contacts/TSThread.m
+@@ -49,6 +49,9 @@ @interface TSThread ()
+ @property (atomic, nullable) NSDate *mutedUntilDate;
+ @property (nonatomic) int64_t lastInteractionRowId;
+ 
++@property (nonatomic) uint64_t lastVisibleSortId;
++@property (nonatomic) double lastVisibleSortIdOnScreenPercentage;
++
+ @end
+ 
+ #pragma mark -
+@@ -115,6 +118,8 @@ - (instancetype)initWithGrdbId:(int64_t)grdbId
+                       isArchived:(BOOL)isArchived
+                   isMarkedUnread:(BOOL)isMarkedUnread
+             lastInteractionRowId:(int64_t)lastInteractionRowId
++               lastVisibleSortId:(uint64_t)lastVisibleSortId
++lastVisibleSortIdOnScreenPercentage:(double)lastVisibleSortIdOnScreenPercentage
+                     messageDraft:(nullable NSString *)messageDraft
+                   mutedUntilDate:(nullable NSDate *)mutedUntilDate
+            shouldThreadBeVisible:(BOOL)shouldThreadBeVisible
+@@ -131,6 +136,8 @@ - (instancetype)initWithGrdbId:(int64_t)grdbId
+     _isArchived = isArchived;
+     _isMarkedUnread = isMarkedUnread;
+     _lastInteractionRowId = lastInteractionRowId;
++    _lastVisibleSortId = lastVisibleSortId;
++    _lastVisibleSortIdOnScreenPercentage = lastVisibleSortIdOnScreenPercentage;
+     _messageDraft = messageDraft;
+     _mutedUntilDate = mutedUntilDate;
+     _shouldThreadBeVisible = shouldThreadBeVisible;
+@@ -449,6 +456,15 @@ - (nullable TSInteraction *)lastInteractionForInboxWithTransaction:(SDSAnyReadTr
+         mostRecentInteractionForInboxWithTransaction:transaction];
+ }
+ 
++- (nullable TSInteraction *)firstInteractionAtOrBeforeSortId:(uint64_t)sortId
++                                                 transaction:(SDSAnyReadTransaction *)transaction
++{
++    OWSAssertDebug(transaction);
++    return
++        [[[InteractionFinder alloc] initWithThreadUniqueId:self.uniqueId] firstInteractionAtOrBeforeSortId:sortId
++                                                                                               transaction:transaction];
++}
++
+ // Returns YES IFF the interaction should show up in the inbox as the last message.
+ + (BOOL)shouldInteractionAppearInInbox:(TSInteraction *)interaction
+ {
+@@ -538,12 +554,20 @@ - (void)updateWithMessage:(TSInteraction *)message
+     }
+ 
+     BOOL needsToUpdateLastInteractionRowId = messageSortId > self.lastInteractionRowId;
+-    if (needsToMarkAsVisible || needsToClearArchived || needsToUpdateLastInteractionRowId) {
++
++    BOOL needsToUpdateLastVisibleSortId = self.lastVisibleSortId > 0 && wasMessageInserted;
++
++    if (needsToMarkAsVisible || needsToClearArchived || needsToUpdateLastInteractionRowId
++        || needsToUpdateLastVisibleSortId) {
+         self.shouldThreadBeVisible = YES;
+         self.lastInteractionRowId = MAX(self.lastInteractionRowId, messageSortId);
+         if (needsToClearArchived) {
+             self.isArchived = NO;
+         }
++        if (needsToUpdateLastVisibleSortId) {
++            self.lastVisibleSortId = 0;
++            self.lastVisibleSortIdOnScreenPercentage = 0;
++        }
+         [self anyOverwritingUpdateWithTransaction:transaction];
+     } else {
+         [self scheduleTouchFinalizationWithTransaction:transaction];
+@@ -557,9 +581,22 @@ - (void)updateWithRemovedMessage:(TSInteraction *)message transaction:(SDSAnyWri
+ 
+     int64_t messageSortId = [self messageSortIdForMessage:message transaction:transaction];
+     BOOL needsToUpdateLastInteractionRowId = messageSortId == self.lastInteractionRowId;
+-    if (needsToUpdateLastInteractionRowId) {
+-        TSInteraction *_Nullable latestInteraction = [self lastInteractionForInboxWithTransaction:transaction];
+-        self.lastInteractionRowId = latestInteraction ? latestInteraction.sortId : 0;
++
++    BOOL needsToUpdateLastVisibleSortId = self.lastVisibleSortId == messageSortId;
++
++    if (needsToUpdateLastInteractionRowId || needsToUpdateLastVisibleSortId) {
++        if (needsToUpdateLastVisibleSortId) {
++            TSInteraction *_Nullable latestInteraction = [self lastInteractionForInboxWithTransaction:transaction];
++            self.lastInteractionRowId = latestInteraction ? latestInteraction.sortId : 0;
++        }
++
++        if (needsToUpdateLastVisibleSortId) {
++            TSInteraction *_Nullable messageBeforeDeletedMessage =
++                [self firstInteractionAtOrBeforeSortId:self.lastVisibleSortId transaction:transaction];
++            self.lastVisibleSortId = messageBeforeDeletedMessage ? messageBeforeDeletedMessage.sortId : 0;
++            self.lastVisibleSortIdOnScreenPercentage = 1;
++        }
++
+         [self anyOverwritingUpdateWithTransaction:transaction];
+     } else {
+         [self scheduleTouchFinalizationWithTransaction:transaction];
+@@ -694,6 +731,23 @@ - (void)updateWithDraft:(NSString *)draftString transaction:(SDSAnyWriteTransact
+                              }];
+ }
+ 
++#pragma mark - Last Visible
++
++- (void)updateWithLastVisibileSortId:(uint64_t)lastVisibleSortId
++                  onScreenPercentage:(double)onScreenPercentage
++                         transaction:(SDSAnyWriteTransaction *)transaction
++{
++    OWSAssertDebug(onScreenPercentage >= 0);
++    OWSAssertDebug(onScreenPercentage <= 1);
++    OWSAssertDebug(transaction);
++
++    [self anyUpdateWithTransaction:transaction
++                             block:^(TSThread *thread) {
++                                 thread.lastVisibleSortId = lastVisibleSortId;
++                                 thread.lastVisibleSortIdOnScreenPercentage = onScreenPercentage;
++                             }];
++}
++
+ #pragma mark - Muted
+ 
+ - (BOOL)isMuted
+diff --git a/SignalServiceKit/src/Contacts/Threads/TSContactThread+SDS.swift b/SignalServiceKit/src/Contacts/Threads/TSContactThread+SDS.swift
+index fc217ce5188..2ed3ed2484c 100644
+--- a/SignalServiceKit/src/Contacts/Threads/TSContactThread+SDS.swift
++++ b/SignalServiceKit/src/Contacts/Threads/TSContactThread+SDS.swift
+@@ -73,7 +73,9 @@ class TSContactThreadSerializer: SDSSerializer {
+         let groupModel: Data? = nil
+         let hasDismissedOffers: Bool? = model.hasDismissedOffers
+         let isMarkedUnread: Bool = model.isMarkedUnread
++        let lastVisibleSortIdOnScreenPercentage: Double = model.lastVisibleSortIdOnScreenPercentage
++        let lastVisibleSortId: UInt64 = model.lastVisibleSortId
+ 
+-        return ThreadRecord(delegate: model, id: id, recordType: recordType, uniqueId: uniqueId, conversationColorName: conversationColorName, creationDate: creationDate, isArchived: isArchived, lastInteractionRowId: lastInteractionRowId, messageDraft: messageDraft, mutedUntilDate: mutedUntilDate, shouldThreadBeVisible: shouldThreadBeVisible, contactPhoneNumber: contactPhoneNumber, contactUUID: contactUUID, groupModel: groupModel, hasDismissedOffers: hasDismissedOffers, isMarkedUnread: isMarkedUnread)
++        return ThreadRecord(delegate: model, id: id, recordType: recordType, uniqueId: uniqueId, conversationColorName: conversationColorName, creationDate: creationDate, isArchived: isArchived, lastInteractionRowId: lastInteractionRowId, messageDraft: messageDraft, mutedUntilDate: mutedUntilDate, shouldThreadBeVisible: shouldThreadBeVisible, contactPhoneNumber: contactPhoneNumber, contactUUID: contactUUID, groupModel: groupModel, hasDismissedOffers: hasDismissedOffers, isMarkedUnread: isMarkedUnread, lastVisibleSortIdOnScreenPercentage: lastVisibleSortIdOnScreenPercentage, lastVisibleSortId: lastVisibleSortId)
+     }
+ }
+diff --git a/SignalServiceKit/src/Contacts/Threads/TSContactThread.h b/SignalServiceKit/src/Contacts/Threads/TSContactThread.h
+index cf5967f4f4a..55fc1edc623 100644
+--- a/SignalServiceKit/src/Contacts/Threads/TSContactThread.h
++++ b/SignalServiceKit/src/Contacts/Threads/TSContactThread.h
+@@ -43,13 +43,15 @@ NS_ASSUME_NONNULL_BEGIN
+                       isArchived:(BOOL)isArchived
+                   isMarkedUnread:(BOOL)isMarkedUnread
+             lastInteractionRowId:(int64_t)lastInteractionRowId
++               lastVisibleSortId:(uint64_t)lastVisibleSortId
++lastVisibleSortIdOnScreenPercentage:(double)lastVisibleSortIdOnScreenPercentage
+                     messageDraft:(nullable NSString *)messageDraft
+                   mutedUntilDate:(nullable NSDate *)mutedUntilDate
+            shouldThreadBeVisible:(BOOL)shouldThreadBeVisible
+               contactPhoneNumber:(nullable NSString *)contactPhoneNumber
+                      contactUUID:(nullable NSString *)contactUUID
+               hasDismissedOffers:(BOOL)hasDismissedOffers
+-NS_DESIGNATED_INITIALIZER NS_SWIFT_NAME(init(grdbId:uniqueId:conversationColorName:creationDate:isArchived:isMarkedUnread:lastInteractionRowId:messageDraft:mutedUntilDate:shouldThreadBeVisible:contactPhoneNumber:contactUUID:hasDismissedOffers:));
++NS_DESIGNATED_INITIALIZER NS_SWIFT_NAME(init(grdbId:uniqueId:conversationColorName:creationDate:isArchived:isMarkedUnread:lastInteractionRowId:lastVisibleSortId:lastVisibleSortIdOnScreenPercentage:messageDraft:mutedUntilDate:shouldThreadBeVisible:contactPhoneNumber:contactUUID:hasDismissedOffers:));
+ 
+ // clang-format on
+ 
+diff --git a/SignalServiceKit/src/Contacts/Threads/TSContactThread.m b/SignalServiceKit/src/Contacts/Threads/TSContactThread.m
+index 5a5dea801a3..3f3f1620589 100644
+--- a/SignalServiceKit/src/Contacts/Threads/TSContactThread.m
++++ b/SignalServiceKit/src/Contacts/Threads/TSContactThread.m
+@@ -52,6 +52,8 @@ - (instancetype)initWithGrdbId:(int64_t)grdbId
+                       isArchived:(BOOL)isArchived
+                   isMarkedUnread:(BOOL)isMarkedUnread
+             lastInteractionRowId:(int64_t)lastInteractionRowId
++               lastVisibleSortId:(uint64_t)lastVisibleSortId
++lastVisibleSortIdOnScreenPercentage:(double)lastVisibleSortIdOnScreenPercentage
+                     messageDraft:(nullable NSString *)messageDraft
+                   mutedUntilDate:(nullable NSDate *)mutedUntilDate
+            shouldThreadBeVisible:(BOOL)shouldThreadBeVisible
+@@ -66,6 +68,8 @@ - (instancetype)initWithGrdbId:(int64_t)grdbId
+                         isArchived:isArchived
+                     isMarkedUnread:isMarkedUnread
+               lastInteractionRowId:lastInteractionRowId
++                 lastVisibleSortId:lastVisibleSortId
++lastVisibleSortIdOnScreenPercentage:lastVisibleSortIdOnScreenPercentage
+                       messageDraft:messageDraft
+                     mutedUntilDate:mutedUntilDate
+              shouldThreadBeVisible:shouldThreadBeVisible];
+diff --git a/SignalServiceKit/src/Contacts/Threads/TSGroupThread+SDS.swift b/SignalServiceKit/src/Contacts/Threads/TSGroupThread+SDS.swift
+index efa3ff8293f..e93c661942a 100644
+--- a/SignalServiceKit/src/Contacts/Threads/TSGroupThread+SDS.swift
++++ b/SignalServiceKit/src/Contacts/Threads/TSGroupThread+SDS.swift
+@@ -73,7 +73,9 @@ class TSGroupThreadSerializer: SDSSerializer {
+         let groupModel: Data? = optionalArchive(model.groupModel)
+         let hasDismissedOffers: Bool? = nil
+         let isMarkedUnread: Bool = model.isMarkedUnread
++        let lastVisibleSortIdOnScreenPercentage: Double = model.lastVisibleSortIdOnScreenPercentage
++        let lastVisibleSortId: UInt64 = model.lastVisibleSortId
+ 
+-        return ThreadRecord(delegate: model, id: id, recordType: recordType, uniqueId: uniqueId, conversationColorName: conversationColorName, creationDate: creationDate, isArchived: isArchived, lastInteractionRowId: lastInteractionRowId, messageDraft: messageDraft, mutedUntilDate: mutedUntilDate, shouldThreadBeVisible: shouldThreadBeVisible, contactPhoneNumber: contactPhoneNumber, contactUUID: contactUUID, groupModel: groupModel, hasDismissedOffers: hasDismissedOffers, isMarkedUnread: isMarkedUnread)
++        return ThreadRecord(delegate: model, id: id, recordType: recordType, uniqueId: uniqueId, conversationColorName: conversationColorName, creationDate: creationDate, isArchived: isArchived, lastInteractionRowId: lastInteractionRowId, messageDraft: messageDraft, mutedUntilDate: mutedUntilDate, shouldThreadBeVisible: shouldThreadBeVisible, contactPhoneNumber: contactPhoneNumber, contactUUID: contactUUID, groupModel: groupModel, hasDismissedOffers: hasDismissedOffers, isMarkedUnread: isMarkedUnread, lastVisibleSortIdOnScreenPercentage: lastVisibleSortIdOnScreenPercentage, lastVisibleSortId: lastVisibleSortId)
+     }
+ }
+diff --git a/SignalServiceKit/src/Contacts/Threads/TSGroupThread.h b/SignalServiceKit/src/Contacts/Threads/TSGroupThread.h
+index a1e5d0e649c..09dfdfabf5c 100644
+--- a/SignalServiceKit/src/Contacts/Threads/TSGroupThread.h
++++ b/SignalServiceKit/src/Contacts/Threads/TSGroupThread.h
+@@ -48,11 +48,13 @@ extern NSString *const TSGroupThread_NotificationKey_UniqueId;
+                       isArchived:(BOOL)isArchived
+                   isMarkedUnread:(BOOL)isMarkedUnread
+             lastInteractionRowId:(int64_t)lastInteractionRowId
++               lastVisibleSortId:(uint64_t)lastVisibleSortId
++lastVisibleSortIdOnScreenPercentage:(double)lastVisibleSortIdOnScreenPercentage
+                     messageDraft:(nullable NSString *)messageDraft
+                   mutedUntilDate:(nullable NSDate *)mutedUntilDate
+            shouldThreadBeVisible:(BOOL)shouldThreadBeVisible
+                       groupModel:(TSGroupModel *)groupModel
+-NS_DESIGNATED_INITIALIZER NS_SWIFT_NAME(init(grdbId:uniqueId:conversationColorName:creationDate:isArchived:isMarkedUnread:lastInteractionRowId:messageDraft:mutedUntilDate:shouldThreadBeVisible:groupModel:));
++NS_DESIGNATED_INITIALIZER NS_SWIFT_NAME(init(grdbId:uniqueId:conversationColorName:creationDate:isArchived:isMarkedUnread:lastInteractionRowId:lastVisibleSortId:lastVisibleSortIdOnScreenPercentage:messageDraft:mutedUntilDate:shouldThreadBeVisible:groupModel:));
+ 
+ // clang-format on
+ 
+diff --git a/SignalServiceKit/src/Contacts/Threads/TSGroupThread.m b/SignalServiceKit/src/Contacts/Threads/TSGroupThread.m
+index 86f5e7aa2cc..e635975964d 100644
+--- a/SignalServiceKit/src/Contacts/Threads/TSGroupThread.m
++++ b/SignalServiceKit/src/Contacts/Threads/TSGroupThread.m
+@@ -38,6 +38,8 @@ - (instancetype)initWithGrdbId:(int64_t)grdbId
+                       isArchived:(BOOL)isArchived
+                   isMarkedUnread:(BOOL)isMarkedUnread
+             lastInteractionRowId:(int64_t)lastInteractionRowId
++               lastVisibleSortId:(uint64_t)lastVisibleSortId
++lastVisibleSortIdOnScreenPercentage:(double)lastVisibleSortIdOnScreenPercentage
+                     messageDraft:(nullable NSString *)messageDraft
+                   mutedUntilDate:(nullable NSDate *)mutedUntilDate
+            shouldThreadBeVisible:(BOOL)shouldThreadBeVisible
+@@ -50,6 +52,8 @@ - (instancetype)initWithGrdbId:(int64_t)grdbId
+                         isArchived:isArchived
+                     isMarkedUnread:isMarkedUnread
+               lastInteractionRowId:lastInteractionRowId
++                 lastVisibleSortId:lastVisibleSortId
++lastVisibleSortIdOnScreenPercentage:lastVisibleSortIdOnScreenPercentage
+                       messageDraft:messageDraft
+                     mutedUntilDate:mutedUntilDate
+              shouldThreadBeVisible:shouldThreadBeVisible];
+diff --git a/SignalServiceKit/src/Storage/Database/GRDBSchemaMigrator.swift b/SignalServiceKit/src/Storage/Database/GRDBSchemaMigrator.swift
+index 58779dcb86a..706dfc3f680 100644
+--- a/SignalServiceKit/src/Storage/Database/GRDBSchemaMigrator.swift
++++ b/SignalServiceKit/src/Storage/Database/GRDBSchemaMigrator.swift
+@@ -71,6 +71,7 @@ public class GRDBSchemaMigrator: NSObject {
+         case addIsMarkedUnreadToThreads
+         case addIsMediaMessageToMessageSenderJobQueue
+         case readdAttachmentIndex
++        case addLastVisibleRowIdToThreads
+ 
+         // NOTE: Every time we add a migration id, consider
+         // incrementing grdbSchemaVersionLatest.
+@@ -648,6 +649,17 @@ public class GRDBSchemaMigrator: NSObject {
+             }
+         }
+ 
++        migrator.registerMigration(MigrationId.addLastVisibleRowIdToThreads.rawValue) { db in
++            do {
++                try db.alter(table: "model_TSThread") { (table: TableAlteration) -> Void in
++                    table.add(column: "lastVisibleSortIdOnScreenPercentage", .double).notNull().defaults(to: 0)
++                    table.add(column: "lastVisibleSortId", .integer).notNull().defaults(to: 0)
++                }
++            } catch {
++                owsFail("Error: \(error)")
++            }
++        }
++
+         // MARK: - Schema Migration Insertion Point
+     }
+ 
+diff --git a/SignalServiceKit/src/Storage/Database/Records/InteractionFinder.swift b/SignalServiceKit/src/Storage/Database/Records/InteractionFinder.swift
+index 7d6494ad63e..a58755b75c5 100644
+--- a/SignalServiceKit/src/Storage/Database/Records/InteractionFinder.swift
++++ b/SignalServiceKit/src/Storage/Database/Records/InteractionFinder.swift
+@@ -46,6 +46,8 @@ protocol InteractionFinderAdapter {
+ 
+     func interaction(at index: UInt, transaction: ReadTransaction) throws -> TSInteraction?
+ 
++    func firstInteraction(atOrBeforeSortId sortId: UInt64, transaction: ReadTransaction) -> TSInteraction?
++
+     #if DEBUG
+     func enumerateUnstartedExpiringMessages(transaction: ReadTransaction, block: @escaping (TSMessage, UnsafeMutablePointer<ObjCBool>) -> Void)
+     #endif
+@@ -486,6 +488,16 @@ public class InteractionFinder: NSObject, InteractionFinderAdapter {
+         }
+     }
+ 
++    @objc
++    public func firstInteraction(atOrBeforeSortId sortId: UInt64, transaction: SDSAnyReadTransaction) -> TSInteraction? {
++        switch transaction.readTransaction {
++        case .yapRead:
++            fatalError("YAP not supported")
++        case .grdbRead(let grdbRead):
++            return grdbAdapter.firstInteraction(atOrBeforeSortId: sortId, transaction: grdbRead)
++        }
++    }
++
+     @objc
+     public func existsOutgoingMessage(transaction: SDSAnyReadTransaction) -> Bool {
+         switch transaction.readTransaction {
+@@ -739,6 +751,10 @@ struct YAPDBInteractionFinderAdapter: InteractionFinderAdapter {
+         return interaction
+     }
+ 
++    func firstInteraction(atOrBeforeSortId sortId: UInt64, transaction: YapDatabaseReadTransaction) -> TSInteraction? {
++        fatalError("YAP not supported")
++    }
++
+     func existsOutgoingMessage(transaction: YapDatabaseReadTransaction) -> Bool {
+         guard let dbView = TSDatabaseView.threadOutgoingMessageDatabaseView(transaction) as? YapDatabaseAutoViewTransaction else {
+             owsFailDebug("unexpected view")
+@@ -1173,6 +1189,19 @@ public class GRDBInteractionFinder: NSObject, InteractionFinderAdapter {
+         return TSInteraction.grdbFetchOne(sql: sql, arguments: arguments, transaction: transaction)
+     }
+ 
++    func firstInteraction(atOrBeforeSortId sortId: UInt64, transaction: GRDBReadTransaction) -> TSInteraction? {
++        let sql = """
++        SELECT *
++        FROM \(InteractionRecord.databaseTableName)
++        WHERE \(interactionColumn: .threadUniqueId) = ?
++        AND \(interactionColumn: .id) <= ?
++        ORDER BY \(interactionColumn: .id) DESC
++        LIMIT 1
++        """
++        let arguments: StatementArguments = [threadUniqueId, sortId]
++        return TSInteraction.grdbFetchOne(sql: sql, arguments: arguments, transaction: transaction)
++    }
++
+     func existsOutgoingMessage(transaction: GRDBReadTransaction) -> Bool {
+         let sql = """
+         SELECT EXISTS(

@@ -1,0 +1,169 @@
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index db8df96930cc..1ae3423d8b77 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -60,7 +60,8 @@
+ <string name="session_question_limit_reached">Session question limit reached</string>
+ <string name="session_time_limit_reached">Session time limit reached</string>
+ <string name="cram_edit_warning">Card editing not allowed while cramming</string>
+-<string name="leech_notification">Card marked as leech and suspended</string>
++<string name="leech_suspend_notification">Card marked as leech and suspended</string>
++<string name="leech_notification">Card marked as leech</string>
+ 
+ <!-- deck_preferences.xml -->
+ <string name="newcards_day_summ">The maximum number of new cards shown per day.</string>
+diff --git a/src/com/ichi2/anki/Card.java b/src/com/ichi2/anki/Card.java
+index de74e8f1c8e0..0669619870c3 100644
+--- a/src/com/ichi2/anki/Card.java
++++ b/src/com/ichi2/anki/Card.java
+@@ -105,7 +105,8 @@ public class Card {
+     double timerStopped;
+     double fuzz;
+ 
+-    // Leech flag, not read from database, only set to true during the actual suspension
++    // Leech flags, not read from database, only set to true during the actual suspension
++    private boolean isLeechMarked;
+     private boolean isLeechSuspended;
+ 
+     public Card(Deck deck, Fact fact, CardModel cardModel, double created) {
+@@ -254,7 +255,12 @@ public void updateStats(int ease, String state) {
+ 
+ 
+     public String[] splitTags() {
+-        return tagsBySrc;
++        String[] tags = new String[]{
++            getFact().tags,
++            Model.getModel(deck, getFact().modelId, true).tags,
++            getCardModel().name
++        };
++        return tags;
+     }
+ 
+ 
+@@ -439,9 +445,16 @@ public void updateQAfields() {
+ 
+     // Leech flag
+     public boolean getLeechFlag() {
+-        return isLeechSuspended;
++        return isLeechMarked;
+     }
+     public void setLeechFlag(boolean flag) {
++        isLeechMarked = flag;
++    }
++    // Suspended flag
++    public boolean getSuspendedFlag() {
++        return isLeechSuspended;
++    }
++    public void setSuspendedFlag(boolean flag) {
+         isLeechSuspended = flag;
+     }
+ }
+diff --git a/src/com/ichi2/anki/Deck.java b/src/com/ichi2/anki/Deck.java
+index 864d2e3592ba..30f341e9eeb9 100644
+--- a/src/com/ichi2/anki/Deck.java
++++ b/src/com/ichi2/anki/Deck.java
+@@ -2169,14 +2169,17 @@ private void handleLeech(Card card) {
+         String tags = scard.getFact().tags;
+         tags = Utils.addTags("Leech", tags);
+         scard.getFact().tags = Utils.canonifyTags(tags);
++        // FIXME: Inefficient, we need to save the fact so that the modified tags can be used in setModified,
++        // then after setModified we need to save again! Just make setModified to use the tags from the fact,
++        // not reload them from the DB.
++        scard.getFact().toDb();
+         scard.getFact().setModified(true);
+         scard.getFact().toDb();
+         updateFactTags(new long[] {scard.getFact().id});
+-        scard.toDB();
++        card.setLeechFlag(true);
+         if (getBool("suspendLeeches")) {
+             suspendCards(new long[]{card.id});
+-            card.setLeechFlag(true);
+-            Log.i(TAG, "card is leech!");
++            card.setSuspendedFlag(true);
+         }
+     }
+ 
+diff --git a/src/com/ichi2/anki/DeckTask.java b/src/com/ichi2/anki/DeckTask.java
+index 36cd0e96bc74..fb671b208672 100644
+--- a/src/com/ichi2/anki/DeckTask.java
++++ b/src/com/ichi2/anki/DeckTask.java
+@@ -186,7 +186,7 @@ private TaskData doInBackgroundAnswerCard(TaskData... params) {
+             newCard = deck.getCard();
+             Log.v(TAG, "doInBackgroundAnswerCard - Loaded new card in " + (System.currentTimeMillis() - start) + " ms.");
+             if (oldCard != null) {
+-                publishProgress(new TaskData(newCard, oldCard.getLeechFlag()));
++                publishProgress(new TaskData(newCard, oldCard.getLeechFlag(), oldCard.getSuspendedFlag()));
+             } else {
+                 publishProgress(new TaskData(newCard));
+             }
+@@ -299,7 +299,8 @@ public static class TaskData {
+         private Card card;
+         private int integer;
+         private String msg;
+-        private boolean previousCardLeech;
++        private boolean previousCardLeech;     // answer card resulted in card marked as leech
++        private boolean previousCardSuspended; // answer card resulted in card marked as leech and suspended
+ 
+ 
+         public TaskData(int value, Deck deck, Card card) {
+@@ -312,11 +313,13 @@ public TaskData(int value, Deck deck, Card card) {
+         public TaskData(Card card) {
+             this.card = card;
+             this.previousCardLeech = false;
++            this.previousCardSuspended = false;
+         }
+ 
+-        public TaskData(Card card, boolean markedLeech) {
++        public TaskData(Card card, boolean markedLeech, boolean suspendedLeech) {
+             this.card = card;
+             this.previousCardLeech = markedLeech;
++            this.previousCardSuspended = suspendedLeech;
+         }
+ 
+ 
+@@ -352,6 +355,9 @@ public String getString() {
+         public boolean isPreviousCardLeech() {
+             return previousCardLeech;
+         }
++        public boolean isPreviousCardSuspended() {
++            return previousCardSuspended;
++        }
+     }
+ 
+ }
+diff --git a/src/com/ichi2/anki/Fact.java b/src/com/ichi2/anki/Fact.java
+index 70942c9af6cf..573960bdec62 100644
+--- a/src/com/ichi2/anki/Fact.java
++++ b/src/com/ichi2/anki/Fact.java
+@@ -229,6 +229,7 @@ public void setModified(boolean textChanged) {
+                 spaceUntil += f.value + " ";
+             }
+             spaceUntil.substring(0, spaceUntil.length()-1);
++            spaceUntil = Utils.stripHTMLMedia(spaceUntil.substring(0, spaceUntil.length()-1));
+             Log.d(TAG, "spaceUntil = " + spaceUntil);
+             for (Card card : getUpdatedRelatedCards()) {
+                 card.setModified();
+diff --git a/src/com/ichi2/anki/Reviewer.java b/src/com/ichi2/anki/Reviewer.java
+index c2dd472e61aa..921484679926 100644
+--- a/src/com/ichi2/anki/Reviewer.java
++++ b/src/com/ichi2/anki/Reviewer.java
+@@ -313,11 +313,17 @@ public void onProgressUpdate(DeckTask.TaskData... values) {
+             long sessionTime = deck.getSessionTimeLimit();
+             Toast sessionMessage = null;
+             Toast leechMessage = null;
+-            Log.i(TAG, "reviewer leech flag: " + values[0].isPreviousCardLeech());
++            Log.i(TAG, "reviewer leech flag: " + values[0].isPreviousCardLeech() +
++                    " " + values[0].isPreviousCardSuspended());
+ 
+             if (values[0].isPreviousCardLeech()) {
+-                leechMessage = Toast.makeText(Reviewer.this, res.getString(R.string.leech_notification),
++                if (values[0].isPreviousCardSuspended()) {
++                    leechMessage = Toast.makeText(Reviewer.this, res.getString(R.string.leech_suspend_notification),
+                         Toast.LENGTH_LONG);
++                } else {
++                    leechMessage = Toast.makeText(Reviewer.this, res.getString(R.string.leech_notification),
++                            Toast.LENGTH_LONG);
++                }
+                 leechMessage.show();
+             }
+ 

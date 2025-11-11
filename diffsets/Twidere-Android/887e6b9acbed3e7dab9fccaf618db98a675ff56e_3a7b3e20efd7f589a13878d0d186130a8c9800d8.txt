@@ -1,0 +1,234 @@
+diff --git a/twidere/src/main/java/org/mariotaku/twidere/adapter/MessageEntriesAdapter.java b/twidere/src/main/java/org/mariotaku/twidere/adapter/MessageEntriesAdapter.java
+index 6cb064ce19..09de80a60a 100644
+--- a/twidere/src/main/java/org/mariotaku/twidere/adapter/MessageEntriesAdapter.java
++++ b/twidere/src/main/java/org/mariotaku/twidere/adapter/MessageEntriesAdapter.java
+@@ -20,6 +20,8 @@
+ package org.mariotaku.twidere.adapter;
+ 
+ import android.content.Context;
++import android.content.SharedPreferences;
++import android.content.SharedPreferences.OnSharedPreferenceChangeListener;
+ import android.database.Cursor;
+ import android.support.v7.widget.RecyclerView.Adapter;
+ import android.support.v7.widget.RecyclerView.ViewHolder;
+@@ -32,17 +34,22 @@
+ import org.mariotaku.twidere.R;
+ import org.mariotaku.twidere.adapter.iface.IContentCardAdapter;
+ import org.mariotaku.twidere.app.TwidereApplication;
++import org.mariotaku.twidere.fragment.support.DirectMessagesFragment;
++import org.mariotaku.twidere.model.StringLongPair;
+ import org.mariotaku.twidere.provider.TwidereDataStore.DirectMessages.ConversationEntries;
+ import org.mariotaku.twidere.util.AsyncTwitterWrapper;
+ import org.mariotaku.twidere.util.ImageLoadingHandler;
+ import org.mariotaku.twidere.util.MediaLoaderWrapper;
+ import org.mariotaku.twidere.util.MultiSelectManager;
++import org.mariotaku.twidere.util.ReadStateManager;
++import org.mariotaku.twidere.util.ReadStateManager.OnReadStateChangeListener;
+ import org.mariotaku.twidere.util.SharedPreferencesWrapper;
+ import org.mariotaku.twidere.util.Utils;
+ import org.mariotaku.twidere.view.holder.LoadIndicatorViewHolder;
+ import org.mariotaku.twidere.view.holder.MessageEntryViewHolder;
+ 
+-public class MessageEntriesAdapter extends Adapter<ViewHolder> implements Constants, IContentCardAdapter, OnClickListener {
++public class MessageEntriesAdapter extends Adapter<ViewHolder> implements Constants,
++        IContentCardAdapter, OnClickListener, OnReadStateChangeListener {
+ 
+     public static final int ITEM_VIEW_TYPE_MESSAGE = 0;
+     public static final int ITEM_VIEW_TYPE_LOAD_INDICATOR = 1;
+@@ -54,9 +61,12 @@ public class MessageEntriesAdapter extends Adapter<ViewHolder> implements Consta
+     private final int mTextSize;
+     private final int mProfileImageStyle;
+     private final int mMediaPreviewStyle;
++    private final ReadStateManager mReadStateManager;
++    private final OnSharedPreferenceChangeListener mReadStateChangeListener;
+     private boolean mLoadMoreIndicatorEnabled;
+     private Cursor mCursor;
+     private MessageEntriesAdapterListener mListener;
++    private StringLongPair[] mPositionPairs;
+ 
+     public MessageEntriesAdapter(final Context context) {
+         mContext = context;
+@@ -69,6 +79,19 @@ public MessageEntriesAdapter(final Context context) {
+         mProfileImageStyle = Utils.getProfileImageStyle(preferences.getString(KEY_PROFILE_IMAGE_STYLE, null));
+         mMediaPreviewStyle = Utils.getMediaPreviewStyle(preferences.getString(KEY_MEDIA_PREVIEW_STYLE, null));
+         mTextSize = preferences.getInt(KEY_TEXT_SIZE, context.getResources().getInteger(R.integer.default_text_size));
++        mReadStateManager = new ReadStateManager(context);
++        mReadStateChangeListener = new OnSharedPreferenceChangeListener() {
++
++            @Override
++            public void onSharedPreferenceChanged(SharedPreferences sharedPreferences, String key) {
++                updateReadState();
++            }
++        };
++    }
++
++    public void updateReadState() {
++        mPositionPairs = mReadStateManager.getPositionPairs(DirectMessagesFragment.KEY_READ_POSITION_TAG);
++        notifyDataSetChanged();
+     }
+ 
+     public DirectMessageEntry getEntry(final int position) {
+@@ -115,6 +138,11 @@ public boolean hasLoadMoreIndicator() {
+         return mLoadMoreIndicatorEnabled;
+     }
+ 
++    @Override
++    public void onReadStateChanged() {
++
++    }
++
+     @Override
+     public void setLoadMoreIndicatorEnabled(boolean enabled) {
+         if (mLoadMoreIndicatorEnabled == enabled) return;
+@@ -172,12 +200,24 @@ public void onBindViewHolder(ViewHolder holder, int position) {
+             case ITEM_VIEW_TYPE_MESSAGE: {
+                 final Cursor c = mCursor;
+                 c.moveToPosition(position);
+-                ((MessageEntryViewHolder) holder).displayMessage(c);
++                ((MessageEntryViewHolder) holder).displayMessage(c, isUnread(c));
+                 break;
+             }
+         }
+     }
+ 
++    private boolean isUnread(Cursor c) {
++        if (mPositionPairs == null) return true;
++        final long accountId = c.getLong(ConversationEntries.IDX_ACCOUNT_ID);
++        final long conversationId = c.getLong(ConversationEntries.IDX_CONVERSATION_ID);
++        final long messageId = c.getLong(ConversationEntries.IDX_MESSAGE_ID);
++        final String key = accountId + "-" + conversationId;
++        for (StringLongPair pair : mPositionPairs) {
++            if (key.equals(pair.getKey())) return messageId > pair.getValue();
++        }
++        return true;
++    }
++
+     @Override
+     public int getItemViewType(int position) {
+         if (position == getMessagesCount()) {
+@@ -208,6 +248,11 @@ public void onMessageClick(int position) {
+ 
+     public void setCursor(Cursor cursor) {
+         mCursor = cursor;
++        mReadStateManager.unregisterOnSharedPreferenceChangeListener(mReadStateChangeListener);
++        if (cursor != null) {
++            updateReadState();
++            mReadStateManager.registerOnSharedPreferenceChangeListener(mReadStateChangeListener);
++        }
+         notifyDataSetChanged();
+     }
+ 
+diff --git a/twidere/src/main/java/org/mariotaku/twidere/fragment/support/DirectMessagesFragment.java b/twidere/src/main/java/org/mariotaku/twidere/fragment/support/DirectMessagesFragment.java
+index 95098012a1..032702fbc3 100644
+--- a/twidere/src/main/java/org/mariotaku/twidere/fragment/support/DirectMessagesFragment.java
++++ b/twidere/src/main/java/org/mariotaku/twidere/fragment/support/DirectMessagesFragment.java
+@@ -272,6 +272,7 @@ public void onStart() {
+         resolver.registerContentObserver(Accounts.CONTENT_URI, true, mReloadContentObserver);
+         final Bus bus = TwidereApplication.getInstance(getActivity()).getMessageBus();
+         bus.register(this);
++        mAdapter.updateReadState();
+     }
+ 
+ 
+diff --git a/twidere/src/main/java/org/mariotaku/twidere/util/ReadStateManager.java b/twidere/src/main/java/org/mariotaku/twidere/util/ReadStateManager.java
+index 5254513ab1..65530bc78b 100644
+--- a/twidere/src/main/java/org/mariotaku/twidere/util/ReadStateManager.java
++++ b/twidere/src/main/java/org/mariotaku/twidere/util/ReadStateManager.java
+@@ -21,6 +21,7 @@
+ 
+ import android.content.Context;
+ import android.content.SharedPreferences;
++import android.content.SharedPreferences.OnSharedPreferenceChangeListener;
+ import android.support.annotation.NonNull;
+ import android.support.annotation.Nullable;
+ import android.text.TextUtils;
+@@ -74,6 +75,14 @@ public long getPosition(final String key, final String keyId) {
+         return -1;
+     }
+ 
++    public void registerOnSharedPreferenceChangeListener(OnSharedPreferenceChangeListener listener) {
++        mPreferences.registerOnSharedPreferenceChangeListener(listener);
++    }
++
++    public void unregisterOnSharedPreferenceChangeListener(OnSharedPreferenceChangeListener listener) {
++        mPreferences.unregisterOnSharedPreferenceChangeListener(listener);
++    }
++
+     public boolean setPosition(final String key, final String keyId, final long position, boolean acceptOlder) {
+         if (TextUtils.isEmpty(key)) return false;
+         Set<String> set = mPreferences.getStringSet(key, null);
+@@ -134,4 +143,8 @@ public boolean setPosition(final String key, final long id, boolean acceptOlder)
+         return true;
+     }
+ 
++    public interface OnReadStateChangeListener {
++        void onReadStateChanged();
++    }
++
+ }
+diff --git a/twidere/src/main/java/org/mariotaku/twidere/view/holder/MessageEntryViewHolder.java b/twidere/src/main/java/org/mariotaku/twidere/view/holder/MessageEntryViewHolder.java
+index 80ff14afe3..735ecbc46a 100644
+--- a/twidere/src/main/java/org/mariotaku/twidere/view/holder/MessageEntryViewHolder.java
++++ b/twidere/src/main/java/org/mariotaku/twidere/view/holder/MessageEntryViewHolder.java
+@@ -22,6 +22,7 @@
+ import android.content.Context;
+ import android.database.Cursor;
+ import android.graphics.Color;
++import android.graphics.Typeface;
+ import android.support.v7.widget.RecyclerView.ViewHolder;
+ import android.view.View;
+ import android.view.View.OnClickListener;
+@@ -63,7 +64,7 @@ public MessageEntryViewHolder(final MessageEntriesAdapter adapter, final View it
+         itemView.setOnClickListener(this);
+     }
+ 
+-    public void displayMessage(Cursor cursor) {
++    public void displayMessage(Cursor cursor, boolean isUnread) {
+         final Context context = adapter.getContext();
+         final MediaLoaderWrapper loader = adapter.getImageLoader();
+ 
+@@ -79,7 +80,14 @@ public void displayMessage(Cursor cursor) {
+         screenNameView.setText("@" + screenName);
+         textView.setText(toPlainText(cursor.getString(ConversationEntries.IDX_TEXT)));
+         timeView.setTime(timestamp);
+-        setIsOutgoing(isOutgoing);
++        if (isOutgoing) {
++            timeView.setCompoundDrawablesWithIntrinsicBounds(0, 0, R.drawable.ic_indicator_sent, 0);
++        } else {
++            timeView.setCompoundDrawablesWithIntrinsicBounds(0, 0, 0, 0);
++        }
++        nameView.setTypeface(null, isUnread ? Typeface.BOLD : Typeface.NORMAL);
++        screenNameView.setTypeface(null, isUnread ? Typeface.BOLD : Typeface.NORMAL);
++        textView.setTypeface(null, isUnread ? Typeface.BOLD : Typeface.NORMAL);
+         if (account_color_enabled) {
+             content.drawEnd(Utils.getAccountColor(context, accountId));
+         }
+@@ -112,15 +120,11 @@ public void setAccountColorEnabled(final boolean enabled) {
+         }
+     }
+ 
+-    public void setIsOutgoing(final boolean is_outgoing) {
+-        timeView.setCompoundDrawablesWithIntrinsicBounds(0, 0, is_outgoing ? R.drawable.ic_indicator_sent : 0, 0);
+-    }
+-
+     public void setTextSize(final float textSize) {
+         nameView.setTextSize(textSize * 1.1f);
+         screenNameView.setTextSize(textSize);
+         textView.setTextSize(textSize);
+-        timeView.setTextSize(textSize);
++        timeView.setTextSize(textSize * 0.85f);
+     }
+ 
+     public void setUserColor(final int color) {
+diff --git a/twidere/src/main/res/layout/list_item_message_entry.xml b/twidere/src/main/res/layout/list_item_message_entry.xml
+index 7a8c6414fc..a22432827a 100644
+--- a/twidere/src/main/res/layout/list_item_message_entry.xml
++++ b/twidere/src/main/res/layout/list_item_message_entry.xml
+@@ -73,7 +73,6 @@
+                 android:layout_height="wrap_content"
+                 android:singleLine="true"
+                 android:textColor="?android:attr/textColorPrimary"
+-                android:textStyle="bold"
+                 tools:text="Mariotaku Lee"/>
+ 
+             <org.mariotaku.twidere.view.HandleSpanClickTextView

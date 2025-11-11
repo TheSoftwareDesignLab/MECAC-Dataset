@@ -1,0 +1,167 @@
+Fix snackbar appearing on the very bottom of the screen
+
+Snackbars are dismissible by swiping and thus should appear above the
+bottom gesture area. Some of the snackbars were appearing on the bottom
+of the screen even though they were using CoordinatorLayout as the root,
+this fixes it. Also, this fixes excessive relayout/remeasure while
+snackbars are showing.
+
+This does not fix snackbars not using CoordinatorLayout as the root.
+
+An attentive reader might ask, what on Earth does this change have to do
+with Snackbars? Well, let me tell you a story.
+
+I noticed that in Full screen navigation drawer mode, which I was using,
+snackbars are appearing too high. (This is another issue.) When I almost
+made a commit to make them appear on the very bottom of the screen,
+by setting bottomMarginGestureInsetRunnable to true, I realized that
+while this does make snackbars look consistent, they shouldn't be at
+the bottom of the screen in the first place. So in one case they were
+too high, and in another case too low, and, if dismissed via swiping,
+they left the fab too high. (This is yet another issue.)
+
+After minute investigation, that totally didn't take several hours,
+I found what I think is the issue. The timing is the problem.
+Animating snackbars in should work like this:
+
+  * Ask the framework for insets
+  * Post a callback, bottomMarginGestureInsetRunnable,
+    that adjusts margins taking insets into account
+    * This removes any callbacks posted previously!
+  * Post an animation
+
+Looks okay? Well, turns out that if Full screen drawer mode is not on,
+there's *a lot* of remeasuring going on. Remeasuring results in the
+above callback getting reposted again and again, and it ends up running
+*after* animation.
+
+Here's a debug log in case of Full screen drawer mode:
+
+  showing snackbar
+  posting callback
+  posting callback
+  callback run
+  animating
+
+And here's one in regular mode:
+
+  showing snackbar
+  posting callback ¹
+  posting callback ²
+  posting callback †
+  posting callback †
+  posting callback †
+  animating
+  posting callback †
+  callback run ‡
+  posting callback
+  callback run ‡
+  posting callback
+  callback run ‡
+    (many more lines)
+  posting callback
+  callback run ‡
+
+I guess you see the issue. What happens here:
+
+  * Callback gets posted “normally” twice (¹, ²).
+  * DrawerLayout.onMeasure sees if its child, CoordinatorLayout,
+    fits system windows. Since it does, it calls its method
+    dispatchApplyWindowInsets, which propagates to
+    BaseTransientBottomBar's inset listener, which reposts
+    bottomMarginGestureInsetRunnable (†).
+  * The callback ends up running too late ... and when it is run, its
+    parent has already ended its own layout. This is why, I think,
+    its call to requestLayout propagates to the root, which begins to
+    remeasure things again (‡).
+  * The last two steps are repeated on and on in a loop.
+
+Why does this happen? Well, I think that:
+
+  * The positioning problem is an issue with Snackbar itself.
+    It does not make sure that animation is run after inset listener
+    has been called.
+  * The loop problem is likely one of those weird Android issues that
+    come out of nowhere. Maybe it's this particular combination of
+    views? Or some funny flag somewhere deep in the code? Who knows.
+
+How this solves it? Well, I looked at why this is not an issue if Full
+screen navigation drawer setting is on. As mentioned above,
+DrawerLayout.onMeasure checks if its child fits system windows, and then
+calls dispatchApplyWindowInsets. In this case, CoordinatorLayout is
+wrapped in FullDraggableContainer, which does not have the fit system
+windows flag set. Removing this flag in CoordinatorLayout makes the
+behavior the same.
+
+***
+
+For reference, here's tracebacks for ¹ and ²:
+
+  Breakpoint reached
+    at com.google.android.material.snackbar.BaseTransientBottomBar.updateMargins(BaseTransientBottomBar.java:438)
+    at com.google.android.material.snackbar.BaseTransientBottomBar.onAttachedToWindow(BaseTransientBottomBar.java:737)
+    at com.google.android.material.snackbar.BaseTransientBottomBar$SnackbarBaseLayout.onAttachedToWindow(BaseTransientBottomBar.java:1221)
+    at android.view.View.dispatchAttachedToWindow(View.java:20479)
+    at android.view.ViewGroup.dispatchAttachedToWindow(ViewGroup.java:3489)
+    at android.view.ViewGroup.addViewInner(ViewGroup.java:5278)
+    at android.view.ViewGroup.addView(ViewGroup.java:5064)
+    at android.view.ViewGroup.addView(ViewGroup.java:5004)
+    at android.view.ViewGroup.addView(ViewGroup.java:4976)
+    at com.google.android.material.snackbar.BaseTransientBottomBar$SnackbarBaseLayout.addToTargetParent(BaseTransientBottomBar.java:1275)
+    at com.google.android.material.snackbar.BaseTransientBottomBar.showView(BaseTransientBottomBar.java:715)
+    at com.google.android.material.snackbar.BaseTransientBottomBar$1.handleMessage(BaseTransientBottomBar.java:244)
+    at android.os.Handler.dispatchMessage(Handler.java:102)
+    ...
+  Breakpoint reached
+    at com.google.android.material.snackbar.BaseTransientBottomBar.updateMargins(BaseTransientBottomBar.java:438)
+    at com.google.android.material.snackbar.BaseTransientBottomBar.recalculateAndUpdateMargins(BaseTransientBottomBar.java:840)
+    at com.google.android.material.snackbar.BaseTransientBottomBar.showView(BaseTransientBottomBar.java:716)
+    at com.google.android.material.snackbar.BaseTransientBottomBar$1.handleMessage(BaseTransientBottomBar.java:244)
+    at android.os.Handler.dispatchMessage(Handler.java:102)
+    ...
+
+And here's traceback for †
+
+  Breakpoint reached
+    at com.google.android.material.snackbar.BaseTransientBottomBar.updateMargins(BaseTransientBottomBar.java:438)
+    at com.google.android.material.snackbar.BaseTransientBottomBar.access$900(BaseTransientBottomBar.java:96)
+    at com.google.android.material.snackbar.BaseTransientBottomBar$3.onApplyWindowInsets(BaseTransientBottomBar.java:383)
+    at androidx.core.view.ViewCompat$Api21Impl$1.onApplyWindowInsets(ViewCompat.java:4858)
+    at android.view.View.dispatchApplyWindowInsets(View.java:11309)
+    at android.view.ViewGroup.dispatchApplyWindowInsets(ViewGroup.java:7320)
+    at android.view.ViewGroup.brokenDispatchApplyWindowInsets(ViewGroup.java:7334)
+    at android.view.ViewGroup.dispatchApplyWindowInsets(ViewGroup.java:7325)
+    at android.view.ViewGroup.brokenDispatchApplyWindowInsets(ViewGroup.java:7334)
+    at android.view.ViewGroup.dispatchApplyWindowInsets(ViewGroup.java:7325)
+    at androidx.drawerlayout.widget.DrawerLayout.onMeasure(DrawerLayout.java:1128)
+    at android.view.View.measure(View.java:25466)
+    at android.view.ViewGroup.measureChildWithMargins(ViewGroup.java:6957)
+    at android.widget.FrameLayout.onMeasure(FrameLayout.java:194)
+    at androidx.appcompat.widget.ContentFrameLayout.onMeasure(ContentFrameLayout.java:145)
+    at android.view.View.measure(View.java:25466)
+    at android.view.ViewGroup.measureChildWithMargins(ViewGroup.java:6957)
+    at android.widget.FrameLayout.onMeasure(FrameLayout.java:194)
+    at android.view.View.measure(View.java:25466)
+    at android.view.ViewGroup.measureChildWithMargins(ViewGroup.java:6957)
+    at android.widget.FrameLayout.onMeasure(FrameLayout.java:194)
+    at android.view.View.measure(View.java:25466)
+    at android.view.ViewGroup.measureChildWithMargins(ViewGroup.java:6957)
+    at android.widget.LinearLayout.measureChildBeforeLayout(LinearLayout.java:1552)
+    at android.widget.LinearLayout.measureVertical(LinearLayout.java:842)
+    at android.widget.LinearLayout.onMeasure(LinearLayout.java:721)
+    at android.view.View.measure(View.java:25466)
+    at android.view.ViewGroup.measureChildWithMargins(ViewGroup.java:6957)
+    at android.widget.FrameLayout.onMeasure(FrameLayout.java:194)
+    at com.android.internal.policy.DecorView.onMeasure(DecorView.java:747)
+    at android.view.View.measure(View.java:25466)
+    at android.view.ViewRootImpl.performMeasure(ViewRootImpl.java:3402)
+    at android.view.ViewRootImpl.measureHierarchy(ViewRootImpl.java:2246)
+    at android.view.ViewRootImpl.performTraversals(ViewRootImpl.java:2544)
+    at android.view.ViewRootImpl.doTraversal(ViewRootImpl.java:1948)
+    at android.view.ViewRootImpl$TraversalRunnable.run(ViewRootImpl.java:8177)
+    at android.view.Choreographer$CallbackRecord.run(Choreographer.java:972)
+    at android.view.Choreographer.doCallbacks(Choreographer.java:796)
+    at android.view.Choreographer.doFrame(Choreographer.java:731)
+    at android.view.Choreographer$FrameDisplayEventReceiver.run(Choreographer.java:957)
+    at android.os.Handler.handleCallback(Handler.java:938)
+    at android.os.Handler.dispatchMessage(Handler.java:99)

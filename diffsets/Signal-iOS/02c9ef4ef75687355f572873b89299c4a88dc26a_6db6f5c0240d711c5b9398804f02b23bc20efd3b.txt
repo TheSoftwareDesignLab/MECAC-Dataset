@@ -1,0 +1,1718 @@
+diff --git a/Signal/src/AppDelegate.m b/Signal/src/AppDelegate.m
+index 9fc65b6297d..c64160d1d4d 100644
+--- a/Signal/src/AppDelegate.m
++++ b/Signal/src/AppDelegate.m
+@@ -268,6 +268,11 @@ - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
+                                                  name:NSNotificationName_2FAStateDidChange
+                                                object:nil];
+ 
++    [[NSNotificationCenter defaultCenter] addObserver:self
++                                             selector:@selector(spamChallenge:)
++                                                 name:OWSSpamChallengeResolver.NeedsCaptchaNotification
++                                               object:nil];
++
+     OWSLogInfo(@"application: didFinishLaunchingWithOptions completed.");
+ 
+     OWSLogInfo(@"launchOptions: %@.", launchOptions);
+@@ -277,6 +282,13 @@ - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
+     return YES;
+ }
+ 
++- (void)spamChallenge:(NSNotification *)notification
++{
++    [OWSSpamCaptchaViewController presentModallyWithCompletion:^void(NSString *token){
++        [self.spamChallengeResolver handleIncomingCaptchaChallengeToken:token];
++    }];
++}
++
+ /**
+  *  The user must unlock the device once after reboot before the database encryption key can be accessed.
+  */
+@@ -1011,14 +1023,10 @@ - (void)processRemoteNotification:(NSDictionary *)userInfo completion:(nullable
+     }
+ 
+     AppReadinessRunNowOrWhenAppDidBecomeReadySync(^{
+-        NSString *_Nullable spamChallengeToken = userInfo[@"rate_limit_challenge"];
+-        if (spamChallengeToken) {
+-            OWSSpamChallengeResolver *spamResolver = self.spamChallengeResolver;
+-            [spamResolver didReceiveIncomingPushChallengeWithToken:spamChallengeToken];
++        BOOL isSilentPush = [self handleSilentPushContent:userInfo];
++        if (!isSilentPush) {
++            [self.messageFetcherJob runObjc];
+         }
+-
+-        [self.messageFetcherJob runObjc];
+-
+         if (completion != nil) {
+             completion();
+         }
+@@ -1182,6 +1190,18 @@ - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event
+ 
+ #pragma mark - UNUserNotificationsDelegate
+ 
++- (BOOL)handleSilentPushContent:(NSDictionary *)userInfo
++{
++    NSString *_Nullable spamChallengeToken = userInfo[@"rateLimitChallenge"];
++
++    if (spamChallengeToken) {
++        OWSSpamChallengeResolver *spamResolver = self.spamChallengeResolver;
++        [spamResolver handleIncomingPushChallengeToken:spamChallengeToken];
++        return YES;
++    }
++    return NO;
++}
++
+ // The method will be called on the delegate only if the application is in the foreground. If the method is not
+ // implemented or the handler is not called in a timely manner then the notification will not be presented. The
+ // application can choose to have the notification presented as a sound, badge, alert and/or in the notification list.
+@@ -1192,13 +1212,19 @@ - (void)userNotificationCenter:(UNUserNotificationCenter *)center
+ {
+     OWSLogInfo(@"");
+     AppReadinessRunNowOrWhenAppDidBecomeReadySync(^{
+-        // We need to respect the in-app notification sound preference. This method, which is called
+-        // for modern UNUserNotification users, could be a place to do that, but since we'd still
+-        // need to handle this behavior for legacy UINotification users anyway, we "allow" all
+-        // notification options here, and rely on the shared logic in NotificationPresenter to
+-        // honor notification sound preferences for both modern and legacy users.
+-        UNNotificationPresentationOptions options = UNNotificationPresentationOptionAlert
+-            | UNNotificationPresentationOptionBadge | UNNotificationPresentationOptionSound;
++        UNNotificationPresentationOptions options = 0;
++        BOOL isSilent = [self handleSilentPushContent:notification.request.content.userInfo];
++
++        if (!isSilent) {
++            // We need to respect the in-app notification sound preference. This method, which is called
++            // for modern UNUserNotification users, could be a place to do that, but since we'd still
++            // need to handle this behavior for legacy UINotification users anyway, we "allow" all
++            // notification options here, and rely on the shared logic in NotificationPresenter to
++            // honor notification sound preferences for both modern and legacy users.
++            options |= UNNotificationPresentationOptionAlert;
++            options |= UNNotificationPresentationOptionBadge;
++            options |= UNNotificationPresentationOptionSound;
++        }
+         completionHandler(options);
+     });
+ }
+diff --git a/Signal/src/ViewControllers/ConversationView/CV/CVComponentState.swift b/Signal/src/ViewControllers/ConversationView/CV/CVComponentState.swift
+index 9969993dade..6b304695c99 100644
+--- a/Signal/src/ViewControllers/ConversationView/CV/CVComponentState.swift
++++ b/Signal/src/ViewControllers/ConversationView/CV/CVComponentState.swift
+@@ -729,6 +729,7 @@ fileprivate extension CVComponentState.Builder {
+         try buildBodyText(message: message)
+ 
+         if let outgoingMessage = message as? TSOutgoingMessage,
++           // SPAM TODO: badge pending messages
+            outgoingMessage.messageState == .failed {
+             self.sendFailureBadge = SendFailureBadge()
+         }
+@@ -813,7 +814,7 @@ fileprivate extension CVComponentState.Builder {
+                 viewOnceState = .outgoingSentExpired
+             } else {
+                 switch outgoingMessage.messageState {
+-                case .sending:
++                case .sending, .pending:        // todo verify this makes sense
+                     viewOnceState = .outgoingSending
+                 case .failed:
+                     viewOnceState = .outgoingFailed
+diff --git a/Signal/src/ViewControllers/ConversationView/CV/CVComponents/CVComponentMessage.swift b/Signal/src/ViewControllers/ConversationView/CV/CVComponents/CVComponentMessage.swift
+index a3d55c90202..f999d274f52 100644
+--- a/Signal/src/ViewControllers/ConversationView/CV/CVComponents/CVComponentMessage.swift
++++ b/Signal/src/ViewControllers/ConversationView/CV/CVComponents/CVComponentMessage.swift
+@@ -975,6 +975,7 @@ public class CVComponentMessage: CVComponentBase, CVRootComponent {
+             return true
+         }
+ 
++        // SPAM TODO: add captcha retry handler
+         if let outgoingMessage = interaction as? TSOutgoingMessage {
+             switch outgoingMessage.messageState {
+             case .failed:
+diff --git a/Signal/src/ViewControllers/ConversationView/CV/CVItemViewState.swift b/Signal/src/ViewControllers/ConversationView/CV/CVItemViewState.swift
+index 1cb041788dc..af74633f795 100644
+--- a/Signal/src/ViewControllers/ConversationView/CV/CVItemViewState.swift
++++ b/Signal/src/ViewControllers/ConversationView/CV/CVItemViewState.swift
+@@ -267,6 +267,7 @@ struct CVItemModelBuilder: CVItemBuilding, Dependencies {
+                                                     receiptStatus == nextReceiptStatus &&
+                                                     outgoingMessage.messageState != .failed &&
+                                                     outgoingMessage.messageState != .sending &&
++                                                    outgoingMessage.messageState != .pending &&
+                                                     !isDisappearingMessage &&
+                                                     !hasTapForMore)
+             }
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationViewController+OWS.swift b/Signal/src/ViewControllers/ConversationView/ConversationViewController+OWS.swift
+index e479a873251..8f6e9c81e1c 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationViewController+OWS.swift
++++ b/Signal/src/ViewControllers/ConversationView/ConversationViewController+OWS.swift
+@@ -365,7 +365,7 @@ extension ConversationViewController: MessageActionsViewControllerDelegate {
+             if outgoingMessage.wasRemotelyDeleted { return false }
+ 
+             switch outgoingMessage.messageState {
+-            case .failed, .sending:
++            case .failed, .sending, .pending:
+                 return false
+             default:
+                 return true
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationViewController.m b/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
+index 3280d6eef12..dd2738a7d52 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
++++ b/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
+@@ -1633,6 +1633,7 @@ - (void)handleTapOnFailedOrPendingDownloads:(TSMessage *)message
+         failure:^(NSError *error) { OWSLogWarn(@"Failed to redownload message with error: %@", error); }];
+ }
+ 
++// SPAM TODO: present captcha for pending message?
+ - (void)resendFailedOutgoingMessage:(TSOutgoingMessage *)message
+ {
+     TSOutgoingMessage *messageToSend;
+@@ -4125,6 +4126,9 @@ - (BOOL)cvc_shouldAllowReplyForItem:(CVItemViewModelImpl *)itemViewModel
+         } else if (outgoingMessage.messageState == TSOutgoingMessageStateSending) {
+             // Don't allow "delete" or "reply" on "sending" outgoing messages.
+             return NO;
++        }  else if (outgoingMessage.messageState == TSOutgoingMessageStatePending) {
++            // Don't allow "delete" or "reply" on "sending" outgoing messages.
++            return NO;
+         }
+     }
+ 
+diff --git a/Signal/src/ViewControllers/HomeView/ConversationListCell.m b/Signal/src/ViewControllers/HomeView/ConversationListCell.m
+index b68431dfc47..6631d9c8571 100644
+--- a/Signal/src/ViewControllers/HomeView/ConversationListCell.m
++++ b/Signal/src/ViewControllers/HomeView/ConversationListCell.m
+@@ -355,6 +355,7 @@ - (void)configureWithThread:(ThreadViewModel *)thread
+                 shouldHideStatusIndicator = outgoingMessage.wasRemotelyDeleted;
+                 break;
+             case MessageReceiptStatusFailed:
++            case MessageReceiptStatusPending:           // SPAM TODO
+                 statusIndicatorImage = [UIImage imageNamed:@"error-outline-12"];
+                 messageStatusViewTintColor = UIColor.ows_accentRedColor;
+                 break;
+diff --git a/Signal/src/ViewControllers/MessageDetailViewController.swift b/Signal/src/ViewControllers/MessageDetailViewController.swift
+index 73878adaaa7..d585aa0767e 100644
+--- a/Signal/src/ViewControllers/MessageDetailViewController.swift
++++ b/Signal/src/ViewControllers/MessageDetailViewController.swift
+@@ -287,6 +287,7 @@ class MessageDetailViewController: OWSTableViewController2 {
+             .sent,
+             .uploading,
+             .sending,
++            .pending,           // SPAM TODO: Is this the right position?
+             .failed,
+             .skipped
+         ]
+@@ -430,7 +431,7 @@ class MessageDetailViewController: OWSTableViewController2 {
+ 
+     private func sectionIconName(for messageReceiptStatus: MessageReceiptStatus) -> String? {
+         switch messageReceiptStatus {
+-        case .uploading, .sending:
++        case .uploading, .sending, .pending:            // SPAM TODO: Is this the right icon?
+             return "message_status_sending"
+         case .sent:
+             return "message_status_sent"
+@@ -448,7 +449,7 @@ class MessageDetailViewController: OWSTableViewController2 {
+         case .uploading:
+             return NSLocalizedString("MESSAGE_METADATA_VIEW_MESSAGE_STATUS_UPLOADING",
+                               comment: "Status label for messages which are uploading.")
+-        case .sending:
++        case .sending, .pending:            // SPAM TODO
+             return NSLocalizedString("MESSAGE_METADATA_VIEW_MESSAGE_STATUS_SENDING",
+                               comment: "Status label for messages which are sending.")
+         case .sent:
+@@ -769,7 +770,7 @@ extension MessageDetailViewController: UIDatabaseSnapshotDelegate {
+                         accessoryText: statusMessage,
+                         displayUDIndicator: recipientState.wasSentByUD
+                     ))
+-                case .sending, .failed, .skipped, .uploading:
++                case .sending, .failed, .skipped, .uploading, pending:              // SPAM TODO
+                     bucket.append(MessageRecipientModel(
+                         address: address,
+                         accessoryText: "",
+diff --git a/Signal/src/ViewControllers/Registration/OnboardingCaptchaViewController.swift b/Signal/src/ViewControllers/Registration/OnboardingCaptchaViewController.swift
+index c11d8181a78..b8c668cea7f 100644
+--- a/Signal/src/ViewControllers/Registration/OnboardingCaptchaViewController.swift
++++ b/Signal/src/ViewControllers/Registration/OnboardingCaptchaViewController.swift
+@@ -6,155 +6,98 @@ import UIKit
+ import WebKit
+ 
+ @objc
+-public class OnboardingCaptchaViewController: OnboardingBaseViewController {
++public protocol CaptchaViewDelegate: NSObjectProtocol {
++    @objc
++    optional func captchaView(_: CaptchaView, didCompleteCaptchaWithToken: String)
++    @objc
++    optional func captchaViewDidFailToCompleteCaptcha(_: CaptchaView)
+ 
+-    private var webView: WKWebView?
+-
+-    override public func loadView() {
+-        view = UIView()
+-        view.addSubview(primaryView)
+-        primaryView.autoPinEdgesToSuperviewEdges()
++}
+ 
+-        view.backgroundColor = Theme.backgroundColor
++@objc
++public class CaptchaView: UIView {
+ 
+-        let titleLabel = self.createTitleLabel(text: NSLocalizedString("ONBOARDING_CAPTCHA_TITLE", comment: "Title of the 'onboarding Captcha' view."))
+-        titleLabel.accessibilityIdentifier = "onboarding.captcha." + "titleLabel"
+-
+-        let titleRow = UIStackView(arrangedSubviews: [
+-            titleLabel
+-            ])
+-        titleRow.axis = .vertical
+-        titleRow.alignment = .fill
+-        titleRow.layoutMargins = UIEdgeInsets(top: 10, left: 0, bottom: 0, right: 0)
+-        titleRow.isLayoutMarginsRelativeArrangement = true
++    private let captchaURL = URL(string: "https://signalcaptchas.org/registration/generate.html")!
+ 
++    private var webView: WKWebView = {
+         // We want the CAPTCHA web content to "fill the screen (honoring margins)".
+         // The way to do this with WKWebView is to inject a javascript snippet that
+         // manipulates the viewport.
+-        let jscript = "var meta = document.createElement('meta'); meta.setAttribute('name', 'viewport'); meta.setAttribute('content', 'width=device-width'); document.getElementsByTagName('head')[0].appendChild(meta);"
+-        let userScript = WKUserScript(source: jscript, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+-        let wkUController = WKUserContentController()
+-        wkUController.addUserScript(userScript)
+-        let wkWebConfig = WKWebViewConfiguration()
+-        wkWebConfig.userContentController = wkUController
+-        let webView = WKWebView(frame: self.view.bounds, configuration: wkWebConfig)
+-        self.webView = webView
+-        webView.navigationDelegate = self
++        //
++        // TODO: There's a long outstanding where short devices will require vertical
++        // scrolling to see the entire captcha. We should manipulate the viewport to mitigate
++        // this.
++        let viewportInjection = WKUserScript(
++            source: """
++                var meta = document.createElement('meta');
++                meta.setAttribute('name', 'viewport');
++                meta.setAttribute('content', 'width=device-width');
++                document.getElementsByTagName('head')[0].appendChild(meta);
++                """,
++            injectionTime: .atDocumentEnd,
++            forMainFrameOnly: true)
++
++        let contentController = WKUserContentController()
++        contentController.addUserScript(viewportInjection)
++        let configuration = WKWebViewConfiguration()
++        configuration.userContentController = contentController
++
++        let webView = WKWebView(frame: .zero, configuration: configuration)
+         webView.allowsBackForwardNavigationGestures = false
+         webView.customUserAgent = "Signal iOS (+https://signal.org/download)"
+         webView.allowsLinkPreview = false
+         webView.scrollView.contentInset = .zero
+         webView.layoutMargins = .zero
+         webView.accessibilityIdentifier = "onboarding.captcha." + "webView"
++        return webView
++    }()
+ 
+-        let stackView = UIStackView(arrangedSubviews: [
+-            titleRow,
+-            webView
+-            ])
+-        stackView.axis = .vertical
+-        stackView.alignment = .fill
+-        primaryView.addSubview(stackView)
+-        stackView.autoPinEdgesToSuperviewSafeArea()
+-
+-        NotificationCenter.default.addObserver(self,
+-                                               selector: #selector(didBecomeActive),
+-                                               name: .OWSApplicationDidBecomeActive,
+-                                               object: nil)
+-    }
+-
+-    deinit {
+-        NotificationCenter.default.removeObserver(self)
+-    }
+-
+-    public override func viewWillAppear(_ animated: Bool) {
+-        super.viewWillAppear(animated)
++    override init(frame: CGRect) {
++        super.init(frame: frame)
++        addSubview(webView)
++        webView.autoPinEdgesToSuperviewEdges()
+ 
+-        loadContent()
++        webView.navigationDelegate = self
+ 
+-        webView?.scrollView.contentOffset = .zero
++        NotificationCenter.default.addObserver(
++            self,
++            selector: #selector(didBecomeActive),
++            name: .OWSApplicationDidBecomeActive,
++            object: nil)
+     }
+ 
+-    public override func viewDidAppear(_ animated: Bool) {
+-        super.viewDidAppear(animated)
+-
+-        webView?.scrollView.contentOffset = .zero
++    required init?(coder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
+     }
+ 
+-    fileprivate let contentUrl = "https://signalcaptchas.org/registration/generate.html"
++    public weak var delegate: CaptchaViewDelegate?
+ 
+-    private func loadContent() {
+-        guard let webView = webView else {
+-            owsFailDebug("Missing webView.")
+-            return
+-        }
+-        guard let url = URL(string: contentUrl) else {
+-            owsFailDebug("Invalid URL.")
+-            return
+-        }
+-        webView.load(URLRequest(url: url))
+-        webView.scrollView.contentOffset = .zero
++    public func loadCaptcha() {
++        webView.load(URLRequest(url: captchaURL))
+     }
+ 
+-    // MARK: - Notifications
+-
+-    @objc func didBecomeActive() {
+-        AssertIsOnMainThread()
+-
+-        loadContent()
++    @objc
++    private func didBecomeActive() {
++        loadCaptcha()
+     }
+ 
+-    // MARK: -
+-
+-    private func parseCaptchaAndRequestVerification(url: URL) {
+-        Logger.info("")
+-
+-        guard let captchaToken = parseCaptcha(url: url) else {
++    // Example URL:
++    // signalcaptcha://03AF6jDqXgf1PocNNrWRJEENZ9l6RAMIsUoESi2dFKkxTgE2qjdZGVjE
++    // W6SZNFQqeRRTgGqOii6zHGG--uLyC1HnhSmRt8wHeKxHcg1hsK4ucTusANIeFXVB8wPPiV7U
++    // _0w2jUFVak5clMCvW9_JBfbfzj51_e9sou8DYfwc_R6THuTBTdpSV8Nh0yJalgget-nSukCx
++    // h6FPA6hRVbw7lP3r-me1QCykHOfh-V29UVaQ4Fs5upHvwB5rtiViqT_HN8WuGmdIdGcaWxaq
++    // y1lQTgFSs2Shdj593wZiXfhJnCWAw9rMn3jSgIZhkFxdXwKOmslQ2E_I8iWkm6
++    private func parseCaptchaResult(url: URL) {
++        if let token = url.host, token.count > 0 {
++            delegate?.captchaView?(self, didCompleteCaptchaWithToken: token)
++        } else {
+             owsFailDebug("Could not parse captcha token: \(url)")
+-            // TODO: Alert?
+-            //
+-            // Reload content so user can try again.
+-            loadContent()
+-            return
++            delegate?.captchaViewDidFailToCompleteCaptcha?(self)
+         }
+-        onboardingController.update(captchaToken: captchaToken)
+-
+-        let progressView = AnimatedProgressView()
+-        view.addSubview(progressView)
+-        progressView.autoCenterInSuperview()
+-        progressView.startAnimating()
+-
+-        onboardingController.requestVerification(fromViewController: self, isSMS: true) { [weak self] willDismiss, _ in
+-            if !willDismiss {
+-                // There's nothing left to do here. If onboardingController isn't taking us anywhere, let's
+-                // just pop back to the phone number verification controller
+-                self?.navigationController?.popViewController(animated: true)
+-            }
+-            UIView.animate(withDuration: 0.15) {
+-                progressView.alpha = 0
+-            } completion: { _ in
+-                progressView.removeFromSuperview()
+-            }
+-        }
+-    }
+-
+-    private func parseCaptcha(url: URL) -> String? {
+-        Logger.info("")
+-
+-        // Example URL:
+-        // signalcaptcha://03AF6jDqXgf1PocNNrWRJEENZ9l6RAMIsUoESi2dFKkxTgE2qjdZGVjEW6SZNFQqeRRTgGqOii6zHGG--uLyC1HnhSmRt8wHeKxHcg1hsK4ucTusANIeFXVB8wPPiV7U_0w2jUFVak5clMCvW9_JBfbfzj51_e9sou8DYfwc_R6THuTBTdpSV8Nh0yJalgget-nSukCxh6FPA6hRVbw7lP3r-me1QCykHOfh-V29UVaQ4Fs5upHvwB5rtiViqT_HN8WuGmdIdGcaWxaqy1lQTgFSs2Shdj593wZiXfhJnCWAw9rMn3jSgIZhkFxdXwKOmslQ2E_I8iWkm6
+-        guard let host = url.host,
+-            host.count > 0 else {
+-                owsFailDebug("Missing host.")
+-                return nil
+-        }
+-
+-        return host
+     }
+ }
+ 
+-// MARK: -
+-
+-extension OnboardingCaptchaViewController: WKNavigationDelegate {
++extension CaptchaView: WKNavigationDelegate {
+     public func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+         Logger.verbose("navigationAction: \(String(describing: navigationAction.request.url))")
+ 
+@@ -166,7 +109,7 @@ extension OnboardingCaptchaViewController: WKNavigationDelegate {
+         if url.scheme == "signalcaptcha" {
+             decisionHandler(.cancel)
+             DispatchQueue.main.async {
+-                self.parseCaptchaAndRequestVerification(url: url)
++                self.parseCaptchaResult(url: url)
+             }
+             return
+         }
+@@ -191,6 +134,9 @@ extension OnboardingCaptchaViewController: WKNavigationDelegate {
+ 
+     public func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+         Logger.verbose("navigation: \(String(describing: navigation)), error: \(error)")
++        DispatchQueue.main.async {
++            self.delegate?.captchaViewDidFailToCompleteCaptcha?(self)
++        }
+     }
+ 
+     public func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+@@ -203,9 +149,149 @@ extension OnboardingCaptchaViewController: WKNavigationDelegate {
+ 
+     public func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+         Logger.verbose("navigation: \(String(describing: navigation)), error: \(error)")
++        DispatchQueue.main.async {
++            self.delegate?.captchaViewDidFailToCompleteCaptcha?(self)
++        }
+     }
+ 
+     public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+         Logger.verbose("")
++        DispatchQueue.main.async {
++            self.delegate?.captchaViewDidFailToCompleteCaptcha?(self)
++        }
+     }
+ }
++
++@objc
++public class OnboardingCaptchaViewController: OnboardingBaseViewController, CaptchaViewDelegate {
++
++    private var captchaView: CaptchaView?
++
++    override public func loadView() {
++        view = UIView()
++        view.addSubview(primaryView)
++        primaryView.autoPinEdgesToSuperviewEdges()
++
++        view.backgroundColor = Theme.backgroundColor
++
++        let titleLabel = self.createTitleLabel(text: NSLocalizedString("ONBOARDING_CAPTCHA_TITLE", comment: "Title of the 'onboarding Captcha' view."))
++        titleLabel.accessibilityIdentifier = "onboarding.captcha." + "titleLabel"
++
++        let titleRow = UIStackView(arrangedSubviews: [
++            titleLabel
++            ])
++        titleRow.axis = .vertical
++        titleRow.alignment = .fill
++        titleRow.layoutMargins = UIEdgeInsets(top: 10, left: 0, bottom: 0, right: 0)
++        titleRow.isLayoutMarginsRelativeArrangement = true
++
++        let captchaView = CaptchaView()
++        self.captchaView = captchaView
++        captchaView.delegate = self
++
++        let stackView = UIStackView(arrangedSubviews: [
++            titleRow,
++            captchaView
++            ])
++        stackView.axis = .vertical
++        stackView.alignment = .fill
++        primaryView.addSubview(stackView)
++        stackView.autoPinEdgesToSuperviewSafeArea()
++    }
++
++    public override func viewWillAppear(_ animated: Bool) {
++        super.viewWillAppear(animated)
++        captchaView?.loadCaptcha()
++    }
++
++    // MARK: -
++
++    public func captchaView(_: CaptchaView, didCompleteCaptchaWithToken token: String) {
++        requestCaptchaVerification(captchaToken: token)
++    }
++
++    public func captchaViewDidFailToCompleteCaptcha(_ captchaView: CaptchaView) {
++        captchaView.loadCaptcha()
++    }
++
++    private func requestCaptchaVerification(captchaToken: String) {
++        Logger.info("")
++        onboardingController.update(captchaToken: captchaToken)
++
++        let progressView = AnimatedProgressView()
++        view.addSubview(progressView)
++        progressView.autoCenterInSuperview()
++        progressView.startAnimating()
++
++        onboardingController.requestVerification(fromViewController: self, isSMS: true) { [weak self] willDismiss, _ in
++            if !willDismiss {
++                // There's nothing left to do here. If onboardingController isn't taking us anywhere, let's
++                // just pop back to the phone number verification controller
++                self?.navigationController?.popViewController(animated: true)
++            }
++            UIView.animate(withDuration: 0.15) {
++                progressView.alpha = 0
++            } completion: { _ in
++                progressView.removeFromSuperview()
++            }
++        }
++    }
++}
++
++@objc(OWSSpamCaptchaViewController)
++class SpamCaptchaViewController: UIViewController, CaptchaViewDelegate {
++    private var captchaView: CaptchaView?
++    var completionHandler: ((String) -> Void)?
++
++    private init() {
++        super.init(nibName: nil, bundle: nil)
++    }
++
++    @objc
++    static func presentModallyWithCompletion(_ completion: @escaping (String?) -> Void) {
++        guard let frontmostVC = UIApplication.shared.frontmostViewController else {
++            return completion(nil)
++        }
++
++        let vc = SpamCaptchaViewController()
++        vc.completionHandler = { token in
++            completion(token)
++            vc.dismiss(animated: true, completion: nil)
++        }
++
++        let navVC = OWSNavigationController(rootViewController: vc)
++        frontmostVC.present(navVC, animated: true, completion: nil)
++    }
++
++    override func loadView() {
++        let captchaView = CaptchaView()
++        captchaView.delegate = self
++
++        let view = UIView()
++        view.addSubview(captchaView)
++        captchaView.autoPinEdgesToSuperviewEdges()
++
++        self.captchaView = captchaView
++        self.view = view
++        view.backgroundColor = .blue
++    }
++
++    required init?(coder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    override func viewWillAppear(_ animated: Bool) {
++        super.viewWillAppear(animated)
++        captchaView?.loadCaptcha()
++    }
++
++    func captchaView(_: CaptchaView, didCompleteCaptchaWithToken token: String) {
++        completionHandler?(token)
++        completionHandler = nil
++    }
++
++    func captchaViewDidFailToCompleteCaptcha(_: CaptchaView) {
++        captchaView?.loadCaptcha()
++    }
++
++}
+diff --git a/Signal/src/ViewControllers/Utils/MessageRecipientStatusUtils.swift b/Signal/src/ViewControllers/Utils/MessageRecipientStatusUtils.swift
+index c394bc0a091..0d4e0b6467e 100644
+--- a/Signal/src/ViewControllers/Utils/MessageRecipientStatusUtils.swift
++++ b/Signal/src/ViewControllers/Utils/MessageRecipientStatusUtils.swift
+@@ -15,6 +15,7 @@ import SignalMessaging
+     case viewed
+     case failed
+     case skipped
++    case pending
+ }
+ 
+ @objc
+@@ -57,7 +58,7 @@ public class MessageRecipientStatusUtils: NSObject {
+         recipientState: TSOutgoingMessageRecipientState) -> (status: MessageReceiptStatus, shortStatusMessage: String, longStatusMessage: String) {
+ 
+         switch recipientState.state {
+-        case .failed:
++        case .failed, .pending:         // SPAM TODO: message status for pending messages?
+             let shortStatusMessage = NSLocalizedString("MESSAGE_STATUS_FAILED_SHORT", comment: "status message for failed messages")
+             let longStatusMessage = NSLocalizedString("MESSAGE_STATUS_FAILED", comment: "status message for failed messages")
+             return (status:.failed, shortStatusMessage:shortStatusMessage, longStatusMessage:longStatusMessage)
+@@ -112,7 +113,7 @@ public class MessageRecipientStatusUtils: NSObject {
+     internal class func receiptStatusAndMessage(outgoingMessage: TSOutgoingMessage) -> (status: MessageReceiptStatus, message: String) {
+ 
+         switch outgoingMessage.messageState {
+-        case .failed:
++        case .failed, .pending:         // SPAM TODO
+             // Use the "long" version of this message here.
+             return (.failed, NSLocalizedString("MESSAGE_STATUS_FAILED", comment: "status message for failed messages"))
+         case .sending:
+@@ -176,6 +177,8 @@ public class MessageRecipientStatusUtils: NSObject {
+             return "failed"
+         case .skipped:
+             return "skipped"
++        case .pending:
++            return "pending"
+         }
+     }
+ }
+diff --git a/SignalMessaging/utils/ConversationStyle.swift b/SignalMessaging/utils/ConversationStyle.swift
+index 2cb6cae0813..a478f8d295d 100644
+--- a/SignalMessaging/utils/ConversationStyle.swift
++++ b/SignalMessaging/utils/ConversationStyle.swift
+@@ -236,7 +236,7 @@ public class ConversationStyle: NSObject {
+             switch outgoingMessage.messageState {
+             case .failed:
+                 return bubbleColorOutgoingFailed
+-            case .sending:
++            case .sending, .pending:
+                 return bubbleColorOutgoingSending
+             default:
+                 return bubbleColorOutgoingSent
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSOutgoingMessage.h b/SignalServiceKit/src/Messages/Interactions/TSOutgoingMessage.h
+index 97580515de2..aae582b8b70 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSOutgoingMessage.h
++++ b/SignalServiceKit/src/Messages/Interactions/TSOutgoingMessage.h
+@@ -22,6 +22,8 @@ typedef NS_ENUM(NSInteger, TSOutgoingMessageState) {
+     TSOutgoingMessageStateDelivered_OBSOLETE,
+     // The message has been sent to the service.
+     TSOutgoingMessageStateSent,
++    // The message is blocked behind some precondition.
++    TSOutgoingMessageStatePending
+ };
+ 
+ NSString *NSStringForOutgoingMessageState(TSOutgoingMessageState value);
+@@ -36,9 +38,12 @@ typedef NS_CLOSED_ENUM(NSInteger, OWSOutgoingMessageRecipientState) {
+     OWSOutgoingMessageRecipientStateSkipped,
+     // The message has been sent to the service.  It may also have been delivered or read.
+     OWSOutgoingMessageRecipientStateSent,
++    // The server rejected the message send request until some other condition is satisfied.
++    // Currently, this only flags messages that the server suspects may be spam.
++    OWSOutgoingMessageRecipientStatePending,
+ 
+     OWSOutgoingMessageRecipientStateMin = OWSOutgoingMessageRecipientStateFailed,
+-    OWSOutgoingMessageRecipientStateMax = OWSOutgoingMessageRecipientStateSent,
++    OWSOutgoingMessageRecipientStateMax = OWSOutgoingMessageRecipientStatePending,
+ };
+ 
+ NSString *NSStringForOutgoingMessageRecipientState(OWSOutgoingMessageRecipientState value);
+@@ -228,7 +233,7 @@ NS_DESIGNATED_INITIALIZER NS_SWIFT_NAME(init(grdbId:uniqueId:receivedAtTimestamp
+ @property (atomic, nullable, readonly)
+     NSDictionary<SignalServiceAddress *, TSOutgoingMessageRecipientState *> *recipientAddressStates;
+ 
+-// All recipients of this message who we are currently trying to send to (queued, uploading or during send).
++// All recipients of this message who we are currently trying to send to (pending, queued, uploading or during send).
+ - (NSArray<SignalServiceAddress *> *)sendingRecipientAddresses;
+ 
+ // All recipients of this message to whom it has been sent (and possibly delivered or read).
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSOutgoingMessage.m b/SignalServiceKit/src/Messages/Interactions/TSOutgoingMessage.m
+index 391f805ede6..da12d286ead 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSOutgoingMessage.m
++++ b/SignalServiceKit/src/Messages/Interactions/TSOutgoingMessage.m
+@@ -41,6 +41,8 @@ typedef NS_CLOSED_ENUM(NSUInteger, OutgoingGroupProtoResult) { OutgoingGroupProt
+             return @"TSOutgoingMessageStateDelivered_OBSOLETE";
+         case TSOutgoingMessageStateSent:
+             return @"TSOutgoingMessageStateSent";
++        case TSOutgoingMessageStatePending:
++            return @"TSOutgoingMessageStatePending";
+     }
+ }
+ 
+@@ -55,6 +57,8 @@ typedef NS_CLOSED_ENUM(NSUInteger, OutgoingGroupProtoResult) { OutgoingGroupProt
+             return @"OWSOutgoingMessageRecipientStateSkipped";
+         case OWSOutgoingMessageRecipientStateSent:
+             return @"OWSOutgoingMessageRecipientStateSent";
++        case OWSOutgoingMessageRecipientStatePending:
++            return @"OWSOutgoingMessageRecipientStatePending";
+     }
+ }
+ 
+@@ -411,10 +415,13 @@ + (TSOutgoingMessageState)messageStateForRecipientStates:(NSArray<TSOutgoingMess
+     OWSAssertDebug(recipientStates);
+ 
+     // If there are any "sending" recipients, consider this message "sending".
++    // If there are any "pending" recipients, consider this message "pending".
+     BOOL hasFailed = NO;
+     for (TSOutgoingMessageRecipientState *recipientState in recipientStates) {
+         if (recipientState.state == OWSOutgoingMessageRecipientStateSending) {
+             return TSOutgoingMessageStateSending;
++        } else if (recipientState.state == OWSOutgoingMessageRecipientStatePending) {
++            return TSOutgoingMessageStatePending;
+         } else if (recipientState.state == OWSOutgoingMessageRecipientStateFailed) {
+             hasFailed = YES;
+         }
+@@ -503,7 +510,7 @@ - (OWSInteractionType)interactionType
+     NSMutableArray<SignalServiceAddress *> *result = [NSMutableArray new];
+     for (SignalServiceAddress *recipientAddress in self.recipientAddressStates) {
+         TSOutgoingMessageRecipientState *recipientState = self.recipientAddressStates[recipientAddress];
+-        if (recipientState.state == OWSOutgoingMessageRecipientStateSending) {
++        if (recipientState.state == OWSOutgoingMessageRecipientStateSending || recipientState.state == OWSOutgoingMessageRecipientStatePending) {
+             [result addObject:recipientAddress];
+         }
+     }
+@@ -711,9 +718,14 @@ - (void)updateWithFailedRecipient:(SignalServiceAddress *)recipientAddress
+                                                         @"Missing recipient state for recipient: %@", recipientAddress);
+                                                     return;
+                                                 }
+-                                                recipientState.state = OWSOutgoingMessageRecipientStateFailed;
+-                                                recipientState.errorCode = @(error.code);
+-                                            }];
++
++        if ([error ows_isSSKErrorWithCode:OWSErrorCodeServerRejectedSuspectedSpam]) {
++            recipientState.state = OWSOutgoingMessageRecipientStatePending;
++        } else {
++            recipientState.state = OWSOutgoingMessageRecipientStateFailed;
++        }
++        recipientState.errorCode = @(error.code);
++    }];
+ }
+ 
+ - (void)updateWithDeliveredRecipient:(SignalServiceAddress *)recipientAddress
+@@ -971,6 +983,9 @@ - (void)updateWithFakeMessageState:(TSOutgoingMessageState)messageState
+                                                         case TSOutgoingMessageStateSent:
+                                                             recipientState.state = OWSOutgoingMessageRecipientStateSent;
+                                                             break;
++                                                        case TSOutgoingMessageStatePending:
++                                                            recipientState.state = OWSOutgoingMessageRecipientStatePending;
++                                                            break;
+                                                         default:
+                                                             OWSFailDebug(@"unexpected message state.");
+                                                             break;
+diff --git a/SignalServiceKit/src/Messages/MessageSender.m b/SignalServiceKit/src/Messages/MessageSender.m
+index 23e95451a63..25fc29b726e 100644
+--- a/SignalServiceKit/src/Messages/MessageSender.m
++++ b/SignalServiceKit/src/Messages/MessageSender.m
+@@ -301,6 +301,8 @@ - (void)didFailWithError:(NSError *)error
+ 
+ NSString *const MessageSenderInvalidDeviceException = @"InvalidDeviceException";
+ NSString *const MessageSenderRateLimitedException = @"RateLimitedException";
++NSString *const MessageSenderSpamChallengeRequiredException = @"SpamChallengeRequiredException";
++NSString *const MessageSenderSpamChallengeResolvedException = @"SpamChallengeResolvedException";
+ 
+ @interface MessageSender ()
+ 
+@@ -907,6 +909,21 @@ - (nullable TSThread *)threadForMessage:(TSMessage *)message transaction:(SDSAny
+             return nil;
+         }
+ 
++        if ([exception.name isEqualToString:MessageSenderSpamChallengeResolvedException] ||
++            [exception.name isEqualToString:MessageSenderSpamChallengeRequiredException]) {
++
++            NSString *description = @"Suspected spam NEEDS LOCALIZATION";
++            NSUInteger code = OWSErrorCodeServerRejectedSuspectedSpam;
++            NSError *error = OWSErrorWithCodeDescription(code, description);
++
++            BOOL didResolve = [exception.name isEqualToString:MessageSenderSpamChallengeResolvedException];
++            [error setIsRetryable:didResolve];
++            [error setIsFatal:NO];
++            *errorHandle = error;
++            return nil;
++        }
++
++
+         OWSLogWarn(@"Could not build device messages: %@", exception);
+         NSError *error = OWSErrorMakeFailedToSendOutgoingMessageError();
+         [error setIsRetryable:YES];
+@@ -976,6 +993,9 @@ - (void)_sendMessageToRecipient:(OWSMessageSend *)messageSend
+     if ([message isKindOfClass:[OWSOutgoingSyncMessage class]]
+         && ![message isKindOfClass:[OWSOutgoingSentMessageTranscript class]]) {
+         [messageSend disableUD];
++    } else if (SSKDebugFlags.disableUD.value) {
++        OWSLogDebug(@"Disabling UD because of testable flag");
++        [messageSend disableUD];
+     }
+ 
+     NSError *deviceMessagesError;
+@@ -1351,10 +1371,14 @@ - (void)throws_ensureRecipientHasSessionForMessageSend:(OWSMessageSend *)message
+                                                   userInfo:@{ NSUnderlyingErrorKey : error }];
+             } else if ([MessageSender isSpamChallengeRequiredError:error]) {
+                 // Can't throw exception from within callback as it's probabably a different thread.
+-                exception = [NSException exceptionWithName:MessageSenderRateLimitedException
++                exception = [NSException exceptionWithName:MessageSenderSpamChallengeRequiredException
+                                                     reason:@"Spam challenge required"
+                                                   userInfo:@ { NSUnderlyingErrorKey : error }];
+-
++            } else if ([MessageSender isSpamChallengeResolvedError:error]) {
++                // Can't throw exception from within callback as it's probabably a different thread.
++                exception = [NSException exceptionWithName:MessageSenderSpamChallengeResolvedException
++                                                    reason:@"Spam challenge resolved"
++                                                  userInfo:@ { NSUnderlyingErrorKey : error }];
+             } else if ([MessageSender isUntrustedIdentityError:error]) {
+                 // Can't throw exception from within callback as it's probabably a different thread.
+                 exception = [NSException exceptionWithName:UntrustedIdentityKeyException
+diff --git a/SignalServiceKit/src/Messages/MessageSender.swift b/SignalServiceKit/src/Messages/MessageSender.swift
+index 6eb847a8765..ac618a1c66a 100644
+--- a/SignalServiceKit/src/Messages/MessageSender.swift
++++ b/SignalServiceKit/src/Messages/MessageSender.swift
+@@ -15,6 +15,7 @@ public enum MessageSenderError: Int, Error {
+     case blockedContactRecipient
+     case threadMissing
+     case spamChallengeRequired
++    case spamChallengeResolved
+ }
+ 
+ // MARK: -
+@@ -58,6 +59,15 @@ public extension MessageSender {
+         }
+     }
+ 
++    class func isSpamChallengeResolvedError(_ error: Error) -> Bool {
++        switch error {
++        case MessageSenderError.spamChallengeResolved:
++            return true
++        default:
++            return false
++        }
++    }
++
+     class func ensureSessionsforMessageSendsObjc(_ messageSends: [OWSMessageSend],
+                                                  ignoreErrors: Bool) -> AnyPromise {
+         AnyPromise(ensureSessions(forMessageSends: messageSends,
+@@ -283,19 +293,37 @@ public extension MessageSender {
+                     return failure(MessageSenderError.missingDevice)
+                 } else if httpStatusCode == 413 {
+                     return failure(MessageSenderError.prekeyRateLimit)
+-                } else if httpStatusCode == 428, FeatureFlags.spamChallenges {
+-                    let userInfo = (error as NSError).userInfo
++                } else if httpStatusCode == 428 {
++                    var unpackedError = error
++                    if case NetworkManagerError.taskError(_, let underlyingError) = unpackedError {
++                        unpackedError = underlyingError
++                    }
++                    let userInfo = (unpackedError as NSError).userInfo
+                     let responseData = userInfo[AFNetworkingOperationFailingURLResponseDataErrorKey] as? Data
+-
+-                    if let responseData = responseData {
+-                        spamChallengeResolver.serverFlaggedRequestAsPotentialSpam(responseBody: responseData)
++                    let expiry = unpackedError.httpRetryAfterDate
++
++                    if let body = responseData, let expiry = expiry {
++                        // The resolver has 10s to asynchronously resolve a challenge
++                        // If it resolves, great! We'll let MessageSender auto-retry
++                        // Otherwise, it'll be marked as "pending"
++                        spamChallengeResolver.handleServerChallengeBody(
++                            body,
++                            retryAfter: expiry
++                        ) { didResolve in
++                            if didResolve {
++                                failure(MessageSenderError.spamChallengeResolved)
++                            } else {
++                                failure(MessageSenderError.spamChallengeRequired)
++                            }
++                        }
+                     } else {
+                         owsFailDebug("No response body for spam challenge")
++                        return failure(MessageSenderError.spamChallengeRequired)
+                     }
+-                    return failure(MessageSenderError.spamChallengeRequired)
+                 }
++            } else {
++                failure(error)
+             }
+-            failure(error)
+         }
+     }
+ 
+@@ -1011,19 +1039,31 @@ public extension MessageSender {
+             retrySend()
+         case 428:
+             Logger.warn("Server requested user complete spam challenge.")
+-            if let data = responseData {
+-                spamChallengeResolver.serverFlaggedRequestAsPotentialSpam(responseBody: data)
++
++            let errorDescription = "Spam challenge NEEDS LOCALIZATION"
++            let error = OWSErrorWithCodeDescription(.serverRejectedSuspectedSpam, errorDescription) as NSError
++            error.isRetryable = false
++            error.isFatal = false
++
++            if let data = responseData, let expiry = responseError.httpRetryAfterDate {
++                // The resolver has 10s to asynchronously resolve a challenge
++                // If it resolves, great! We'll let MessageSender auto-retry
++                // Otherwise, it'll be marked as "pending"
++                spamChallengeResolver.handleServerChallengeBody(
++                    data,
++                    retryAfter: expiry
++                ) { didResolve in
++                    if didResolve {
++                        retrySend()
++                    } else {
++                        messageSend.failure(error)
++                    }
++                }
+             } else {
+                 owsFailDebug("Expected response body from server")
++                messageSend.failure(error)
+             }
+ 
+-            let errorDescription = NSLocalizedString("FAILED_SENDING_BECAUSE_RATE_LIMIT", comment: "action sheet header when re-sending message which failed because of too many attempts")
+-            let error = OWSErrorWithCodeDescription(.signalServiceRateLimited, errorDescription) as NSError
+-
+-            error.isRetryable = false
+-            error.isFatal = true
+-            messageSend.failure(error)
+-
+         default:
+             retrySend()
+         }
+diff --git a/SignalServiceKit/src/Network/API/Requests/OWSRequestFactory.h b/SignalServiceKit/src/Network/API/Requests/OWSRequestFactory.h
+index 2c692fb99b1..1ab2b7be5c8 100644
+--- a/SignalServiceKit/src/Network/API/Requests/OWSRequestFactory.h
++++ b/SignalServiceKit/src/Network/API/Requests/OWSRequestFactory.h
+@@ -193,6 +193,7 @@ typedef NS_ENUM(NSUInteger, TSVerificationTransport) { TSVerificationTransportVo
+ 
+ #pragma mark - Spam
+ 
+++ (TSRequest *)pushChallengeRequest;
+ + (TSRequest *)pushChallengeResponseWithToken:(NSString *)challengeToken;
+ + (TSRequest *)recaptchChallengeResponseWithToken:(NSString *)serverToken captchaToken:(NSString *)captchaToken;
+ 
+diff --git a/SignalServiceKit/src/Network/API/Requests/OWSRequestFactory.m b/SignalServiceKit/src/Network/API/Requests/OWSRequestFactory.m
+index 8f19eac5975..c5600a0c199 100644
+--- a/SignalServiceKit/src/Network/API/Requests/OWSRequestFactory.m
++++ b/SignalServiceKit/src/Network/API/Requests/OWSRequestFactory.m
+@@ -859,11 +859,18 @@ + (TSRequest *)paymentsAuthenticationCredentialRequest
+ 
+ #pragma mark - Spam
+ 
+++ (TSRequest *)pushChallengeRequest
++{
++    return [TSRequest requestWithUrl:[NSURL URLWithString:@"/v1/challenge/push"]
++                              method:@"POST"
++                          parameters:@{}];
++}
++
+ + (TSRequest *)pushChallengeResponseWithToken:(NSString *)challengeToken
+ {
+     return [TSRequest requestWithUrl:[NSURL URLWithString:@"/v1/challenge"]
+-                              method:@"GET"
+-                          parameters:@{ @"type" : @"rate_limit_challenge", @"challenge" : challengeToken }];
++                              method:@"PUT"
++                          parameters:@{ @"type" : @"rateLimitPushChallenge", @"challenge" : challengeToken }];
+ }
+ 
+ + (TSRequest *)recaptchChallengeResponseWithToken:(NSString *)serverToken captchaToken:(NSString *)captchaToken
+diff --git a/SignalServiceKit/src/Network/Spam/CaptchChallenge.swift b/SignalServiceKit/src/Network/Spam/CaptchChallenge.swift
+index b4618dfeb3c..daa4865fdb6 100644
+--- a/SignalServiceKit/src/Network/Spam/CaptchChallenge.swift
++++ b/SignalServiceKit/src/Network/Spam/CaptchChallenge.swift
+@@ -3,9 +3,16 @@
+ //
+ 
+ class CaptchaChallenge: SpamChallenge {
+-
+     let token: String
+-    var captchaToken: String?
++    var captchaToken: String? {
++        didSet {
++            guard oldValue != captchaToken else { return }
++            owsAssertDebug(oldValue == nil)
++            Logger.info("")
++            state = .actionable
++        }
++    }
++
+     var failureCount: UInt = 0
+     let kMaxFailures = 15
+ 
+@@ -26,13 +33,8 @@ class CaptchaChallenge: SpamChallenge {
+     }
+ 
+     private func requestCaptchaFromUser() {
+-        // TODO
+-        workQueue.asyncAfter(deadline: .now() + .seconds(3)) {
+-            if self.state == .inProgress {
+-                self.captchaToken = "fake"
+-                self.state = .actionable
+-            }
+-        }
++        NotificationCenter.default.postNotificationNameAsync(
++            SpamChallengeResolver.NeedsCaptchaNotification, object: nil)
+     }
+ 
+     private func notifyServerOfCompletedCaptcha() {
+@@ -106,7 +108,7 @@ class CaptchaChallenge: SpamChallenge {
+ 
+         if decodedToken == nil {
+             owsFailDebug("Invalid decoding")
+-            state = .complete
++            state = .failed
+         }
+     }
+ 
+diff --git a/SignalServiceKit/src/Network/Spam/PushChallenge.swift b/SignalServiceKit/src/Network/Spam/PushChallenge.swift
+index 1747e939df6..2e76e342500 100644
+--- a/SignalServiceKit/src/Network/Spam/PushChallenge.swift
++++ b/SignalServiceKit/src/Network/Spam/PushChallenge.swift
+@@ -4,20 +4,76 @@
+ 
+ class PushChallenge: SpamChallenge {
+ 
+-    private let token: String
+     private var failureCount: UInt = 0
+     private let kMaxFailures = 15
+ 
+-    init(tokenIn: String) {
++    init(tokenIn: String? = nil, expiry: Date = .distantFuture) {
+         token = tokenIn
+-        super.init(expiry: .distantFuture)
++        super.init(expiry: expiry)
++
++        if Platform.isSimulator {
++            state = .failed
++        }
++    }
++
++    var token: String? {
++        didSet {
++            if oldValue == nil {
++                state = .actionable
++            } else {
++                owsFailDebug("Token should only be set non-nil after init.")
++            }
++        }
+     }
+ 
+     override public func resolveChallenge() {
+-        Logger.verbose("Performing push challenge")
+         super.resolveChallenge()
+ 
+-        let request = OWSRequestFactory.pushChallengeResponse(withToken: self.token)
++        if let token = token {
++            postToken(token)
++        } else {
++            requestToken()
++        }
++    }
++
++    private func requestToken() {
++        Logger.verbose("Requesting push token for challenge")
++        let request = OWSRequestFactory.pushChallengeRequest()
++
++        firstly(on: workQueue) {
++            self.networkManager.makePromise(request: request)
++
++        }.done(on: workQueue) { _ in
++            Logger.verbose("Push challenge request succeeded. Waiting for push delivery.")
++            self.state = .deferred(self.expirationDate)
++
++        }.catch(on: workQueue) { error in
++            owsFailDebugUnlessNetworkFailure(error)
++            self.failureCount += 1
++
++            if self.failureCount > self.kMaxFailures {
++                Logger.info("Too many failures. Making push challenge as failed")
++                self.state = .failed
++
++            } else if let statusCode = error.httpStatusCode {
++                if (500..<600).contains(statusCode), statusCode != 508 {
++                    let retryDate = error.httpRetryAfterDate ?? self.fallbackRetryAfter
++                    self.state = .deferred(retryDate)
++                } else {
++                    Logger.info("Permanent failure. Making push challenge as failed")
++                    self.state = .failed
++                }
++
++            } else {
++                self.state = .deferred(self.fallbackRetryAfter)
++            }
++        }
++
++    }
++
++    private func postToken(_ token: String) {
++        Logger.verbose("Posting push token for challenge")
++        let request = OWSRequestFactory.pushChallengeResponse(withToken: token)
+ 
+         firstly(on: workQueue) {
+             self.networkManager.makePromise(request: request)
+@@ -32,7 +88,7 @@ class PushChallenge: SpamChallenge {
+ 
+             if self.failureCount > self.kMaxFailures {
+                 Logger.info("Too many failures. Making push challenge as complete")
+-                self.state = .complete
++                self.state = .failed
+ 
+             } else if let statusCode = error.httpStatusCode {
+                 if (500..<600).contains(statusCode), statusCode != 508 {
+@@ -40,7 +96,7 @@ class PushChallenge: SpamChallenge {
+                     self.state = .deferred(retryDate)
+                 } else {
+                     Logger.info("Permanent failure. Making push challenge as complete")
+-                    self.state = .complete
++                    self.state = .failed
+                 }
+ 
+             } else {
+@@ -71,7 +127,7 @@ class PushChallenge: SpamChallenge {
+ 
+         if decodedToken == nil {
+             owsFailDebug("Invalid decoding")
+-            state = .complete
++            state = .failed
+         }
+     }
+ 
+diff --git a/SignalServiceKit/src/Network/Spam/SpamChallenge.swift b/SignalServiceKit/src/Network/Spam/SpamChallenge.swift
+index 1abaed72d9e..2ea253b53c8 100644
+--- a/SignalServiceKit/src/Network/Spam/SpamChallenge.swift
++++ b/SignalServiceKit/src/Network/Spam/SpamChallenge.swift
+@@ -17,11 +17,15 @@ class SpamChallenge: Codable {
+     /// The date this challenge will expire.
+     var expirationDate: Date
+ 
++    /// Blah
++    var completionHandler: ((Bool) -> Void)?
++
+     enum State: Equatable {
+         case actionable
+         case inProgress
+         case deferred(Date)
+         case complete
++        case failed
+ 
+         var isActionable: Bool {
+             switch self {
+@@ -30,19 +34,30 @@ class SpamChallenge: Codable {
+             default: return false
+             }
+         }
+-
+-        var deferralDate: Date? {
+-            switch self {
+-            case let .deferred(date): return date
+-            default: return nil
+-            }
+-        }
+     }
+ 
+     var state: State = .actionable {
+         didSet {
++            // Complete and failed are final states
++            owsAssertDebug([.complete, .failed].contains(oldValue) == false)
++
+             guard oldValue != state else { return }
+             schedulingDelegate?.spamChallenge(self, stateDidChangeFrom: oldValue)
++
++            if state == .complete {
++                completionHandler?(true)
++                completionHandler = nil
++            } else if state == .failed {
++                completionHandler?(false)
++                completionHandler = nil
++            }
++        }
++    }
++
++    var nextActionableDate: Date {
++        switch state {
++        case let .deferred(date): return min(date, expirationDate)
++        default: return expirationDate
+         }
+     }
+ 
+@@ -51,6 +66,11 @@ class SpamChallenge: Codable {
+         expirationDate = expiry
+     }
+ 
++    deinit {
++        // If we haven't fired our completion handler yet, fire a failure.
++        completionHandler?(false)
++    }
++
+     public func resolveChallenge() {
+         // Subclass work should happen here.
+         // Subclasses a responsible for updating their state
+@@ -66,6 +86,7 @@ class SpamChallenge: Codable {
+         case creationDate
+         case expirationDate
+         case isComplete
++        case isFailed
+         case deferralDate
+     }
+ 
+@@ -74,16 +95,18 @@ class SpamChallenge: Codable {
+         let decodedCreationDate = try values.decodeIfPresent(Date.self, forKey: .creationDate)
+         let decodedExpirationDate = try values.decodeIfPresent(Date.self, forKey: .expirationDate)
+         let decodedIsComplete = try values.decodeIfPresent(Bool.self, forKey: .isComplete)
++        let decodedIsFailed = try values.decodeIfPresent(Bool.self, forKey: .isFailed)
+         let decodedDeferralDate = try values.decodeIfPresent(Date.self, forKey: .deferralDate)
+ 
+         creationDate = decodedCreationDate ?? Date()
+         expirationDate = decodedExpirationDate ?? Date()
+-        switch (decodedIsComplete, decodedDeferralDate) {
+-        case let (_, date?):
++        if let date = decodedDeferralDate {
+             state = .deferred(date)
+-        case (true, _):
++        } else if decodedIsFailed == true {
++            state = .failed
++        } else if decodedIsComplete == true {
+             state = .complete
+-        default:
++        } else {
+             state = .actionable
+         }
+     }
+@@ -93,17 +116,20 @@ class SpamChallenge: Codable {
+         try container.encode(creationDate, forKey: .creationDate)
+         try container.encode(expirationDate, forKey: .expirationDate)
+ 
+-        let (deferralDate, isComplete) = { () -> (Date?, Bool) in
++        let (deferralDate, isComplete, isFailed) = { () -> (Date?, Bool, Bool) in
+             switch state {
+             case .complete:
+-                return (nil, true)
++                return (nil, true, false)
++            case .failed:
++                return (nil, false, true)
+             case let .deferred(date):
+-                return (date, false)
++                return (date, false, false)
+             default:
+-                return (nil, false)
++                return (nil, false, false)
+             }
+         }()
+         try container.encode(deferralDate, forKey: .deferralDate)
+         try container.encode(isComplete, forKey: .isComplete)
++        try container.encode(isFailed, forKey: .isFailed)
+     }
+ }
+diff --git a/SignalServiceKit/src/Network/Spam/SpamChallengeResolver.swift b/SignalServiceKit/src/Network/Spam/SpamChallengeResolver.swift
+index 8d5b75e6f71..712c05c3aaa 100644
+--- a/SignalServiceKit/src/Network/Spam/SpamChallengeResolver.swift
++++ b/SignalServiceKit/src/Network/Spam/SpamChallengeResolver.swift
+@@ -13,102 +13,33 @@ public class SpamChallengeResolver: NSObject, SpamChallengeSchedulingDelegate {
+         label: "org.signal.SpamChallengeResolver",
+         target: .sharedUtility)
+ 
+-    private var challenges: [SpamChallenge]?
++    private var challenges: [SpamChallenge]? {
++        didSet {
++            let oldValueHasCaptcha = oldValue?.contains { $0 is CaptchaChallenge } ?? false
++            let newValueHasCaptcha = challenges?.contains { $0 is CaptchaChallenge } ?? false
++            if oldValueHasCaptcha, !newValueHasCaptcha {
++                retryPausedMessages()
++            }
++        }
++    }
+     private var nextAttemptTimer: Timer? {
+-        didSet { oldValue?.invalidate() }
++        didSet {
++            guard oldValue !== nextAttemptTimer else { return }
++            oldValue?.invalidate()
++            nextAttemptTimer.map { RunLoop.main.add($0, forMode: .default) }
++        }
+     }
+ 
+     @objc override init() {
+         super.init()
+         SwiftSingletons.register(self)
+ 
+-        guard FeatureFlags.spamChallenges else { return }
+         AppReadiness.runNowOrWhenAppWillBecomeReady {
+             self.loadChallengesFromDatabase()
+             Logger.info("Loaded \(self.challenges?.count ?? -1) unresolved challenges")
+         }
+     }
+ 
+-    // MARK: - Public
+-
+-    @objc
+-    public func didReceiveIncomingPushChallenge(token: String) {
+-        guard AppReadiness.isAppReady else {
+-            owsFailDebug("App not ready")
+-            return
+-        }
+-        guard FeatureFlags.spamChallenges else { return }
+-
+-        workQueue.async {
+-            let challenge = PushChallenge(tokenIn: token)
+-            challenge.schedulingDelegate = self
+-            self.challenges?.append(challenge)
+-            self.recheckChallenges()
+-        }
+-    }
+-
+-    @objc
+-    public func serverFlaggedRequestAsPotentialSpam(responseBody: Data) {
+-        guard AppReadiness.isAppReady else {
+-            owsFailDebug("App not ready")
+-            return
+-        }
+-        guard FeatureFlags.spamChallenges else { return }
+-
+-        struct ServerChallengePayload: Decodable {
+-            let required: Requirement
+-            let token: String
+-            let options: [Options]
+-            let expiry: Date
+-
+-            private enum CodingKeys: String, CodingKey {
+-                case required, token, options
+-                case expiry = "retry-after"
+-            }
+-
+-            enum Requirement: String, Codable {
+-                case human
+-            }
+-
+-            enum Options: String, Codable {
+-                case recaptcha
+-            }
+-        }
+-
+-        let decoder = JSONDecoder()
+-        decoder.dateDecodingStrategy = .millisecondsSince1970
+-
+-        guard let payload = try? decoder.decode(ServerChallengePayload.self, from: responseBody) else {
+-            owsFailDebug("Invalid server spam request response body: \(responseBody)")
+-            return
+-        }
+-
+-        guard payload.required == .human else {
+-            owsFailDebug("Unrecognized server challenge request")
+-            return
+-        }
+-
+-        let challenge: SpamChallenge
+-        if payload.options.contains(.recaptcha) {
+-            challenge = CaptchaChallenge(tokenIn: payload.token, expiry: payload.expiry)
+-        } else {
+-            challenge = TimeElapsedChallenge(expiry: payload.expiry)
+-        }
+-        challenge.schedulingDelegate = self
+-
+-        workQueue.async {
+-            self.challenges?.append(challenge)
+-            self.recheckChallenges()
+-        }
+-    }
+-
+-    func spamChallenge(_ challenge: SpamChallenge,
+-                       stateDidChangeFrom priorState: SpamChallenge.State) {
+-        if challenge.state != .inProgress, challenge.state != priorState {
+-            workQueue.async { self.recheckChallenges() }
+-        }
+-    }
+-
+     // MARK: - Private
+ 
+     private func recheckChallenges() {
+@@ -127,7 +58,7 @@ public class SpamChallengeResolver: NSObject, SpamChallengeSchedulingDelegate {
+         let countBefore = challenges?.count ?? 0
+ 
+         challenges = challenges?
+-            .filter { $0.state != .complete }
++            .filter { ![.complete, .failed].contains($0.state) }
+             .filter { $0.expirationDate.isAfterNow }
+ 
+         if let countAfter = challenges?.count, countBefore != countAfter {
+@@ -139,16 +70,16 @@ public class SpamChallengeResolver: NSObject, SpamChallengeSchedulingDelegate {
+         assertOnQueue(workQueue)
+ 
+         let deferral = challenges?
+-            .compactMap { $0.state.deferralDate }
++            .map { $0.nextActionableDate }
+             .min()
+ 
+         guard let deferral = deferral else { return }
+         guard deferral.isAfterNow else { return }
+         guard deferral != nextAttemptTimer?.fireDate else { return }
+ 
+-        Logger.verbose("Deferred challenges will be re-checked at \(deferral)")
+-        nextAttemptTimer = Timer.scheduledTimer(
+-            withTimeInterval: deferral.timeIntervalSinceNow,
++        Logger.verbose("Deferred challenges will be re-checked in \(deferral.timeIntervalSinceNow)")
++        nextAttemptTimer = Timer(
++            timeInterval: deferral.timeIntervalSinceNow,
+             repeats: false) { [weak self] _ in
+ 
+             Logger.verbose("Deferral timer fired!")
+@@ -171,10 +102,152 @@ public class SpamChallengeResolver: NSObject, SpamChallengeSchedulingDelegate {
+         }
+     }
+ 
+-    // MARK: - Storage
++    private func retryPausedMessages() {
++        databaseStorage.asyncWrite { writeTx in
++            let pendingInteractionIds = InteractionFinder.pendingInteractionIds(transaction: writeTx)
++            Logger.info("retrying paused messages: \(pendingInteractionIds)")
++
++            pendingInteractionIds
++                .compactMap { TSOutgoingMessage.anyFetchOutgoingMessage(uniqueId: $0, transaction: writeTx) }
++                .forEach { self.messageSenderJobQueue.add(message: $0.asPreparer, transaction: writeTx) }
++        }
++    }
++}
++
++// MARK: - Push challenges
++
++extension SpamChallengeResolver {
++    @objc
++    static public var NeedsCaptchaNotification: Notification.Name { .init("NeedsCaptchaNotification") }
++
++    @objc
++    public func handleIncomingPushChallengeToken(_ token: String) {
++        guard AppReadiness.isAppReady else {
++            owsFailDebug("App not ready")
++            return
++        }
++
++        workQueue.async {
++            Logger.info("Did receive push token")
++
++            let awaitingToken = self.challenges?
++                .compactMap { $0 as? PushChallenge }
++                .filter { $0.token == nil }
++                .min { $0.creationDate < $1.creationDate }
++
++            // If there's an existing push challenge without a token, fulfill that first
++            // Otherwise, create a new one
++            if let existingChallenge = awaitingToken {
++                Logger.info("Populating token for in-progress challenge")
++                existingChallenge.token = token
++            } else {
++                Logger.info("Creating new push challenge")
++
++                let challenge = PushChallenge(tokenIn: token)
++                challenge.schedulingDelegate = self
++                self.challenges?.append(challenge)
++                self.recheckChallenges()
++            }
++        }
++    }
++
++    @objc
++    public func handleIncomingCaptchaChallengeToken(_ token: String) {
++        guard AppReadiness.isAppReady else {
++            owsFailDebug("App not ready")
++            return
++        }
++
++        workQueue.async {
++            Logger.info("Did receive captcha token")
++
++            let awaitingToken = self.challenges?
++                .compactMap { $0 as? CaptchaChallenge }
++                .filter { $0.captchaToken == nil }
++                .min { $0.creationDate < $1.creationDate }
++
++            awaitingToken?.captchaToken = token
++        }
++    }
++}
++
++// MARK: - Server challenges
++
++private struct ServerChallengePayload: Decodable {
++    let token: String
++    let options: [Options]
+ 
+-    private let outstandingChallengesKey = "OutstandingChallengesArray"
+-    private let keyValueStore = SDSKeyValueStore(collection: "SpamChallengeResolver")
++    enum Options: String, Decodable {
++        case recaptcha
++        case push_challengexxx         // TODO double check with server
++        case unrecognized
++
++        init(from decoder: Decoder) throws {
++            let container = try decoder.singleValueContainer()
++            let string = try container.decode(String.self)
++            self = Options(rawValue: string) ?? .unrecognized
++        }
++    }
++}
++
++extension SpamChallengeResolver {
++
++    @objc
++    public func handleServerChallengeBody(
++        _ body: Data,
++        retryAfter: Date,
++        silentRecoveryCompletionHandler: ((Bool) -> Void)? = nil
++    ) {
++        guard AppReadiness.isAppReady else { return owsFailDebug("App not ready") }
++        guard let payload = try? JSONDecoder().decode(ServerChallengePayload.self, from: body) else {
++            return owsFailDebug("Invalid server spam request response body: \(body)")
++        }
++
++        Logger.info("Received incoming spam challenge: \(payload.options.map { $0.rawValue })")
++
++        workQueue.async {
++            // If we already have a pending captcha challenge, we should wait for that to resolve
++            // If we were given a silent recovery closure, reply with a failure
++            guard self.challenges?.contains(where: { $0 is CaptchaChallenge }) == false else {
++                Logger.info("Captcha challenge already in progress")
++                silentRecoveryCompletionHandler?(false)
++                return
++            }
++
++            if payload.options.contains(.push_challengexxx), let completion = silentRecoveryCompletionHandler {
++                Logger.info("Requesting push for silent recovery")
++                let challenge = PushChallenge(expiry: Date(timeIntervalSinceNow: 10))
++                challenge.schedulingDelegate = self
++                challenge.completionHandler = { didSucceed in
++                    Logger.info("Silent recovery \(didSucceed ? "did" : "did not") succeed")
++                    if !didSucceed {
++                        self.handleServerChallengeBody(body, retryAfter: retryAfter)
++                    }
++                    completion(didSucceed)
++                }
++                self.challenges?.append(challenge)
++                self.recheckChallenges()
++
++            } else if payload.options.contains(.recaptcha) {
++                Logger.info("Registering captcha challenge")
++
++                let challenge = CaptchaChallenge(tokenIn: payload.token, expiry: retryAfter)
++                challenge.schedulingDelegate = self
++                self.challenges?.append(challenge)
++                self.recheckChallenges()
++                silentRecoveryCompletionHandler?(false)
++            }
++        }
++    }
++}
++
++// MARK: - Storage
++
++extension SpamChallengeResolver {
++    static private let outstandingChallengesKey = "OutstandingChallengesArray"
++    static private let keyValueStore = SDSKeyValueStore(collection: "SpamChallengeResolver")
++    private var outstandingChallengesKey: String { Self.outstandingChallengesKey }
++    private var keyValueStore: SDSKeyValueStore { Self.keyValueStore }
+ 
+     private func loadChallengesFromDatabase() {
+         guard challenges == nil else {
+@@ -212,3 +285,13 @@ public class SpamChallengeResolver: NSObject, SpamChallengeSchedulingDelegate {
+     }
+ }
+ 
++// MARK: - <SpamChallengeSchedulingDelegate>
++
++extension SpamChallengeResolver {
++    func spamChallenge(_ challenge: SpamChallenge,
++                       stateDidChangeFrom priorState: SpamChallenge.State) {
++        if challenge.state != .inProgress, challenge.state != priorState {
++            workQueue.async { self.recheckChallenges() }
++        }
++    }
++}
+diff --git a/SignalServiceKit/src/Storage/Database/Records/InteractionFinder.swift b/SignalServiceKit/src/Storage/Database/Records/InteractionFinder.swift
+index 13caf0a1729..d37b8064a54 100644
+--- a/SignalServiceKit/src/Storage/Database/Records/InteractionFinder.swift
++++ b/SignalServiceKit/src/Storage/Database/Records/InteractionFinder.swift
+@@ -19,6 +19,7 @@ protocol InteractionFinderAdapter {
+     static func incompleteCallIds(transaction: ReadTransaction) -> [String]
+ 
+     static func attemptingOutInteractionIds(transaction: ReadTransaction) -> [String]
++    static func pendingInteractionIds(transaction: ReadTransaction) -> [String]
+ 
+     // The interactions should be enumerated in order from "first to expire" to "last to expire".
+     static func enumerateMessagesWithStartedPerConversationExpiration(transaction: ReadTransaction, block: @escaping (TSInteraction, UnsafeMutablePointer<ObjCBool>) -> Void)
+@@ -122,6 +123,14 @@ public class InteractionFinder: NSObject, InteractionFinderAdapter {
+         }
+     }
+ 
++    @objc
++    public class func pendingInteractionIds(transaction: SDSAnyReadTransaction) -> [String] {
++        switch transaction.readTransaction {
++        case .grdbRead(let grdbRead):
++            return GRDBInteractionFinder.pendingInteractionIds(transaction: grdbRead)
++        }
++    }
++
+     @objc
+     public class func unreadCountInAllThreads(transaction: GRDBReadTransaction) -> UInt {
+         do {
+@@ -718,6 +727,23 @@ public class GRDBInteractionFinder: NSObject, InteractionFinderAdapter {
+         return result
+     }
+ 
++    static func pendingInteractionIds(transaction: ReadTransaction) -> [String] {
++        let sql: String = """
++        SELECT \(interactionColumn: .uniqueId)
++        FROM \(InteractionRecord.databaseTableName)
++        WHERE \(interactionColumn: .storedMessageState) = ?
++        """
++        var result = [String]()
++        do {
++            result = try String.fetchAll(transaction.database,
++                                         sql: sql,
++                                         arguments: [TSOutgoingMessageState.pending.rawValue])
++        } catch {
++            owsFailDebug("error: \(error)")
++        }
++        return result
++    }
++
+     // The interactions should be enumerated in order from "next to expire" to "last to expire".
+     static func enumerateMessagesWithStartedPerConversationExpiration(transaction: ReadTransaction, block: @escaping (TSInteraction, UnsafeMutablePointer<ObjCBool>) -> Void) {
+         // NOTE: We DO NOT consult storedShouldStartExpireTimer here;
+diff --git a/SignalServiceKit/src/Util/FeatureFlags.swift b/SignalServiceKit/src/Util/FeatureFlags.swift
+index 00aaf887d93..0ec5373d349 100644
+--- a/SignalServiceKit/src/Util/FeatureFlags.swift
++++ b/SignalServiceKit/src/Util/FeatureFlags.swift
+@@ -484,6 +484,11 @@ public class DebugFlags: BaseFlags {
+                                                       title: LocalizationNotNeeded("Message Sends Fail"),
+                                                       details: LocalizationNotNeeded("All outgoing message sends will fail."))
+ 
++    @objc
++    public static let disableUD = TestableFlag(false,
++                                               title: LocalizationNotNeeded("Disable sealed sender"),
++                                               details: LocalizationNotNeeded("Sealed sender will be disabled for all messages."))
++
+     public static func buildFlagMap() -> [String: Any] {
+         BaseFlags.buildFlagMap(for: DebugFlags.self) { (key: String) -> Any? in
+             DebugFlags.value(forKey: key)
+diff --git a/SignalServiceKit/src/Util/OWSError.h b/SignalServiceKit/src/Util/OWSError.h
+index b8bd46ee4d0..b0eab5b2d94 100644
+--- a/SignalServiceKit/src/Util/OWSError.h
++++ b/SignalServiceKit/src/Util/OWSError.h
+@@ -62,7 +62,8 @@ typedef NS_ENUM(NSInteger, OWSErrorCode) {
+     OWSErrorCodeContactSyncFailed,
+     OWSErrorCodeAppDeregistered,
+     OWSErrorCodeRegistrationTransferAvailable,
+-    OWSErrorCodeFailedToDecryptDuplicateMessage
++    OWSErrorCodeFailedToDecryptDuplicateMessage,
++    OWSErrorCodeServerRejectedSuspectedSpam
+ };
+ 
+ extern NSString *const OWSErrorRecipientAddressKey;
+@@ -78,4 +79,11 @@ extern NSError *OWSErrorMakeGenericError(NSString *descriptionFormat, ...);
+ extern NSError *OWSErrorMakeMessageSendDisabledDueToPreKeyUpdateFailuresError(void);
+ extern NSError *OWSErrorMakeMessageSendFailedDueToBlockListError(void);
+ 
++@interface NSError (OWSError)
++
++- (BOOL)ows_isSameError:(NSError *)other;
++- (BOOL)ows_isSSKErrorWithCode:(NSUInteger)code;
++
++@end
++
+ NS_ASSUME_NONNULL_END
+diff --git a/SignalServiceKit/src/Util/OWSError.m b/SignalServiceKit/src/Util/OWSError.m
+index 47280262226..e0387e1877c 100644
+--- a/SignalServiceKit/src/Util/OWSError.m
++++ b/SignalServiceKit/src/Util/OWSError.m
+@@ -84,4 +84,22 @@
+             @"Error message indicating that message send failed due to block list"));
+ }
+ 
++@implementation NSError (OWSError)
++
++- (BOOL)ows_isSameError:(NSError *)other
++{
++    BOOL sameDomain = [self.domain isEqualToString:other.domain];
++    BOOL sameCode = (self.code == other.code);
++    return (sameDomain && sameCode);
++}
++
++- (BOOL)ows_isSSKErrorWithCode:(NSUInteger)code
++{
++    BOOL sameDomain = [self.domain isEqualToString:OWSSignalServiceKitErrorDomain];
++    BOOL sameCode = (self.code == code);
++    return (sameDomain && sameCode);
++}
++
++@end
++
+ NS_ASSUME_NONNULL_END

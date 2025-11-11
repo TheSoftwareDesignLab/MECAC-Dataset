@@ -1,0 +1,1316 @@
+diff --git a/app/src/full/java/io/homeassistant/companion/android/sensors/LocationSensorManager.kt b/app/src/full/java/io/homeassistant/companion/android/sensors/LocationSensorManager.kt
+index 43ff8faddf0..d4d5acf0c07 100644
+--- a/app/src/full/java/io/homeassistant/companion/android/sensors/LocationSensorManager.kt
++++ b/app/src/full/java/io/homeassistant/companion/android/sensors/LocationSensorManager.kt
+@@ -149,7 +149,7 @@ class LocationSensorManager : LocationSensorManagerBase() {
+         private var zones = mutableMapOf<Int, Array<Entity<ZoneAttributes>>>()
+         private var zonesLastReceived = mutableMapOf<Int, Long>()
+ 
+-        private var geofenceRegistered = mutableListOf<Int>()
++        private var geofenceRegistered = mutableSetOf<Int>()
+ 
+         private var lastHighAccuracyMode = false
+         private var lastHighAccuracyUpdateInterval = DEFAULT_UPDATE_INTERVAL_HA_SECONDS
+@@ -236,6 +236,7 @@ class LocationSensorManager : LocationSensorManagerBase() {
+ 
+         val backgroundEnabled = isEnabled(latestContext, backgroundLocation)
+         val zoneEnabled = isEnabled(latestContext, zoneLocation)
++        val zoneServers = getEnabledServers(latestContext, zoneLocation)
+ 
+         ioScope.launch {
+             try {
+@@ -257,6 +258,11 @@ class LocationSensorManager : LocationSensorManagerBase() {
+                     isZoneLocationSetup = true
+                     requestZoneUpdates()
+                 }
++                if (zoneEnabled && isZoneLocationSetup && geofenceRegistered != zoneServers) {
++                    Log.d(TAG, "Zone enabled servers changed. Reconfigure zones.")
++                    removeGeofenceUpdateRequests()
++                    requestZoneUpdates()
++                }
+ 
+                 val now = System.currentTimeMillis()
+                 if (
+@@ -620,8 +626,8 @@ class LocationSensorManager : LocationSensorManagerBase() {
+             return
+         }
+ 
+-        if (serverManager.defaultServers.all { it.id in geofenceRegistered }) {
+-            Log.w(TAG, "Not registering for zones as we already have")
++        if (geofenceRegistered == getEnabledServers(latestContext, zoneLocation)) {
++            Log.w(TAG, "Not registering for zones as we already have / haven't")
+             return
+         }
+ 
+@@ -642,7 +648,7 @@ class LocationSensorManager : LocationSensorManagerBase() {
+ 
+     private fun handleLocationUpdate(intent: Intent) {
+         Log.d(TAG, "Received location update.")
+-        val serverIds = serverManager.defaultServers.map { it.id }
++        val serverIds = getEnabledServers(latestContext, backgroundLocation)
+         serverIds.forEach {
+             lastLocationReceived[it] = System.currentTimeMillis()
+         }
+@@ -729,6 +735,8 @@ class LocationSensorManager : LocationSensorManagerBase() {
+                 runBlocking {
+                     try {
+                         val serverId = zone.split("_")[0].toIntOrNull() ?: return@runBlocking
++                        val enabled = isEnabled(latestContext, backgroundLocation, serverId)
++                        if (!enabled) return@runBlocking
+                         serverManager.integrationRepository(serverId).fireEvent(zoneStatusEvent, zoneAttr as Map<String, Any>)
+                         Log.d(TAG, "Event sent to Home Assistant")
+                     } catch (e: Exception) {
+@@ -754,8 +762,8 @@ class LocationSensorManager : LocationSensorManagerBase() {
+             )
+             requestSingleAccurateLocation()
+         } else {
+-            serverManager.defaultServers.forEach {
+-                sendLocationUpdate(geofencingEvent.triggeringLocation!!, it.id, true)
++            getEnabledServers(latestContext, backgroundLocation).forEach {
++                sendLocationUpdate(geofencingEvent.triggeringLocation!!, it, true)
+             }
+         }
+ 
+@@ -876,7 +884,7 @@ class LocationSensorManager : LocationSensorManagerBase() {
+                     latestContext.sendBroadcast(intent)
+                 }
+             } catch (e: Exception) {
+-                Log.e(TAG, "Could not update location.", e)
++                Log.e(TAG, "Could not update location for $serverId.", e)
+             }
+         }
+     }
+@@ -920,16 +928,16 @@ class LocationSensorManager : LocationSensorManagerBase() {
+         val highAccuracyTriggerRange = getHighAccuracyModeTriggerRange()
+         val highAccuracyZones = getHighAccuracyModeZones(false)
+ 
+-        serverManager.defaultServers.map { server ->
++        getEnabledServers(latestContext, zoneLocation).map { serverId ->
+             ioScope.async {
+-                val configuredZones = getZones(server.id, forceRefresh = true)
++                val configuredZones = getZones(serverId, forceRefresh = true)
+                 configuredZones.forEach {
+-                    addGeofenceToBuilder(geofencingRequestBuilder, server.id, it)
++                    addGeofenceToBuilder(geofencingRequestBuilder, serverId, it)
+                     if (highAccuracyTriggerRange > 0 && highAccuracyZones.contains(it.entityId)) {
+-                        addGeofenceToBuilder(geofencingRequestBuilder, server.id, it, highAccuracyTriggerRange)
++                        addGeofenceToBuilder(geofencingRequestBuilder, serverId, it, highAccuracyTriggerRange)
+                     }
+                 }
+-                geofenceRegistered.add(server.id)
++                geofenceRegistered.add(serverId)
+             }
+         }.awaitAll()
+         return geofencingRequestBuilder.build()
+@@ -1067,8 +1075,8 @@ class LocationSensorManager : LocationSensorManagerBase() {
+                                 Log.d(TAG, "Location accurate enough, all done with high accuracy.")
+                                 runBlocking {
+                                     locationResult.lastLocation?.let {
+-                                        serverManager.defaultServers.forEach { server ->
+-                                            sendLocationUpdate(it, server.id)
++                                        getEnabledServers(latestContext, singleAccurateLocation).forEach { serverId ->
++                                            sendLocationUpdate(it, serverId)
+                                         }
+                                     }
+                                 }
+@@ -1081,8 +1089,8 @@ class LocationSensorManager : LocationSensorManagerBase() {
+                                 )
+                                 if (locationResult.lastLocation!!.accuracy <= minAccuracy * 2) {
+                                     runBlocking {
+-                                        serverManager.defaultServers.forEach {
+-                                            sendLocationUpdate(locationResult.lastLocation!!, it.id)
++                                        getEnabledServers(latestContext, singleAccurateLocation).forEach { serverId ->
++                                            sendLocationUpdate(locationResult.lastLocation!!, serverId)
+                                         }
+                                     }
+                                 }
+diff --git a/app/src/main/java/io/homeassistant/companion/android/settings/sensor/SensorDetailFragment.kt b/app/src/main/java/io/homeassistant/companion/android/settings/sensor/SensorDetailFragment.kt
+index 334a43dd545..ac0c8d176fb 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/settings/sensor/SensorDetailFragment.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/settings/sensor/SensorDetailFragment.kt
+@@ -10,15 +10,20 @@ import android.view.Menu
+ import android.view.View
+ import android.view.ViewGroup
+ import androidx.activity.result.contract.ActivityResultContracts
++import androidx.appcompat.widget.Toolbar
+ import androidx.compose.ui.platform.ComposeView
+ import androidx.fragment.app.Fragment
+ import androidx.fragment.app.viewModels
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.lifecycleScope
++import androidx.lifecycle.repeatOnLifecycle
+ import com.google.accompanist.themeadapter.material.MdcTheme
+ import dagger.hilt.android.AndroidEntryPoint
+ import io.homeassistant.companion.android.R
+ import io.homeassistant.companion.android.common.util.DisabledLocationHandler
+ import io.homeassistant.companion.android.common.util.LocationPermissionInfoHandler
+ import io.homeassistant.companion.android.settings.sensor.views.SensorDetailView
++import kotlinx.coroutines.launch
+ 
+ @AndroidEntryPoint
+ class SensorDetailFragment : Fragment() {
+@@ -33,16 +38,28 @@ class SensorDetailFragment : Fragment() {
+ 
+     val viewModel: SensorDetailViewModel by viewModels()
+ 
++    private var requestForServer: Int? = null
+     private val activityResultRequest = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+-        viewModel.onActivityResult()
++        viewModel.onActivityResult(requestForServer)
+     }
+     private val permissionsRequest = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+-        viewModel.onPermissionsResult(it)
++        viewModel.onPermissionsResult(it, requestForServer)
+     }
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         setHasOptionsMenu(true)
++
++        lifecycleScope.launch {
++            repeatOnLifecycle(Lifecycle.State.STARTED) {
++                launch {
++                    viewModel.serversShowExpand.collect { updateSensorToolbarMenu() }
++                }
++                launch {
++                    viewModel.serversDoExpand.collect { updateSensorToolbarMenu() }
++                }
++            }
++        }
+     }
+ 
+     override fun onPrepareOptionsMenu(menu: Menu) {
+@@ -51,6 +68,21 @@ class SensorDetailFragment : Fragment() {
+         menu.removeItem(R.id.action_filter)
+         menu.removeItem(R.id.action_search)
+ 
++        menu.setGroupVisible(R.id.sensor_detail_server_group, true)
++        menu.findItem(R.id.action_sensor_expand)?.let {
++            it.setOnMenuItemClickListener {
++                viewModel.setServersExpanded(true)
++                true
++            }
++        }
++        menu.findItem(R.id.action_sensor_collapse)?.let {
++            it.setOnMenuItemClickListener {
++                viewModel.setServersExpanded(false)
++                true
++            }
++        }
++        updateSensorToolbarMenu(menu)
++
+         menu.findItem(R.id.get_help)?.let {
+             val docsLink = viewModel.basicSensor?.docsLink ?: viewModel.sensorManager?.docsLink()
+             it.intent = Intent(Intent.ACTION_VIEW, Uri.parse(docsLink))
+@@ -68,7 +100,7 @@ class SensorDetailFragment : Fragment() {
+                 MdcTheme {
+                     SensorDetailView(
+                         viewModel = viewModel,
+-                        onSetEnabled = { enable -> viewModel.setEnabled(enable) },
++                        onSetEnabled = { enable, serverId -> viewModel.setEnabled(enable, serverId) },
+                         onToggleSettingSubmitted = { setting -> viewModel.setSetting(setting) },
+                         onDialogSettingClicked = { setting -> viewModel.onSettingWithDialogPressed(setting) },
+                         onDialogSettingSubmitted = { state -> viewModel.submitSettingWithDialog(state) }
+@@ -81,20 +113,21 @@ class SensorDetailFragment : Fragment() {
+     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+         super.onViewCreated(view, savedInstanceState)
+ 
+-        viewModel.permissionRequests.observe(viewLifecycleOwner) { permissions ->
+-            if (permissions.isEmpty()) return@observe
++        viewModel.permissionRequests.observe(viewLifecycleOwner) {
++            if (it == null || it.permissions.isNullOrEmpty()) return@observe
++            requestForServer = it.serverId
+             when {
+-                permissions.any { perm -> perm == Manifest.permission.BIND_NOTIFICATION_LISTENER_SERVICE } ->
++                it.permissions.any { perm -> perm == Manifest.permission.BIND_NOTIFICATION_LISTENER_SERVICE } ->
+                     activityResultRequest.launch(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+-                permissions.any { perm -> perm == Manifest.permission.PACKAGE_USAGE_STATS } ->
++                it.permissions.any { perm -> perm == Manifest.permission.PACKAGE_USAGE_STATS } ->
+                     activityResultRequest.launch(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                 android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R ->
+-                    if (permissions.size == 1 && permissions[0] == Manifest.permission.ACCESS_BACKGROUND_LOCATION) {
+-                        permissionsRequest.launch(permissions)
++                    if (it.permissions.size == 1 && it.permissions[0] == Manifest.permission.ACCESS_BACKGROUND_LOCATION) {
++                        permissionsRequest.launch(it.permissions)
+                     } else {
+-                        permissionsRequest.launch(permissions.toSet().minus(Manifest.permission.ACCESS_BACKGROUND_LOCATION).toTypedArray())
++                        permissionsRequest.launch(it.permissions.toSet().minus(Manifest.permission.ACCESS_BACKGROUND_LOCATION).toTypedArray())
+                     }
+-                else -> permissionsRequest.launch(permissions)
++                else -> permissionsRequest.launch(it.permissions)
+             }
+         }
+         viewModel.locationPermissionRequests.observe(viewLifecycleOwner) {
+@@ -105,6 +138,7 @@ class SensorDetailFragment : Fragment() {
+                     LocationPermissionInfoHandler.showLocationPermInfoDialogIfNeeded(
+                         requireContext(), it.permissions!!,
+                         continueYesCallback = {
++                            requestForServer = it.serverId
+                             permissionsRequest.launch(
+                                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                                     it.permissions.toSet().minus(Manifest.permission.ACCESS_BACKGROUND_LOCATION).toTypedArray()
+@@ -122,4 +156,20 @@ class SensorDetailFragment : Fragment() {
+         super.onResume()
+         activity?.title = null
+     }
++
++    private fun updateSensorToolbarMenu(menu: Menu? = null) {
++        val group = if (menu != null) {
++            menu
++        } else {
++            if (view == null || activity == null) return
++            val toolbar = activity?.findViewById<Toolbar>(R.id.toolbar) ?: return
++            toolbar.menu
++        }
++        group.findItem(R.id.action_sensor_expand)?.let {
++            it.isVisible = viewModel.serversShowExpand.value && !viewModel.serversDoExpand.value
++        }
++        group.findItem(R.id.action_sensor_collapse)?.let {
++            it.isVisible = viewModel.serversShowExpand.value && viewModel.serversDoExpand.value
++        }
++    }
+ }
+diff --git a/app/src/main/java/io/homeassistant/companion/android/settings/sensor/SensorDetailViewModel.kt b/app/src/main/java/io/homeassistant/companion/android/settings/sensor/SensorDetailViewModel.kt
+index 8ebb46387c0..b02850d2958 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/settings/sensor/SensorDetailViewModel.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/settings/sensor/SensorDetailViewModel.kt
+@@ -24,7 +24,7 @@ import io.homeassistant.companion.android.database.sensor.SensorDao
+ import io.homeassistant.companion.android.database.sensor.SensorSetting
+ import io.homeassistant.companion.android.database.sensor.SensorSettingType
+ import io.homeassistant.companion.android.database.sensor.SensorWithAttributes
+-import io.homeassistant.companion.android.database.sensor.toSensorWithAttributes
++import io.homeassistant.companion.android.database.sensor.toSensorsWithAttributes
+ import io.homeassistant.companion.android.database.settings.SensorUpdateFrequencySetting
+ import io.homeassistant.companion.android.database.settings.SettingsDao
+ import io.homeassistant.companion.android.sensors.LastAppSensorManager
+@@ -33,7 +33,9 @@ import kotlinx.coroutines.async
+ import kotlinx.coroutines.awaitAll
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.MutableSharedFlow
++import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.asSharedFlow
++import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.runBlocking
+ import javax.inject.Inject
+@@ -53,14 +55,20 @@ class SensorDetailViewModel @Inject constructor(
+ 
+         private const val SENSOR_SETTING_TRANS_KEY_PREFIX = "sensor_setting_"
+ 
++        data class PermissionsDialog(
++            val serverId: Int?,
++            val permissions: Array<String>? = null
++        )
+         data class LocationPermissionsDialog(
+             val block: Boolean,
++            val serverId: Int?,
+             val sensors: Array<String>,
+             val permissions: Array<String>? = null
+         )
+         data class PermissionSnackbar(
+             @StringRes val message: Int,
+-            val actionOpensSettings: Boolean
++            val actionOpensSettings: Boolean,
++            val serverId: Int? = null
+         )
+         data class SettingDialogState(
+             val setting: SensorSetting,
+@@ -73,7 +81,7 @@ class SensorDetailViewModel @Inject constructor(
+ 
+     val sensorId: String = state["id"]!!
+ 
+-    val permissionRequests = MutableLiveData<Array<String>>()
++    val permissionRequests = MutableLiveData<PermissionsDialog?>()
+     val locationPermissionRequests = MutableLiveData<LocationPermissionsDialog?>()
+ 
+     private val _permissionSnackbar = MutableSharedFlow<PermissionSnackbar>()
+@@ -91,6 +99,10 @@ class SensorDetailViewModel @Inject constructor(
+             ?.find { it.id == sensorId }
+     }
+ 
++    /** A list of all sensors (for each server) with states */
++    var sensors by mutableStateOf<List<SensorWithAttributes>>(emptyList())
++        private set
++    /** A sensor for displaying the main state in the UI */
+     var sensor by mutableStateOf<SensorWithAttributes?>(null)
+         private set
+     private var sensorCheckedEnabled = false
+@@ -102,45 +114,67 @@ class SensorDetailViewModel @Inject constructor(
+         settingsDao.get(0)?.sensorUpdateFrequency ?: SensorUpdateFrequencySetting.NORMAL
+     }
+ 
++    val serverNames: Map<Int, String>
++        get() = serverManager.defaultServers.associate { it.id to it.friendlyName }
++
++    private val _serversShowExpand = MutableStateFlow(false)
++    val serversShowExpand = _serversShowExpand.asStateFlow()
++    private val _serversDoExpand = MutableStateFlow(false)
++    val serversDoExpand = _serversDoExpand.asStateFlow()
++    val serversStateExpand = serversDoExpand.collectAsState(false)
++
+     private val zones by lazy {
+         Log.d(TAG, "Get zones from Home Assistant for listing zones in preferences...")
+         runBlocking {
+-            try {
+-                val cachedZones = mutableListOf<String>()
+-                serverManager.defaultServers.map { server ->
+-                    async {
++            val cachedZones = mutableListOf<String>()
++            serverManager.defaultServers.map { server ->
++                async {
++                    try {
+                         serverManager.integrationRepository(server.id).getZones().map { "${server.id}_${it.entityId}" }
++                    } catch (e: Exception) {
++                        Log.e(TAG, "Error receiving zones from Home Assistant", e)
++                        emptyList()
+                     }
+-                }.awaitAll().forEach { cachedZones.addAll(it) }
+-                Log.d(TAG, "Successfully received " + cachedZones.size + " zones (" + cachedZones + ") from Home Assistant")
+-                cachedZones
+-            } catch (e: Exception) {
+-                Log.e(TAG, "Error receiving zones from Home Assistant", e)
+-                emptyList()
+-            }
++                }
++            }.awaitAll().forEach { cachedZones.addAll(it) }
++            Log.d(TAG, "Successfully received " + cachedZones.size + " zones (" + cachedZones + ") from Home Assistant")
++            cachedZones
+         }
+     }
+ 
+     init {
+         val sensorFlow = sensorDao.getFullFlow(sensorId)
+         viewModelScope.launch {
+-            sensorFlow.collect {
+-                sensor = it.toSensorWithAttributes()
+-                if (!sensorCheckedEnabled) checkSensorEnabled(sensor)
++            sensorFlow.collect { map ->
++                sensors = map.toSensorsWithAttributes()
++                sensor = map.toSensorsWithAttributes().maxByOrNull { it.sensor.enabled }
++                if (!sensorCheckedEnabled) checkSensorEnabled(sensors)
++
++                val expandable = sensors.size > 1 && (sensors.all { it.sensor.enabled } || sensors.all { !it.sensor.enabled })
++                _serversShowExpand.emit(expandable)
++                if (!expandable) {
++                    if (sensors.size == 1) {
++                        _serversDoExpand.emit(false)
++                    } else {
++                        _serversDoExpand.emit(true)
++                    }
++                }
+             }
+         }
+     }
+ 
+-    private suspend fun checkSensorEnabled(sensor: SensorWithAttributes?) {
+-        if (sensorManager != null && basicSensor != null && sensor != null) {
++    private suspend fun checkSensorEnabled(sensors: List<SensorWithAttributes>) {
++        if (sensorManager != null && basicSensor != null && sensors.isNotEmpty()) {
+             sensorCheckedEnabled = true
+             val hasPermission = sensorManager.checkPermission(getApplication(), basicSensor.id)
+-            val enabled = sensor.sensor.enabled && hasPermission
+-            updateSensorEntity(enabled)
++            sensors.forEach { thisSensor ->
++                val enabled = thisSensor.sensor.enabled && hasPermission
++                updateSensorEntity(enabled, thisSensor.sensor.serverId)
++            }
+         }
+     }
+ 
+-    fun setEnabled(isEnabled: Boolean) {
++    fun setEnabled(isEnabled: Boolean, serverId: Int?) {
+         if (isEnabled) {
+             sensorManager?.requiredPermissions(sensorId)?.let { permissions ->
+                 val fineLocation = DisabledLocationHandler.containsLocationPermission(permissions, true)
+@@ -154,16 +188,16 @@ class SensorDetailViewModel @Inject constructor(
+                             basicSensor.name
+                         )
+                     }.orEmpty()
+-                    locationPermissionRequests.value = LocationPermissionsDialog(block = true, sensors = arrayOf(sensorName))
++                    locationPermissionRequests.value = LocationPermissionsDialog(block = true, serverId = serverId, sensors = arrayOf(sensorName))
+                     return
+                 } else {
+                     if (!sensorManager.checkPermission(getApplication(), sensorId)) {
+                         if (sensorManager is NetworkSensorManager) {
+-                            locationPermissionRequests.value = LocationPermissionsDialog(block = false, sensors = emptyArray(), permissions = permissions)
++                            locationPermissionRequests.value = LocationPermissionsDialog(false, serverId, emptyArray(), permissions)
+                         } else if (sensorManager is LastAppSensorManager && !sensorManager.checkUsageStatsPermission(getApplication())) {
+-                            permissionRequests.value = permissions
++                            permissionRequests.value = PermissionsDialog(serverId, permissions)
+                         } else {
+-                            permissionRequests.value = permissions
++                            permissionRequests.value = PermissionsDialog(serverId, permissions)
+                         }
+ 
+                         return
+@@ -173,7 +207,7 @@ class SensorDetailViewModel @Inject constructor(
+         }
+ 
+         viewModelScope.launch {
+-            updateSensorEntity(isEnabled)
++            updateSensorEntity(isEnabled, serverId)
+             if (isEnabled) try {
+                 sensorManager?.requestSensorUpdate(getApplication())
+             } catch (e: Exception) {
+@@ -182,6 +216,8 @@ class SensorDetailViewModel @Inject constructor(
+         }
+     }
+ 
++    fun setServersExpanded(expand: Boolean) = viewModelScope.launch { _serversDoExpand.emit(expand) }
++
+     /**
+      * Builds a SettingDialogState based on the given Sensor Setting.
+      * Should trigger a dialog open in view.
+@@ -236,10 +272,11 @@ class SensorDetailViewModel @Inject constructor(
+         refreshSensorData()
+     }
+ 
+-    private suspend fun updateSensorEntity(isEnabled: Boolean) {
+-        serverManager.defaultServers.forEach {
+-            sensorDao.setSensorsEnabled(listOf(sensorId), it.id, isEnabled)
+-        }
++    private suspend fun updateSensorEntity(isEnabled: Boolean, serverId: Int?) {
++        val serverIds =
++            if (serverId == null) serverManager.defaultServers.map { it.id }
++            else listOf(serverId)
++        sensorDao.setSensorEnabled(sensorId, serverIds, isEnabled)
+         refreshSensorData()
+     }
+ 
+@@ -371,7 +408,7 @@ class SensorDetailViewModel @Inject constructor(
+         }
+     }
+ 
+-    fun onActivityResult() {
++    fun onActivityResult(serverId: Int?) {
+         viewModelScope.launch {
+             // This is only called when we requested permissions to enable a sensor, so check if
+             // we have all permissions and should enable the sensor.
+@@ -379,18 +416,18 @@ class SensorDetailViewModel @Inject constructor(
+             if (!hasPermission) {
+                 _permissionSnackbar.emit(PermissionSnackbar(commonR.string.enable_sensor_missing_permission_general, false))
+             }
+-            updateSensorEntity(hasPermission)
+-            permissionRequests.value = emptyArray()
++            updateSensorEntity(hasPermission, serverId)
++            permissionRequests.value = null
+         }
+     }
+ 
+-    fun onPermissionsResult(results: Map<String, Boolean>) {
++    fun onPermissionsResult(results: Map<String, Boolean>, serverId: Int?) {
+         // This is only called when we requested permissions to enable a sensor, so check if we
+         // need to do another request, or if we have all permissions and should enable the sensor.
+         if (results.keys.contains(Manifest.permission.ACCESS_FINE_LOCATION) &&
+             android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R
+         ) {
+-            permissionRequests.value = arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
++            permissionRequests.value = PermissionsDialog(serverId, arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION))
+             return
+         }
+ 
+@@ -414,12 +451,13 @@ class SensorDetailViewModel @Inject constructor(
+                             else ->
+                                 commonR.string.enable_sensor_missing_permission_general
+                         },
+-                        true
++                        true,
++                        serverId
+                     )
+                 )
+             }
+-            updateSensorEntity(hasPermission)
+-            permissionRequests.value = emptyArray()
++            updateSensorEntity(hasPermission, serverId)
++            permissionRequests.value = null
+         }
+     }
+ 
+diff --git a/app/src/main/java/io/homeassistant/companion/android/settings/sensor/SensorSettingsViewModel.kt b/app/src/main/java/io/homeassistant/companion/android/settings/sensor/SensorSettingsViewModel.kt
+index 3b38f839c32..f58b7ff7d19 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/settings/sensor/SensorSettingsViewModel.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/settings/sensor/SensorSettingsViewModel.kt
+@@ -82,7 +82,10 @@ class SensorSettingsViewModel @Inject constructor(
+                                     (sensorFilter == SensorFilter.DISABLED && !manager.isEnabled(app.applicationContext, sensor))
+                                 )
+                     }
+-                    .mapNotNull { sensor -> sensorsList.firstOrNull { it.id == sensor.id } }
++                    .mapNotNull { sensor ->
++                        sensorsList.filter { it.id == sensor.id }
++                            .maxByOrNull { it.enabled } // If any server is enabled, show the value
++                    }
+             }
+             .associateBy { it.id }
+ 
+diff --git a/app/src/main/java/io/homeassistant/companion/android/settings/sensor/views/SensorDetailView.kt b/app/src/main/java/io/homeassistant/companion/android/settings/sensor/views/SensorDetailView.kt
+index f983a14952e..a2ca6876048 100644
+--- a/app/src/main/java/io/homeassistant/companion/android/settings/sensor/views/SensorDetailView.kt
++++ b/app/src/main/java/io/homeassistant/companion/android/settings/sensor/views/SensorDetailView.kt
+@@ -3,10 +3,12 @@ package io.homeassistant.companion.android.settings.sensor.views
+ import android.content.Intent
+ import android.net.Uri
+ import android.provider.Settings
++import androidx.compose.animation.animateContentSize
+ import androidx.compose.animation.core.animateDpAsState
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.Row
+@@ -68,9 +70,9 @@ import com.mikepenz.iconics.IconicsDrawable
+ import com.mikepenz.iconics.compose.Image
+ import com.mikepenz.iconics.typeface.library.community.material.CommunityMaterial
+ import io.homeassistant.companion.android.common.sensors.SensorManager
+-import io.homeassistant.companion.android.database.sensor.Sensor
+ import io.homeassistant.companion.android.database.sensor.SensorSetting
+ import io.homeassistant.companion.android.database.sensor.SensorSettingType
++import io.homeassistant.companion.android.database.sensor.SensorWithAttributes
+ import io.homeassistant.companion.android.database.settings.SensorUpdateFrequencySetting
+ import io.homeassistant.companion.android.settings.sensor.SensorDetailViewModel
+ import io.homeassistant.companion.android.util.compose.MdcAlertDialog
+@@ -82,7 +84,7 @@ import io.homeassistant.companion.android.common.R as commonR
+ @Composable
+ fun SensorDetailView(
+     viewModel: SensorDetailViewModel,
+-    onSetEnabled: (Boolean) -> Unit,
++    onSetEnabled: (Boolean, Int?) -> Unit,
+     onToggleSettingSubmitted: (SensorSetting) -> Unit,
+     onDialogSettingClicked: (SensorSetting) -> Unit,
+     onDialogSettingSubmitted: (SensorDetailViewModel.Companion.SettingDialogState) -> Unit
+@@ -105,7 +107,7 @@ fun SensorDetailView(
+             ).let { result ->
+                 if (result == SnackbarResult.ActionPerformed) {
+                     if (it.actionOpensSettings) context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
+-                    else onSetEnabled(true)
++                    else onSetEnabled(true, it.serverId)
+                 }
+             }
+         }.launchIn(this)
+@@ -132,8 +134,9 @@ fun SensorDetailView(
+                 item {
+                     SensorDetailTopPanel(
+                         basicSensor = viewModel.basicSensor,
+-                        dbSensor = viewModel.sensor?.sensor,
+-                        sensorEnabled = sensorEnabled,
++                        dbSensor = viewModel.sensors,
++                        sensorsExpanded = viewModel.serversStateExpand.value,
++                        serverNames = viewModel.serverNames,
+                         onSetEnabled = onSetEnabled
+                     )
+                 }
+@@ -239,18 +242,20 @@ fun SensorDetailView(
+ @Composable
+ fun SensorDetailTopPanel(
+     basicSensor: SensorManager.BasicSensor,
+-    dbSensor: Sensor?,
+-    sensorEnabled: Boolean,
+-    onSetEnabled: (Boolean) -> Unit
++    dbSensor: List<SensorWithAttributes>,
++    sensorsExpanded: Boolean,
++    serverNames: Map<Int, String>,
++    onSetEnabled: (Boolean, Int?) -> Unit
+ ) {
+     val context = LocalContext.current
++    val sensor = dbSensor.map { it.sensor }.maxByOrNull { it.enabled }
+ 
+     Surface(color = colorResource(commonR.color.colorSensorTopBackground)) {
+         Column {
+             CompositionLocalProvider(
+-                LocalContentAlpha provides (if (sensorEnabled) ContentAlpha.high else ContentAlpha.disabled)
++                LocalContentAlpha provides (if (sensor?.enabled == true) ContentAlpha.high else ContentAlpha.disabled)
+             ) {
+-                val cardElevation: Dp by animateDpAsState(if (sensorEnabled) 8.dp else 1.dp)
++                val cardElevation: Dp by animateDpAsState(if (sensor?.enabled == true) 8.dp else 1.dp)
+                 Card(
+                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 32.dp),
+                     elevation = cardElevation
+@@ -263,10 +268,8 @@ fun SensorDetailTopPanel(
+                         verticalAlignment = Alignment.CenterVertically
+                     ) {
+                         var iconToUse = basicSensor.statelessIcon
+-                        dbSensor?.let {
+-                            if (it.enabled && it.icon.isNotBlank()) {
+-                                iconToUse = it.icon
+-                            }
++                        if (sensor?.enabled == true && sensor.icon.isNotBlank()) {
++                            iconToUse = sensor.icon
+                         }
+                         val mdiIcon = try {
+                             IconicsDrawable(context, "cmd-${iconToUse.split(":")[1]}").icon
+@@ -278,9 +281,9 @@ fun SensorDetailTopPanel(
+                                 contentDescription = stringResource(commonR.string.icon),
+                                 modifier = Modifier
+                                     .size(24.dp)
+-                                    .alpha(if (sensorEnabled) ContentAlpha.high else ContentAlpha.disabled),
++                                    .alpha(if (sensor?.enabled == true) ContentAlpha.high else ContentAlpha.disabled),
+                                 colorFilter = ColorFilter.tint(
+-                                    if (sensorEnabled) colorResource(commonR.color.colorSensorIconEnabled)
++                                    if (sensor?.enabled == true) colorResource(commonR.color.colorSensorIconEnabled)
+                                     else contentColorFor(backgroundColor = MaterialTheme.colors.background)
+                                 )
+                             )
+@@ -294,12 +297,12 @@ fun SensorDetailTopPanel(
+                         )
+                         SelectionContainer(modifier = Modifier.weight(0.5f)) {
+                             Text(
+-                                text = if (dbSensor?.enabled == true) {
+-                                    if (dbSensor.state.isBlank()) {
++                                text = if (sensor?.enabled == true) {
++                                    if (sensor.state.isBlank()) {
+                                         stringResource(commonR.string.enabled)
+                                     } else {
+-                                        if (dbSensor.unitOfMeasurement.isNullOrBlank()) dbSensor.state
+-                                        else "${dbSensor.state} ${dbSensor.unitOfMeasurement}"
++                                        if (sensor.unitOfMeasurement.isNullOrBlank()) sensor.state
++                                        else "${sensor.state} ${sensor.unitOfMeasurement}"
+                                     }
+                                 } else {
+                                     stringResource(commonR.string.disabled)
+@@ -311,38 +314,22 @@ fun SensorDetailTopPanel(
+                 }
+             }
+ 
+-            val enableBarModifier = Modifier
+-                .fillMaxWidth()
+-                .heightIn(min = 64.dp)
+-                .clickable {
+-                    onSetEnabled(!sensorEnabled)
+-                }
+-            Column(
+-                modifier =
+-                if (sensorEnabled) Modifier
+-                    .background(colorResource(commonR.color.colorSensorTopEnabled))
+-                    .then(enableBarModifier)
+-                else enableBarModifier
+-            ) {
+-                Row(
+-                    modifier = Modifier
+-                        .padding(all = 16.dp)
+-                        .weight(1f),
+-                    verticalAlignment = Alignment.CenterVertically
+-                ) {
+-                    Text(
+-                        text = stringResource(
+-                            if (basicSensor.type == "binary_sensor" || basicSensor.type == "sensor") commonR.string.enable_sensor
+-                            else (if (sensorEnabled) commonR.string.enabled else commonR.string.disabled)
+-                        ),
+-                        fontWeight = FontWeight.SemiBold,
+-                        modifier = Modifier.weight(1f)
+-                    )
+-                    Switch(
+-                        checked = sensorEnabled,
+-                        onCheckedChange = null,
+-                        modifier = Modifier.padding(start = 16.dp),
+-                        colors = SwitchDefaults.colors(uncheckedThumbColor = colorResource(commonR.color.colorSwitchUncheckedThumb))
++            Column(modifier = Modifier.animateContentSize()) {
++                if (sensorsExpanded) {
++                    dbSensor.forEach { thisSensor ->
++                        SensorDetailEnableRow(
++                            basicSensor = basicSensor,
++                            enabled = thisSensor.sensor.enabled,
++                            serverName = serverNames[thisSensor.sensor.serverId],
++                            onSetEnabled = { onSetEnabled(!thisSensor.sensor.enabled, thisSensor.sensor.serverId) }
++                        )
++                    }
++                } else {
++                    SensorDetailEnableRow(
++                        basicSensor = basicSensor,
++                        enabled = sensor?.enabled == true,
++                        serverName = null,
++                        onSetEnabled = { onSetEnabled(sensor?.enabled != true, null) }
+                     )
+                 }
+             }
+@@ -351,6 +338,50 @@ fun SensorDetailTopPanel(
+     }
+ }
+ 
++@Composable
++fun SensorDetailEnableRow(
++    basicSensor: SensorManager.BasicSensor,
++    enabled: Boolean,
++    serverName: String?,
++    onSetEnabled: () -> Unit
++) {
++    val enableBarModifier = Modifier
++        .fillMaxWidth()
++        .heightIn(min = 64.dp)
++        .clickable { onSetEnabled() }
++    val switchDescription = stringResource(
++        if (basicSensor.type == "binary_sensor" || basicSensor.type == "sensor") commonR.string.enable_sensor
++        else (if (enabled) commonR.string.enabled else commonR.string.disabled)
++    )
++    Box(
++        modifier =
++        if (enabled) Modifier
++            .background(colorResource(commonR.color.colorSensorTopEnabled))
++            .then(enableBarModifier)
++        else enableBarModifier,
++        contentAlignment = Alignment.Center
++    ) {
++        Row(
++            modifier = Modifier
++                .padding(all = 16.dp)
++                .fillMaxWidth(),
++            verticalAlignment = Alignment.CenterVertically
++        ) {
++            Text(
++                text = if (serverName.isNullOrBlank()) switchDescription else "$serverName: $switchDescription",
++                fontWeight = FontWeight.SemiBold,
++                modifier = Modifier.weight(1f)
++            )
++            Switch(
++                checked = enabled,
++                onCheckedChange = null,
++                modifier = Modifier.padding(start = 16.dp),
++                colors = SwitchDefaults.colors(uncheckedThumbColor = colorResource(commonR.color.colorSwitchUncheckedThumb))
++            )
++        }
++    }
++}
++
+ @Composable
+ fun SensorDetailHeader(text: String) {
+     Row(
+diff --git a/app/src/main/res/drawable/ic_unfold_less.xml b/app/src/main/res/drawable/ic_unfold_less.xml
+new file mode 100644
+index 00000000000..a7c13f68068
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_unfold_less.xml
+@@ -0,0 +1,5 @@
++<vector android:height="24dp" android:tint="?attr/colorControlNormal"
++    android:viewportHeight="24" android:viewportWidth="24"
++    android:width="24dp" xmlns:android="http://schemas.android.com/apk/res/android">
++    <path android:fillColor="@android:color/white" android:pathData="M7.41,18.59L8.83,20 12,16.83 15.17,20l1.41,-1.41L12,14l-4.59,4.59zM16.59,5.41L15.17,4 12,7.17 8.83,4 7.41,5.41 12,10l4.59,-4.59z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/ic_unfold_more.xml b/app/src/main/res/drawable/ic_unfold_more.xml
+new file mode 100644
+index 00000000000..c00f311fe09
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_unfold_more.xml
+@@ -0,0 +1,5 @@
++<vector android:height="24dp" android:tint="?attr/colorControlNormal"
++    android:viewportHeight="24" android:viewportWidth="24"
++    android:width="24dp" xmlns:android="http://schemas.android.com/apk/res/android">
++    <path android:fillColor="@android:color/white" android:pathData="M12,5.83L15.17,9l1.41,-1.41L12,3 7.41,7.59 8.83,9 12,5.83zM12,18.17L8.83,15l-1.41,1.41L12,21l4.59,-4.59L15.17,15 12,18.17z"/>
++</vector>
+diff --git a/app/src/main/res/menu/menu_activity_settings.xml b/app/src/main/res/menu/menu_activity_settings.xml
+index 12ab8add232..f6f3a1dd706 100644
+--- a/app/src/main/res/menu/menu_activity_settings.xml
++++ b/app/src/main/res/menu/menu_activity_settings.xml
+@@ -37,6 +37,25 @@
+         </item>
+     </group>
+ 
++    <group
++        android:id="@+id/sensor_detail_server_group"
++        android:visible="false">
++
++        <item
++            android:id="@+id/action_sensor_expand"
++            android:icon="@drawable/ic_unfold_more"
++            android:title="@string/sensor_unfold_more"
++            android:visible="false"
++            app:showAsAction="ifRoom"/>
++
++        <item
++            android:id="@+id/action_sensor_collapse"
++            android:icon="@drawable/ic_unfold_less"
++            android:title="@string/sensor_unfold_less"
++            android:visible="false"
++            app:showAsAction="ifRoom"/>
++    </group>
++
+     <group
+         android:id="@+id/log_toolbar_group"
+         android:visible="false">
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/sensors/SensorManager.kt b/common/src/main/java/io/homeassistant/companion/android/common/sensors/SensorManager.kt
+index 9a10465c9d9..d007825b13c 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/common/sensors/SensorManager.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/common/sensors/SensorManager.kt
+@@ -82,6 +82,7 @@ interface SensorManager {
+         return mode == AppOpsManager.MODE_ALLOWED
+     }
+ 
++    /** @return `true` if this sensor is enabled on any server */
+     fun isEnabled(context: Context, basicSensor: BasicSensor): Boolean {
+         val sensorDao = AppDatabase.getInstance(context).sensorDao()
+         val permission = checkPermission(context, basicSensor.id)
+@@ -93,6 +94,25 @@ interface SensorManager {
+         )
+     }
+ 
++    /** @return `true` if this sensor is enabled for the specified server */
++    fun isEnabled(context: Context, basicSensor: BasicSensor, serverId: Int): Boolean {
++        val sensorDao = AppDatabase.getInstance(context).sensorDao()
++        val permission = checkPermission(context, basicSensor.id)
++        return sensorDao.getOrDefault(
++            basicSensor.id,
++            serverId,
++            permission,
++            basicSensor.enabledByDefault
++        )?.enabled == true
++    }
++
++    /** @return Set of server IDs for which this sensor is enabled */
++    fun getEnabledServers(context: Context, basicSensor: BasicSensor): Set<Int> {
++        val sensorDao = AppDatabase.getInstance(context).sensorDao()
++        val permission = checkPermission(context, basicSensor.id)
++        return sensorDao.get(basicSensor.id).filter { it.enabled && permission }.map { it.serverId }.toSet()
++    }
++
+     /**
+      * Request to update a sensor, including any broadcast intent which may have triggered the request
+      * The intent will be null if the update is being done on a timer, rather than as a result
+diff --git a/common/src/main/java/io/homeassistant/companion/android/common/sensors/SensorReceiverBase.kt b/common/src/main/java/io/homeassistant/companion/android/common/sensors/SensorReceiverBase.kt
+index 55fa42c81e9..645a8067f3b 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/common/sensors/SensorReceiverBase.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/common/sensors/SensorReceiverBase.kt
+@@ -20,7 +20,9 @@ import io.homeassistant.companion.android.common.util.sensorCoreSyncChannel
+ import io.homeassistant.companion.android.database.AppDatabase
+ import io.homeassistant.companion.android.database.sensor.SensorDao
+ import io.homeassistant.companion.android.database.sensor.SensorWithAttributes
++import io.homeassistant.companion.android.database.sensor.toSensorWithAttributes
+ import io.homeassistant.companion.android.database.sensor.toSensorsWithAttributes
++import io.homeassistant.companion.android.database.server.Server
+ import io.homeassistant.companion.android.database.settings.SensorUpdateFrequencySetting
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.CoroutineScope
+@@ -30,7 +32,6 @@ import kotlinx.coroutines.async
+ import kotlinx.coroutines.awaitAll
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
+-import kotlinx.coroutines.withTimeoutOrNull
+ import java.io.IOException
+ import java.util.Locale
+ import javax.inject.Inject
+@@ -109,10 +110,11 @@ abstract class SensorReceiverBase : BroadcastReceiver() {
+                     val eventData = intent.extras?.keySet()?.map { it.toString() to intent.extras?.get(it).toString() }?.toMap()?.plus("intent" to intent.action.toString())
+                         ?: mapOf("intent" to intent.action.toString())
+                     Log.d(tag, "Event data: $eventData")
+-                    serverManager.defaultServers.forEach { server ->
++                    sensorDao.get(LastUpdateManager.lastUpdate.id).forEach { sensor ->
++                        if (!sensor.enabled) return@forEach
+                         ioScope.launch {
+                             try {
+-                                serverManager.integrationRepository(server.id).fireEvent(
++                                serverManager.integrationRepository(sensor.serverId).fireEvent(
+                                     "android.intent_received",
+                                     eventData as Map<String, Any>
+                                 )
+@@ -158,39 +160,11 @@ abstract class SensorReceiverBase : BroadcastReceiver() {
+         sensorDao: SensorDao,
+         intent: Intent?
+     ) {
+-        val enabledRegistrations = mutableListOf<SensorRegistration<Any>>()
+-
+         if (!serverManager.isRegistered()) {
+             Log.w(tag, "Device not registered, skipping sensor update/registration")
+             return
+         }
+ 
+-        val serverHAversion = mutableMapOf<Int, String>()
+-        val serverSupportsDisabled = mutableMapOf<Int, Boolean>()
+-        val serverSensorStatus = mutableMapOf<Int, Map<String, Boolean>?>()
+-        serverManager.defaultServers.map { server ->
+-            ioScope.async {
+-                withTimeoutOrNull(10_000) {
+-                    server._version?.let { serverHAversion[server.id] = it } // Cached
+-                    serverHAversion[server.id] =
+-                        serverManager.integrationRepository(server.id).getHomeAssistantVersion()
+-                    serverSupportsDisabled[server.id] =
+-                        serverManager.integrationRepository(server.id).isHomeAssistantVersionAtLeast(2022, 6, 0)
+-                    serverSensorStatus[server.id] = if (serverSupportsDisabled[server.id] == true) {
+-                        try {
+-                            val config = serverManager.integrationRepository(server.id).getConfig().entities
+-                            config
+-                                ?.filter { it.value["disabled"] != null }
+-                                ?.mapValues { !(it.value["disabled"] as Boolean) } // Map to sensor id -> enabled
+-                        } catch (e: Exception) {
+-                            Log.e(tag, "Error while getting core config to sync sensor status", e)
+-                            null
+-                        }
+-                    } else null
+-                }
+-            }
+-        }.awaitAll()
+-
+         managers.forEach { manager ->
+             // Since we don't have this manager injected it doesn't fulfil its injects, manually
+             // inject for now I guess?
+@@ -205,9 +179,50 @@ abstract class SensorReceiverBase : BroadcastReceiver() {
+                     Log.e(tag, "Issue requesting updates for ${context.getString(manager.name)}", e)
+                 }
+             }
++        }
++
++        try {
++            serverManager.defaultServers.map { server ->
++                ioScope.async { syncSensorsWithServer(context, serverManager, server, sensorDao) }
++            }.awaitAll()
++            Log.i(tag, "Sensor updates and sync completed")
++        } catch (e: Exception) {
++            Log.e(tag, "Exception while awaiting sensor updates.", e)
++        }
++    }
++
++    private suspend fun syncSensorsWithServer(
++        context: Context,
++        serverManager: ServerManager,
++        server: Server,
++        sensorDao: SensorDao
++    ): Boolean {
++        val currentHAversion = serverManager.integrationRepository(server.id).getHomeAssistantVersion()
++        val supportsDisabledSensors = serverManager.integrationRepository(server.id).isHomeAssistantVersionAtLeast(2022, 6, 0)
++        val coreSensorStatus: Map<String, Boolean>? = if (supportsDisabledSensors) {
++            try {
++                val config = serverManager.integrationRepository(server.id).getConfig().entities
++                config
++                    ?.filter { it.value["disabled"] != null }
++                    ?.mapValues { !(it.value["disabled"] as Boolean) } // Map to sensor id -> enabled
++            } catch (e: Exception) {
++                Log.e(tag, "Error while getting core config to sync sensor status", e)
++                null
++            }
++        } else {
++            null
++        }
++
++        val enabledRegistrations = mutableListOf<SensorRegistration<Any>>()
++
++        managers.forEach { manager ->
++            // Each manager was already asked to update in updateSensors
++            val hasSensor = manager.hasSensor(context)
++
+             manager.getAvailableSensors(context).forEach sensorForEach@{ basicSensor ->
+-                val fullSensors = sensorDao.getFull(basicSensor.id).toSensorsWithAttributes()
+-                if (fullSensors.isEmpty()) return@sensorForEach
++                val fullSensor = sensorDao.getFull(basicSensor.id, server.id).toSensorWithAttributes()
++                val sensor = fullSensor?.sensor ?: return@sensorForEach
++                val sensorCoreEnabled = coreSensorStatus?.get(basicSensor.id)
+                 val canBeRegistered = hasSensor &&
+                     basicSensor.type.isNotBlank() &&
+                     basicSensor.statelessIcon.isNotBlank()
+@@ -216,161 +231,124 @@ abstract class SensorReceiverBase : BroadcastReceiver() {
+                 // 1. There is a new sensor or change in enabled state according to the app
+                 // 2. There is a change in enabled state according to core (user changed in frontend)
+                 // 3. There is no change in enabled state, but app/core version has changed
+-                // Because sensor enabled state is kept in sync across all servers, if one of the
+-                // first 2 scenarios applies on one server, it will be applied to all servers.
+-
+-                val coreEnabledDifference: (SensorWithAttributes) -> Boolean = { (sensor, _) ->
+-                    serverSupportsDisabled[sensor.serverId] == true &&
+-                        serverSensorStatus[sensor.serverId]?.get(sensor.id) != null &&
+-                        serverSensorStatus[sensor.serverId]!![sensor.id] != sensor.registered
+-                }
+-                val versionDifference: (SensorWithAttributes) -> Boolean = { (sensor, _) ->
+-                    (sensor.enabled || serverSupportsDisabled[sensor.serverId] == true) &&
+-                        (currentAppVersion != sensor.appRegistration || serverHAversion[sensor.serverId] != sensor.coreRegistration)
+-                }
+                 if (
+                     canBeRegistered &&
+-                    fullSensors.any { (sensor, _) ->
+-                        (sensor.registered == null && (sensor.enabled || serverSupportsDisabled[sensor.serverId] == true)) ||
+-                            (sensor.enabled != sensor.registered && serverSupportsDisabled[sensor.serverId] == true) ||
+-                            (sensor.registered != null && serverSensorStatus[sensor.serverId] != null && serverSensorStatus[sensor.serverId]!![sensor.id] == null)
+-                    }
++                    (
++                        (sensor.registered == null && (sensor.enabled || supportsDisabledSensors)) ||
++                            (sensor.enabled != sensor.registered && supportsDisabledSensors) ||
++                            (sensor.registered != null && coreSensorStatus != null && sensorCoreEnabled == null)
++                        )
+                 ) {
+                     // 1. (Re-)register sensors with core when they can be registered and:
+                     // - sensor isn't registered, but is enabled or on core >=2022.6
+                     // - sensor enabled has changed from registered enabled state on core >=2022.6
+                     // - sensor is registered according to database, but core >=2022.6 doesn't know about it
+-                    fullSensors.forEach { fullSensor ->
+-                        val sensor = fullSensor.sensor
+-                        if (serverSupportsDisabled[sensor.serverId] == true || (sensor.registered == null && sensor.enabled)) {
+-                            try {
+-                                registerSensor(context, serverManager, fullSensor, basicSensor)
+-                                sensor.registered = sensor.enabled
+-                                sensor.coreRegistration = serverHAversion[sensor.serverId]
+-                                sensor.appRegistration = currentAppVersion
+-                                sensorDao.update(sensor)
+-                            } catch (e: Exception) {
+-                                Log.e(tag, "Issue registering sensor ${basicSensor.id}", e)
+-                            }
+-                        }
++                    try {
++                        registerSensor(context, serverManager, fullSensor, basicSensor)
++                        sensor.registered = sensor.enabled
++                        sensor.coreRegistration = currentHAversion
++                        sensor.appRegistration = currentAppVersion
++                        sensorDao.update(sensor)
++                    } catch (e: Exception) {
++                        Log.e(tag, "Issue registering sensor ${basicSensor.id}", e)
+                     }
+-                } else if (canBeRegistered && fullSensors.any(coreEnabledDifference)) {
++                } else if (
++                    canBeRegistered &&
++                    supportsDisabledSensors &&
++                    sensorCoreEnabled != null &&
++                    sensorCoreEnabled != sensor.registered
++                ) {
+                     // 2. Try updating the sensor enabled state to match core state when it's different from
+                     // the app, if the sensor can be registered and on core >= 2022.6
+-                    val difference = fullSensors.first(coreEnabledDifference).sensor
+-                    val sensorCoreEnabled =
+-                        serverSensorStatus[difference.serverId]?.get(difference.id) == true
+-                    Log.d(tag, "Sync: ${if (sensorCoreEnabled) "enabling" else "disabling"} ${difference.id}")
+-
+-                    fullSensors.forEach { fullSensor ->
+-                        try {
+-                            val sensor = fullSensor.sensor
+-                            var appliedDifference = true
+-                            if (sensorCoreEnabled) { // App disabled, should enable
+-                                if (manager.checkPermission(context.applicationContext, basicSensor.id)) {
+-                                    sensor.enabled = true
+-                                    sensor.registered = true
+-                                } else {
+-                                    // Can't enable due to missing permission(s), 'override' core and notify user
+-                                    if (difference.serverId == sensor.serverId && serverSupportsDisabled[sensor.serverId] == true) {
+-                                        registerSensor(context, serverManager, fullSensor, basicSensor)
+-                                        appliedDifference = false
+-                                    }
+-
+-                                    context.getSystemService<NotificationManager>()?.let { notificationManager ->
+-                                        createNotificationChannel(context)
+-                                        val notificationId = "$sensorCoreSyncChannel-${basicSensor.id}".hashCode()
+-                                        val notificationIntent = getSensorSettingsIntent(context, basicSensor.id, manager.id(), notificationId)
+-                                        val notification = NotificationCompat.Builder(context, sensorCoreSyncChannel)
+-                                            .setSmallIcon(R.drawable.ic_stat_ic_notification)
+-                                            .setContentTitle(context.getString(basicSensor.name))
+-                                            .setContentText(context.getString(R.string.sensor_worker_sync_missing_permissions))
+-                                            .setContentIntent(notificationIntent)
+-                                            .setAutoCancel(true)
+-                                            .build()
+-                                        notificationManager.notify(notificationId, notification)
+-                                    }
+-                                }
+-                            } else { // App enabled, should disable
+-                                sensor.enabled = false
+-                                sensor.registered = false
+-                            }
+-
+-                            sensor.coreRegistration = serverHAversion[sensor.serverId]
+-                            sensor.appRegistration = currentAppVersion
+-                            if (appliedDifference && difference.serverId != sensor.serverId) {
+-                                // We're applying enabled from a different server, send it to this one as well
++                    try {
++                        if (sensorCoreEnabled) { // App disabled, should enable
++                            if (manager.checkPermission(context.applicationContext, basicSensor.id)) {
++                                sensor.enabled = true
++                                sensor.registered = true
++                            } else {
++                                // Can't enable due to missing permission(s), 'override' core and notify user
+                                 registerSensor(context, serverManager, fullSensor, basicSensor)
++
++                                context.getSystemService<NotificationManager>()?.let { notificationManager ->
++                                    createNotificationChannel(context)
++                                    val notificationId = "$sensorCoreSyncChannel-${basicSensor.id}".hashCode()
++                                    val notificationIntent = getSensorSettingsIntent(context, basicSensor.id, manager.id(), notificationId)
++                                    val notification = NotificationCompat.Builder(context, sensorCoreSyncChannel)
++                                        .setSmallIcon(R.drawable.ic_stat_ic_notification)
++                                        .setContentTitle(context.getString(basicSensor.name))
++                                        .setContentText(context.getString(R.string.sensor_worker_sync_missing_permissions))
++                                        .setContentIntent(notificationIntent)
++                                        .setAutoCancel(true)
++                                        .build()
++                                    notificationManager.notify(notificationId, notification)
++                                }
+                             }
+-                            sensorDao.update(sensor)
+-                        } catch (e: Exception) {
+-                            Log.e(tag, "Issue enabling/disabling sensor ${basicSensor.id}", e)
++                        } else { // App enabled, should disable
++                            sensor.enabled = false
++                            sensor.registered = false
+                         }
++
++                        sensor.coreRegistration = currentHAversion
++                        sensor.appRegistration = currentAppVersion
++                        sensorDao.update(sensor)
++                    } catch (e: Exception) {
++                        Log.e(tag, "Issue enabling/disabling sensor ${basicSensor.id}", e)
+                     }
+-                } else if (canBeRegistered && fullSensors.any(versionDifference)) {
++                } else if (
++                    canBeRegistered &&
++                    (sensor.enabled || supportsDisabledSensors) &&
++                    (currentAppVersion != sensor.appRegistration || currentHAversion != sensor.coreRegistration)
++                ) {
+                     // 3. Re-register sensors with core when they can be registered and are enabled or on
+                     // core >= 2022.6, and app or core version change is detected
+-                    fullSensors.filter(versionDifference).forEach { fullSensor ->
+-                        try {
+-                            registerSensor(context, serverManager, fullSensor, basicSensor)
+-                            val sensor = fullSensor.sensor
+-                            sensor.registered = sensor.enabled
+-                            sensor.coreRegistration = serverHAversion[sensor.serverId]
+-                            sensor.appRegistration = currentAppVersion
+-                            sensorDao.update(sensor)
+-                        } catch (e: Exception) {
+-                            Log.e(tag, "Issue re-registering sensor ${basicSensor.id}", e)
+-                        }
++                    try {
++                        registerSensor(context, serverManager, fullSensor, basicSensor)
++                        sensor.registered = sensor.enabled
++                        sensor.coreRegistration = currentHAversion
++                        sensor.appRegistration = currentAppVersion
++                        sensorDao.update(sensor)
++                    } catch (e: Exception) {
++                        Log.e(tag, "Issue re-registering sensor ${basicSensor.id}", e)
+                     }
+                 }
+ 
+-                fullSensors.forEach { fullSensor ->
+-                    val sensor = fullSensor.sensor
+-                    if (canBeRegistered && sensor.enabled && sensor.registered != null && (sensor.state != sensor.lastSentState || sensor.icon != sensor.lastSentIcon)) {
+-                        enabledRegistrations.add(fullSensor.toSensorRegistration(basicSensor))
+-                    }
++                if (canBeRegistered && sensor.enabled && sensor.registered != null && (sensor.state != sensor.lastSentState || sensor.icon != sensor.lastSentIcon)) {
++                    enabledRegistrations.add(fullSensor.toSensorRegistration(basicSensor))
+                 }
+             }
+         }
+ 
++        var success = true
+         if (enabledRegistrations.isNotEmpty()) {
+-            val jobs = enabledRegistrations.groupBy { it.serverId }.map { (serverId, registrations) ->
+-                ioScope.async {
+-                    val success = try {
+-                        val success = serverManager.integrationRepository(serverId).updateSensors(registrations.toTypedArray())
+-                        registrations.forEach {
+-                            sensorDao.updateLastSentStateAndIcon(it.uniqueId, it.serverId, it.state.toString(), it.icon)
+-                        }
+-                        success
+-                    } catch (e: Exception) {
+-                        // Don't trigger re-registration when the server is down or job was cancelled
+-                        val exceptionOk = e is IntegrationException &&
+-                            (e.cause is IOException || e.cause is CancellationException)
+-                        if (exceptionOk) Log.w(tag, "Exception while updating sensors: ${e::class.java.simpleName}: ${e.cause?.let { it::class.java.name } }")
+-                        else Log.e(tag, "Exception while updating sensors.", e)
+-                        exceptionOk
+-                    }
++            success = try {
++                val serverSuccess = serverManager.integrationRepository(server.id).updateSensors(enabledRegistrations.toTypedArray())
++                enabledRegistrations.forEach {
++                    sensorDao.updateLastSentStateAndIcon(it.uniqueId, it.serverId, it.state.toString(), it.icon)
++                }
++                serverSuccess
++            } catch (e: Exception) {
++                // Don't trigger re-registration when the server is down or job was cancelled
++                val exceptionOk = e is IntegrationException &&
++                    (e.cause is IOException || e.cause is CancellationException)
++                if (exceptionOk) Log.w(tag, "Exception while updating sensors: ${e::class.java.simpleName}: ${e.cause?.let { it::class.java.name } }")
++                else Log.e(tag, "Exception while updating sensors.", e)
++                exceptionOk
++            }
+ 
+-                    // We failed to update a sensor, we should re register next time
+-                    if (!success) {
+-                        registrations.forEach {
+-                            val sensor = sensorDao.get(it.uniqueId, it.serverId)
+-                            if (sensor != null) {
+-                                sensor.registered = null
+-                                sensor.lastSentState = null
+-                                sensor.lastSentIcon = null
+-                                sensorDao.update(sensor)
+-                            }
+-                        }
++            // We failed to update a sensor, we should re register next time
++            if (!success) {
++                enabledRegistrations.forEach {
++                    val sensor = sensorDao.get(it.uniqueId, it.serverId)
++                    if (sensor != null) {
++                        sensor.registered = null
++                        sensor.lastSentState = null
++                        sensor.lastSentIcon = null
++                        sensorDao.update(sensor)
+                     }
+                 }
+             }
+-            try {
+-                jobs.awaitAll()
+-            } catch (e: Exception) {
+-                Log.e(tag, "Exception while awaiting sensor updates.", e)
+-            }
+-        } else Log.d(tag, "Nothing to update")
++        } else Log.d(tag, "Nothing to update for server ${server.id} (${server.friendlyName})")
++        return success
+     }
+ 
+     private suspend fun registerSensor(
+diff --git a/common/src/main/java/io/homeassistant/companion/android/database/sensor/SensorDao.kt b/common/src/main/java/io/homeassistant/companion/android/database/sensor/SensorDao.kt
+index 3b681c3ef62..d169536758f 100644
+--- a/common/src/main/java/io/homeassistant/companion/android/database/sensor/SensorDao.kt
++++ b/common/src/main/java/io/homeassistant/companion/android/database/sensor/SensorDao.kt
+@@ -27,6 +27,10 @@ interface SensorDao {
+     @Query("SELECT * FROM sensors LEFT JOIN sensor_attributes ON sensors.id = sensor_attributes.sensor_id WHERE sensors.id = :id")
+     fun getFull(id: String): Map<Sensor, List<Attribute>>
+ 
++    @Transaction
++    @Query("SELECT * FROM sensors LEFT JOIN sensor_attributes ON sensors.id = sensor_attributes.sensor_id WHERE sensors.id = :id AND sensors.server_id = :serverId")
++    fun getFull(id: String, serverId: Int): Map<Sensor, List<Attribute>>
++
+     @Transaction
+     @Query("SELECT * FROM sensors LEFT JOIN sensor_attributes ON sensors.id = sensor_attributes.sensor_id WHERE sensors.id = :id")
+     fun getFullFlow(id: String): Flow<Map<Sensor, List<Attribute>>>
+@@ -104,6 +108,13 @@ interface SensorDao {
+     @Query("SELECT COUNT(id) FROM sensors WHERE enabled = 1")
+     suspend fun getEnabledCount(): Int?
+ 
++    @Transaction
++    suspend fun setSensorEnabled(sensorId: String, serverIds: List<Int>, enabled: Boolean) {
++        serverIds.forEach {
++            setSensorsEnabled(listOf(sensorId), it, enabled)
++        }
++    }
++
+     @Transaction
+     suspend fun setSensorsEnabled(sensorIds: List<String>, serverId: Int, enabled: Boolean) {
+         coroutineScope {
+@@ -121,14 +132,10 @@ interface SensorDao {
+     }
+ 
+     @Transaction
+-    fun getOrDefault(sensorId: String, serverId: Int, permission: Boolean, enabledByDefault: Boolean): Sensor {
+-        var sensor = get(sensorId, serverId)
++    fun getOrDefault(sensorId: String, serverId: Int, permission: Boolean, enabledByDefault: Boolean): Sensor? {
++        val sensor = get(sensorId, serverId)
+ 
+-        if (sensor == null) {
+-            // If we haven't created the entity yet do so and default to enabled if required
+-            sensor = Sensor(sensorId, serverId, enabled = permission && enabledByDefault, state = "")
+-            add(sensor)
+-        } else if (sensor.enabled && !permission) {
++        if (sensor?.enabled == true && !permission) {
+             // If we don't have permission but we are still enabled then we aren't really enabled.
+             sensor.enabled = false
+             update(sensor)
+@@ -159,7 +166,7 @@ interface SensorDao {
+             val newServers = servers.filter { it !in sensorList.map { sensor -> sensor.serverId } }
+             if (newServers.isNotEmpty()) {
+                 // If we have any new servers but don't have entries create one for updates.
+-                val singleSensor = sensorList.first()
++                val singleSensor = sensorList.maxBy { it.enabled } // Prefer enabled
+                 newServers.forEach {
+                     add(
+                         singleSensor.copy(
+diff --git a/common/src/main/res/values/strings.xml b/common/src/main/res/values/strings.xml
+index 6fb53c93bf5..68d5576be4d 100644
+--- a/common/src/main/res/values/strings.xml
++++ b/common/src/main/res/values/strings.xml
+@@ -646,6 +646,8 @@
+     <string name="sensor_settings">Sensor Settings</string>
+     <string name="sensor_summary">Use this to manage what sensors are enabled/disabled.</string>
+     <string name="sensor_title">Manage Sensors</string>
++    <string name="sensor_unfold_less">Hide Server Settings</string>
++    <string name="sensor_unfold_more">Show Server Settings</string>
+     <string name="sensor">Sensor</string>
+     <string name="sensors_with_settings">The following sensors offer custom settings: %1$s</string>
+     <string name="sensors">Sensors</string>

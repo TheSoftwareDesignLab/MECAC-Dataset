@@ -1,0 +1,146 @@
+diff --git a/mobile/apps/auth/lib/ui/home_page.dart b/mobile/apps/auth/lib/ui/home_page.dart
+index 3a3d650259e..f836afb7dbe 100644
+--- a/mobile/apps/auth/lib/ui/home_page.dart
++++ b/mobile/apps/auth/lib/ui/home_page.dart
+@@ -321,7 +321,8 @@ class _HomePageState extends State<HomePage> {
+     final bool shouldShowLockScreen =
+         await LockScreenSettings.instance.shouldShowLockScreen();
+     if (shouldShowLockScreen) {
+-      await AppLock.of(context)!.showLockScreen();
++      // Manual lock: do not auto-prompt Touch ID; wait for user tap
++      await AppLock.of(context)!.showManualLockScreen();
+     } else {
+       await showDialogWidget(
+         context: context,
+diff --git a/mobile/apps/auth/lib/ui/tools/app_lock.dart b/mobile/apps/auth/lib/ui/tools/app_lock.dart
+index 1428c553c67..25289e680db 100644
+--- a/mobile/apps/auth/lib/ui/tools/app_lock.dart
++++ b/mobile/apps/auth/lib/ui/tools/app_lock.dart
+@@ -127,14 +127,19 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
+           case '/lock-screen':
+             return PageRouteBuilder(
+               pageBuilder: (_, __, ___) => this._lockScreen,
++              settings: settings,
+             );
+           case '/unlocked':
+             return PageRouteBuilder(
+               pageBuilder: (_, __, ___) =>
+                   this.widget.builder(settings.arguments),
++              settings: settings,
+             );
+         }
+-        return PageRouteBuilder(pageBuilder: (_, __, ___) => this._lockScreen);
++        return PageRouteBuilder(
++          pageBuilder: (_, __, ___) => this._lockScreen,
++          settings: settings,
++        );
+       },
+     );
+   }
+@@ -190,10 +195,18 @@ class _AppLockState extends State<AppLock> with WidgetsBindingObserver {
+     });
+   }
+ 
+-  /// Manually show the [lockScreen].
++  /// Show the [lockScreen] for automatic locking (app launch, background resume).
+   Future<void> showLockScreen() {
+     this._isLocked = true;
+-    return _navigatorKey.currentState!.pushNamed('/lock-screen');
++    return _navigatorKey.currentState!
++        .pushNamed('/lock-screen', arguments: {"manual": false});
++  }
++
++  /// Show the [lockScreen] for user-initiated manual lock (no auto-auth on first frame).
++  Future<void> showManualLockScreen() {
++    this._isLocked = true;
++    return _navigatorKey.currentState!
++        .pushNamed('/lock-screen', arguments: {"manual": true});
+   }
+ 
+   void _didUnlockOnAppLaunch(Object? args) {
+diff --git a/mobile/apps/auth/lib/ui/tools/lock_screen.dart b/mobile/apps/auth/lib/ui/tools/lock_screen.dart
+index 71adcd3f285..bdc6336498b 100644
+--- a/mobile/apps/auth/lib/ui/tools/lock_screen.dart
++++ b/mobile/apps/auth/lib/ui/tools/lock_screen.dart
+@@ -34,6 +34,9 @@ class _LockScreenState extends State<LockScreen> with WidgetsBindingObserver {
+   final _lockscreenSetting = LockScreenSettings.instance;
+   late Brightness _platformBrightness;
+   final bool isLoggedIn = Configuration.instance.isLoggedIn();
++  bool _isManualPresentation = false;
++  // Suppress auto-auth only for the initial manual presentation.
++  bool _suppressAutoPrompt = false;
+ 
+   @override
+   void initState() {
+@@ -42,7 +45,16 @@ class _LockScreenState extends State<LockScreen> with WidgetsBindingObserver {
+     invalidAttemptCount = _lockscreenSetting.getInvalidAttemptCount();
+     WidgetsBinding.instance.addObserver(this);
+     WidgetsBinding.instance.addPostFrameCallback((timeStamp) {
+-      _showLockScreen(source: "postFrameInit");
++      final Object? args = ModalRoute.of(context)?.settings.arguments;
++      if (args is Map && args['manual'] is bool) {
++        _isManualPresentation = args['manual'] as bool;
++      } else {
++        _isManualPresentation = false;
++      }
++      _suppressAutoPrompt = _isManualPresentation;
++      if (!_isManualPresentation) {
++        _showLockScreen(source: "postFrameInit");
++      }
+     });
+     _platformBrightness =
+         SchedulerBinding.instance.platformDispatcher.platformBrightness;
+@@ -67,7 +79,8 @@ class _LockScreenState extends State<LockScreen> with WidgetsBindingObserver {
+       ),
+       body: GestureDetector(
+         onTap: () {
+-          isTimerRunning ? null : _showLockScreen(source: "tap");
++          if (isTimerRunning) return;
++          _showLockScreen(source: "tap");
+         },
+         child: Container(
+           decoration: BoxDecoration(
+@@ -215,8 +228,7 @@ class _LockScreenState extends State<LockScreen> with WidgetsBindingObserver {
+           DateTime.now().millisecondsSinceEpoch - lastAuthenticatingTime! <
+               5000;
+       if (!_hasAuthenticationFailed && !didAuthInLast5Seconds) {
+-        // Show the lock screen again only if the app is resuming from the
+-        // background, and not when the lock screen was explicitly dismissed
++        // If there is a cooldown timer (after multiple failures), respect it
+         if (_lockscreenSetting.getlastInvalidAttemptTime() >
+                 DateTime.now().millisecondsSinceEpoch &&
+             !_isShowingLockScreen) {
+@@ -227,6 +239,9 @@ class _LockScreenState extends State<LockScreen> with WidgetsBindingObserver {
+             startLockTimer(time);
+             _showLockScreen(source: "lifeCycle");
+           });
++        } else if (!_suppressAutoPrompt) {
++          // No cooldown: auto-prompt when app becomes active again
++          _showLockScreen(source: "lifeCycle");
+         }
+       } else {
+         _hasAuthenticationFailed = false; // Reset failure state
+@@ -238,6 +253,9 @@ class _LockScreenState extends State<LockScreen> with WidgetsBindingObserver {
+       if (!_isShowingLockScreen) {
+         _hasPlacedAppInBackground = true;
+         _hasAuthenticationFailed = false; // reset failure state
++        // If we suppressed the initial auto-prompt due to manual lock,
++        // enable auto-prompt for the next resume after focus loss.
++        _suppressAutoPrompt = false;
+       }
+     }
+   }
+diff --git a/mobile/apps/auth/lib/utils/auth_util.dart b/mobile/apps/auth/lib/utils/auth_util.dart
+index 6c797a43283..9e363ee63cf 100644
+--- a/mobile/apps/auth/lib/utils/auth_util.dart
++++ b/mobile/apps/auth/lib/utils/auth_util.dart
+@@ -30,7 +30,8 @@ Future<bool> requestAuthentication(
+       isAuthenticatingForInAppChange: isAuthenticatingForInAppChange,
+     );
+   }
+-  if (Platform.isMacOS || Platform.isLinux) {
++  if (Platform.isLinux) {
++    // Linux uses flutter_local_authentication
+     return await FlutterLocalAuthentication().authenticate();
+   } else {
+     await LocalAuthentication().stopAuthentication();

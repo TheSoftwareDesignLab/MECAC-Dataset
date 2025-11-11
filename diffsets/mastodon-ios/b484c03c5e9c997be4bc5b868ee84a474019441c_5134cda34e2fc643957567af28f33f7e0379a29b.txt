@@ -1,0 +1,160 @@
+diff --git a/Mastodon/Coordinator/SceneCoordinator.swift b/Mastodon/Coordinator/SceneCoordinator.swift
+index bf3343f4ad..f4d6c2669c 100644
+--- a/Mastodon/Coordinator/SceneCoordinator.swift
++++ b/Mastodon/Coordinator/SceneCoordinator.swift
+@@ -433,9 +433,14 @@ private extension SceneCoordinator {
+             let _viewController = ComposeViewController(viewModel: viewModel)
+             viewController = _viewController
+         case .thread(let viewModel):
+-            let _viewController = ThreadViewController()
+-            _viewController.viewModel = viewModel
+-            viewController = _viewController
++            if UserDefaults.standard.testNewHomeTimeline {
++                guard let rootStatus = viewModel.root?.record, let rootPost = GenericMastodonPost.fromStatus(rootStatus.entity) as? MastodonContentPost else { return nil }
++                viewController = TimelineListViewController(.thread(root: rootPost))
++            } else {
++                let _viewController = ThreadViewController()
++                _viewController.viewModel = viewModel
++                viewController = _viewController
++            }
+         case .editHistory(let viewModel):
+             let editHistoryViewController = StatusEditHistoryViewController(viewModel: viewModel)
+             viewController = editHistoryViewController
+diff --git a/Mastodon/In Progress New Layout and Datamodel/GenericMastodonPost and Subclasses/GenericMastodonPost+Subclasses.swift b/Mastodon/In Progress New Layout and Datamodel/GenericMastodonPost and Subclasses/GenericMastodonPost+Subclasses.swift
+index b2387f7821..1eb8b8ca48 100644
+--- a/Mastodon/In Progress New Layout and Datamodel/GenericMastodonPost and Subclasses/GenericMastodonPost+Subclasses.swift	
++++ b/Mastodon/In Progress New Layout and Datamodel/GenericMastodonPost and Subclasses/GenericMastodonPost+Subclasses.swift	
+@@ -38,7 +38,7 @@ extension GenericMastodonPost {
+     }
+ }
+ 
+-class MastodonContentPost: GenericMastodonPost {
++public class MastodonContentPost: GenericMastodonPost {
+     let content: GenericMastodonPost.PostContent
+     
+     init(id: Mastodon.Entity.Status.ID, metaData: GenericMastodonPost.PostMetadata, content: GenericMastodonPost.PostContent, _legacyEntity: Mastodon.Entity.Status) {
+diff --git a/Mastodon/In Progress New Layout and Datamodel/Timeline/TimelineFeedLoader.swift b/Mastodon/In Progress New Layout and Datamodel/Timeline/TimelineFeedLoader.swift
+index d505bd7ee0..f6cfaa9e38 100644
+--- a/Mastodon/In Progress New Layout and Datamodel/Timeline/TimelineFeedLoader.swift	
++++ b/Mastodon/In Progress New Layout and Datamodel/Timeline/TimelineFeedLoader.swift	
+@@ -13,6 +13,21 @@ public enum MastodonTimelineType: Equatable {
+     case discovery
+     case search(String)
+     case userPosts(userID: String, queryFilter: TimelineQueryFilter)
++    case thread(root: MastodonContentPost)
++
++    public static func == (lhs: MastodonTimelineType, rhs: MastodonTimelineType) -> Bool {
++        switch (lhs, rhs) {
++        case (.following, .following): return true
++        case (.local, .local): return true
++        case (.list(let first), .list(let second)): return first == second
++        case (.hashtag(let first), .hashtag(let second)): return first == second
++        case (.discovery, .discovery): return true
++        case (.search(let first), .search(let second)): return first == second
++        case (.userPosts(let firstID, let firstFilter), .userPosts(let secondID, let secondFilter)): return firstID == secondID && firstFilter == secondFilter
++        case (.thread(let first), .thread(let second)): return first.id == second.id
++        default: return false
++        }
++    }
+ }
+ 
+ public struct TimelineQueryFilter: Equatable {
+@@ -102,6 +117,8 @@ final class TimelineFeedLoader: MastodonFeedLoader<TimelineItem, CacheableTimeli
+     private let myAccountID: Mastodon.Entity.Account.ID?
+     
+     let timeline: MastodonTimelineType
++    var threadModel: MastodonStatusThreadViewModel?
++    var threadRoot: Mastodon.Entity.Status.ID?
+     
+     init(currentUser: MastodonAuthenticationBox, timeline: MastodonTimelineType) {
+         self.timeline = timeline
+@@ -125,6 +142,8 @@ final class TimelineFeedLoader: MastodonFeedLoader<TimelineItem, CacheableTimeli
+             self.filterContext = nil
+         case .userPosts:
+             self.filterContext = .account
++        case .thread:
++            self.filterContext = .account
+         }
+         super.init(cacheManager)
+     }
+@@ -241,6 +260,50 @@ final class TimelineFeedLoader: MastodonFeedLoader<TimelineItem, CacheableTimeli
+                 onlyMedia: queryFilter.onlyMedia,
+                 authenticationBox: authenticatedUser
+             ).value
++        case .thread(let root):
++            let threadModel = MastodonStatusThreadViewModel(filterContext: .thread)
++            self.threadModel = threadModel
++            self.threadRoot = root.id
++            
++            let context = try await APIService.shared.statusContext(
++                statusID: root.id,
++                authenticationBox: authenticatedUser
++            ).value
++            
++            threadModel.appendAncestor(
++                nodes: MastodonStatusThreadViewModel.Node.replyToThread(
++                    for: (root as? MastodonBasicPost)?.inReplyTo?.postID,
++                    from: context.ancestors
++                )
++            )
++
++            threadModel.appendDescendant(
++                nodes: context.descendants.map { status in
++                    return .init(status: .fromEntity(status), children: [])
++                }
++            )
++            
++            let anscestorStatuses = threadModel.ancestors.compactMap {
++                switch $0 {
++                case .thread(let context):
++                    return context.record.entity
++                default:
++                    assertionFailure()
++                    return nil
++                }
++            }
++            
++            let descendentStatuses = threadModel.descendants.compactMap {
++                switch $0 {
++                case .thread(let context):
++                    return context.record.entity
++                default:
++                    assertionFailure()
++                    return nil
++                }
++            }
++            
++            response = anscestorStatuses + [root._legacyEntity] + descendentStatuses
+         }
+         
+         let newBatch = response.map { status in
+diff --git a/Mastodon/In Progress New Layout and Datamodel/Timeline/TimelineListViewController.swift b/Mastodon/In Progress New Layout and Datamodel/Timeline/TimelineListViewController.swift
+index 0ef8bac702..4c59ba3a4b 100644
+--- a/Mastodon/In Progress New Layout and Datamodel/Timeline/TimelineListViewController.swift	
++++ b/Mastodon/In Progress New Layout and Datamodel/Timeline/TimelineListViewController.swift	
+@@ -20,6 +20,7 @@ enum TimelineViewType {
+     case trendingPosts
+     case searchPosts(String)
+     case profilePosts(tabTitle: String?, userID: String, queryFilter: TimelineQueryFilter)
++    case thread(root: MastodonContentPost)
+     
+     var tabTitle: String? {
+         switch self {
+@@ -51,6 +52,8 @@ class TimelineListViewController: UIHostingController<TimelineListView>
+             viewModel = TimelineListViewModel(timeline: .search(searchText))
+         case .profilePosts(_, let user, let queryFilter):
+             viewModel = TimelineListViewModel(timeline: .userPosts(userID: user, queryFilter: queryFilter))
++        case .thread(let root):
++            viewModel = TimelineListViewModel(timeline: .thread(root: root))
+         }
+         let root = TimelineListView(viewModel: viewModel)
+         super.init(rootView: root)
+@@ -204,7 +207,7 @@ class TimelineListViewController: UIHostingController<TimelineListView>
+         case .hashtag:
+             showLocalTimelineAction.state = .off
+             showFollowingAction.state = .off
+-        case .discovery, .search, .userPosts:
++        case .discovery, .search, .userPosts, .thread:
+             assertionFailure()
+         }
+         

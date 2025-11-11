@@ -1,0 +1,147 @@
+diff --git a/Signal/src/ViewControllers/ConversationView/Emoji Picker/EmojiReactionPickerConfigViewController.swift b/Signal/src/ViewControllers/ConversationView/Emoji Picker/EmojiReactionPickerConfigViewController.swift
+index da60db66ef1..db5e5bcbb68 100644
+--- a/Signal/src/ViewControllers/ConversationView/Emoji Picker/EmojiReactionPickerConfigViewController.swift	
++++ b/Signal/src/ViewControllers/ConversationView/Emoji Picker/EmojiReactionPickerConfigViewController.swift	
+@@ -1,5 +1,5 @@
+ //
+-//  Copyright (c) 2020 Open Whisper Systems. All rights reserved.
++//  Copyright (c) 2022 Open Whisper Systems. All rights reserved.
+ //
+ 
+ import Foundation
+@@ -59,7 +59,7 @@ public class EmojiReactionPickerConfigViewController: UIViewController {
+     private func doneButtonTapped(sender: UIButton) {
+         let currentEmojiSet = reactionPicker.currentEmojiSet()
+         SDSDatabaseStorage.shared.write { transaction in
+-            ReactionManager.setEmojiSet(currentEmojiSet, transaction: transaction)
++            ReactionManager.setCustomEmojiSet(currentEmojiSet, transaction: transaction)
+         }
+         Self.storageServiceManager.recordPendingLocalAccountUpdates()
+         dismiss(animated: true, completion: nil)
+diff --git a/Signal/src/ViewControllers/DebugUI/DebugUIMisc.m b/Signal/src/ViewControllers/DebugUI/DebugUIMisc.m
+index 873ed1e989c..da9cedc0b09 100644
+--- a/Signal/src/ViewControllers/DebugUI/DebugUIMisc.m
++++ b/Signal/src/ViewControllers/DebugUI/DebugUIMisc.m
+@@ -217,6 +217,9 @@ - (nullable OWSTableSection *)sectionForThread:(nullable TSThread *)thread
+     [items addObject:[OWSTableItem itemWithTitle:@"Clear Temporal Credentials"
+                                      actionBlock:^() { [DebugUIMisc clearTemporalCredentials]; }]];
+ 
++    [items addObject:[OWSTableItem itemWithTitle:@"Clear custom reaction emoji (locally)"
++                                     actionBlock:^() { [DebugUIMisc clearLocalCustomEmoji]; }]];
++
+     return [OWSTableSection sectionWithTitle:self.name items:items];
+ }
+ 
+diff --git a/Signal/src/ViewControllers/DebugUI/DebugUIMisc.swift b/Signal/src/ViewControllers/DebugUI/DebugUIMisc.swift
+index 5982dc4a572..a57ffefa0be 100644
+--- a/Signal/src/ViewControllers/DebugUI/DebugUIMisc.swift
++++ b/Signal/src/ViewControllers/DebugUI/DebugUIMisc.swift
+@@ -1,5 +1,5 @@
+ //
+-//  Copyright (c) 2021 Open Whisper Systems. All rights reserved.
++//  Copyright (c) 2022 Open Whisper Systems. All rights reserved.
+ //
+ 
+ import Foundation
+@@ -61,6 +61,12 @@ public extension DebugUIMisc {
+             Self.groupsV2.clearTemporalCredentials(transaction: transaction)
+         }
+     }
++
++    static func clearLocalCustomEmoji() {
++        Self.databaseStorage.write { transaction in
++            ReactionManager.setCustomEmojiSet(nil, transaction: transaction)
++        }
++    }
+ }
+ 
+ #endif
+diff --git a/Signal/src/ViewControllers/MessageReactionPicker.swift b/Signal/src/ViewControllers/MessageReactionPicker.swift
+index 0942acd7169..a9e423181b6 100644
+--- a/Signal/src/ViewControllers/MessageReactionPicker.swift
++++ b/Signal/src/ViewControllers/MessageReactionPicker.swift
+@@ -62,7 +62,20 @@ class MessageReactionPicker: UIStackView {
+         layoutMargins = UIEdgeInsets(top: pickerPadding, leading: pickerPadding, bottom: pickerPadding, trailing: pickerPadding)
+ 
+         var emojiSet: [EmojiWithSkinTones] = SDSDatabaseStorage.shared.read { transaction in
+-            return ReactionManager.emojiSet(transaction: transaction).compactMap { Emoji(rawValue: $0)?.withPreferredSkinTones(transaction: transaction) }
++            let customSetStrings = ReactionManager.customEmojiSet(transaction: transaction) ?? []
++            let customSet = customSetStrings.lazy.map { EmojiWithSkinTones(rawValue: $0) }
++
++            // Any holes or invalid choices are filled in with the default reactions.
++            // This should never happen piecemeal, but we've had bugs in the past where a string isn't considered a
++            // valid emoji, and that *removed* the reaction from iOS in a way that could not consistently be reset
++            // from the UI. So now we make sure there are always as many reactions as the default set.
++            return ReactionManager.defaultEmojiSet.enumerated().map { (i, defaultEmoji) -> EmojiWithSkinTones in
++                if let customReaction = customSet[safe: i] ?? nil {
++                    return customReaction
++                } else {
++                    return Emoji(rawValue: defaultEmoji)!.withPreferredSkinTones(transaction: transaction)
++                }
++            }
+         }
+ 
+         var addAnyButton = !self.configureMode
+diff --git a/SignalMessaging/Storage Service/StorageServiceProto+Sync.swift b/SignalMessaging/Storage Service/StorageServiceProto+Sync.swift
+index 2a9599f734b..abe43922d49 100644
+--- a/SignalMessaging/Storage Service/StorageServiceProto+Sync.swift	
++++ b/SignalMessaging/Storage Service/StorageServiceProto+Sync.swift	
+@@ -1,5 +1,5 @@
+ //
+-//  Copyright (c) 2021 Open Whisper Systems. All rights reserved.
++//  Copyright (c) 2022 Open Whisper Systems. All rights reserved.
+ //
+ 
+ import Foundation
+@@ -586,7 +586,9 @@ extension StorageServiceProtoAccountRecord: Dependencies {
+             builder.setE164(localPhoneNumber)
+         }
+ 
+-        builder.setPreferredReactionEmoji(ReactionManager.emojiSet(transaction: transaction))
++        if let customEmojiSet = ReactionManager.customEmojiSet(transaction: transaction) {
++            builder.setPreferredReactionEmoji(customEmojiSet)
++        }
+ 
+         if let subscriberID = SubscriptionManager.getSubscriberID(transaction: transaction),
+            let subscriberCurrencyCode = SubscriptionManager.getSubscriberCurrencyCode(transaction: transaction) {
+@@ -766,7 +768,7 @@ extension StorageServiceProtoAccountRecord: Dependencies {
+                     return defaultEmoji
+                 }
+             }
+-            ReactionManager.setEmojiSet(reactionEmoji, transaction: transaction)
++            ReactionManager.setCustomEmojiSet(reactionEmoji, transaction: transaction)
+         }
+ 
+         if let subscriberIDData = subscriberID, let subscriberCurrencyCode = subscriberCurrencyCode {
+diff --git a/SignalServiceKit/src/Messages/Reactions/ReactionManager.swift b/SignalServiceKit/src/Messages/Reactions/ReactionManager.swift
+index dc3ee5b1465..50ea7f7056c 100644
+--- a/SignalServiceKit/src/Messages/Reactions/ReactionManager.swift
++++ b/SignalServiceKit/src/Messages/Reactions/ReactionManager.swift
+@@ -1,5 +1,5 @@
+ //
+-//  Copyright (c) 2021 Open Whisper Systems. All rights reserved.
++//  Copyright (c) 2022 Open Whisper Systems. All rights reserved.
+ //
+ 
+ import Foundation
+@@ -12,11 +12,17 @@ public class ReactionManager: NSObject {
+     private static let emojiSetKVS = SDSKeyValueStore(collection: "EmojiSetKVS")
+     private static let emojiSetKey = "EmojiSetKey"
+ 
+-    public class func emojiSet(transaction: SDSAnyReadTransaction) -> [String] {
+-        return emojiSetKVS.getObject(forKey: emojiSetKey, transaction: transaction) as? [String] ?? defaultEmojiSet
++    /// Returns custom emoji set by the user, or `nil` if the user has never customized their emoji
++    /// (including on linked devices).
++    ///
++    /// This is important because the primary reactions preserve their skin tone, even if the user has a different
++    /// preferred (last-used) skin tone for a particular emoji. If the user has never customized their set, though,
++    /// we should follow the last-used color for the default thumbs-up and thumbs-down reacts.
++    public class func customEmojiSet(transaction: SDSAnyReadTransaction) -> [String]? {
++        return emojiSetKVS.getObject(forKey: emojiSetKey, transaction: transaction) as? [String]
+     }
+ 
+-    public class func setEmojiSet(_ emojis: [String], transaction: SDSAnyWriteTransaction) {
++    public class func setCustomEmojiSet(_ emojis: [String]?, transaction: SDSAnyWriteTransaction) {
+         emojiSetKVS.setObject(emojis, key: emojiSetKey, transaction: transaction)
+     }
+ 

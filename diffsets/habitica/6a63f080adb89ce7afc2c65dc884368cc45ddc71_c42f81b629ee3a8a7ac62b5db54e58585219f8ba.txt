@@ -1,0 +1,172 @@
+diff --git a/test/api/v3/integration/groups/POST-groups_groupId_join.test.js b/test/api/v3/integration/groups/POST-groups_groupId_join.test.js
+index f47a734e897..13572f79bb9 100644
+--- a/test/api/v3/integration/groups/POST-groups_groupId_join.test.js
++++ b/test/api/v3/integration/groups/POST-groups_groupId_join.test.js
+@@ -134,6 +134,22 @@ describe('POST /group/:groupId/join', () => {
+ 
+         await expect(user.get('/user')).to.eventually.have.deep.property('items.quests.basilist', 1);
+       });
++
++      it('notifies inviting user that their invitation was accepted', async () => {
++        await invitedUser.post(`/groups/${guild._id}/join`);
++
++        let inviter = await user.get('/user');
++        let expectedData = {
++          headerText: t('invitationAcceptedHeader'),
++          bodyText: t('invitationAcceptedBody', {
++            username: invitedUser.auth.local.username,
++            groupName: guild.name,
++          }),
++        };
++
++        expect(inviter.notifications[0].type).to.eql('GROUP_INVITE_ACCEPTED');
++        expect(inviter.notifications[0].data).to.eql(expectedData);
++      });
+     });
+   });
+ 
+@@ -172,6 +188,23 @@ describe('POST /group/:groupId/join', () => {
+         await expect(invitedUser.get('/user')).to.eventually.have.deep.property('party._id', party._id);
+       });
+ 
++      it('notifies inviting user that their invitation was accepted', async () => {
++        await invitedUser.post(`/groups/${party._id}/join`);
++
++        let inviter = await user.get('/user');
++
++        let expectedData = {
++          headerText: t('invitationAcceptedHeader'),
++          bodyText: t('invitationAcceptedBody', {
++            username: invitedUser.auth.local.username,
++            groupName: party.name,
++          }),
++        };
++
++        expect(inviter.notifications[0].type).to.eql('GROUP_INVITE_ACCEPTED');
++        expect(inviter.notifications[0].data).to.eql(expectedData);
++      });
++
+       it('clears invitation from user when joining party', async () => {
+         await invitedUser.post(`/groups/${party._id}/join`);
+ 
+diff --git a/website/client-old/js/controllers/notificationCtrl.js b/website/client-old/js/controllers/notificationCtrl.js
+index 0f302ed2c64..acb91cc510e 100644
+--- a/website/client-old/js/controllers/notificationCtrl.js
++++ b/website/client-old/js/controllers/notificationCtrl.js
+@@ -145,7 +145,14 @@ habitrpg.controller('NotificationCtrl',
+             Notification.showLoginIncentive(User.user, notification.data, Social.loadWidgets);
+             break;
+           default:
+-            markAsRead = false; // If the notification is not implemented, skip it
++            if (notification.data.headerText && notification.data.bodyText) {
++              var modalScope = $rootScope.$new();
++              modalScope.data = notification.data;
++              $rootScope.openModal('generic', {scope: modalScope});
++            }
++            else {
++              markAsRead = false; // If the notification is not implemented, skip it
++            }
+             break;
+         }
+ 
+diff --git a/website/common/locales/en/groups.json b/website/common/locales/en/groups.json
+index b32b98aaead..8f126775f0d 100644
+--- a/website/common/locales/en/groups.json
++++ b/website/common/locales/en/groups.json
+@@ -35,6 +35,8 @@
+     "leave": "Leave",
+     "invitedTo": "Invited to <%= name %>",
+     "invitedToNewParty": "You were invited to join a party! Do you want to leave this party and join <%= partyName %>?",
++    "invitationAcceptedHeader": "Your Invitation has been Accepted",
++    "invitationAcceptedBody": "<%= username %> accepted your invitation to <%= groupName %>!",
+     "joinNewParty": "Join New Party",
+     "declineInvitation": "Decline Invitation",
+     "partyLoading1": "Your party is being summoned. Please wait...",
+diff --git a/website/server/controllers/api-v3/groups.js b/website/server/controllers/api-v3/groups.js
+index 47668ede7c7..d5c8a4845ff 100644
+--- a/website/server/controllers/api-v3/groups.js
++++ b/website/server/controllers/api-v3/groups.js
+@@ -20,6 +20,7 @@ import { sendTxn as sendTxnEmail } from '../../libs/email';
+ import { encrypt } from '../../libs/encryption';
+ import { sendNotification as sendPushNotification } from '../../libs/pushNotifications';
+ import pusher from '../../libs/pusher';
++import common from '../../../common';
+ 
+ /**
+  * @apiDefine GroupBodyInvalid
+@@ -284,6 +285,7 @@ api.joinGroup = {
+ 
+       if (hasInvitation) {
+         isUserInvited = true;
++        inviter = hasInvitation.inviter;
+       } else {
+         isUserInvited = group.privacy === 'private' ? false : true;
+       }
+@@ -303,8 +305,29 @@ api.joinGroup = {
+ 
+     let promises = [group.save(), user.save()];
+ 
++    if (inviter) {
++      inviter = await User.findById(inviter).select('notifications preferences.language items.quests.basilist').exec();
++
++      let data = {
++        headerText: common.i18n.t('invitationAcceptedHeader', inviter.preferences.language),
++        bodyText: common.i18n.t('invitationAcceptedBody', {
++          groupName: group.name,
++          username: user.auth.local.username,
++        }, inviter.preferences.language),
++      };
++      inviter.addNotification('GROUP_INVITE_ACCEPTED', data);
++
++      // Reward Inviter
++      if (group.type === 'party') {
++        if (!inviter.items.quests.basilist) {
++          inviter.items.quests.basilist = 0;
++        }
++        inviter.items.quests.basilist++;
++      }
++      promises.push(inviter.save());
++    }
++
+     if (group.type === 'party' && inviter) {
+-      promises.push(User.update({_id: inviter}, {$inc: {'items.quests.basilist': 1}}).exec()); // Reward inviter
+       if (group.memberCount > 1) {
+         promises.push(User.update({$or: [{'party._id': group._id}, {_id: user._id}], 'achievements.partyUp': {$ne: true}}, {$set: {'achievements.partyUp': true}}, {multi: true}).exec());
+       }
+diff --git a/website/server/models/userNotification.js b/website/server/models/userNotification.js
+index 7098de17999..dae5e70769e 100644
+--- a/website/server/models/userNotification.js
++++ b/website/server/models/userNotification.js
+@@ -15,6 +15,7 @@ const NOTIFICATION_TYPES = [
+   'GROUP_TASK_APPROVAL',
+   'GROUP_TASK_APPROVED',
+   'LOGIN_INCENTIVE',
++  'GROUP_INVITE_ACCEPTED',
+ ];
+ 
+ const Schema = mongoose.Schema;
+diff --git a/website/views/shared/modals/generic.jade b/website/views/shared/modals/generic.jade
+new file mode 100644
+index 00000000000..8e4d5a5574c
+--- /dev/null
++++ b/website/views/shared/modals/generic.jade
+@@ -0,0 +1,7 @@
++script(type='text/ng-template', id='modals/generic.html')
++  .modal-header
++    h4 {{data.headerText}}
++  .modal-body
++    p {{data.bodyText}}
++  .modal-footer
++    .btn.btn-default.pull-right(ng-click='$close()')=env.t('close')
+diff --git a/website/views/shared/modals/index.jade b/website/views/shared/modals/index.jade
+index 82b8db92cfc..df9dbd9078a 100644
+--- a/website/views/shared/modals/index.jade
++++ b/website/views/shared/modals/index.jade
+@@ -23,6 +23,7 @@ include ./modify-inventory.jade
+ include ./enable-desktop-notifications.jade
+ include ./login-incentives.jade
+ include ./login-incentives-reward-unlocked.jade
++include ./generic.jade
+ 
+ //- Settings
+ script(type='text/ng-template', id='modals/change-day-start.html')

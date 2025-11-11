@@ -1,0 +1,1830 @@
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/application/database_controller.dart b/frontend/appflowy_flutter/lib/plugins/database_view/application/database_controller.dart
+index 940cf788b9f70..6616dd80d1ae7 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/application/database_controller.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/application/database_controller.dart
+@@ -1,5 +1,6 @@
+ import 'package:appflowy/plugins/database_view/application/field/field_controller.dart';
+ import 'package:appflowy/plugins/database_view/application/view/view_cache.dart';
++import 'package:appflowy_backend/dispatch/dispatch.dart';
+ import 'package:appflowy_backend/log.dart';
+ import 'package:appflowy_backend/protobuf/flowy-database2/calendar_entities.pb.dart';
+ import 'package:appflowy_backend/protobuf/flowy-database2/database_entities.pb.dart';
+@@ -23,18 +24,21 @@ import 'row/row_cache.dart';
+ import 'group/group_listener.dart';
+ import 'row/row_service.dart';
+ 
++typedef OnGroupConfigurationChanged = void Function(List<GroupSettingPB>);
+ typedef OnGroupByField = void Function(List<GroupPB>);
+ typedef OnUpdateGroup = void Function(List<GroupPB>);
+ typedef OnDeleteGroup = void Function(List<String>);
+ typedef OnInsertGroup = void Function(InsertedGroupPB);
+ 
+ class GroupCallbacks {
++  final OnGroupConfigurationChanged? onGroupConfigurationChanged;
+   final OnGroupByField? onGroupByField;
+   final OnUpdateGroup? onUpdateGroup;
+   final OnDeleteGroup? onDeleteGroup;
+   final OnInsertGroup? onInsertGroup;
+ 
+   GroupCallbacks({
++    this.onGroupConfigurationChanged,
+     this.onGroupByField,
+     this.onUpdateGroup,
+     this.onDeleteGroup,
+@@ -237,6 +241,15 @@ class DatabaseController {
+     });
+   }
+ 
++  void updateGroupConfiguration(bool hideUngrouped) async {
++    final payload = GroupSettingChangesetPB(
++      viewId: viewId,
++      groupConfigurationId: "",
++      hideUngrouped: hideUngrouped,
++    );
++    DatabaseEventUpdateGroupConfiguration(payload).send();
++  }
++
+   Future<void> dispose() async {
+     await _databaseViewBackendSvc.closeView();
+     await fieldController.dispose();
+@@ -248,16 +261,17 @@ class DatabaseController {
+   }
+ 
+   Future<void> _loadGroups() async {
+-    final result = await _databaseViewBackendSvc.loadGroups();
+-    return Future(
+-      () => result.fold(
+-        (groups) {
+-          for (final callback in _groupCallbacks) {
+-            callback.onGroupByField?.call(groups.items);
+-          }
+-        },
+-        (err) => Log.error(err),
+-      ),
++    final configResult = await loadGroupConfigurations(viewId: viewId);
++    _handleGroupConfigurationChanged(configResult);
++
++    final groupsResult = await _databaseViewBackendSvc.loadGroups();
++    groupsResult.fold(
++      (groups) {
++        for (final callback in _groupCallbacks) {
++          callback.onGroupByField?.call(groups.items);
++        }
++      },
++      (err) => Log.error(err),
+     );
+   }
+ 
+@@ -325,6 +339,7 @@ class DatabaseController {
+ 
+   void _listenOnGroupChanged() {
+     _groupListener.start(
++      onGroupConfigurationChanged: _handleGroupConfigurationChanged,
+       onNumOfGroupsChanged: (result) {
+         result.fold(
+           (changeset) {
+@@ -379,6 +394,29 @@ class DatabaseController {
+       },
+     );
+   }
++
++  Future<Either<List<GroupSettingPB>, FlowyError>> loadGroupConfigurations({
++    required String viewId,
++  }) {
++    final payload = DatabaseViewIdPB(value: viewId);
++
++    return DatabaseEventGetGroupConfigurations(payload).send().then((result) {
++      return result.fold((l) => left(l.items), (r) => right(r));
++    });
++  }
++
++  void _handleGroupConfigurationChanged(
++    Either<List<GroupSettingPB>, FlowyError> result,
++  ) {
++    result.fold(
++      (configurations) {
++        for (final callback in _groupCallbacks) {
++          callback.onGroupConfigurationChanged?.call(configurations);
++        }
++      },
++      (r) => Log.error(r),
++    );
++  }
+ }
+ 
+ class RowDataBuilder {
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/application/field/field_controller.dart b/frontend/appflowy_flutter/lib/plugins/database_view/application/field/field_controller.dart
+index b7975b9abe9e0..7556640fb9e63 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/application/field/field_controller.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/application/field/field_controller.dart
+@@ -22,6 +22,7 @@ import 'package:collection/collection.dart';
+ import 'package:dartz/dartz.dart';
+ import 'package:flutter/foundation.dart';
+ 
++import '../setting/setting_service.dart';
+ import 'field_info.dart';
+ import 'field_listener.dart';
+ 
+@@ -558,6 +559,7 @@ class FieldController {
+             _loadFilters(),
+             _loadSorts(),
+             _loadAllFieldSettings(),
++            _loadSettings(),
+           ]);
+           _updateFieldInfos();
+ 
+@@ -608,6 +610,22 @@ class FieldController {
+     });
+   }
+ 
++  Future<Either<Unit, FlowyError>> _loadSettings() async {
++    return SettingBackendService(viewId: viewId).getSetting().then(
++          (result) => result.fold(
++            (setting) {
++              _groupConfigurationByFieldId.clear();
++              for (final configuration in setting.groupSettings.items) {
++                _groupConfigurationByFieldId[configuration.fieldId] =
++                    configuration;
++              }
++              return left(unit);
++            },
++            (err) => right(err),
++          ),
++        );
++  }
++
+   /// Attach corresponding `FieldInfo`s to the `FilterPB`s
+   List<FilterInfo> _filterInfoListFromPBs(List<FilterPB> filterPBs) {
+     FilterInfo? getFilterInfo(FilterPB filterPB) {
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/application/group/group_listener.dart b/frontend/appflowy_flutter/lib/plugins/database_view/application/group/group_listener.dart
+index 3745170937bd6..bd419da29b0c7 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/application/group/group_listener.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/application/group/group_listener.dart
+@@ -8,11 +8,15 @@ import 'package:dartz/dartz.dart';
+ import 'package:appflowy_backend/protobuf/flowy-database2/group.pb.dart';
+ import 'package:appflowy_backend/protobuf/flowy-database2/group_changeset.pb.dart';
+ 
++typedef GroupConfigurationUpdateValue
++    = Either<List<GroupSettingPB>, FlowyError>;
+ typedef GroupUpdateValue = Either<GroupChangesPB, FlowyError>;
+ typedef GroupByNewFieldValue = Either<List<GroupPB>, FlowyError>;
+ 
+ class DatabaseGroupListener {
+   final String viewId;
++  PublishNotifier<GroupConfigurationUpdateValue>? _groupConfigurationNotifier =
++      PublishNotifier();
+   PublishNotifier<GroupUpdateValue>? _numOfGroupsNotifier = PublishNotifier();
+   PublishNotifier<GroupByNewFieldValue>? _groupByFieldNotifier =
+       PublishNotifier();
+@@ -20,9 +24,13 @@ class DatabaseGroupListener {
+   DatabaseGroupListener(this.viewId);
+ 
+   void start({
++    required void Function(GroupConfigurationUpdateValue)
++        onGroupConfigurationChanged,
+     required void Function(GroupUpdateValue) onNumOfGroupsChanged,
+     required void Function(GroupByNewFieldValue) onGroupByNewField,
+   }) {
++    _groupConfigurationNotifier
++        ?.addPublishListener(onGroupConfigurationChanged);
+     _numOfGroupsNotifier?.addPublishListener(onNumOfGroupsChanged);
+     _groupByFieldNotifier?.addPublishListener(onGroupByNewField);
+     _listener = DatabaseNotificationListener(
+@@ -36,6 +44,13 @@ class DatabaseGroupListener {
+     Either<Uint8List, FlowyError> result,
+   ) {
+     switch (ty) {
++      case DatabaseNotification.DidUpdateGroupConfiguration:
++        result.fold(
++          (payload) => _groupConfigurationNotifier?.value =
++              left(RepeatedGroupSettingPB.fromBuffer(payload).items),
++          (error) => _groupConfigurationNotifier?.value = right(error),
++        );
++        break;
+       case DatabaseNotification.DidUpdateNumOfGroups:
+         result.fold(
+           (payload) => _numOfGroupsNotifier?.value =
+@@ -57,6 +72,9 @@ class DatabaseGroupListener {
+ 
+   Future<void> stop() async {
+     await _listener?.stop();
++    _groupConfigurationNotifier?.dispose();
++    _groupConfigurationNotifier = null;
++
+     _numOfGroupsNotifier?.dispose();
+     _numOfGroupsNotifier = null;
+ 
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/application/setting/group_bloc.dart b/frontend/appflowy_flutter/lib/plugins/database_view/application/setting/group_bloc.dart
+index 16333fe5db88d..22504f6562e35 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/application/setting/group_bloc.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/application/setting/group_bloc.dart
+@@ -1,4 +1,4 @@
+-import 'package:appflowy/plugins/database_view/application/field/field_controller.dart';
++import 'package:appflowy/plugins/database_view/application/database_controller.dart';
+ import 'package:appflowy/plugins/database_view/application/field/field_info.dart';
+ import 'package:appflowy_backend/log.dart';
+ import 'package:appflowy_backend/protobuf/flowy-database2/field_entities.pb.dart';
+@@ -11,20 +11,27 @@ import '../group/group_service.dart';
+ part 'group_bloc.freezed.dart';
+ 
+ class DatabaseGroupBloc extends Bloc<DatabaseGroupEvent, DatabaseGroupState> {
+-  final FieldController _fieldController;
++  final DatabaseController _databaseController;
+   final GroupBackendService _groupBackendSvc;
+   Function(List<FieldInfo>)? _onFieldsFn;
++  GroupCallbacks? _groupCallbacks;
+ 
+   DatabaseGroupBloc({
+     required String viewId,
+-    required FieldController fieldController,
+-  })  : _fieldController = fieldController,
++    required DatabaseController databaseController,
++  })  : _databaseController = databaseController,
+         _groupBackendSvc = GroupBackendService(viewId),
+-        super(DatabaseGroupState.initial(viewId, fieldController.fieldInfos)) {
++        super(
++          DatabaseGroupState.initial(
++            viewId,
++            databaseController.fieldController.fieldInfos,
++          ),
++        ) {
+     on<DatabaseGroupEvent>(
+       (event, emit) async {
+         event.when(
+           initial: () {
++            _loadGroupConfigurations();
+             _startListening();
+           },
+           didReceiveFieldUpdate: (fieldInfos) {
+@@ -36,6 +43,9 @@ class DatabaseGroupBloc extends Bloc<DatabaseGroupEvent, DatabaseGroupState> {
+             );
+             result.fold((l) => null, (err) => Log.error(err));
+           },
++          didUpdateHideUngrouped: (bool hideUngrouped) {
++            emit(state.copyWith(hideUngrouped: hideUngrouped));
++          },
+         );
+       },
+     );
+@@ -44,19 +54,49 @@ class DatabaseGroupBloc extends Bloc<DatabaseGroupEvent, DatabaseGroupState> {
+   @override
+   Future<void> close() async {
+     if (_onFieldsFn != null) {
+-      _fieldController.removeListener(onFieldsListener: _onFieldsFn!);
++      _databaseController.fieldController
++          .removeListener(onFieldsListener: _onFieldsFn!);
+       _onFieldsFn = null;
+     }
++    _groupCallbacks = null;
+     return super.close();
+   }
+ 
+   void _startListening() {
+     _onFieldsFn = (fieldInfos) =>
+         add(DatabaseGroupEvent.didReceiveFieldUpdate(fieldInfos));
+-    _fieldController.addListener(
++    _databaseController.fieldController.addListener(
+       onReceiveFields: _onFieldsFn,
+       listenWhen: () => !isClosed,
+     );
++
++    _groupCallbacks = GroupCallbacks(
++      onGroupConfigurationChanged: (configurations) {
++        if (isClosed) {
++          return;
++        }
++        final configuration = configurations.first;
++        add(
++          DatabaseGroupEvent.didUpdateHideUngrouped(
++            configuration.hideUngrouped,
++          ),
++        );
++      },
++    );
++    _databaseController.addListener(onGroupChanged: _groupCallbacks);
++  }
++
++  void _loadGroupConfigurations() async {
++    final configResult = await _databaseController.loadGroupConfigurations(
++      viewId: _databaseController.viewId,
++    );
++    configResult.fold(
++      (configurations) {
++        final hideUngrouped = configurations.first.hideUngrouped;
++        add(DatabaseGroupEvent.didUpdateHideUngrouped(hideUngrouped));
++      },
++      (err) => Log.error(err),
++    );
+   }
+ }
+ 
+@@ -70,6 +110,8 @@ class DatabaseGroupEvent with _$DatabaseGroupEvent {
+   const factory DatabaseGroupEvent.didReceiveFieldUpdate(
+     List<FieldInfo> fields,
+   ) = _DidReceiveFieldUpdate;
++  const factory DatabaseGroupEvent.didUpdateHideUngrouped(bool hideUngrouped) =
++      _DidUpdateHideUngrouped;
+ }
+ 
+ @freezed
+@@ -77,6 +119,7 @@ class DatabaseGroupState with _$DatabaseGroupState {
+   const factory DatabaseGroupState({
+     required String viewId,
+     required List<FieldInfo> fieldInfos,
++    required bool hideUngrouped,
+   }) = _DatabaseGroupState;
+ 
+   factory DatabaseGroupState.initial(
+@@ -86,5 +129,6 @@ class DatabaseGroupState with _$DatabaseGroupState {
+       DatabaseGroupState(
+         viewId: viewId,
+         fieldInfos: fieldInfos,
++        hideUngrouped: true,
+       );
+ }
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/board/application/board_bloc.dart b/frontend/appflowy_flutter/lib/plugins/database_view/board/application/board_bloc.dart
+index 025141bfa70af..b398dec9e8892 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/board/application/board_bloc.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/board/application/board_bloc.dart
+@@ -6,6 +6,7 @@ import 'package:appflowy/plugins/database_view/application/field/field_info.dart
+ import 'package:appflowy/plugins/database_view/application/group/group_service.dart';
+ import 'package:appflowy/plugins/database_view/application/row/row_service.dart';
+ import 'package:appflowy_board/appflowy_board.dart';
++import 'package:collection/collection.dart';
+ import 'package:dartz/dartz.dart';
+ import 'package:equatable/equatable.dart';
+ import 'package:appflowy_backend/log.dart';
+@@ -29,6 +30,7 @@ class BoardBloc extends Bloc<BoardEvent, BoardState> {
+   late final AppFlowyBoardController boardController;
+   final LinkedHashMap<String, GroupController> groupControllers =
+       LinkedHashMap();
++  GroupPB? ungroupedGroup;
+ 
+   FieldController get fieldController => databaseController.fieldController;
+   String get viewId => databaseController.viewId;
+@@ -144,6 +146,9 @@ class BoardBloc extends Bloc<BoardEvent, BoardState> {
+               ),
+             );
+           },
++          didUpdateHideUngrouped: (bool hideUngrouped) {
++            emit(state.copyWith(hideUngrouped: hideUngrouped));
++          },
+           startEditingHeader: (String groupId) {
+             emit(
+               state.copyWith(isEditingHeader: true, editingHeaderId: groupId),
+@@ -188,6 +193,17 @@ class BoardBloc extends Bloc<BoardEvent, BoardState> {
+     groupControllers.clear();
+     boardController.clear();
+ 
++    final ungroupedGroupIndex =
++        groups.indexWhere((group) => group.groupId == group.fieldId);
++
++    if (ungroupedGroupIndex != -1) {
++      ungroupedGroup = groups[ungroupedGroupIndex];
++      final group = groups.removeAt(ungroupedGroupIndex);
++      if (!state.hideUngrouped) {
++        groups.add(group);
++      }
++    }
++
+     boardController.addGroups(
+       groups
+           .where((group) => fieldController.getField(group.fieldId) != null)
+@@ -214,8 +230,22 @@ class BoardBloc extends Bloc<BoardEvent, BoardState> {
+       },
+     );
+     final onGroupChanged = GroupCallbacks(
++      onGroupConfigurationChanged: (configurations) {
++        if (isClosed) return;
++        final config = configurations.first;
++        if (config.hideUngrouped) {
++          boardController.removeGroup(config.fieldId);
++        } else if (ungroupedGroup != null) {
++          final newGroup = initializeGroupData(ungroupedGroup!);
++          final controller = initializeGroupController(ungroupedGroup!);
++          groupControllers[controller.group.groupId] = (controller);
++          boardController.addGroup(newGroup);
++        }
++        add(BoardEvent.didUpdateHideUngrouped(config.hideUngrouped));
++      },
+       onGroupByField: (groups) {
+         if (isClosed) return;
++        ungroupedGroup = null;
+         initializeGroups(groups);
+         add(BoardEvent.didReceiveGroups(groups));
+       },
+@@ -329,6 +359,8 @@ class BoardEvent with _$BoardEvent {
+   ) = _DidReceiveGridUpdate;
+   const factory BoardEvent.didReceiveGroups(List<GroupPB> groups) =
+       _DidReceiveGroups;
++  const factory BoardEvent.didUpdateHideUngrouped(bool hideUngrouped) =
++      _DidUpdateHideUngrouped;
+ }
+ 
+ @freezed
+@@ -343,6 +375,7 @@ class BoardState with _$BoardState {
+     BoardEditingRow? editingRow,
+     required LoadingState loadingState,
+     required Option<FlowyError> noneOrError,
++    required bool hideUngrouped,
+   }) = _BoardState;
+ 
+   factory BoardState.initial(String viewId) => BoardState(
+@@ -353,6 +386,7 @@ class BoardState with _$BoardState {
+         isEditingRow: false,
+         noneOrError: none(),
+         loadingState: const LoadingState.loading(),
++        hideUngrouped: false,
+       );
+ }
+ 
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/board/application/ungrouped_items_bloc.dart b/frontend/appflowy_flutter/lib/plugins/database_view/board/application/ungrouped_items_bloc.dart
+new file mode 100644
+index 0000000000000..b2510087a3311
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/board/application/ungrouped_items_bloc.dart
+@@ -0,0 +1,112 @@
++import 'package:appflowy_backend/log.dart';
++import 'package:appflowy_backend/protobuf/flowy-database2/protobuf.dart';
++import 'package:bloc/bloc.dart';
++import 'package:freezed_annotation/freezed_annotation.dart';
++
++import 'group_controller.dart';
++
++part 'ungrouped_items_bloc.freezed.dart';
++
++class UngroupedItemsBloc
++    extends Bloc<UngroupedItemsEvent, UngroupedItemsState> {
++  UngroupedItemsListener? listener;
++
++  UngroupedItemsBloc({required GroupPB group})
++      : super(UngroupedItemsState(ungroupedItems: group.rows)) {
++    on<UngroupedItemsEvent>(
++      (event, emit) {
++        event.when(
++          initial: () {
++            listener = UngroupedItemsListener(
++              initialGroup: group,
++              onGroupChanged: (ungroupedItems) {
++                if (isClosed) return;
++                add(
++                  UngroupedItemsEvent.updateGroup(
++                    ungroupedItems: ungroupedItems,
++                  ),
++                );
++              },
++            )..startListening();
++          },
++          updateGroup: (newItems) =>
++              emit(UngroupedItemsState(ungroupedItems: newItems)),
++        );
++      },
++    );
++  }
++}
++
++@freezed
++class UngroupedItemsEvent with _$UngroupedItemsEvent {
++  const factory UngroupedItemsEvent.initial() = _Initial;
++  const factory UngroupedItemsEvent.updateGroup({
++    required List<RowMetaPB> ungroupedItems,
++  }) = _UpdateGroup;
++}
++
++@freezed
++class UngroupedItemsState with _$UngroupedItemsState {
++  const factory UngroupedItemsState({
++    required List<RowMetaPB> ungroupedItems,
++  }) = _UngroupedItemsState;
++}
++
++class UngroupedItemsListener {
++  List<RowMetaPB> _ungroupedItems;
++  final SingleGroupListener _listener;
++  final void Function(List<RowMetaPB> items) onGroupChanged;
++
++  UngroupedItemsListener({
++    required GroupPB initialGroup,
++    required this.onGroupChanged,
++  })  : _ungroupedItems = List<RowMetaPB>.from(initialGroup.rows),
++        _listener = SingleGroupListener(initialGroup);
++
++  void startListening() {
++    _listener.start(
++      onGroupChanged: (result) {
++        result.fold(
++          (GroupRowsNotificationPB changeset) {
++            final newItems = List<RowMetaPB>.from(_ungroupedItems);
++            for (final deletedRow in changeset.deletedRows) {
++              newItems.removeWhere((rowPB) => rowPB.id == deletedRow);
++            }
++
++            for (final insertedRow in changeset.insertedRows) {
++              final index = newItems.indexWhere(
++                (rowPB) => rowPB.id == insertedRow.rowMeta.id,
++              );
++              if (index != -1) {
++                continue;
++              }
++              if (insertedRow.hasIndex() &&
++                  newItems.length > insertedRow.index) {
++                newItems.insert(insertedRow.index, insertedRow.rowMeta);
++              } else {
++                newItems.add(insertedRow.rowMeta);
++              }
++            }
++
++            for (final updatedRow in changeset.updatedRows) {
++              final index = newItems.indexWhere(
++                (rowPB) => rowPB.id == updatedRow.id,
++              );
++
++              if (index != -1) {
++                newItems[index] = updatedRow;
++              }
++            }
++            onGroupChanged.call(newItems);
++            _ungroupedItems = newItems;
++          },
++          (err) => Log.error(err),
++        );
++      },
++    );
++  }
++
++  Future<void> dispose() async {
++    _listener.stop();
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/board/presentation/board_page.dart b/frontend/appflowy_flutter/lib/plugins/database_view/board/presentation/board_page.dart
+index 16b51108566bd..4a3673a0e8759 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/board/presentation/board_page.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/board/presentation/board_page.dart
+@@ -20,6 +20,7 @@ import 'package:easy_localization/easy_localization.dart';
+ import 'package:flowy_infra_ui/flowy_infra_ui_web.dart';
+ import 'package:flowy_infra_ui/style_widget/text.dart';
+ import 'package:flowy_infra_ui/widget/error_page.dart';
++import 'package:flowy_infra_ui/widget/spacing.dart';
+ import 'package:flutter/material.dart' hide Card;
+ import 'package:flutter_bloc/flutter_bloc.dart';
+ 
+@@ -29,6 +30,7 @@ import '../../widgets/row/cell_builder.dart';
+ import '../application/board_bloc.dart';
+ import '../../widgets/card/card.dart';
+ import 'toolbar/board_setting_bar.dart';
++import 'ungrouped_items_button.dart';
+ 
+ class BoardPageTabBarBuilderImpl implements DatabaseTabBarItemBuilder {
+   @override
+@@ -157,33 +159,42 @@ class _BoardContentState extends State<BoardContent> {
+         widget.onEditStateChanged?.call();
+       },
+       child: BlocBuilder<BoardBloc, BoardState>(
+-        // Only rebuild when groups are added/removed/rearranged
+-        buildWhen: (previous, current) => previous.groupIds != current.groupIds,
+         builder: (context, state) {
+           return Padding(
+             padding: GridSize.contentInsets,
+-            child: AppFlowyBoard(
+-              boardScrollController: scrollManager,
+-              scrollController: ScrollController(),
+-              controller: context.read<BoardBloc>().boardController,
+-              headerBuilder: (_, groupData) => BlocProvider<BoardBloc>.value(
+-                value: context.read<BoardBloc>(),
+-                child: BoardColumnHeader(
+-                  groupData: groupData,
+-                  margin: config.headerPadding,
+-                ),
+-              ),
+-              footerBuilder: _buildFooter,
+-              cardBuilder: (_, column, columnItem) => _buildCard(
+-                context,
+-                column,
+-                columnItem,
+-              ),
+-              groupConstraints: const BoxConstraints.tightFor(width: 300),
+-              config: AppFlowyBoardConfig(
+-                groupBackgroundColor:
+-                    Theme.of(context).colorScheme.surfaceVariant,
+-              ),
++            child: Column(
++              crossAxisAlignment: CrossAxisAlignment.start,
++              mainAxisSize: MainAxisSize.min,
++              children: [
++                const VSpace(8.0),
++                if (state.hideUngrouped) _buildBoardHeader(context),
++                Expanded(
++                  child: AppFlowyBoard(
++                    boardScrollController: scrollManager,
++                    scrollController: ScrollController(),
++                    controller: context.read<BoardBloc>().boardController,
++                    headerBuilder: (_, groupData) =>
++                        BlocProvider<BoardBloc>.value(
++                      value: context.read<BoardBloc>(),
++                      child: BoardColumnHeader(
++                        groupData: groupData,
++                        margin: config.headerPadding,
++                      ),
++                    ),
++                    footerBuilder: _buildFooter,
++                    cardBuilder: (_, column, columnItem) => _buildCard(
++                      context,
++                      column,
++                      columnItem,
++                    ),
++                    groupConstraints: const BoxConstraints.tightFor(width: 300),
++                    config: AppFlowyBoardConfig(
++                      groupBackgroundColor:
++                          Theme.of(context).colorScheme.surfaceVariant,
++                    ),
++                  ),
++                )
++              ],
+             ),
+           );
+         },
+@@ -191,6 +202,19 @@ class _BoardContentState extends State<BoardContent> {
+     );
+   }
+ 
++  Widget _buildBoardHeader(BuildContext context) {
++    return const Padding(
++      padding: EdgeInsets.only(bottom: 8.0),
++      child: SizedBox(
++        height: 24,
++        child: Align(
++          alignment: AlignmentDirectional.centerEnd,
++          child: UngroupedItemsButton(),
++        ),
++      ),
++    );
++  }
++
+   void _handleEditStateChanged(BoardState state, BuildContext context) {
+     if (state.isEditingRow && state.editingRow != null) {
+       WidgetsBinding.instance.addPostFrameCallback((_) {
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/board/presentation/ungrouped_items_button.dart b/frontend/appflowy_flutter/lib/plugins/database_view/board/presentation/ungrouped_items_button.dart
+new file mode 100644
+index 0000000000000..b77809b11ff42
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/board/presentation/ungrouped_items_button.dart
+@@ -0,0 +1,230 @@
++import 'package:appflowy/generated/locale_keys.g.dart';
++import 'package:appflowy/plugins/database_view/application/cell/cell_service.dart';
++import 'package:appflowy/plugins/database_view/application/field/field_info.dart';
++import 'package:appflowy/plugins/database_view/application/row/row_cache.dart';
++import 'package:appflowy/plugins/database_view/application/row/row_controller.dart';
++import 'package:appflowy/plugins/database_view/board/application/board_bloc.dart';
++import 'package:appflowy/plugins/database_view/board/application/ungrouped_items_bloc.dart';
++import 'package:appflowy/plugins/database_view/grid/presentation/layout/sizes.dart';
++import 'package:appflowy/plugins/database_view/widgets/card/card_cell_builder.dart';
++import 'package:appflowy/plugins/database_view/widgets/card/cells/card_cell.dart';
++import 'package:appflowy/plugins/database_view/widgets/row/cell_builder.dart';
++import 'package:appflowy/plugins/database_view/widgets/row/cells/text_cell/text_cell_bloc.dart';
++import 'package:appflowy/plugins/database_view/widgets/row/row_detail.dart';
++import 'package:appflowy_backend/protobuf/flowy-database2/row_entities.pb.dart';
++import 'package:appflowy_popover/appflowy_popover.dart';
++import 'package:collection/collection.dart';
++import 'package:easy_localization/easy_localization.dart';
++import 'package:flowy_infra/size.dart';
++import 'package:flowy_infra_ui/flowy_infra_ui.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_bloc/flutter_bloc.dart';
++
++class UngroupedItemsButton extends StatefulWidget {
++  const UngroupedItemsButton({super.key});
++
++  @override
++  State<UngroupedItemsButton> createState() => _UnscheduledEventsButtonState();
++}
++
++class _UnscheduledEventsButtonState extends State<UngroupedItemsButton> {
++  late final PopoverController _popoverController;
++
++  @override
++  void initState() {
++    super.initState();
++    _popoverController = PopoverController();
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return BlocBuilder<BoardBloc, BoardState>(
++      builder: (context, boardState) {
++        final ungroupedGroup = context.watch<BoardBloc>().ungroupedGroup;
++        final databaseController = context.read<BoardBloc>().databaseController;
++        final primaryField = databaseController.fieldController.fieldInfos
++            .firstWhereOrNull((element) => element.isPrimary)!;
++
++        if (ungroupedGroup == null) {
++          return const SizedBox.shrink();
++        }
++
++        return BlocProvider<UngroupedItemsBloc>(
++          create: (_) => UngroupedItemsBloc(group: ungroupedGroup)
++            ..add(const UngroupedItemsEvent.initial()),
++          child: BlocBuilder<UngroupedItemsBloc, UngroupedItemsState>(
++            builder: (context, state) {
++              return AppFlowyPopover(
++                direction: PopoverDirection.bottomWithCenterAligned,
++                triggerActions: PopoverTriggerFlags.none,
++                controller: _popoverController,
++                offset: const Offset(0, 8),
++                constraints:
++                    const BoxConstraints(maxWidth: 282, maxHeight: 600),
++                child: OutlinedButton(
++                  style: OutlinedButton.styleFrom(
++                    shape: RoundedRectangleBorder(
++                      side: BorderSide(
++                        color: Theme.of(context).dividerColor,
++                        width: 1,
++                      ),
++                      borderRadius: Corners.s6Border,
++                    ),
++                    side: BorderSide(
++                      color: Theme.of(context).dividerColor,
++                      width: 1,
++                    ),
++                    padding:
++                        const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
++                    visualDensity: VisualDensity.compact,
++                  ),
++                  onPressed: () {
++                    if (state.ungroupedItems.isNotEmpty) {
++                      _popoverController.show();
++                    }
++                  },
++                  child: FlowyText.regular(
++                    "${LocaleKeys.board_ungroupedButtonText.tr()} (${state.ungroupedItems.length})",
++                    fontSize: 10,
++                  ),
++                ),
++                popupBuilder: (context) {
++                  return UngroupedItemList(
++                    viewId: databaseController.viewId,
++                    primaryField: primaryField,
++                    rowCache: databaseController.rowCache,
++                    ungroupedItems: state.ungroupedItems,
++                  );
++                },
++              );
++            },
++          ),
++        );
++      },
++    );
++  }
++}
++
++class UngroupedItemList extends StatelessWidget {
++  final String viewId;
++  final FieldInfo primaryField;
++  final RowCache rowCache;
++  final List<RowMetaPB> ungroupedItems;
++  const UngroupedItemList({
++    required this.viewId,
++    required this.primaryField,
++    required this.ungroupedItems,
++    required this.rowCache,
++    super.key,
++  });
++
++  @override
++  Widget build(BuildContext context) {
++    final cells = <Widget>[
++      Padding(
++        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
++        child: FlowyText.medium(
++          LocaleKeys.board_ungroupedItemsTitle.tr(),
++          fontSize: 10,
++          color: Theme.of(context).hintColor,
++          overflow: TextOverflow.ellipsis,
++        ),
++      ),
++      ...ungroupedItems.map(
++        (item) {
++          final rowController = RowController(
++            rowMeta: item,
++            viewId: viewId,
++            rowCache: rowCache,
++          );
++          final renderHook = RowCardRenderHook<String>();
++          renderHook.addTextCellHook((cellData, _, __) {
++            return BlocBuilder<TextCellBloc, TextCellState>(
++              builder: (context, state) {
++                final text = cellData.isEmpty
++                    ? LocaleKeys.grid_row_titlePlaceholder.tr()
++                    : cellData;
++
++                if (text.isEmpty) {
++                  return const SizedBox.shrink();
++                }
++
++                return Align(
++                  alignment: Alignment.centerLeft,
++                  child: FlowyText.medium(
++                    text,
++                    textAlign: TextAlign.left,
++                    fontSize: 11,
++                    maxLines: 1,
++                    overflow: TextOverflow.ellipsis,
++                  ),
++                );
++              },
++            );
++          });
++          return UngroupedItem(
++            cellContext: rowCache.loadCells(item)[primaryField.id]!,
++            primaryField: primaryField,
++            rowController: rowController,
++            cellBuilder: CardCellBuilder<String>(rowController.cellCache),
++            renderHook: renderHook,
++            onPressed: () {
++              FlowyOverlay.show(
++                context: context,
++                builder: (BuildContext context) {
++                  return RowDetailPage(
++                    cellBuilder:
++                        GridCellBuilder(cellCache: rowController.cellCache),
++                    rowController: rowController,
++                  );
++                },
++              );
++              PopoverContainer.of(context).close();
++            },
++          );
++        },
++      )
++    ];
++
++    return ListView.separated(
++      itemBuilder: (context, index) => cells[index],
++      itemCount: cells.length,
++      separatorBuilder: (context, index) =>
++          VSpace(GridSize.typeOptionSeparatorHeight),
++      shrinkWrap: true,
++    );
++  }
++}
++
++class UngroupedItem extends StatelessWidget {
++  final DatabaseCellContext cellContext;
++  final FieldInfo primaryField;
++  final RowController rowController;
++  final CardCellBuilder cellBuilder;
++  final RowCardRenderHook<String> renderHook;
++  final VoidCallback onPressed;
++  const UngroupedItem({
++    super.key,
++    required this.cellContext,
++    required this.onPressed,
++    required this.cellBuilder,
++    required this.rowController,
++    required this.primaryField,
++    required this.renderHook,
++  });
++
++  @override
++  Widget build(BuildContext context) {
++    return SizedBox(
++      height: 26,
++      child: FlowyButton(
++        margin: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
++        text: cellBuilder.buildCell(
++          cellContext: cellContext,
++          renderHook: renderHook,
++        ),
++        onTap: onPressed,
++      ),
++    );
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/toolbar/calendar_layout_setting.dart b/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/toolbar/calendar_layout_setting.dart
+index 97dc3cbef797b..7b4a031424277 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/toolbar/calendar_layout_setting.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/calendar/presentation/toolbar/calendar_layout_setting.dart
+@@ -231,7 +231,7 @@ class LayoutDateField extends StatelessWidget {
+       triggerActions: PopoverTriggerFlags.hover | PopoverTriggerFlags.click,
+       constraints: BoxConstraints.loose(const Size(300, 400)),
+       mutex: popoverMutex,
+-      offset: const Offset(-16, 0),
++      offset: const Offset(-14, 0),
+       popupBuilder: (context) {
+         return BlocProvider(
+           create: (context) => getIt<DatabasePropertyBloc>(
+@@ -349,7 +349,7 @@ class FirstDayOfWeek extends StatelessWidget {
+       constraints: BoxConstraints.loose(const Size(300, 400)),
+       triggerActions: PopoverTriggerFlags.hover | PopoverTriggerFlags.click,
+       mutex: popoverMutex,
+-      offset: const Offset(-16, 0),
++      offset: const Offset(-14, 0),
+       popupBuilder: (context) {
+         final symbols =
+             DateFormat.EEEE(context.locale.toLanguageTag()).dateSymbols;
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/widgets/group/database_group.dart b/frontend/appflowy_flutter/lib/plugins/database_view/widgets/group/database_group.dart
+index 2cd04e5d41571..066cf9f1b693f 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/widgets/group/database_group.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/widgets/group/database_group.dart
+@@ -1,9 +1,15 @@
+ import 'package:appflowy/generated/flowy_svgs.g.dart';
+-import 'package:appflowy/plugins/database_view/application/field/field_controller.dart';
++import 'package:appflowy/generated/locale_keys.g.dart';
++import 'package:appflowy/plugins/database_view/application/database_controller.dart';
+ import 'package:appflowy/plugins/database_view/application/field/field_info.dart';
+ import 'package:appflowy/plugins/database_view/application/setting/group_bloc.dart';
+ import 'package:appflowy/plugins/database_view/grid/presentation/layout/sizes.dart';
++import 'package:appflowy/plugins/database_view/grid/presentation/widgets/common/type_option_separator.dart';
+ import 'package:appflowy/plugins/database_view/grid/presentation/widgets/header/field_type_extension.dart';
++import 'package:appflowy/workspace/presentation/widgets/toggle/toggle.dart';
++import 'package:appflowy/workspace/presentation/widgets/toggle/toggle_style.dart';
++import 'package:appflowy_backend/protobuf/flowy-database2/field_entities.pb.dart';
++import 'package:easy_localization/easy_localization.dart';
+ 
+ import 'package:flowy_infra/theme_extension.dart';
+ import 'package:flowy_infra_ui/style_widget/button.dart';
+@@ -15,11 +21,11 @@ import 'package:flutter_bloc/flutter_bloc.dart';
+ 
+ class DatabaseGroupList extends StatelessWidget {
+   final String viewId;
+-  final FieldController fieldController;
++  final DatabaseController databaseController;
+   final VoidCallback onDismissed;
+   const DatabaseGroupList({
+     required this.viewId,
+-    required this.fieldController,
++    required this.databaseController,
+     required this.onDismissed,
+     Key? key,
+   }) : super(key: key);
+@@ -29,31 +35,71 @@ class DatabaseGroupList extends StatelessWidget {
+     return BlocProvider(
+       create: (context) => DatabaseGroupBloc(
+         viewId: viewId,
+-        fieldController: fieldController,
++        databaseController: databaseController,
+       )..add(const DatabaseGroupEvent.initial()),
+       child: BlocBuilder<DatabaseGroupBloc, DatabaseGroupState>(
+-        buildWhen: (previous, current) => true,
+         builder: (context, state) {
+-          final cells = state.fieldInfos.map((fieldInfo) {
+-            Widget cell = _GridGroupCell(
+-              fieldInfo: fieldInfo,
+-              onSelected: () => onDismissed(),
+-              key: ValueKey(fieldInfo.id),
+-            );
+-
+-            if (!fieldInfo.canBeGroup) {
+-              cell = IgnorePointer(child: Opacity(opacity: 0.3, child: cell));
+-            }
+-            return cell;
+-          }).toList();
++          final showHideUngroupedToggle = state.fieldInfos.any(
++            (field) =>
++                field.canBeGroup &&
++                field.isGroupField &&
++                field.fieldType != FieldType.Checkbox,
++          );
++          final children = [
++            if (showHideUngroupedToggle) ...[
++              SizedBox(
++                height: GridSize.popoverItemHeight,
++                child: Padding(
++                  padding:
++                      const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
++                  child: Row(
++                    children: [
++                      Expanded(
++                        child: FlowyText.medium(
++                          LocaleKeys.board_showUngrouped.tr(),
++                        ),
++                      ),
++                      Toggle(
++                        value: !state.hideUngrouped,
++                        onChanged: (value) =>
++                            databaseController.updateGroupConfiguration(value),
++                        style: ToggleStyle.big,
++                        padding: EdgeInsets.zero,
++                      ),
++                    ],
++                  ),
++                ),
++              ),
++              const TypeOptionSeparator(spacing: 0),
++            ],
++            SizedBox(
++              height: GridSize.popoverItemHeight,
++              child: Padding(
++                padding:
++                    const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
++                child: FlowyText.medium(
++                  LocaleKeys.board_groupBy.tr(),
++                  textAlign: TextAlign.left,
++                  color: Theme.of(context).hintColor,
++                ),
++              ),
++            ),
++            ...state.fieldInfos.where((fieldInfo) => fieldInfo.canBeGroup).map(
++                  (fieldInfo) => _GridGroupCell(
++                    fieldInfo: fieldInfo,
++                    onSelected: onDismissed,
++                    key: ValueKey(fieldInfo.id),
++                  ),
++                ),
++          ];
+ 
+           return ListView.separated(
+             shrinkWrap: true,
+-            itemCount: cells.length,
+-            itemBuilder: (BuildContext context, int index) => cells[index],
++            itemCount: children.length,
++            itemBuilder: (BuildContext context, int index) => children[index],
+             separatorBuilder: (BuildContext context, int index) =>
+                 VSpace(GridSize.typeOptionSeparatorHeight),
+-            padding: const EdgeInsets.all(6.0),
++            padding: const EdgeInsets.symmetric(vertical: 6.0),
+           );
+         },
+       ),
+@@ -82,26 +128,29 @@ class _GridGroupCell extends StatelessWidget {
+ 
+     return SizedBox(
+       height: GridSize.popoverItemHeight,
+-      child: FlowyButton(
+-        hoverColor: AFThemeExtension.of(context).lightGreyHover,
+-        text: FlowyText.medium(
+-          fieldInfo.name,
+-          color: AFThemeExtension.of(context).textColor,
+-        ),
+-        leftIcon: FlowySvg(
+-          fieldInfo.fieldType.icon(),
+-          color: Theme.of(context).iconTheme.color,
++      child: Padding(
++        padding: const EdgeInsets.symmetric(horizontal: 6.0),
++        child: FlowyButton(
++          hoverColor: AFThemeExtension.of(context).lightGreyHover,
++          text: FlowyText.medium(
++            fieldInfo.name,
++            color: AFThemeExtension.of(context).textColor,
++          ),
++          leftIcon: FlowySvg(
++            fieldInfo.fieldType.icon(),
++            color: Theme.of(context).iconTheme.color,
++          ),
++          rightIcon: rightIcon,
++          onTap: () {
++            context.read<DatabaseGroupBloc>().add(
++                  DatabaseGroupEvent.setGroupByField(
++                    fieldInfo.id,
++                    fieldInfo.fieldType,
++                  ),
++                );
++            onSelected();
++          },
+         ),
+-        rightIcon: rightIcon,
+-        onTap: () {
+-          context.read<DatabaseGroupBloc>().add(
+-                DatabaseGroupEvent.setGroupByField(
+-                  fieldInfo.id,
+-                  fieldInfo.fieldType,
+-                ),
+-              );
+-          onSelected();
+-        },
+       ),
+     );
+   }
+diff --git a/frontend/appflowy_flutter/lib/plugins/database_view/widgets/setting/setting_button.dart b/frontend/appflowy_flutter/lib/plugins/database_view/widgets/setting/setting_button.dart
+index 653aaf96f60b8..5b809371eb455 100644
+--- a/frontend/appflowy_flutter/lib/plugins/database_view/widgets/setting/setting_button.dart
++++ b/frontend/appflowy_flutter/lib/plugins/database_view/widgets/setting/setting_button.dart
+@@ -170,7 +170,7 @@ extension DatabaseSettingActionExtension on DatabaseSettingAction {
+         ),
+       DatabaseSettingAction.showGroup => DatabaseGroupList(
+           viewId: databaseController.viewId,
+-          fieldController: databaseController.fieldController,
++          databaseController: databaseController,
+           onDismissed: () {},
+         ),
+       DatabaseSettingAction.showProperties => DatabasePropertyList(
+@@ -191,7 +191,7 @@ extension DatabaseSettingActionExtension on DatabaseSettingAction {
+       direction: PopoverDirection.leftWithTopAligned,
+       mutex: popoverMutex,
+       margin: EdgeInsets.zero,
+-      offset: const Offset(-16, 0),
++      offset: const Offset(-14, 0),
+       child: SizedBox(
+         height: GridSize.popoverItemHeight,
+         child: FlowyButton(
+diff --git a/frontend/appflowy_flutter/test/bloc_test/board_test/group_by_checkbox_field_test.dart b/frontend/appflowy_flutter/test/bloc_test/board_test/group_by_checkbox_field_test.dart
+index dca6f39d14fcf..d5ccc0047e602 100644
+--- a/frontend/appflowy_flutter/test/bloc_test/board_test/group_by_checkbox_field_test.dart
++++ b/frontend/appflowy_flutter/test/bloc_test/board_test/group_by_checkbox_field_test.dart
+@@ -35,7 +35,7 @@ void main() {
+     final checkboxField = context.fieldContexts.last.field;
+     final gridGroupBloc = DatabaseGroupBloc(
+       viewId: context.gridView.id,
+-      fieldController: context.fieldController,
++      databaseController: context.databaseController,
+     )..add(const DatabaseGroupEvent.initial());
+     gridGroupBloc.add(
+       DatabaseGroupEvent.setGroupByField(
+diff --git a/frontend/appflowy_flutter/test/bloc_test/board_test/group_by_multi_select_field_test.dart b/frontend/appflowy_flutter/test/bloc_test/board_test/group_by_multi_select_field_test.dart
+index f8443ddf77857..b6d66c6bec02b 100644
+--- a/frontend/appflowy_flutter/test/bloc_test/board_test/group_by_multi_select_field_test.dart
++++ b/frontend/appflowy_flutter/test/bloc_test/board_test/group_by_multi_select_field_test.dart
+@@ -27,7 +27,7 @@ void main() {
+     // set grouped by the new multi-select field"
+     final gridGroupBloc = DatabaseGroupBloc(
+       viewId: context.gridView.id,
+-      fieldController: context.fieldController,
++      databaseController: context.databaseController,
+     )..add(const DatabaseGroupEvent.initial());
+     await boardResponseFuture();
+ 
+@@ -82,7 +82,7 @@ void main() {
+     // set grouped by the new multi-select field"
+     final gridGroupBloc = DatabaseGroupBloc(
+       viewId: context.gridView.id,
+-      fieldController: context.fieldController,
++      databaseController: context.databaseController,
+     )..add(const DatabaseGroupEvent.initial());
+     await boardResponseFuture();
+ 
+diff --git a/frontend/appflowy_flutter/test/bloc_test/board_test/util.dart b/frontend/appflowy_flutter/test/bloc_test/board_test/util.dart
+index 6a630e3697a39..d9c11130fea50 100644
+--- a/frontend/appflowy_flutter/test/bloc_test/board_test/util.dart
++++ b/frontend/appflowy_flutter/test/bloc_test/board_test/util.dart
+@@ -78,6 +78,8 @@ class BoardTestContext {
+     return _boardDataController.fieldController;
+   }
+ 
++  DatabaseController get databaseController => _boardDataController;
++
+   FieldEditorBloc makeFieldEditor({
+     required FieldInfo fieldInfo,
+   }) {
+diff --git a/frontend/resources/translations/en.json b/frontend/resources/translations/en.json
+index a3d2b906dbd4d..6e5fc863dcf78 100644
+--- a/frontend/resources/translations/en.json
++++ b/frontend/resources/translations/en.json
+@@ -748,6 +748,10 @@
+       "renameGroupTooltip": "Press to rename group"
+     },
+     "menuName": "Board",
++    "showUngrouped": "Show ungrouped items",
++    "ungroupedButtonText": "Ungrouped",
++    "ungroupedItemsTitle": "Click to add to the board",
++    "groupBy": "Group by",
+     "referencedBoardPrefix": "View of"
+   },
+   "calendar": {
+diff --git a/frontend/rust-lib/flowy-database2/src/entities/group_entities/group.rs b/frontend/rust-lib/flowy-database2/src/entities/group_entities/group.rs
+index 7200c2987e332..6e7c2a598fa83 100644
+--- a/frontend/rust-lib/flowy-database2/src/entities/group_entities/group.rs
++++ b/frontend/rust-lib/flowy-database2/src/entities/group_entities/group.rs
+@@ -5,7 +5,7 @@ use flowy_error::ErrorCode;
+ 
+ use crate::entities::parser::NotEmptyStr;
+ use crate::entities::{FieldType, RowMetaPB};
+-use crate::services::group::{GroupChangeset, GroupData, GroupSetting};
++use crate::services::group::{GroupChangeset, GroupData, GroupSetting, GroupSettingChangeset};
+ 
+ #[derive(Eq, PartialEq, ProtoBuf, Debug, Default, Clone)]
+ pub struct GroupSettingPB {
+@@ -14,6 +14,9 @@ pub struct GroupSettingPB {
+ 
+   #[pb(index = 2)]
+   pub field_id: String,
++
++  #[pb(index = 3)]
++  pub hide_ungrouped: bool,
+ }
+ 
+ impl std::convert::From<&GroupSetting> for GroupSettingPB {
+@@ -21,6 +24,7 @@ impl std::convert::From<&GroupSetting> for GroupSettingPB {
+     GroupSettingPB {
+       id: rev.id.clone(),
+       field_id: rev.field_id.clone(),
++      hide_ungrouped: rev.hide_ungrouped,
+     }
+   }
+ }
+@@ -48,6 +52,26 @@ impl std::convert::From<Vec<GroupSetting>> for RepeatedGroupSettingPB {
+   }
+ }
+ 
++#[derive(Debug, Default, ProtoBuf)]
++pub struct GroupSettingChangesetPB {
++  #[pb(index = 1)]
++  pub view_id: String,
++
++  #[pb(index = 2)]
++  pub group_configuration_id: String,
++
++  #[pb(index = 3, one_of)]
++  pub hide_ungrouped: Option<bool>,
++}
++
++impl From<GroupSettingChangesetPB> for GroupSettingChangeset {
++  fn from(value: GroupSettingChangesetPB) -> Self {
++    Self {
++      hide_ungrouped: value.hide_ungrouped,
++    }
++  }
++}
++
+ #[derive(ProtoBuf, Debug, Default, Clone)]
+ pub struct RepeatedGroupPB {
+   #[pb(index = 1)]
+diff --git a/frontend/rust-lib/flowy-database2/src/event_handler.rs b/frontend/rust-lib/flowy-database2/src/event_handler.rs
+index a8dcefa6f511e..b72e2e73c5160 100644
+--- a/frontend/rust-lib/flowy-database2/src/event_handler.rs
++++ b/frontend/rust-lib/flowy-database2/src/event_handler.rs
+@@ -15,7 +15,7 @@ use crate::services::field::{
+   type_option_data_from_pb_or_default, DateCellChangeset, SelectOptionCellChangeset,
+ };
+ use crate::services::field_settings::FieldSettingsChangesetParams;
+-use crate::services::group::{GroupChangeset, GroupSettingChangeset};
++use crate::services::group::{GroupChangeset, GroupChangesets};
+ use crate::services::share::csv::CSVFormat;
+ 
+ fn upgrade_manager(
+@@ -645,6 +645,36 @@ pub(crate) async fn update_date_cell_handler(
+   Ok(())
+ }
+ 
++#[tracing::instrument(level = "trace", skip_all, err)]
++pub(crate) async fn get_group_configurations_handler(
++  data: AFPluginData<DatabaseViewIdPB>,
++  manager: AFPluginState<Weak<DatabaseManager>>,
++) -> DataResult<RepeatedGroupSettingPB, FlowyError> {
++  let manager = upgrade_manager(manager)?;
++  let params = data.into_inner();
++  let database_editor = manager.get_database_with_view_id(params.as_ref()).await?;
++  let group_configs = database_editor
++    .get_group_configuration_settings(params.as_ref())
++    .await?;
++  data_result_ok(group_configs.into())
++}
++
++#[tracing::instrument(level = "trace", skip_all, err)]
++pub(crate) async fn update_group_configuration_handler(
++  data: AFPluginData<GroupSettingChangesetPB>,
++  manager: AFPluginState<Weak<DatabaseManager>>,
++) -> Result<(), FlowyError> {
++  let manager = upgrade_manager(manager)?;
++  let params = data.into_inner();
++  let view_id = params.view_id.clone();
++  let database_editor = manager.get_database_with_view_id(&view_id).await?;
++  database_editor
++    .update_group_configuration_setting(&view_id, params.into())
++    .await?;
++
++  Ok(())
++}
++
+ #[tracing::instrument(level = "trace", skip_all, err)]
+ pub(crate) async fn get_groups_handler(
+   data: AFPluginData<DatabaseViewIdPB>,
+@@ -701,7 +731,7 @@ pub(crate) async fn update_group_handler(
+   database_editor
+     .update_group_setting(
+       &view_id,
+-      GroupSettingChangeset {
++      GroupChangesets {
+         update_groups: vec![group_changeset],
+       },
+     )
+diff --git a/frontend/rust-lib/flowy-database2/src/event_map.rs b/frontend/rust-lib/flowy-database2/src/event_map.rs
+index 0d7d8e5d78029..594feac09c68f 100644
+--- a/frontend/rust-lib/flowy-database2/src/event_map.rs
++++ b/frontend/rust-lib/flowy-database2/src/event_map.rs
+@@ -54,11 +54,13 @@ pub fn init(database_manager: Weak<DatabaseManager>) -> AFPlugin {
+         // Date
+         .event(DatabaseEvent::UpdateDateCell, update_date_cell_handler)
+         // Group
++        .event(DatabaseEvent::GetGroupConfigurations, get_group_configurations_handler)
++        .event(DatabaseEvent::UpdateGroupConfiguration, update_group_configuration_handler)
++        .event(DatabaseEvent::SetGroupByField, set_group_by_field_handler)
+         .event(DatabaseEvent::MoveGroup, move_group_handler)
+         .event(DatabaseEvent::MoveGroupRow, move_group_row_handler)
+         .event(DatabaseEvent::GetGroups, get_groups_handler)
+         .event(DatabaseEvent::GetGroup, get_group_handler)
+-        .event(DatabaseEvent::SetGroupByField, set_group_by_field_handler)
+         .event(DatabaseEvent::UpdateGroup, update_group_handler)
+         // Database
+         .event(DatabaseEvent::GetDatabases, get_databases_handler)
+@@ -264,6 +266,15 @@ pub enum DatabaseEvent {
+   #[event(input = "DateChangesetPB")]
+   UpdateDateCell = 80,
+ 
++  #[event(input = "DatabaseViewIdPB", output = "RepeatedGroupSettingPB")]
++  GetGroupConfigurations = 90,
++
++  #[event(input = "GroupSettingChangesetPB")]
++  UpdateGroupConfiguration = 91,
++
++  #[event(input = "GroupByFieldPayloadPB")]
++  SetGroupByField = 92,
++
+   #[event(input = "DatabaseViewIdPB", output = "RepeatedGroupPB")]
+   GetGroups = 100,
+ 
+@@ -276,11 +287,8 @@ pub enum DatabaseEvent {
+   #[event(input = "MoveGroupRowPayloadPB")]
+   MoveGroupRow = 112,
+ 
+-  #[event(input = "GroupByFieldPayloadPB")]
+-  SetGroupByField = 113,
+-
+   #[event(input = "UpdateGroupPB")]
+-  UpdateGroup = 114,
++  UpdateGroup = 113,
+ 
+   /// Returns all the databases
+   #[event(output = "RepeatedDatabaseDescriptionPB")]
+diff --git a/frontend/rust-lib/flowy-database2/src/notification.rs b/frontend/rust-lib/flowy-database2/src/notification.rs
+index 6f5db3b4a5385..acf90e471704d 100644
+--- a/frontend/rust-lib/flowy-database2/src/notification.rs
++++ b/frontend/rust-lib/flowy-database2/src/notification.rs
+@@ -20,6 +20,8 @@ pub enum DatabaseNotification {
+   DidUpdateCell = 40,
+   /// Trigger after editing a field properties including rename,update type option, etc
+   DidUpdateField = 50,
++  /// Trigger after the group configuration is changed
++  DidUpdateGroupConfiguration = 59,
+   /// Trigger after the number of groups is changed
+   DidUpdateNumOfGroups = 60,
+   /// Trigger after inserting/deleting/updating/moving a row
+@@ -69,6 +71,7 @@ impl std::convert::From<i32> for DatabaseNotification {
+       22 => DatabaseNotification::DidUpdateFields,
+       40 => DatabaseNotification::DidUpdateCell,
+       50 => DatabaseNotification::DidUpdateField,
++      59 => DatabaseNotification::DidUpdateGroupConfiguration,
+       60 => DatabaseNotification::DidUpdateNumOfGroups,
+       61 => DatabaseNotification::DidUpdateGroupRow,
+       62 => DatabaseNotification::DidGroupByField,
+diff --git a/frontend/rust-lib/flowy-database2/src/services/database/database_editor.rs b/frontend/rust-lib/flowy-database2/src/services/database/database_editor.rs
+index 5a136b07ca228..6bafa9361a2d1 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/database/database_editor.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/database/database_editor.rs
+@@ -32,7 +32,8 @@ use crate::services::field_settings::{
+ };
+ use crate::services::filter::Filter;
+ use crate::services::group::{
+-  default_group_setting, GroupChangeset, GroupSetting, GroupSettingChangeset, RowChangeset,
++  default_group_setting, GroupChangeset, GroupChangesets, GroupSetting, GroupSettingChangeset,
++  RowChangeset,
+ };
+ use crate::services::share::csv::{CSVExport, CSVFormat};
+ use crate::services::sort::Sort;
+@@ -179,11 +180,11 @@ impl DatabaseEditor {
+   pub async fn update_group_setting(
+     &self,
+     view_id: &str,
+-    group_setting_changeset: GroupSettingChangeset,
++    group_setting_changeset: GroupChangesets,
+   ) -> FlowyResult<()> {
+     let view_editor = self.database_views.get_view_editor(view_id).await?;
+     view_editor
+-      .update_group_setting(group_setting_changeset)
++      .v_update_group_setting(group_setting_changeset)
+       .await?;
+     Ok(())
+   }
+@@ -907,6 +908,40 @@ impl DatabaseEditor {
+     Ok(())
+   }
+ 
++  pub async fn get_group_configuration_settings(
++    &self,
++    view_id: &str,
++  ) -> FlowyResult<Vec<GroupSettingPB>> {
++    let view = self.database_views.get_view_editor(view_id).await?;
++
++    let group_settings = view
++      .v_get_group_configuration_settings()
++      .await
++      .into_iter()
++      .map(|value| GroupSettingPB::from(&value))
++      .collect::<Vec<GroupSettingPB>>();
++
++    Ok(group_settings)
++  }
++
++  pub async fn update_group_configuration_setting(
++    &self,
++    view_id: &str,
++    changeset: GroupSettingChangeset,
++  ) -> FlowyResult<()> {
++    let view = self.database_views.get_view_editor(view_id).await?;
++    let group_configuration = view.v_update_group_configuration_setting(changeset).await?;
++
++    if let Some(configuration) = group_configuration {
++      let payload: RepeatedGroupSettingPB = vec![configuration].into();
++      send_notification(view_id, DatabaseNotification::DidUpdateGroupConfiguration)
++        .payload(payload)
++        .send();
++    }
++
++    Ok(())
++  }
++
+   #[tracing::instrument(level = "trace", skip_all, err)]
+   pub async fn load_groups(&self, view_id: &str) -> FlowyResult<RepeatedGroupPB> {
+     let view = self.database_views.get_view_editor(view_id).await?;
+diff --git a/frontend/rust-lib/flowy-database2/src/services/database_view/view_editor.rs b/frontend/rust-lib/flowy-database2/src/services/database_view/view_editor.rs
+index 64aa89e49a68c..4c5266c708dbb 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/database_view/view_editor.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/database_view/view_editor.rs
+@@ -37,8 +37,8 @@ use crate::services::filter::{
+   Filter, FilterChangeset, FilterController, FilterType, UpdatedFilterType,
+ };
+ use crate::services::group::{
+-  GroupChangeset, GroupController, GroupSetting, GroupSettingChangeset, MoveGroupRowContext,
+-  RowChangeset,
++  GroupChangeset, GroupChangesets, GroupController, GroupSetting, GroupSettingChangeset,
++  MoveGroupRowContext, RowChangeset,
+ };
+ use crate::services::setting::CalendarLayoutSetting;
+ use crate::services::sort::{DeletedSortType, Sort, SortChangeset, SortController, SortType};
+@@ -407,6 +407,7 @@ impl DatabaseViewEditor {
+       }
+     }
+   }
++
+   /// Only call once after database view editor initialized
+   #[tracing::instrument(level = "trace", skip(self))]
+   pub async fn v_load_groups(&self) -> Option<Vec<GroupPB>> {
+@@ -471,7 +472,20 @@ impl DatabaseViewEditor {
+     Ok(())
+   }
+ 
+-  pub async fn update_group_setting(&self, changeset: GroupSettingChangeset) -> FlowyResult<()> {
++  pub async fn v_update_group_configuration_setting(
++    &self,
++    changeset: GroupSettingChangeset,
++  ) -> FlowyResult<Option<GroupSetting>> {
++    let result = self
++      .mut_group_controller(|group_controller, _| {
++        group_controller.apply_group_configuration_setting_changeset(changeset)
++      })
++      .await;
++
++    Ok(result.flatten())
++  }
++
++  pub async fn v_update_group_setting(&self, changeset: GroupChangesets) -> FlowyResult<()> {
+     self
+       .mut_group_controller(|group_controller, _| {
+         group_controller.apply_group_setting_changeset(changeset)
+@@ -480,6 +494,10 @@ impl DatabaseViewEditor {
+     Ok(())
+   }
+ 
++  pub async fn v_get_group_configuration_settings(&self) -> Vec<GroupSetting> {
++    self.delegate.get_group_setting(&self.view_id)
++  }
++
+   pub async fn update_group(
+     &self,
+     changeset: GroupChangeset,
+diff --git a/frontend/rust-lib/flowy-database2/src/services/group/action.rs b/frontend/rust-lib/flowy-database2/src/services/group/action.rs
+index 015fd8f79626e..2163e840a1da0 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/group/action.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/group/action.rs
+@@ -6,7 +6,8 @@ use flowy_error::FlowyResult;
+ use crate::entities::{GroupChangesPB, GroupPB, GroupRowsNotificationPB, InsertedGroupPB};
+ use crate::services::cell::DecodedCellData;
+ use crate::services::group::controller::MoveGroupRowContext;
+-use crate::services::group::{GroupData, GroupSettingChangeset};
++use crate::services::group::entities::GroupSetting;
++use crate::services::group::{GroupChangesets, GroupData, GroupSettingChangeset};
+ 
+ /// Using polymorphism to provides the customs action for different group controller.
+ ///
+@@ -103,7 +104,12 @@ pub trait GroupControllerOperation: Send + Sync {
+   /// Update the group if the corresponding field is changed
+   fn did_update_group_field(&mut self, field: &Field) -> FlowyResult<Option<GroupChangesPB>>;
+ 
+-  fn apply_group_setting_changeset(&mut self, changeset: GroupSettingChangeset) -> FlowyResult<()>;
++  fn apply_group_setting_changeset(&mut self, changeset: GroupChangesets) -> FlowyResult<()>;
++
++  fn apply_group_configuration_setting_changeset(
++    &mut self,
++    changeset: GroupSettingChangeset,
++  ) -> FlowyResult<Option<GroupSetting>>;
+ }
+ 
+ #[derive(Debug)]
+diff --git a/frontend/rust-lib/flowy-database2/src/services/group/configuration.rs b/frontend/rust-lib/flowy-database2/src/services/group/configuration.rs
+index 89b69e1acb6de..ed44bf0ed3221 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/group/configuration.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/group/configuration.rs
+@@ -15,6 +15,7 @@ use crate::entities::{GroupChangesPB, GroupPB, InsertedGroupPB};
+ use crate::services::field::RowSingleCellData;
+ use crate::services::group::{
+   default_group_setting, GeneratedGroups, Group, GroupChangeset, GroupData, GroupSetting,
++  GroupSettingChangeset,
+ };
+ 
+ pub trait GroupSettingReader: Send + Sync + 'static {
+@@ -374,6 +375,20 @@ where
+     Ok(())
+   }
+ 
++  pub(crate) fn update_configuration(
++    &mut self,
++    changeset: GroupSettingChangeset,
++  ) -> FlowyResult<Option<GroupSetting>> {
++    self.mut_configuration(|configuration| match changeset.hide_ungrouped {
++      Some(value) if value != configuration.hide_ungrouped => {
++        configuration.hide_ungrouped = value;
++        true
++      },
++      _ => false,
++    })?;
++    Ok(Some(GroupSetting::clone(&self.setting)))
++  }
++
+   pub(crate) async fn get_all_cells(&self) -> Vec<RowSingleCellData> {
+     self
+       .reader
+@@ -402,7 +417,9 @@ where
+       let view_id = self.view_id.clone();
+       tokio::spawn(async move {
+         match writer.save_configuration(&view_id, configuration).await {
+-          Ok(_) => {},
++          Ok(_) => {
++            tracing::trace!("SUCCESSFULLY SAVED CONFIGURATION"); // TODO(richard): remove this
++          },
+           Err(e) => {
+             tracing::error!("Save group configuration failed: {}", e);
+           },
+diff --git a/frontend/rust-lib/flowy-database2/src/services/group/controller.rs b/frontend/rust-lib/flowy-database2/src/services/group/controller.rs
+index 5bdb004057009..94af701498107 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/group/controller.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/group/controller.rs
+@@ -17,8 +17,8 @@ use crate::services::group::action::{
+   DidMoveGroupRowResult, DidUpdateGroupRowResult, GroupControllerOperation, GroupCustomize,
+ };
+ use crate::services::group::configuration::GroupContext;
+-use crate::services::group::entities::GroupData;
+-use crate::services::group::{Group, GroupSettingChangeset};
++use crate::services::group::entities::{GroupData, GroupSetting};
++use crate::services::group::{Group, GroupChangesets, GroupSettingChangeset};
+ 
+ // use collab_database::views::Group;
+ 
+@@ -137,8 +137,6 @@ where
+     })
+   }
+ 
+-  // https://stackoverflow.com/questions/69413164/how-to-fix-this-clippy-warning-needless-collect
+-  #[allow(clippy::needless_collect)]
+   fn update_no_status_group(
+     &mut self,
+     row_detail: &RowDetail,
+@@ -382,7 +380,7 @@ where
+     Ok(None)
+   }
+ 
+-  fn apply_group_setting_changeset(&mut self, changeset: GroupSettingChangeset) -> FlowyResult<()> {
++  fn apply_group_setting_changeset(&mut self, changeset: GroupChangesets) -> FlowyResult<()> {
+     for group_changeset in changeset.update_groups {
+       if let Err(e) = self.context.update_group(group_changeset) {
+         tracing::error!("Failed to update group: {:?}", e);
+@@ -390,6 +388,13 @@ where
+     }
+     Ok(())
+   }
++
++  fn apply_group_configuration_setting_changeset(
++    &mut self,
++    changeset: GroupSettingChangeset,
++  ) -> FlowyResult<Option<GroupSetting>> {
++    self.context.update_configuration(changeset)
++  }
+ }
+ 
+ struct GroupedRow {
+diff --git a/frontend/rust-lib/flowy-database2/src/services/group/controller_impls/default_controller.rs b/frontend/rust-lib/flowy-database2/src/services/group/controller_impls/default_controller.rs
+index 3b2a0d40e6d76..fe9c85f4e5a22 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/group/controller_impls/default_controller.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/group/controller_impls/default_controller.rs
+@@ -10,7 +10,8 @@ use crate::services::group::action::{
+   DidMoveGroupRowResult, DidUpdateGroupRowResult, GroupControllerOperation,
+ };
+ use crate::services::group::{
+-  GroupController, GroupData, GroupSettingChangeset, MoveGroupRowContext,
++  GroupChangesets, GroupController, GroupData, GroupSetting, GroupSettingChangeset,
++  MoveGroupRowContext,
+ };
+ 
+ /// A [DefaultGroupController] is used to handle the group actions for the [FieldType] that doesn't
+@@ -101,11 +102,15 @@ impl GroupControllerOperation for DefaultGroupController {
+     Ok(None)
+   }
+ 
+-  fn apply_group_setting_changeset(
++  fn apply_group_setting_changeset(&mut self, _changeset: GroupChangesets) -> FlowyResult<()> {
++    Ok(())
++  }
++
++  fn apply_group_configuration_setting_changeset(
+     &mut self,
+     _changeset: GroupSettingChangeset,
+-  ) -> FlowyResult<()> {
+-    Ok(())
++  ) -> FlowyResult<Option<GroupSetting>> {
++    Ok(None)
+   }
+ }
+ 
+diff --git a/frontend/rust-lib/flowy-database2/src/services/group/entities.rs b/frontend/rust-lib/flowy-database2/src/services/group/entities.rs
+index 8711976beba8d..72c35c91b9bb1 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/group/entities.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/group/entities.rs
+@@ -12,9 +12,14 @@ pub struct GroupSetting {
+   pub field_type: i64,
+   pub groups: Vec<Group>,
+   pub content: String,
++  pub hide_ungrouped: bool,
+ }
+ 
+ pub struct GroupSettingChangeset {
++  pub hide_ungrouped: Option<bool>,
++}
++
++pub struct GroupChangesets {
+   pub update_groups: Vec<GroupChangeset>,
+ }
+ 
+@@ -27,13 +32,14 @@ pub struct GroupChangeset {
+ }
+ 
+ impl GroupSetting {
+-  pub fn new(field_id: String, field_type: i64, content: String) -> Self {
++  pub fn new(field_id: String, field_type: i64, content: String, hide_ungrouped: bool) -> Self {
+     Self {
+       id: gen_database_group_id(),
+       field_id,
+       field_type,
+       groups: vec![],
+       content,
++      hide_ungrouped,
+     }
+   }
+ }
+@@ -43,6 +49,7 @@ const FIELD_ID: &str = "field_id";
+ const FIELD_TYPE: &str = "ty";
+ const GROUPS: &str = "groups";
+ const CONTENT: &str = "content";
++const HIDE_UNGROUPED: &str = "hide_ungrouped";
+ 
+ impl TryFrom<GroupSettingMap> for GroupSetting {
+   type Error = anyhow::Error;
+@@ -52,8 +59,9 @@ impl TryFrom<GroupSettingMap> for GroupSetting {
+       value.get_str_value(GROUP_ID),
+       value.get_str_value(FIELD_ID),
+       value.get_i64_value(FIELD_TYPE),
++      value.get_bool_value(HIDE_UNGROUPED),
+     ) {
+-      (Some(id), Some(field_id), Some(field_type)) => {
++      (Some(id), Some(field_id), Some(field_type), Some(hide_ungrouped)) => {
+         let content = value.get_str_value(CONTENT).unwrap_or_default();
+         let groups = value.try_get_array(GROUPS);
+         Ok(Self {
+@@ -62,6 +70,7 @@ impl TryFrom<GroupSettingMap> for GroupSetting {
+           field_type,
+           groups,
+           content,
++          hide_ungrouped,
+         })
+       },
+       _ => {
+@@ -79,6 +88,7 @@ impl From<GroupSetting> for GroupSettingMap {
+       .insert_i64_value(FIELD_TYPE, setting.field_type)
+       .insert_maps(GROUPS, setting.groups)
+       .insert_str_value(CONTENT, setting.content)
++      .insert_bool_value(HIDE_UNGROUPED, setting.hide_ungrouped)
+       .build()
+   }
+ }
+diff --git a/frontend/rust-lib/flowy-database2/src/services/group/group_builder.rs b/frontend/rust-lib/flowy-database2/src/services/group/group_builder.rs
+index 87f8930234a17..bc610302be6bf 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/group/group_builder.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/group/group_builder.rs
+@@ -154,7 +154,7 @@ pub fn find_new_grouping_field(
+ ///
+ pub fn default_group_setting(field: &Field) -> GroupSetting {
+   let field_id = field.id.clone();
+-  GroupSetting::new(field_id, field.field_type, "".to_owned())
++  GroupSetting::new(field_id, field.field_type, "".to_owned(), false)
+ }
+ 
+ pub fn make_no_status_group(field: &Field) -> Group {
+diff --git a/frontend/rust-lib/flowy-database2/src/services/group/mod.rs b/frontend/rust-lib/flowy-database2/src/services/group/mod.rs
+index c9f9e91b655a8..fd11447bb8011 100644
+--- a/frontend/rust-lib/flowy-database2/src/services/group/mod.rs
++++ b/frontend/rust-lib/flowy-database2/src/services/group/mod.rs
+@@ -8,5 +8,5 @@ mod group_builder;
+ pub(crate) use configuration::*;
+ pub(crate) use controller::*;
+ pub(crate) use controller_impls::*;
+-pub(crate) use entities::*;
++pub use entities::*;
+ pub(crate) use group_builder::*;
+diff --git a/frontend/rust-lib/flowy-database2/tests/database/database_editor.rs b/frontend/rust-lib/flowy-database2/tests/database/database_editor.rs
+index 9546bd4bf1466..852b7ae1e8567 100644
+--- a/frontend/rust-lib/flowy-database2/tests/database/database_editor.rs
++++ b/frontend/rust-lib/flowy-database2/tests/database/database_editor.rs
+@@ -59,7 +59,7 @@ impl DatabaseEditorTest {
+     let _ = sdk.init_anon_user().await;
+ 
+     let params = make_test_board();
+-    let view_test = ViewTest::new_grid_view(&sdk, params.to_json_bytes().unwrap()).await;
++    let view_test = ViewTest::new_board_view(&sdk, params.to_json_bytes().unwrap()).await;
+     Self::new(sdk, view_test).await
+   }
+ 
+diff --git a/frontend/rust-lib/flowy-database2/tests/database/group_test/script.rs b/frontend/rust-lib/flowy-database2/tests/database/group_test/script.rs
+index a8a39c645ad7a..55ab2bc1d49b5 100644
+--- a/frontend/rust-lib/flowy-database2/tests/database/group_test/script.rs
++++ b/frontend/rust-lib/flowy-database2/tests/database/group_test/script.rs
+@@ -10,6 +10,7 @@ use flowy_database2::services::field::{
+   edit_single_select_type_option, SelectOption, SelectTypeOptionSharedAction,
+   SingleSelectTypeOption,
+ };
++use flowy_database2::services::group::GroupSettingChangeset;
+ use lib_infra::util::timestamp;
+ 
+ use crate::database::database_editor::DatabaseEditorTest;
+@@ -67,6 +68,12 @@ pub enum GroupScript {
+     group_id: String,
+     group_name: String,
+   },
++  AssertGroupConfiguration {
++    hide_ungrouped: bool,
++  },
++  UpdateGroupConfiguration {
++    hide_ungrouped: Option<bool>,
++  },
+ }
+ 
+ pub struct DatabaseGroupTest {
+@@ -269,6 +276,25 @@ impl DatabaseGroupTest {
+         assert_eq!(group_id, group.group_id, "group index: {}", group_index);
+         assert_eq!(group_name, group.group_name, "group index: {}", group_index);
+       },
++      GroupScript::AssertGroupConfiguration { hide_ungrouped } => {
++        let group_configuration = self
++          .editor
++          .get_group_configuration_settings(&self.view_id)
++          .await
++          .unwrap();
++        let group_configuration = group_configuration.get(0).unwrap();
++        assert_eq!(group_configuration.hide_ungrouped, hide_ungrouped);
++      },
++      GroupScript::UpdateGroupConfiguration { hide_ungrouped } => {
++        self
++          .editor
++          .update_group_configuration_setting(
++            &self.view_id,
++            GroupSettingChangeset { hide_ungrouped },
++          )
++          .await
++          .unwrap();
++      },
+     }
+   }
+ 
+diff --git a/frontend/rust-lib/flowy-database2/tests/database/group_test/test.rs b/frontend/rust-lib/flowy-database2/tests/database/group_test/test.rs
+index d9fb97a86518f..fb37bbea6aaca 100644
+--- a/frontend/rust-lib/flowy-database2/tests/database/group_test/test.rs
++++ b/frontend/rust-lib/flowy-database2/tests/database/group_test/test.rs
+@@ -28,6 +28,23 @@ async fn group_init_test() {
+   test.run_scripts(scripts).await;
+ }
+ 
++// #[tokio::test]
++// async fn group_configuration_setting_test() {
++//   let mut test = DatabaseGroupTest::new().await;
++//   let scripts = vec![
++//     AssertGroupConfiguration {
++//       hide_ungrouped: false,
++//     },
++//     UpdateGroupConfiguration {
++//       hide_ungrouped: Some(true),
++//     },
++//     AssertGroupConfiguration {
++//       hide_ungrouped: true,
++//     },
++//   ];
++//   test.run_scripts(scripts).await;
++// }
++
+ #[tokio::test]
+ async fn group_move_row_test() {
+   let mut test = DatabaseGroupTest::new().await;

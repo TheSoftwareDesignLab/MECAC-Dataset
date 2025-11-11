@@ -1,0 +1,4541 @@
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_ai_message_bloc.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_ai_message_bloc.dart
+index dcb9a789023e4..bf45326961a83 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_ai_message_bloc.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_ai_message_bloc.dart
+@@ -13,9 +13,13 @@ part 'chat_ai_message_bloc.freezed.dart';
+ class ChatAIMessageBloc extends Bloc<ChatAIMessageEvent, ChatAIMessageState> {
+   ChatAIMessageBloc({
+     dynamic message,
++    String? metadata,
+     required this.chatId,
+     required this.questionId,
+-  }) : super(ChatAIMessageState.initial(message)) {
++  }) : super(ChatAIMessageState.initial(
++          message,
++          chatMessageMetadataFromString(metadata),
++        ),) {
+     if (state.stream != null) {
+       state.stream!.listen(
+         onData: (text) {
+@@ -33,6 +37,11 @@ class ChatAIMessageBloc extends Bloc<ChatAIMessageEvent, ChatAIMessageState> {
+             add(const ChatAIMessageEvent.onAIResponseLimit());
+           }
+         },
++        onMetadata: (metadata) {
++          if (!isClosed) {
++            add(ChatAIMessageEvent.receiveMetadata(metadata));
++          }
++        },
+       );
+ 
+       if (state.stream!.error != null) {
+@@ -103,6 +112,13 @@ class ChatAIMessageBloc extends Bloc<ChatAIMessageEvent, ChatAIMessageState> {
+               ),
+             );
+           },
++          receiveMetadata: (List<ChatMessageMetadata> metadata) {
++            emit(
++              state.copyWith(
++                metadata: metadata,
++              ),
++            );
++          },
+         );
+       },
+     );
+@@ -120,6 +136,9 @@ class ChatAIMessageEvent with _$ChatAIMessageEvent {
+   const factory ChatAIMessageEvent.retry() = _Retry;
+   const factory ChatAIMessageEvent.retryResult(String text) = _RetryResult;
+   const factory ChatAIMessageEvent.onAIResponseLimit() = _OnAIResponseLimit;
++  const factory ChatAIMessageEvent.receiveMetadata(
++    List<ChatMessageMetadata> data,
++  ) = _ReceiveMetadata;
+ }
+ 
+ @freezed
+@@ -128,13 +147,16 @@ class ChatAIMessageState with _$ChatAIMessageState {
+     AnswerStream? stream,
+     required String text,
+     required MessageState messageState,
++    required List<ChatMessageMetadata> metadata,
+   }) = _ChatAIMessageState;
+ 
+-  factory ChatAIMessageState.initial(dynamic text) {
++  factory ChatAIMessageState.initial(
++      dynamic text, List<ChatMessageMetadata> metadata,) {
+     return ChatAIMessageState(
+       text: text is String ? text : "",
+       stream: text is AnswerStream ? text : null,
+       messageState: const MessageState.ready(),
++      metadata: metadata,
+     );
+   }
+ }
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_bloc.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_bloc.dart
+index 9533a97b64dbe..5cc7525238c4e 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_bloc.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_bloc.dart
+@@ -1,5 +1,6 @@
+ import 'dart:async';
+ import 'dart:collection';
++import 'dart:convert';
+ import 'dart:ffi';
+ import 'dart:isolate';
+ 
+@@ -19,7 +20,9 @@ import 'package:freezed_annotation/freezed_annotation.dart';
+ import 'package:nanoid/nanoid.dart';
+ 
+ import 'chat_message_listener.dart';
++import 'chat_message_service.dart';
+ 
++part 'chat_bloc.g.dart';
+ part 'chat_bloc.freezed.dart';
+ 
+ const sendMessageErrorKey = "sendMessageError";
+@@ -153,8 +156,8 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
+               ),
+             );
+           },
+-          sendMessage: (String message) {
+-            _startStreamingMessage(message, emit);
++          sendMessage: (String message, Map<String, dynamic>? metadata) async {
++            unawaited(_startStreamingMessage(message, metadata, emit));
+             final allMessages = _perminentMessages();
+             emit(
+               state.copyWith(
+@@ -327,6 +330,7 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
+ 
+   Future<void> _startStreamingMessage(
+     String message,
++    Map<String, dynamic>? metadata,
+     Emitter<ChatState> emit,
+   ) async {
+     if (state.answerStream != null) {
+@@ -341,6 +345,7 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
+       message: message,
+       messageType: ChatMessageTypePB.User,
+       textStreamPort: Int64(answerStream.nativePort),
++      metadata: await metadataPBFromMetadata(metadata),
+     );
+ 
+     // Stream message to the server
+@@ -410,6 +415,9 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
+       id: messageId,
+       text: message.content,
+       createdAt: message.createdAt.toInt() * 1000,
++      metadata: {
++        "metadata": message.metadata,
++      },
+     );
+   }
+ }
+@@ -417,7 +425,10 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
+ @freezed
+ class ChatEvent with _$ChatEvent {
+   const factory ChatEvent.initialLoad() = _InitialLoadMessage;
+-  const factory ChatEvent.sendMessage(String message) = _SendMessage;
++  const factory ChatEvent.sendMessage({
++    required String message,
++    Map<String, dynamic>? metadata,
++  }) = _SendMessage;
+   const factory ChatEvent.startLoadingPrevMessage() = _StartLoadPrevMessage;
+   const factory ChatEvent.didLoadPreviousMessages(
+     List<Message> messages,
+@@ -542,6 +553,11 @@ class AnswerStream {
+           if (_onError != null) {
+             _onError!(_error!);
+           }
++        } else if (event.startsWith("metadata:")) {
++          if (_onMetadata != null) {
++            final s = event.substring(9);
++            _onMetadata!(chatMessageMetadataFromString(s));
++          }
+         } else if (event == "AI_RESPONSE_LIMIT") {
+           if (_onAIResponseLimit != null) {
+             _onAIResponseLimit!();
+@@ -574,6 +590,7 @@ class AnswerStream {
+   void Function()? _onEnd;
+   void Function(String error)? _onError;
+   void Function()? _onAIResponseLimit;
++  void Function(List<ChatMessageMetadata> metadata)? _onMetadata;
+ 
+   int get nativePort => _port.sendPort.nativePort;
+   bool get hasStarted => _hasStarted;
+@@ -592,15 +609,66 @@ class AnswerStream {
+     void Function()? onEnd,
+     void Function(String error)? onError,
+     void Function()? onAIResponseLimit,
++    void Function(List<ChatMessageMetadata> metadata)? onMetadata,
+   }) {
+     _onData = onData;
+     _onStart = onStart;
+     _onEnd = onEnd;
+     _onError = onError;
+     _onAIResponseLimit = onAIResponseLimit;
++    _onMetadata = onMetadata;
+ 
+     if (_onStart != null) {
+       _onStart!();
+     }
+   }
+ }
++
++List<ChatMessageMetadata> chatMessageMetadataFromString(String? s) {
++  if (s == null || s.isEmpty || s == "null") {
++    return [];
++  }
++
++  final List<ChatMessageMetadata> metadata = [];
++  try {
++    final metadataJson = jsonDecode(s);
++    if (metadataJson == null) {
++      Log.warn("metadata is null");
++      return [];
++    }
++
++    if (metadataJson is Map<String, dynamic>) {
++      metadata.add(ChatMessageMetadata.fromJson(metadataJson));
++    } else if (metadataJson is List) {
++      metadata.addAll(
++        metadataJson.map(
++          (e) => ChatMessageMetadata.fromJson(e as Map<String, dynamic>),
++        ),
++      );
++    } else {
++      Log.error("Invalid metadata: $metadataJson");
++    }
++  } catch (e) {
++    Log.error("Failed to parse metadata: $e");
++  }
++
++  return metadata;
++}
++
++@JsonSerializable()
++class ChatMessageMetadata {
++  ChatMessageMetadata({
++    required this.id,
++    required this.name,
++    required this.source,
++  });
++
++  factory ChatMessageMetadata.fromJson(Map<String, dynamic> json) =>
++      _$ChatMessageMetadataFromJson(json);
++
++  final String id;
++  final String name;
++  final String source;
++
++  Map<String, dynamic> toJson() => _$ChatMessageMetadataToJson(this);
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_action_bloc.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_action_bloc.dart
+new file mode 100644
+index 0000000000000..a80731d3a89e6
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_action_bloc.dart
+@@ -0,0 +1,161 @@
++import 'dart:async';
++
++import 'package:appflowy/workspace/application/view/view_ext.dart';
++import 'package:appflowy/workspace/application/view/view_service.dart';
++import 'package:appflowy_backend/protobuf/flowy-folder/view.pb.dart';
++import 'package:bloc/bloc.dart';
++import 'package:equatable/equatable.dart';
++import 'package:flutter/services.dart';
++import 'package:freezed_annotation/freezed_annotation.dart';
++
++import 'chat_input_action_control.dart';
++part 'chat_input_action_bloc.freezed.dart';
++
++class ChatInputActionBloc
++    extends Bloc<ChatInputActionEvent, ChatInputActionState> {
++  ChatInputActionBloc({required this.chatId})
++      : super(const ChatInputActionState()) {
++    on<ChatInputActionEvent>(_handleEvent);
++  }
++
++  final String chatId;
++
++  Future<void> _handleEvent(
++    ChatInputActionEvent event,
++    Emitter<ChatInputActionState> emit,
++  ) async {
++    await event.when(
++      started: () async {
++        unawaited(
++          ViewBackendService.getAllViews().then(
++            (result) {
++              final views = result
++                      .toNullable()
++                      ?.items
++                      .where((v) => v.layout.isDocumentView)
++                      .toList() ??
++                  [];
++              if (!isClosed) {
++                add(ChatInputActionEvent.refreshViews(views));
++              }
++            },
++          ),
++        );
++      },
++      refreshViews: (List<ViewPB> views) {
++        emit(
++          state.copyWith(
++            views: views,
++            pages: views.map((v) => ViewActionPage(view: v)).toList(),
++          ),
++        );
++      },
++      filter: (String filter) {
++        final List<ViewActionPage> pages = [];
++        if (filter.isEmpty) {
++          pages.addAll(state.views.map((v) => ViewActionPage(view: v)));
++        } else {
++          pages.addAll(
++            state.views
++                .where(
++                  (v) => v.name.toLowerCase().contains(
++                        filter.toLowerCase(),
++                      ),
++                )
++                .map(
++                  (v) => ViewActionPage(view: v),
++                ),
++          );
++        }
++        pages.retainWhere((view) {
++          return !state.selectedPages.contains(view);
++        });
++        emit(state.copyWith(pages: pages));
++      },
++      handleKeyEvent: (PhysicalKeyboardKey physicalKey) {
++        emit(
++          state.copyWith(
++            keyboardKey: ChatInputKeyboardEvent(physicalKey: physicalKey),
++          ),
++        );
++      },
++      addPage: (ChatInputActionPage page) {
++        if (!state.selectedPages.any((p) => p.pageId == page.pageId)) {
++          emit(
++            state.copyWith(
++              selectedPages: [...state.selectedPages, page],
++            ),
++          );
++        }
++      },
++      removePage: (String text) {
++        final List<ChatInputActionPage> selectedPages =
++            List.from(state.selectedPages);
++        selectedPages.retainWhere((t) => !text.contains(t.title));
++
++        final allPages =
++            state.views.map((v) => ViewActionPage(view: v)).toList();
++        allPages.retainWhere((view) => !selectedPages.contains(view));
++
++        emit(
++          state.copyWith(
++            selectedPages: selectedPages,
++            pages: allPages,
++          ),
++        );
++      },
++    );
++  }
++}
++
++class ViewActionPage extends ChatInputActionPage {
++  ViewActionPage({required this.view});
++
++  final ViewPB view;
++
++  @override
++  String get pageId => view.id;
++
++  @override
++  String get title => view.name;
++
++  @override
++  List<Object?> get props => [pageId];
++
++  @override
++  dynamic get page => view;
++}
++
++@freezed
++class ChatInputActionEvent with _$ChatInputActionEvent {
++  const factory ChatInputActionEvent.started() = _Started;
++  const factory ChatInputActionEvent.refreshViews(List<ViewPB> views) =
++      _RefreshViews;
++  const factory ChatInputActionEvent.filter(String filter) = _Filter;
++  const factory ChatInputActionEvent.handleKeyEvent(
++    PhysicalKeyboardKey keyboardKey,
++  ) = _HandleKeyEvent;
++  const factory ChatInputActionEvent.addPage(ChatInputActionPage page) =
++      _AddPage;
++  const factory ChatInputActionEvent.removePage(String text) = _RemovePage;
++}
++
++@freezed
++class ChatInputActionState with _$ChatInputActionState {
++  const factory ChatInputActionState({
++    @Default([]) List<ViewPB> views,
++    @Default([]) List<ChatInputActionPage> pages,
++    @Default([]) List<ChatInputActionPage> selectedPages,
++    ChatInputKeyboardEvent? keyboardKey,
++  }) = _ChatInputActionState;
++}
++
++class ChatInputKeyboardEvent extends Equatable {
++  ChatInputKeyboardEvent({required this.physicalKey});
++
++  final PhysicalKeyboardKey physicalKey;
++  final int timestamp = DateTime.now().millisecondsSinceEpoch;
++
++  @override
++  List<Object?> get props => [timestamp];
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_action_control.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_action_control.dart
+new file mode 100644
+index 0000000000000..eb6982bf5b5ba
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_action_control.dart
+@@ -0,0 +1,170 @@
++import 'package:appflowy/plugins/ai_chat/application/chat_input_action_bloc.dart';
++import 'package:appflowy/plugins/ai_chat/presentation/chat_input_action_menu.dart';
++import 'package:appflowy_backend/log.dart';
++import 'package:equatable/equatable.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter/services.dart';
++
++abstract class ChatInputActionPage extends Equatable {
++  String get title;
++  String get pageId;
++  dynamic get page;
++}
++
++typedef ChatInputMetadata = Map<String, ChatInputActionPage>;
++
++class ChatInputActionControl extends ChatActionHandler {
++  ChatInputActionControl({
++    required this.textController,
++    required this.textFieldFocusNode,
++    required this.chatId,
++  }) : _commandBloc = ChatInputActionBloc(chatId: chatId);
++
++  final TextEditingController textController;
++  final ChatInputActionBloc _commandBloc;
++  final FocusNode textFieldFocusNode;
++  final String chatId;
++
++  // Private attributes
++  bool _isShowActionMenu = false;
++  String _atText = "";
++  String _prevText = "";
++  bool _didLoadViews = false;
++
++  // Getter
++  List<String> get tags =>
++      _commandBloc.state.selectedPages.map((e) => e.title).toList();
++
++  ChatInputMetadata get metaData => _commandBloc.state.selectedPages.fold(
++        <String, ChatInputActionPage>{},
++        (map, page) => map..putIfAbsent(page.pageId, () => page),
++      );
++
++  void handleKeyEvent(KeyEvent event) {
++    // ignore: deprecated_member_use
++    if (event is KeyDownEvent || event is RawKeyDownEvent) {
++      commandBloc.add(ChatInputActionEvent.handleKeyEvent(event.physicalKey));
++    }
++  }
++
++  bool canHandleKeyEvent(KeyEvent event) {
++    return _isShowActionMenu &&
++        <PhysicalKeyboardKey>{
++          PhysicalKeyboardKey.arrowDown,
++          PhysicalKeyboardKey.arrowUp,
++          PhysicalKeyboardKey.enter,
++          PhysicalKeyboardKey.escape,
++        }.contains(event.physicalKey);
++  }
++
++  void dispose() {
++    commandBloc.close();
++  }
++
++  @override
++  void onSelected(ChatInputActionPage page) {
++    _atText = "";
++    _isShowActionMenu = false;
++
++    _commandBloc.add(ChatInputActionEvent.addPage(page));
++    textController.text =
++        "${textController.text.replaceAll(_atText, '')}${page.title}";
++    _prevText = textController.text;
++  }
++
++  @override
++  void onExit() {
++    _atText = "";
++    _isShowActionMenu = false;
++    _didLoadViews = false;
++    commandBloc.add(const ChatInputActionEvent.filter(""));
++  }
++
++  @override
++  void onEnter() {
++    if (!_didLoadViews) {
++      _didLoadViews = true;
++      commandBloc.add(const ChatInputActionEvent.started());
++    }
++    _isShowActionMenu = true;
++  }
++
++  @override
++  double actionMenuOffsetX() {
++    final TextPosition textPosition = textController.selection.extent;
++    if (textFieldFocusNode.context == null) {
++      return 0;
++    }
++
++    final RenderBox renderBox =
++        textFieldFocusNode.context?.findRenderObject() as RenderBox;
++
++    final TextPainter textPainter = TextPainter(
++      text: TextSpan(text: textController.text),
++      textDirection: TextDirection.ltr,
++    );
++    textPainter.layout(
++      minWidth: renderBox.size.width,
++      maxWidth: renderBox.size.width,
++    );
++
++    final Offset caretOffset =
++        textPainter.getOffsetForCaret(textPosition, Rect.zero);
++    final List<TextBox> boxes = textPainter.getBoxesForSelection(
++      TextSelection(
++        baseOffset: textPosition.offset,
++        extentOffset: textPosition.offset,
++      ),
++    );
++
++    if (boxes.isNotEmpty) {
++      return boxes.last.right;
++    }
++    return caretOffset.dx;
++  }
++
++  bool onTextChanged(String text) {
++    final String inputText = text;
++    if (_prevText.length > inputText.length) {
++      final deleteStartIndex = textController.selection.baseOffset;
++      final deleteEndIndex =
++          _prevText.length - inputText.length + deleteStartIndex;
++      final deletedText = _prevText.substring(deleteStartIndex, deleteEndIndex);
++      _commandBloc.add(ChatInputActionEvent.removePage(deletedText));
++    }
++
++    // If the action menu is shown, filter the views
++    if (_isShowActionMenu) {
++      // before filter the views, remove the first character '@' if it exists
++      if (inputText.startsWith("@")) {
++        final filter = inputText.substring(1);
++        commandBloc.add(ChatInputActionEvent.filter(filter));
++      }
++
++      // If the text change from "xxx @"" to "xxx", which means user delete the @, we should hide the action menu
++      if (_atText.isNotEmpty && !inputText.contains(_atText)) {
++        commandBloc.add(
++          const ChatInputActionEvent.handleKeyEvent(PhysicalKeyboardKey.escape),
++        );
++      }
++    } else {
++      final isTypingNewAt =
++          text.endsWith("@") && _prevText.length < text.length;
++      if (isTypingNewAt) {
++        _atText = text;
++        _prevText = text;
++        return true;
++      }
++    }
++    _prevText = text;
++    return false;
++  }
++
++  @override
++  void onFilter(String filter) {
++    Log.info("filter: $filter");
++  }
++
++  @override
++  ChatInputActionBloc get commandBloc => _commandBloc;
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_bloc.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_bloc.dart
+index 5a4244da1573a..811c61ff57b2b 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_bloc.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_bloc.dart
+@@ -8,19 +8,20 @@ import 'package:bloc/bloc.dart';
+ import 'package:freezed_annotation/freezed_annotation.dart';
+ part 'chat_input_bloc.freezed.dart';
+ 
+-class ChatInputBloc extends Bloc<ChatInputEvent, ChatInputState> {
+-  ChatInputBloc()
++class ChatInputStateBloc
++    extends Bloc<ChatInputStateEvent, ChatInputStateState> {
++  ChatInputStateBloc()
+       : listener = LocalLLMListener(),
+-        super(const ChatInputState(aiType: _AppFlowyAI())) {
++        super(const ChatInputStateState(aiType: _AppFlowyAI())) {
+     listener.start(
+       stateCallback: (pluginState) {
+         if (!isClosed) {
+-          add(ChatInputEvent.updatePluginState(pluginState));
++          add(ChatInputStateEvent.updatePluginState(pluginState));
+         }
+       },
+     );
+ 
+-    on<ChatInputEvent>(_handleEvent);
++    on<ChatInputStateEvent>(_handleEvent);
+   }
+ 
+   final LocalLLMListener listener;
+@@ -32,8 +33,8 @@ class ChatInputBloc extends Bloc<ChatInputEvent, ChatInputState> {
+   }
+ 
+   Future<void> _handleEvent(
+-    ChatInputEvent event,
+-    Emitter<ChatInputState> emit,
++    ChatInputStateEvent event,
++    Emitter<ChatInputStateState> emit,
+   ) async {
+     await event.when(
+       started: () async {
+@@ -42,7 +43,7 @@ class ChatInputBloc extends Bloc<ChatInputEvent, ChatInputState> {
+           (pluginState) {
+             if (!isClosed) {
+               add(
+-                ChatInputEvent.updatePluginState(pluginState),
++                ChatInputStateEvent.updatePluginState(pluginState),
+               );
+             }
+           },
+@@ -53,9 +54,9 @@ class ChatInputBloc extends Bloc<ChatInputEvent, ChatInputState> {
+       },
+       updatePluginState: (pluginState) {
+         if (pluginState.state == RunningStatePB.Running) {
+-          emit(const ChatInputState(aiType: _LocalAI()));
++          emit(const ChatInputStateState(aiType: _LocalAI()));
+         } else {
+-          emit(const ChatInputState(aiType: _AppFlowyAI()));
++          emit(const ChatInputStateState(aiType: _AppFlowyAI()));
+         }
+       },
+     );
+@@ -63,16 +64,16 @@ class ChatInputBloc extends Bloc<ChatInputEvent, ChatInputState> {
+ }
+ 
+ @freezed
+-class ChatInputEvent with _$ChatInputEvent {
+-  const factory ChatInputEvent.started() = _Started;
+-  const factory ChatInputEvent.updatePluginState(
++class ChatInputStateEvent with _$ChatInputStateEvent {
++  const factory ChatInputStateEvent.started() = _Started;
++  const factory ChatInputStateEvent.updatePluginState(
+     LocalAIPluginStatePB pluginState,
+   ) = _UpdatePluginState;
+ }
+ 
+ @freezed
+-class ChatInputState with _$ChatInputState {
+-  const factory ChatInputState({required AIType aiType}) = _ChatInputState;
++class ChatInputStateState with _$ChatInputStateState {
++  const factory ChatInputStateState({required AIType aiType}) = _ChatInputState;
+ }
+ 
+ @freezed
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_service.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_service.dart
+new file mode 100644
+index 0000000000000..2dcc710e741d4
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_service.dart
+@@ -0,0 +1,36 @@
++import 'package:appflowy/plugins/ai_chat/application/chat_input_action_bloc.dart';
++import 'package:appflowy/workspace/application/view/view_ext.dart';
++import 'package:appflowy_backend/dispatch/dispatch.dart';
++import 'package:appflowy_backend/log.dart';
++import 'package:appflowy_backend/protobuf/flowy-ai/protobuf.dart';
++import 'package:appflowy_backend/protobuf/flowy-document/entities.pb.dart';
++import 'package:appflowy_backend/protobuf/flowy-folder/view.pb.dart';
++
++Future<List<ChatMessageMetaPB>> metadataPBFromMetadata(
++    Map<String, dynamic>? map,) async {
++  final List<ChatMessageMetaPB> metadata = [];
++  if (map != null) {
++    for (final entry in map.entries) {
++      if (entry.value is ViewActionPage) {
++        if (entry.value.page is ViewPB) {
++          final view = entry.value.page as ViewPB;
++          if (view.layout.isDocumentView) {
++            final payload = OpenDocumentPayloadPB(documentId: view.id);
++            final result = await DocumentEventGetDocumentText(payload).send();
++            result.fold((pb) {
++              metadata.add(ChatMessageMetaPB(
++                id: view.id,
++                name: view.name,
++                text: pb.text,
++              ),);
++            }, (err) {
++              Log.error('Failed to get document text: $err');
++            });
++          }
++        }
++      }
++    }
++  }
++
++  return metadata;
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_side_pannel_bloc.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_side_pannel_bloc.dart
+new file mode 100644
+index 0000000000000..b79252d6b6835
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_side_pannel_bloc.dart
+@@ -0,0 +1,85 @@
++import 'dart:async';
++
++import 'package:appflowy/plugins/ai_chat/application/chat_bloc.dart';
++import 'package:appflowy/workspace/application/view/view_service.dart';
++import 'package:appflowy_backend/log.dart';
++import 'package:appflowy_backend/protobuf/flowy-folder/view.pb.dart';
++import 'package:flutter_bloc/flutter_bloc.dart';
++import 'package:freezed_annotation/freezed_annotation.dart';
++
++part 'chat_side_pannel_bloc.freezed.dart';
++
++const double kDefaultSidePannelWidth = 500;
++
++class ChatSidePannelBloc
++    extends Bloc<ChatSidePannelEvent, ChatSidePannelState> {
++  ChatSidePannelBloc({
++    required this.chatId,
++  }) : super(const ChatSidePannelState()) {
++    on<ChatSidePannelEvent>(
++      (event, emit) async {
++        await event.when(
++          selectedMetadata: (ChatMessageMetadata metadata) async {
++            emit(
++              state.copyWith(
++                metadata: metadata,
++                indicator: const ChatSidePannelIndicator.loading(),
++              ),
++            );
++            unawaited(
++              ViewBackendService.getView(metadata.id).then(
++                (result) {
++                  result.fold((view) {
++                    if (!isClosed) {
++                      add(ChatSidePannelEvent.open(view));
++                    }
++                  }, (err) {
++                    Log.error("Failed to get view: $err");
++                  });
++                },
++              ),
++            );
++          },
++          close: () {
++            emit(state.copyWith(metadata: null, isShowPannel: false));
++          },
++          open: (ViewPB view) {
++            emit(
++              state.copyWith(
++                indicator: ChatSidePannelIndicator.ready(view),
++                isShowPannel: true,
++              ),
++            );
++          },
++        );
++      },
++    );
++  }
++
++  final String chatId;
++}
++
++@freezed
++class ChatSidePannelEvent with _$ChatSidePannelEvent {
++  const factory ChatSidePannelEvent.selectedMetadata(
++    ChatMessageMetadata metadata,
++  ) = _SelectedMetadata;
++  const factory ChatSidePannelEvent.close() = _Close;
++  const factory ChatSidePannelEvent.open(ViewPB view) = _Open;
++}
++
++@freezed
++class ChatSidePannelState with _$ChatSidePannelState {
++  const factory ChatSidePannelState({
++    ChatMessageMetadata? metadata,
++    @Default(ChatSidePannelIndicator.loading())
++    ChatSidePannelIndicator indicator,
++    @Default(false) bool isShowPannel,
++  }) = _ChatSidePannelState;
++}
++
++@freezed
++class ChatSidePannelIndicator with _$ChatSidePannelIndicator {
++  const factory ChatSidePannelIndicator.ready(ViewPB view) = _Ready;
++  const factory ChatSidePannelIndicator.loading() = _Loading;
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/chat.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/chat.dart
+index d5c76be5175aa..3d7c1609ace2f 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/chat.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/chat.dart
+@@ -6,6 +6,7 @@ import 'package:appflowy/workspace/application/view_info/view_info_bloc.dart';
+ import 'package:appflowy/workspace/presentation/home/home_stack.dart';
+ import 'package:appflowy/workspace/presentation/widgets/tab_bar_item.dart';
+ import 'package:appflowy/workspace/presentation/widgets/view_title_bar.dart';
++import 'package:appflowy_backend/log.dart';
+ import 'package:appflowy_backend/protobuf/flowy-folder/view.pb.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+@@ -104,6 +105,11 @@ class AIChatPagePluginWidgetBuilder extends PluginWidgetBuilder
+       }
+     });
+ 
++    if (context.userProfile == null) {
++      Log.error("User profile is null when opening AI Chat plugin");
++      return const SizedBox();
++    }
++
+     return BlocProvider<ViewInfoBloc>.value(
+       value: bloc,
+       child: AIChatPage(
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
+index acb78faba5f62..a778ed8c13e77 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
+@@ -1,8 +1,11 @@
++import 'dart:math';
++
+ import 'package:appflowy/plugins/ai_chat/application/chat_file_bloc.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_input_bloc.dart';
+ import 'package:appflowy/workspace/presentation/home/menu/sidebar/space/shared_widget.dart';
+ import 'package:appflowy/workspace/presentation/widgets/dialogs.dart';
+ import 'package:desktop_drop/desktop_drop.dart';
++import 'package:flowy_infra/platform_extension.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter/services.dart';
+ 
+@@ -22,9 +25,12 @@ import 'package:flutter_bloc/flutter_bloc.dart';
+ import 'package:flutter_chat_types/flutter_chat_types.dart';
+ import 'package:flutter_chat_types/flutter_chat_types.dart' as types;
+ import 'package:flutter_chat_ui/flutter_chat_ui.dart' show Chat;
++import 'package:styled_widget/styled_widget.dart';
+ 
++import 'application/chat_side_pannel_bloc.dart';
+ import 'presentation/chat_input/chat_input.dart';
+ import 'presentation/chat_popmenu.dart';
++import 'presentation/chat_side_pannel.dart';
+ import 'presentation/chat_theme.dart';
+ import 'presentation/chat_user_invalid_message.dart';
+ import 'presentation/chat_welcome_page.dart';
+@@ -72,19 +78,29 @@ class AIChatPage extends StatelessWidget {
+     if (userProfile.authenticator == AuthenticatorPB.AppFlowyCloud) {
+       return MultiBlocProvider(
+         providers: [
+-          BlocProvider(
+-            create: (_) => ChatFileBloc(chatId: view.id.toString())
+-              ..add(const ChatFileEvent.initial()),
+-          ),
++          /// [ChatBloc] is used to handle chat messages including send/receive message
++          ///
+           BlocProvider(
+             create: (_) => ChatBloc(
+               view: view,
+               userProfile: userProfile,
+             )..add(const ChatEvent.initialLoad()),
+           ),
++
++          /// [ChatFileBloc] is used to handle file indexing as a chat context
++          ///
++          BlocProvider(
++            create: (_) => ChatFileBloc(chatId: view.id.toString())
++              ..add(const ChatFileEvent.initial()),
++          ),
++
++          /// [ChatInputStateBloc] is used to handle chat input text field state
++          ///
+           BlocProvider(
+-            create: (_) => ChatInputBloc()..add(const ChatInputEvent.started()),
++            create: (_) =>
++                ChatInputStateBloc()..add(const ChatInputStateEvent.started()),
+           ),
++          BlocProvider(create: (_) => ChatSidePannelBloc(chatId: view.id)),
+         ],
+         child: BlocListener<ChatFileBloc, ChatFileState>(
+           listenWhen: (previous, current) =>
+@@ -187,7 +203,71 @@ class _ChatContentPageState extends State<_ChatContentPage> {
+   @override
+   Widget build(BuildContext context) {
+     if (widget.userProfile.authenticator == AuthenticatorPB.AppFlowyCloud) {
+-      return buildChatWidget();
++      if (PlatformExtension.isDesktop) {
++        return BlocSelector<ChatSidePannelBloc, ChatSidePannelState, bool>(
++          selector: (state) => state.isShowPannel,
++          builder: (context, isShowPannel) {
++            return LayoutBuilder(
++              builder: (BuildContext context, BoxConstraints constraints) {
++                final double chatOffsetX = isShowPannel
++                    ? 60
++                    : (constraints.maxWidth > 784
++                        ? (constraints.maxWidth - 784) / 2.0
++                        : 60);
++
++                final double width = isShowPannel
++                    ? (constraints.maxWidth - chatOffsetX * 2) * 0.46
++                    : min(constraints.maxWidth - chatOffsetX * 2, 784);
++
++                final double sidePannelOffsetX = chatOffsetX + width;
++
++                return Stack(
++                  alignment: AlignmentDirectional.centerStart,
++                  children: [
++                    buildChatWidget()
++                        .constrained(width: width)
++                        .positioned(
++                          top: 0,
++                          bottom: 0,
++                          left: chatOffsetX,
++                          animate: true,
++                        )
++                        .animate(
++                          const Duration(milliseconds: 200),
++                          Curves.easeOut,
++                        ),
++                    if (isShowPannel)
++                      buildChatSidePannel()
++                          .positioned(
++                            left: sidePannelOffsetX,
++                            right: 0,
++                            top: 0,
++                            bottom: 0,
++                            animate: true,
++                          )
++                          .animate(
++                            const Duration(milliseconds: 200),
++                            Curves.easeOut,
++                          ),
++                  ],
++                );
++              },
++            );
++          },
++        );
++      } else {
++        return Row(
++          mainAxisAlignment: MainAxisAlignment.center,
++          children: [
++            Flexible(
++              child: ConstrainedBox(
++                constraints: const BoxConstraints(maxWidth: 784),
++                child: buildChatWidget(),
++              ),
++            ),
++          ],
++        );
++      }
+     }
+ 
+     return Center(
+@@ -198,73 +278,79 @@ class _ChatContentPageState extends State<_ChatContentPage> {
+     );
+   }
+ 
+-  Widget buildChatWidget() {
+-    return Row(
+-      mainAxisAlignment: MainAxisAlignment.center,
+-      children: [
+-        Flexible(
+-          child: ConstrainedBox(
+-            constraints: const BoxConstraints(maxWidth: 784),
+-            child: BlocBuilder<ChatBloc, ChatState>(
+-              builder: (blocContext, state) => Chat(
+-                messages: state.messages,
+-                onSendPressed: (_) {
+-                  // We use custom bottom widget for chat input, so
+-                  // do not need to handle this event.
+-                },
+-                customBottomWidget: buildChatInput(blocContext),
+-                user: _user,
+-                theme: buildTheme(context),
+-                onEndReached: () async {
+-                  if (state.hasMorePrevMessage &&
+-                      state.loadingPreviousStatus !=
+-                          const LoadingState.loading()) {
+-                    blocContext
+-                        .read<ChatBloc>()
+-                        .add(const ChatEvent.startLoadingPrevMessage());
+-                  }
+-                },
+-                emptyState: BlocBuilder<ChatBloc, ChatState>(
+-                  builder: (_, state) =>
+-                      state.initialLoadingStatus == const LoadingState.finish()
+-                          ? Padding(
+-                              padding: AIChatUILayout.welcomePagePadding,
+-                              child: ChatWelcomePage(
+-                                onSelectedQuestion: (question) => blocContext
+-                                    .read<ChatBloc>()
+-                                    .add(ChatEvent.sendMessage(question)),
+-                              ),
+-                            )
+-                          : const Center(
+-                              child: CircularProgressIndicator.adaptive(),
+-                            ),
+-                ),
+-                messageWidthRatio: AIChatUILayout.messageWidthRatio,
+-                textMessageBuilder: (
+-                  textMessage, {
+-                  required messageWidth,
+-                  required showName,
+-                }) =>
+-                    _buildAITextMessage(blocContext, textMessage),
+-                bubbleBuilder: (
+-                  child, {
+-                  required message,
+-                  required nextMessageInGroup,
+-                }) {
+-                  if (message.author.id == _user.id) {
+-                    return ChatUserMessageBubble(
+-                      message: message,
+-                      child: child,
+-                    );
+-                  }
++  Widget buildChatSidePannel() {
++    if (PlatformExtension.isDesktop) {
++      return BlocBuilder<ChatSidePannelBloc, ChatSidePannelState>(
++        builder: (context, state) {
++          if (state.metadata != null) {
++            return const ChatSidePannel();
++          } else {
++            return const SizedBox.shrink();
++          }
++        },
++      );
++    } else {
++      // TODO(lucas): implement mobile chat side panel
++      return const SizedBox.shrink();
++    }
++  }
+ 
+-                  return _buildAIBubble(message, blocContext, state, child);
+-                },
+-              ),
+-            ),
+-          ),
++  Widget buildChatWidget() {
++    return BlocBuilder<ChatBloc, ChatState>(
++      builder: (blocContext, state) => Chat(
++        messages: state.messages,
++        onSendPressed: (_) {
++          // We use custom bottom widget for chat input, so
++          // do not need to handle this event.
++        },
++        customBottomWidget: buildChatInput(blocContext),
++        user: _user,
++        theme: buildTheme(context),
++        onEndReached: () async {
++          if (state.hasMorePrevMessage &&
++              state.loadingPreviousStatus != const LoadingState.loading()) {
++            blocContext
++                .read<ChatBloc>()
++                .add(const ChatEvent.startLoadingPrevMessage());
++          }
++        },
++        emptyState: BlocBuilder<ChatBloc, ChatState>(
++          builder: (_, state) =>
++              state.initialLoadingStatus == const LoadingState.finish()
++                  ? Padding(
++                      padding: AIChatUILayout.welcomePagePadding,
++                      child: ChatWelcomePage(
++                        onSelectedQuestion: (question) => blocContext
++                            .read<ChatBloc>()
++                            .add(ChatEvent.sendMessage(message: question)),
++                      ),
++                    )
++                  : const Center(
++                      child: CircularProgressIndicator.adaptive(),
++                    ),
+         ),
+-      ],
++        messageWidthRatio: AIChatUILayout.messageWidthRatio,
++        textMessageBuilder: (
++          textMessage, {
++          required messageWidth,
++          required showName,
++        }) =>
++            _buildAITextMessage(blocContext, textMessage),
++        bubbleBuilder: (
++          child, {
++          required message,
++          required nextMessageInGroup,
++        }) {
++          if (message.author.id == _user.id) {
++            return ChatUserMessageBubble(
++              message: message,
++              child: child,
++            );
++          }
++
++          return _buildAIBubble(message, blocContext, state, child);
++        },
++      ),
+     );
+   }
+ 
+@@ -279,6 +365,7 @@ class _ChatContentPageState extends State<_ChatContentPage> {
+     } else {
+       final stream = message.metadata?["$AnswerStream"];
+       final questionId = message.metadata?["question"];
++      final metadata = message.metadata?["metadata"] as String?;
+       return ChatAITextMessageWidget(
+         user: message.author,
+         messageUserId: message.id,
+@@ -286,6 +373,12 @@ class _ChatContentPageState extends State<_ChatContentPage> {
+         key: ValueKey(message.id),
+         questionId: questionId,
+         chatId: widget.view.id,
++        metadata: metadata,
++        onSelectedMetadata: (ChatMessageMetadata metadata) {
++          context.read<ChatSidePannelBloc>().add(
++                ChatSidePannelEvent.selectedMetadata(metadata),
++              );
++        },
+       );
+     }
+   }
+@@ -309,7 +402,9 @@ class _ChatContentPageState extends State<_ChatContentPage> {
+     if (messageType == OnetimeShotType.relatedQuestion) {
+       return RelatedQuestionList(
+         onQuestionSelected: (question) {
+-          blocContext.read<ChatBloc>().add(ChatEvent.sendMessage(question));
++          blocContext
++              .read<ChatBloc>()
++              .add(ChatEvent.sendMessage(message: question));
+           blocContext
+               .read<ChatBloc>()
+               .add(const ChatEvent.clearReleatedQuestion());
+@@ -391,8 +486,9 @@ class _ChatContentPageState extends State<_ChatContentPage> {
+     return ClipRect(
+       child: Padding(
+         padding: AIChatUILayout.safeAreaInsets(context),
+-        child: BlocBuilder<ChatInputBloc, ChatInputState>(
++        child: BlocBuilder<ChatInputStateBloc, ChatInputStateState>(
+           builder: (context, state) {
++            // Show different hint text based on the AI type
+             final hintText = state.aiType.when(
+               appflowyAI: () => LocaleKeys.chat_inputMessageHint.tr(),
+               localAI: () => LocaleKeys.chat_inputLocalAIMessageHint.tr(),
+@@ -405,8 +501,14 @@ class _ChatContentPageState extends State<_ChatContentPage> {
+                   builder: (context, state) {
+                     return ChatInput(
+                       chatId: widget.view.id,
+-                      onSendPressed: (message) =>
+-                          onSendPressed(context, message.text),
++                      onSendPressed: (message) {
++                        context.read<ChatBloc>().add(
++                              ChatEvent.sendMessage(
++                                message: message.text,
++                                metadata: message.metadata,
++                              ),
++                            );
++                      },
+                       isStreaming: state != const LoadingState.finish(),
+                       onStopStreaming: () {
+                         context
+@@ -432,54 +534,50 @@ class _ChatContentPageState extends State<_ChatContentPage> {
+       ),
+     );
+   }
++}
+ 
+-  AFDefaultChatTheme buildTheme(BuildContext context) {
+-    return AFDefaultChatTheme(
+-      backgroundColor: AFThemeExtension.of(context).background,
+-      primaryColor: Theme.of(context).colorScheme.primary,
+-      secondaryColor: AFThemeExtension.of(context).tint1,
+-      receivedMessageDocumentIconColor: Theme.of(context).primaryColor,
+-      receivedMessageCaptionTextStyle: TextStyle(
+-        color: AFThemeExtension.of(context).textColor,
+-        fontSize: 16,
+-        fontWeight: FontWeight.w500,
+-        height: 1.5,
+-      ),
+-      receivedMessageBodyTextStyle: TextStyle(
+-        color: AFThemeExtension.of(context).textColor,
+-        fontSize: 16,
+-        fontWeight: FontWeight.w500,
+-        height: 1.5,
+-      ),
+-      receivedMessageLinkTitleTextStyle: TextStyle(
+-        color: AFThemeExtension.of(context).textColor,
+-        fontSize: 16,
+-        fontWeight: FontWeight.w500,
+-        height: 1.5,
+-      ),
+-      receivedMessageBodyLinkTextStyle: const TextStyle(
+-        color: Colors.lightBlue,
+-        fontSize: 16,
+-        fontWeight: FontWeight.w500,
+-        height: 1.5,
+-      ),
+-      sentMessageBodyTextStyle: TextStyle(
+-        color: AFThemeExtension.of(context).textColor,
+-        fontSize: 16,
+-        fontWeight: FontWeight.w500,
+-        height: 1.5,
+-      ),
+-      sentMessageBodyLinkTextStyle: const TextStyle(
+-        color: Colors.blue,
+-        fontSize: 16,
+-        fontWeight: FontWeight.w500,
+-        height: 1.5,
+-      ),
+-      inputElevation: 2,
+-    );
+-  }
+-
+-  void onSendPressed(BuildContext context, String message) {
+-    context.read<ChatBloc>().add(ChatEvent.sendMessage(message));
+-  }
++AFDefaultChatTheme buildTheme(BuildContext context) {
++  return AFDefaultChatTheme(
++    backgroundColor: AFThemeExtension.of(context).background,
++    primaryColor: Theme.of(context).colorScheme.primary,
++    secondaryColor: AFThemeExtension.of(context).tint1,
++    receivedMessageDocumentIconColor: Theme.of(context).primaryColor,
++    receivedMessageCaptionTextStyle: TextStyle(
++      color: AFThemeExtension.of(context).textColor,
++      fontSize: 16,
++      fontWeight: FontWeight.w500,
++      height: 1.5,
++    ),
++    receivedMessageBodyTextStyle: TextStyle(
++      color: AFThemeExtension.of(context).textColor,
++      fontSize: 16,
++      fontWeight: FontWeight.w500,
++      height: 1.5,
++    ),
++    receivedMessageLinkTitleTextStyle: TextStyle(
++      color: AFThemeExtension.of(context).textColor,
++      fontSize: 16,
++      fontWeight: FontWeight.w500,
++      height: 1.5,
++    ),
++    receivedMessageBodyLinkTextStyle: const TextStyle(
++      color: Colors.lightBlue,
++      fontSize: 16,
++      fontWeight: FontWeight.w500,
++      height: 1.5,
++    ),
++    sentMessageBodyTextStyle: TextStyle(
++      color: AFThemeExtension.of(context).textColor,
++      fontSize: 16,
++      fontWeight: FontWeight.w500,
++      height: 1.5,
++    ),
++    sentMessageBodyLinkTextStyle: const TextStyle(
++      color: Colors.blue,
++      fontSize: 16,
++      fontWeight: FontWeight.w500,
++      height: 1.5,
++    ),
++    inputElevation: 2,
++  );
+ }
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_inline_action_menu.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_inline_action_menu.dart
+deleted file mode 100644
+index d6d85b3b351e3..0000000000000
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_inline_action_menu.dart
++++ /dev/null
+@@ -1,237 +0,0 @@
+-import 'package:flowy_infra_ui/style_widget/button.dart';
+-import 'package:flowy_infra_ui/style_widget/text.dart';
+-import 'package:flutter/material.dart';
+-import 'package:flutter/services.dart';
+-
+-abstract class ChatActionMenuItem {
+-  String get title;
+-}
+-
+-abstract class ChatActionHandler {
+-  List<ChatActionMenuItem> get items;
+-  void onEnter();
+-  void onSelected(ChatActionMenuItem item);
+-  void onExit();
+-}
+-
+-abstract class ChatAnchor {
+-  GlobalKey get anchorKey;
+-  LayerLink get layerLink;
+-}
+-
+-const int _itemHeight = 34;
+-const int _itemVerticalPadding = 4;
+-
+-class ChatActionsMenu {
+-  ChatActionsMenu({
+-    required this.anchor,
+-    required this.context,
+-    required this.handler,
+-    required this.style,
+-  });
+-
+-  final BuildContext context;
+-  final ChatAnchor anchor;
+-  final ChatActionsMenuStyle style;
+-  final ChatActionHandler handler;
+-
+-  OverlayEntry? _overlayEntry;
+-
+-  void dismiss() {
+-    _overlayEntry?.remove();
+-    _overlayEntry = null;
+-    handler.onExit();
+-  }
+-
+-  void show() {
+-    WidgetsBinding.instance.addPostFrameCallback((_) => _show());
+-  }
+-
+-  void _show() {
+-    if (_overlayEntry != null) {
+-      dismiss();
+-    }
+-
+-    if (anchor.anchorKey.currentContext == null) {
+-      return;
+-    }
+-
+-    handler.onEnter();
+-
+-    final height = handler.items.length * (_itemHeight + _itemVerticalPadding);
+-    _overlayEntry = OverlayEntry(
+-      builder: (context) => Stack(
+-        children: [
+-          CompositedTransformFollower(
+-            link: anchor.layerLink,
+-            showWhenUnlinked: false,
+-            offset: Offset(0, -height - 4),
+-            child: Material(
+-              elevation: 4.0,
+-              child: ConstrainedBox(
+-                constraints: const BoxConstraints(
+-                  minWidth: 200,
+-                  maxWidth: 200,
+-                  maxHeight: 200,
+-                ),
+-                child: DecoratedBox(
+-                  decoration: BoxDecoration(
+-                    color:
+-                        Theme.of(context).colorScheme.surfaceContainerHighest,
+-                    borderRadius: BorderRadius.circular(6.0),
+-                  ),
+-                  child: ActionList(
+-                    handler: handler,
+-                    onDismiss: () => dismiss(),
+-                  ),
+-                ),
+-              ),
+-            ),
+-          ),
+-        ],
+-      ),
+-    );
+-
+-    Overlay.of(context).insert(_overlayEntry!);
+-  }
+-}
+-
+-class _ActionItem extends StatelessWidget {
+-  const _ActionItem({
+-    required this.item,
+-    required this.onTap,
+-    required this.isSelected,
+-  });
+-
+-  final ChatActionMenuItem item;
+-  final VoidCallback? onTap;
+-  final bool isSelected;
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    return Container(
+-      height: _itemHeight.toDouble(),
+-      padding: const EdgeInsets.symmetric(vertical: _itemVerticalPadding / 2.0),
+-      decoration: BoxDecoration(
+-        color: isSelected
+-            ? Theme.of(context).colorScheme.primary.withOpacity(0.1)
+-            : Colors.transparent,
+-        borderRadius: BorderRadius.circular(4.0),
+-      ),
+-      child: FlowyButton(
+-        margin: const EdgeInsets.symmetric(horizontal: 6),
+-        iconPadding: 10.0,
+-        text: FlowyText.regular(
+-          item.title,
+-        ),
+-        onTap: onTap,
+-      ),
+-    );
+-  }
+-}
+-
+-class ActionList extends StatefulWidget {
+-  const ActionList({super.key, required this.handler, required this.onDismiss});
+-
+-  final ChatActionHandler handler;
+-  final VoidCallback? onDismiss;
+-
+-  @override
+-  State<ActionList> createState() => _ActionListState();
+-}
+-
+-class _ActionListState extends State<ActionList> {
+-  final FocusScopeNode _focusNode =
+-      FocusScopeNode(debugLabel: 'ChatActionsMenu');
+-  int _selectedIndex = 0;
+-
+-  @override
+-  void initState() {
+-    super.initState();
+-    WidgetsBinding.instance.addPostFrameCallback((_) {
+-      _focusNode.requestFocus();
+-    });
+-  }
+-
+-  @override
+-  void dispose() {
+-    _focusNode.dispose();
+-    super.dispose();
+-  }
+-
+-  void _handleKeyPress(event) {
+-    setState(() {
+-      // ignore: deprecated_member_use
+-      if (event is KeyDownEvent || event is RawKeyDownEvent) {
+-        if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+-          _selectedIndex = (_selectedIndex + 1) % widget.handler.items.length;
+-        } else if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+-          _selectedIndex = (_selectedIndex - 1 + widget.handler.items.length) %
+-              widget.handler.items.length;
+-        } else if (event.logicalKey == LogicalKeyboardKey.enter) {
+-          widget.handler.onSelected(widget.handler.items[_selectedIndex]);
+-          widget.onDismiss?.call();
+-        } else if (event.logicalKey == LogicalKeyboardKey.escape) {
+-          widget.onDismiss?.call();
+-        }
+-      }
+-    });
+-  }
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    return FocusScope(
+-      node: _focusNode,
+-      onKey: (node, event) {
+-        _handleKeyPress(event);
+-        return KeyEventResult.handled;
+-      },
+-      child: ListView(
+-        shrinkWrap: true,
+-        padding: const EdgeInsets.all(8),
+-        children: widget.handler.items.asMap().entries.map((entry) {
+-          final index = entry.key;
+-          final ChatActionMenuItem item = entry.value;
+-          return _ActionItem(
+-            item: item,
+-            onTap: () {
+-              widget.handler.onSelected(item);
+-              widget.onDismiss?.call();
+-            },
+-            isSelected: _selectedIndex == index,
+-          );
+-        }).toList(),
+-      ),
+-    );
+-  }
+-}
+-
+-class ChatActionsMenuStyle {
+-  ChatActionsMenuStyle({
+-    required this.backgroundColor,
+-    required this.groupTextColor,
+-    required this.menuItemTextColor,
+-    required this.menuItemSelectedColor,
+-    required this.menuItemSelectedTextColor,
+-  });
+-
+-  const ChatActionsMenuStyle.light()
+-      : backgroundColor = Colors.white,
+-        groupTextColor = const Color(0xFF555555),
+-        menuItemTextColor = const Color(0xFF333333),
+-        menuItemSelectedColor = const Color(0xFFE0F8FF),
+-        menuItemSelectedTextColor = const Color.fromARGB(255, 56, 91, 247);
+-
+-  const ChatActionsMenuStyle.dark()
+-      : backgroundColor = const Color(0xFF282E3A),
+-        groupTextColor = const Color(0xFFBBC3CD),
+-        menuItemTextColor = const Color(0xFFBBC3CD),
+-        menuItemSelectedColor = const Color(0xFF00BCF0),
+-        menuItemSelectedTextColor = const Color(0xFF131720);
+-
+-  final Color backgroundColor;
+-  final Color groupTextColor;
+-  final Color menuItemTextColor;
+-  final Color menuItemSelectedColor;
+-  final Color menuItemSelectedTextColor;
+-}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_at_button.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_at_button.dart
+new file mode 100644
+index 0000000000000..45a39fcb72772
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_at_button.dart
+@@ -0,0 +1,29 @@
++import 'package:appflowy/generated/flowy_svgs.g.dart';
++import 'package:appflowy/generated/locale_keys.g.dart';
++import 'package:easy_localization/easy_localization.dart';
++import 'package:flowy_infra/theme_extension.dart';
++import 'package:flowy_infra_ui/style_widget/icon_button.dart';
++import 'package:flowy_infra_ui/widget/flowy_tooltip.dart';
++import 'package:flutter/material.dart';
++
++class ChatInputAtButton extends StatelessWidget {
++  const ChatInputAtButton({required this.onTap, super.key});
++
++  final VoidCallback onTap;
++
++  @override
++  Widget build(BuildContext context) {
++    return FlowyTooltip(
++      message: LocaleKeys.chat_clickToMention.tr(),
++      child: FlowyIconButton(
++        hoverColor: AFThemeExtension.of(context).lightGreyHover,
++        radius: BorderRadius.circular(18),
++        icon: const FlowySvg(
++          FlowySvgs.mention_s,
++          size: Size.square(20),
++        ),
++        onPressed: onTap,
++      ),
++    );
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_command.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_command.dart
+deleted file mode 100644
+index 06e2361c57aef..0000000000000
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_command.dart
++++ /dev/null
+@@ -1,76 +0,0 @@
+-import 'package:appflowy/plugins/ai_chat/presentation/chat_inline_action_menu.dart';
+-import 'package:flutter/material.dart';
+-
+-class ChatTextFieldInterceptor {
+-  String previosText = "";
+-
+-  ChatActionHandler? onTextChanged(
+-    String text,
+-    TextEditingController textController,
+-    FocusNode textFieldFocusNode,
+-  ) {
+-    if (previosText == "/" && text == "/ ") {
+-      final handler = IndexActionHandler(
+-        textController: textController,
+-        textFieldFocusNode: textFieldFocusNode,
+-      ) as ChatActionHandler;
+-      return handler;
+-    }
+-    previosText = text;
+-    return null;
+-  }
+-}
+-
+-class FixGrammarMenuItem extends ChatActionMenuItem {
+-  @override
+-  String get title => "Fix Grammar";
+-}
+-
+-class ImproveWritingMenuItem extends ChatActionMenuItem {
+-  @override
+-  String get title => "Improve Writing";
+-}
+-
+-class ChatWithFileMenuItem extends ChatActionMenuItem {
+-  @override
+-  String get title => "Chat With PDF";
+-}
+-
+-class IndexActionHandler extends ChatActionHandler {
+-  IndexActionHandler({
+-    required this.textController,
+-    required this.textFieldFocusNode,
+-  });
+-
+-  final TextEditingController textController;
+-  final FocusNode textFieldFocusNode;
+-
+-  @override
+-  List<ChatActionMenuItem> get items => [
+-        ChatWithFileMenuItem(),
+-        FixGrammarMenuItem(),
+-        ImproveWritingMenuItem(),
+-      ];
+-
+-  @override
+-  void onSelected(ChatActionMenuItem item) {
+-    textController.clear();
+-    WidgetsBinding.instance.addPostFrameCallback(
+-      (_) => textFieldFocusNode.requestFocus(),
+-    );
+-  }
+-
+-  @override
+-  void onExit() {
+-    if (!textFieldFocusNode.hasFocus) {
+-      textFieldFocusNode.requestFocus();
+-    }
+-  }
+-
+-  @override
+-  void onEnter() {
+-    if (textFieldFocusNode.hasFocus) {
+-      textFieldFocusNode.unfocus();
+-    }
+-  }
+-}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input.dart
+index f230c423ca037..c492b9fcc4ead 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input.dart
+@@ -1,12 +1,18 @@
+-import 'package:appflowy/plugins/ai_chat/presentation/chat_inline_action_menu.dart';
++import 'package:appflowy/plugins/ai_chat/presentation/chat_input_action_menu.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_input_action_control.dart';
++import 'package:extended_text_field/extended_text_field.dart';
++import 'package:flowy_infra/platform_extension.dart';
+ import 'package:flowy_infra/theme_extension.dart';
++import 'package:flowy_infra_ui/widget/spacing.dart';
+ import 'package:flutter/foundation.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter/services.dart';
+ import 'package:flutter_chat_types/flutter_chat_types.dart' as types;
+ import 'package:flutter_chat_ui/flutter_chat_ui.dart';
+ 
+-import 'chat_accessory_button.dart';
++import 'chat_at_button.dart';
++import 'chat_send_button.dart';
++import 'chat_input_span.dart';
+ 
+ class ChatInput extends StatefulWidget {
+   /// Creates [ChatInput] widget.
+@@ -39,41 +45,41 @@ class ChatInput extends StatefulWidget {
+ class _ChatInputState extends State<ChatInput> {
+   final GlobalKey _textFieldKey = GlobalKey();
+   final LayerLink _layerLink = LayerLink();
+-  // final ChatTextFieldInterceptor _textFieldInterceptor =
+-  //     ChatTextFieldInterceptor();
+-
+-  late final _inputFocusNode = FocusNode(
+-    onKeyEvent: (node, event) {
+-      if (event.physicalKey == PhysicalKeyboardKey.enter &&
+-          !HardwareKeyboard.instance.physicalKeysPressed.any(
+-            (el) => <PhysicalKeyboardKey>{
+-              PhysicalKeyboardKey.shiftLeft,
+-              PhysicalKeyboardKey.shiftRight,
+-            }.contains(el),
+-          )) {
+-        if (kIsWeb && _textController.value.isComposingRangeValid) {
+-          return KeyEventResult.ignored;
+-        }
+-        if (event is KeyDownEvent) {
+-          if (!widget.isStreaming) {
+-            _handleSendPressed();
+-          }
+-        }
+-        return KeyEventResult.handled;
+-      } else {
+-        return KeyEventResult.ignored;
+-      }
+-    },
+-  );
++  late ChatInputActionControl _inputActionControl;
++  late FocusNode _inputFocusNode;
+   late TextEditingController _textController;
+-
+-  bool _sendButtonVisible = false;
++  bool _sendButtonEnabled = false;
+ 
+   @override
+   void initState() {
+     super.initState();
+-
+     _textController = InputTextFieldController();
++    _inputFocusNode = FocusNode(
++      onKeyEvent: (node, event) {
++        // TODO(lucas): support mobile
++        if (PlatformExtension.isDesktop) {
++          if (_inputActionControl.canHandleKeyEvent(event)) {
++            _inputActionControl.handleKeyEvent(event);
++            return KeyEventResult.handled;
++          } else {
++            return _handleEnterKeyWithoutShift(
++              event,
++              _textController,
++              widget.isStreaming,
++              _handleSendPressed,
++            );
++          }
++        } else {
++          return KeyEventResult.ignored;
++        }
++      },
++    );
++
++    _inputActionControl = ChatInputActionControl(
++      chatId: widget.chatId,
++      textController: _textController,
++      textFieldFocusNode: _inputFocusNode,
++    );
+     _handleSendButtonVisibilityModeChange();
+   }
+ 
+@@ -81,13 +87,14 @@ class _ChatInputState extends State<ChatInput> {
+   void dispose() {
+     _inputFocusNode.dispose();
+     _textController.dispose();
++    _inputActionControl.dispose();
+     super.dispose();
+   }
+ 
+   @override
+   Widget build(BuildContext context) {
+-    const textPadding = EdgeInsets.symmetric(horizontal: 16, vertical: 6);
+-    const buttonPadding = EdgeInsets.symmetric(horizontal: 16, vertical: 6);
++    const textPadding = EdgeInsets.symmetric(horizontal: 16);
++    const buttonPadding = EdgeInsets.symmetric(horizontal: 2);
+     const inputPadding = EdgeInsets.all(6);
+ 
+     return Focus(
+@@ -108,7 +115,11 @@ class _ChatInputState extends State<ChatInput> {
+                   padding: buttonPadding,
+                 ),
+               Expanded(child: _inputTextField(textPadding)),
++
++              // TODO(lucas): support mobile
++              if (PlatformExtension.isDesktop) _atButton(buttonPadding),
+               _sendButton(buttonPadding),
++              const HSpace(14),
+             ],
+           ),
+         ),
+@@ -118,7 +129,7 @@ class _ChatInputState extends State<ChatInput> {
+ 
+   void _handleSendButtonVisibilityModeChange() {
+     _textController.removeListener(_handleTextControllerChange);
+-    _sendButtonVisible =
++    _sendButtonEnabled =
+         _textController.text.trim() != '' || widget.isStreaming;
+     _textController.addListener(_handleTextControllerChange);
+   }
+@@ -126,9 +137,11 @@ class _ChatInputState extends State<ChatInput> {
+   void _handleSendPressed() {
+     final trimmedText = _textController.text.trim();
+     if (trimmedText != '') {
+-      final partialText = types.PartialText(text: trimmedText);
++      final partialText = types.PartialText(
++        text: trimmedText,
++        metadata: _inputActionControl.metaData,
++      );
+       widget.onSendPressed(partialText);
+-
+       _textController.clear();
+     }
+   }
+@@ -138,7 +151,7 @@ class _ChatInputState extends State<ChatInput> {
+       return;
+     }
+     setState(() {
+-      _sendButtonVisible = _textController.text.trim() != '';
++      _sendButtonEnabled = _textController.text.trim() != '';
+     });
+   }
+ 
+@@ -147,8 +160,10 @@ class _ChatInputState extends State<ChatInput> {
+       link: _layerLink,
+       child: Padding(
+         padding: textPadding,
+-        child: TextField(
++        child: ExtendedTextField(
+           key: _textFieldKey,
++          specialTextSpanBuilder:
++              ChatInputTextSpanBuilder(inputActionControl: _inputActionControl),
+           controller: _textController,
+           focusNode: _inputFocusNode,
+           decoration: InputDecoration(
+@@ -160,58 +175,70 @@ class _ChatInputState extends State<ChatInput> {
+           ),
+           style: TextStyle(
+             color: AFThemeExtension.of(context).textColor,
++            fontSize: 15,
+           ),
+           keyboardType: TextInputType.multiline,
+           textCapitalization: TextCapitalization.sentences,
+-          maxLines: 10,
+           minLines: 1,
+-          // onChanged: (text) {
+-          //   final handler = _textFieldInterceptor.onTextChanged(
+-          //     text,
+-          //     _textController,
+-          //     _inputFocusNode,
+-          //   );
+-          //   // If the handler is not null, it means that the text has been
+-          //   // recognized as a command.
+-          //   if (handler != null) {
+-          //     ChatActionsMenu(
+-          //       anchor: ChatInputAnchor(
+-          //         anchorKey: _textFieldKey,
+-          //         layerLink: _layerLink,
+-          //       ),
+-          //       handler: handler,
+-          //       context: context,
+-          //       style: Theme.of(context).brightness == Brightness.dark
+-          //           ? const ChatActionsMenuStyle.dark()
+-          //           : const ChatActionsMenuStyle.light(),
+-          //     ).show();
+-          //   }
+-          // },
++          maxLines: 10,
++          onChanged: (text) {
++            _handleOnTextChange(context, text);
++          },
+         ),
+       ),
+     );
+   }
+ 
+-  ConstrainedBox _sendButton(EdgeInsets buttonPadding) {
+-    return ConstrainedBox(
+-      constraints: BoxConstraints(
+-        minHeight: buttonPadding.bottom + buttonPadding.top + 24,
+-      ),
+-      child: Visibility(
+-        visible: _sendButtonVisible,
+-        child: Padding(
+-          padding: buttonPadding,
+-          child: ChatInputAccessoryButton(
+-            onSendPressed: () {
+-              if (!widget.isStreaming) {
+-                widget.onStopStreaming();
+-                _handleSendPressed();
+-              }
+-            },
+-            onStopStreaming: () => widget.onStopStreaming(),
+-            isStreaming: widget.isStreaming,
++  void _handleOnTextChange(BuildContext context, String text) {
++    if (PlatformExtension.isDesktop) {
++      if (_inputActionControl.onTextChanged(text)) {
++        ChatActionsMenu(
++          anchor: ChatInputAnchor(
++            anchorKey: _textFieldKey,
++            layerLink: _layerLink,
+           ),
+-        ),
++          handler: _inputActionControl,
++          context: context,
++          style: Theme.of(context).brightness == Brightness.dark
++              ? const ChatActionsMenuStyle.dark()
++              : const ChatActionsMenuStyle.light(),
++        ).show();
++      }
++    } else {
++      // TODO(lucas): support mobile
++    }
++  }
++
++  Widget _sendButton(EdgeInsets buttonPadding) {
++    return Padding(
++      padding: buttonPadding,
++      child: ChatInputSendButton(
++        onSendPressed: () {
++          if (!_sendButtonEnabled) {
++            return;
++          }
++
++          if (!widget.isStreaming) {
++            widget.onStopStreaming();
++            _handleSendPressed();
++          }
++        },
++        onStopStreaming: () => widget.onStopStreaming(),
++        isStreaming: widget.isStreaming,
++        enabled: _sendButtonEnabled,
++      ),
++    );
++  }
++
++  Widget _atButton(EdgeInsets buttonPadding) {
++    return Padding(
++      padding: buttonPadding,
++      child: ChatInputAtButton(
++        onTap: () {
++          _textController.text += '@';
++          _inputFocusNode.requestFocus();
++          _handleOnTextChange(context, _textController.text);
++        },
+       ),
+     );
+   }
+@@ -238,3 +265,38 @@ class ChatInputAnchor extends ChatAnchor {
+   @override
+   final LayerLink layerLink;
+ }
++
++/// Handles the key press event for the Enter key without Shift.
++///
++/// This function checks if the Enter key is pressed without either of the Shift keys.
++/// If the conditions are met, it performs the action of sending a message if the
++/// text controller is not in a composing range and if the event is a key down event.
++///
++/// - Returns: A `KeyEventResult` indicating whether the key event was handled or ignored.
++KeyEventResult _handleEnterKeyWithoutShift(
++  KeyEvent event,
++  TextEditingController textController,
++  bool isStreaming,
++  void Function() handleSendPressed,
++) {
++  if (event.physicalKey == PhysicalKeyboardKey.enter &&
++      !HardwareKeyboard.instance.physicalKeysPressed.any(
++        (el) => <PhysicalKeyboardKey>{
++          PhysicalKeyboardKey.shiftLeft,
++          PhysicalKeyboardKey.shiftRight,
++        }.contains(el),
++      )) {
++    if (textController.value.isComposingRangeValid) {
++      return KeyEventResult.ignored;
++    }
++
++    if (event is KeyDownEvent) {
++      if (!isStreaming) {
++        handleSendPressed();
++      }
++    }
++    return KeyEventResult.handled;
++  } else {
++    return KeyEventResult.ignored;
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input_span.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input_span.dart
+new file mode 100644
+index 0000000000000..1a474c48824dc
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input_span.dart
+@@ -0,0 +1,74 @@
++import 'package:extended_text_library/extended_text_library.dart';
++import 'package:flutter/gestures.dart';
++import 'package:flutter/material.dart';
++
++import '../../application/chat_input_action_control.dart';
++
++class ChatInputTextSpanBuilder extends SpecialTextSpanBuilder {
++  ChatInputTextSpanBuilder({
++    required this.inputActionControl,
++  });
++
++  final ChatInputActionControl inputActionControl;
++
++  @override
++  SpecialText? createSpecialText(
++    String flag, {
++    TextStyle? textStyle,
++    SpecialTextGestureTapCallback? onTap,
++    int? index,
++  }) {
++    if (flag == '') {
++      return null;
++    }
++
++    //index is end index of start flag, so text start index should be index-(flag.length-1)
++    if (isStart(flag, AtText.flag)) {
++      return AtText(
++        inputActionControl,
++        textStyle,
++        onTap,
++        start: index! - (AtText.flag.length - 1),
++      );
++    }
++    return null;
++  }
++}
++
++class AtText extends SpecialText {
++  AtText(
++    this.inputActionControl,
++    TextStyle? textStyle,
++    SpecialTextGestureTapCallback? onTap, {
++    this.start,
++  }) : super(flag, '', textStyle, onTap: onTap);
++  static const String flag = '@';
++  final int? start;
++  final ChatInputActionControl inputActionControl;
++
++  @override
++  bool isEnd(String value) {
++    return inputActionControl.tags.contains(value);
++  }
++
++  @override
++  InlineSpan finishText() {
++    final TextStyle? textStyle =
++        this.textStyle?.copyWith(color: Colors.blue, fontSize: 15.0);
++
++    final String atText = toString();
++
++    return SpecialTextSpan(
++      text: atText,
++      actualText: atText,
++      start: start!,
++      style: textStyle,
++      recognizer: (TapGestureRecognizer()
++        ..onTap = () {
++          if (onTap != null) {
++            onTap!(atText);
++          }
++        }),
++    );
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_accessory_button.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_send_button.dart
+similarity index 81%
+rename from frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_accessory_button.dart
+rename to frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_send_button.dart
+index ae4d980da6d02..d3c7a11606ea6 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_accessory_button.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_send_button.dart
+@@ -3,26 +3,27 @@ import 'package:flowy_infra/theme_extension.dart';
+ import 'package:flowy_infra_ui/style_widget/icon_button.dart';
+ import 'package:flutter/material.dart';
+ 
+-class ChatInputAccessoryButton extends StatelessWidget {
+-  const ChatInputAccessoryButton({
++class ChatInputSendButton extends StatelessWidget {
++  const ChatInputSendButton({
+     required this.onSendPressed,
+     required this.onStopStreaming,
+     required this.isStreaming,
++    required this.enabled,
+     super.key,
+   });
+ 
+   final void Function() onSendPressed;
+   final void Function() onStopStreaming;
+   final bool isStreaming;
++  final bool enabled;
+ 
+   @override
+   Widget build(BuildContext context) {
+     if (isStreaming) {
+       return FlowyIconButton(
+-        width: 36,
+         icon: FlowySvg(
+           FlowySvgs.ai_stream_stop_s,
+-          size: const Size.square(28),
++          size: const Size.square(20),
+           color: Theme.of(context).colorScheme.primary,
+         ),
+         onPressed: onStopStreaming,
+@@ -32,14 +33,13 @@ class ChatInputAccessoryButton extends StatelessWidget {
+       );
+     } else {
+       return FlowyIconButton(
+-        width: 36,
+         fillColor: AFThemeExtension.of(context).lightGreyHover,
+         hoverColor: AFThemeExtension.of(context).lightGreyHover,
+         radius: BorderRadius.circular(18),
+         icon: FlowySvg(
+           FlowySvgs.send_s,
+-          size: const Size.square(24),
+-          color: Theme.of(context).colorScheme.primary,
++          size: const Size.square(20),
++          color: enabled ? Theme.of(context).colorScheme.primary : null,
+         ),
+         onPressed: onSendPressed,
+       );
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input_action_menu.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input_action_menu.dart
+new file mode 100644
+index 0000000000000..0250c4be0717e
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input_action_menu.dart
+@@ -0,0 +1,299 @@
++import 'dart:math';
++
++import 'package:appflowy/generated/locale_keys.g.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_input_action_bloc.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_input_action_control.dart';
++import 'package:easy_localization/easy_localization.dart';
++import 'package:flowy_infra_ui/style_widget/button.dart';
++import 'package:flowy_infra_ui/style_widget/text.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter/services.dart';
++import 'package:flutter_bloc/flutter_bloc.dart';
++import 'package:scroll_to_index/scroll_to_index.dart';
++
++abstract class ChatActionHandler {
++  void onEnter();
++  void onSelected(ChatInputActionPage page);
++  void onExit();
++  ChatInputActionBloc get commandBloc;
++  void onFilter(String filter);
++  double actionMenuOffsetX();
++}
++
++abstract class ChatAnchor {
++  GlobalKey get anchorKey;
++  LayerLink get layerLink;
++}
++
++const int _itemHeight = 34;
++const int _itemVerticalPadding = 4;
++const int _noPageHeight = 20;
++
++class ChatActionsMenu {
++  ChatActionsMenu({
++    required this.anchor,
++    required this.context,
++    required this.handler,
++    required this.style,
++  });
++
++  final BuildContext context;
++  final ChatAnchor anchor;
++  final ChatActionsMenuStyle style;
++  final ChatActionHandler handler;
++
++  OverlayEntry? _overlayEntry;
++
++  void dismiss() {
++    _overlayEntry?.remove();
++    _overlayEntry = null;
++    handler.onExit();
++  }
++
++  void show() {
++    WidgetsBinding.instance.addPostFrameCallback((_) => _show());
++  }
++
++  void _show() {
++    if (_overlayEntry != null) {
++      dismiss();
++    }
++
++    if (anchor.anchorKey.currentContext == null) {
++      return;
++    }
++
++    handler.onEnter();
++    const double maxHeight = 300;
++
++    _overlayEntry = OverlayEntry(
++      builder: (context) => BlocProvider.value(
++        value: handler.commandBloc,
++        child: BlocBuilder<ChatInputActionBloc, ChatInputActionState>(
++          builder: (context, state) {
++            final height = min(
++              max(
++                state.pages.length * (_itemHeight + _itemVerticalPadding),
++                _noPageHeight,
++              ),
++              maxHeight,
++            );
++
++            return Stack(
++              children: [
++                CompositedTransformFollower(
++                  link: anchor.layerLink,
++                  showWhenUnlinked: false,
++                  offset: Offset(handler.actionMenuOffsetX(), -height - 4),
++                  child: Material(
++                    elevation: 4.0,
++                    child: ConstrainedBox(
++                      constraints: const BoxConstraints(
++                        minWidth: 200,
++                        maxWidth: 200,
++                        maxHeight: maxHeight,
++                      ),
++                      child: DecoratedBox(
++                        decoration: BoxDecoration(
++                          color: Theme.of(context)
++                              .colorScheme
++                              .surfaceContainerHighest,
++                          borderRadius: BorderRadius.circular(6.0),
++                        ),
++                        child: Padding(
++                          padding: const EdgeInsets.symmetric(
++                            horizontal: 2,
++                            vertical: 2,
++                          ),
++                          child: ActionList(
++                            handler: handler,
++                            onDismiss: () => dismiss(),
++                            pages: state.pages,
++                          ),
++                        ),
++                      ),
++                    ),
++                  ),
++                ),
++              ],
++            );
++          },
++        ),
++      ),
++    );
++
++    Overlay.of(context).insert(_overlayEntry!);
++  }
++}
++
++class _ActionItem extends StatelessWidget {
++  const _ActionItem({
++    required this.item,
++    required this.onTap,
++    required this.isSelected,
++  });
++
++  final ChatInputActionPage item;
++  final VoidCallback? onTap;
++  final bool isSelected;
++
++  @override
++  Widget build(BuildContext context) {
++    return Container(
++      height: _itemHeight.toDouble(),
++      padding: const EdgeInsets.symmetric(vertical: _itemVerticalPadding / 2.0),
++      decoration: BoxDecoration(
++        color: isSelected
++            ? Theme.of(context).colorScheme.primary.withOpacity(0.1)
++            : Colors.transparent,
++        borderRadius: BorderRadius.circular(4.0),
++      ),
++      child: FlowyButton(
++        margin: const EdgeInsets.symmetric(horizontal: 6),
++        iconPadding: 10.0,
++        text: FlowyText.regular(
++          item.title,
++        ),
++        onTap: onTap,
++      ),
++    );
++  }
++}
++
++class ActionList extends StatefulWidget {
++  const ActionList({
++    super.key,
++    required this.handler,
++    required this.onDismiss,
++    required this.pages,
++  });
++
++  final ChatActionHandler handler;
++  final VoidCallback? onDismiss;
++  final List<ChatInputActionPage> pages;
++
++  @override
++  State<ActionList> createState() => _ActionListState();
++}
++
++class _ActionListState extends State<ActionList> {
++  int _selectedIndex = 0;
++  final _scrollController = AutoScrollController();
++
++  @override
++  void dispose() {
++    _scrollController.dispose();
++    super.dispose();
++  }
++
++  KeyEventResult _handleKeyPress(logicalKey) {
++    bool isHandle = false;
++    setState(() {
++      if (logicalKey == PhysicalKeyboardKey.arrowDown) {
++        _selectedIndex = (_selectedIndex + 1) % widget.pages.length;
++        _scrollToSelectedIndex();
++        isHandle = true;
++      } else if (logicalKey == PhysicalKeyboardKey.arrowUp) {
++        _selectedIndex =
++            (_selectedIndex - 1 + widget.pages.length) % widget.pages.length;
++        _scrollToSelectedIndex();
++        isHandle = true;
++      } else if (logicalKey == PhysicalKeyboardKey.enter) {
++        widget.handler.onSelected(widget.pages[_selectedIndex]);
++        widget.onDismiss?.call();
++        isHandle = true;
++      } else if (logicalKey == PhysicalKeyboardKey.escape) {
++        widget.onDismiss?.call();
++        isHandle = true;
++      }
++    });
++    return isHandle ? KeyEventResult.handled : KeyEventResult.ignored;
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return BlocListener<ChatInputActionBloc, ChatInputActionState>(
++      listenWhen: (previous, current) =>
++          previous.keyboardKey != current.keyboardKey,
++      listener: (context, state) {
++        if (state.keyboardKey != null) {
++          _handleKeyPress(state.keyboardKey!.physicalKey);
++        }
++      },
++      child: ListView(
++        shrinkWrap: true,
++        controller: _scrollController,
++        padding: const EdgeInsets.all(8),
++        children: _buildPages(),
++      ),
++    );
++  }
++
++  List<Widget> _buildPages() {
++    if (widget.pages.isEmpty) {
++      return [
++        SizedBox(
++          height: _noPageHeight.toDouble(),
++          child:
++              Center(child: FlowyText(LocaleKeys.chat_inputActionNoPages.tr())),
++        ),
++      ];
++    }
++
++    return widget.pages.asMap().entries.map((entry) {
++      final index = entry.key;
++      final ChatInputActionPage item = entry.value;
++      return AutoScrollTag(
++        key: ValueKey(item.pageId),
++        index: index,
++        controller: _scrollController,
++        child: _ActionItem(
++          item: item,
++          onTap: () {
++            widget.handler.onSelected(item);
++            widget.onDismiss?.call();
++          },
++          isSelected: _selectedIndex == index,
++        ),
++      );
++    }).toList();
++  }
++
++  void _scrollToSelectedIndex() {
++    _scrollController.scrollToIndex(
++      _selectedIndex,
++      duration: const Duration(milliseconds: 200),
++      preferPosition: AutoScrollPosition.begin,
++    );
++  }
++}
++
++class ChatActionsMenuStyle {
++  ChatActionsMenuStyle({
++    required this.backgroundColor,
++    required this.groupTextColor,
++    required this.menuItemTextColor,
++    required this.menuItemSelectedColor,
++    required this.menuItemSelectedTextColor,
++  });
++
++  const ChatActionsMenuStyle.light()
++      : backgroundColor = Colors.white,
++        groupTextColor = const Color(0xFF555555),
++        menuItemTextColor = const Color(0xFF333333),
++        menuItemSelectedColor = const Color(0xFFE0F8FF),
++        menuItemSelectedTextColor = const Color.fromARGB(255, 56, 91, 247);
++
++  const ChatActionsMenuStyle.dark()
++      : backgroundColor = const Color(0xFF282E3A),
++        groupTextColor = const Color(0xFFBBC3CD),
++        menuItemTextColor = const Color(0xFFBBC3CD),
++        menuItemSelectedColor = const Color(0xFF00BCF0),
++        menuItemSelectedTextColor = const Color(0xFF131720);
++
++  final Color backgroundColor;
++  final Color groupTextColor;
++  final Color menuItemTextColor;
++  final Color menuItemSelectedColor;
++  final Color menuItemSelectedTextColor;
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_side_pannel.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_side_pannel.dart
+new file mode 100644
+index 0000000000000..f3899308ce753
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_side_pannel.dart
+@@ -0,0 +1,53 @@
++import 'package:appflowy/generated/flowy_svgs.g.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_side_pannel_bloc.dart';
++import 'package:appflowy/startup/plugin/plugin.dart';
++import 'package:appflowy/workspace/application/view/view_ext.dart';
++import 'package:flowy_infra_ui/flowy_infra_ui.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_bloc/flutter_bloc.dart';
++
++class ChatSidePannel extends StatelessWidget {
++  const ChatSidePannel({super.key});
++
++  @override
++  Widget build(BuildContext context) {
++    return BlocBuilder<ChatSidePannelBloc, ChatSidePannelState>(
++      builder: (context, state) {
++        return state.indicator.when(
++          loading: () {
++            return const CircularProgressIndicator.adaptive();
++          },
++          ready: (view) {
++            final plugin = view.plugin();
++            plugin.init();
++
++            final pluginContext = PluginContext();
++            final child = plugin.widgetBuilder
++                .buildWidget(context: pluginContext, shrinkWrap: false);
++            return Container(
++              color: Theme.of(context).colorScheme.surfaceContainerHighest,
++              child: Column(
++                crossAxisAlignment: CrossAxisAlignment.start,
++                children: [
++                  Padding(
++                    padding: const EdgeInsets.all(8.0),
++                    child: FlowyIconButton(
++                      icon: const FlowySvg(FlowySvgs.show_menu_s),
++                      onPressed: () {
++                        context
++                            .read<ChatSidePannelBloc>()
++                            .add(const ChatSidePannelEvent.close());
++                      },
++                    ),
++                  ),
++                  const VSpace(6),
++                  Expanded(child: child),
++                ],
++              ),
++            );
++          },
++        );
++      },
++    );
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_metadata.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_metadata.dart
+new file mode 100644
+index 0000000000000..723d35301c3e1
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_metadata.dart
+@@ -0,0 +1,62 @@
++import 'package:appflowy/generated/locale_keys.g.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_bloc.dart';
++import 'package:easy_localization/easy_localization.dart';
++import 'package:flowy_infra_ui/style_widget/button.dart';
++import 'package:flowy_infra_ui/style_widget/text.dart';
++import 'package:flowy_infra_ui/widget/spacing.dart';
++import 'package:flutter/material.dart';
++
++class AIMessageMetadata extends StatelessWidget {
++  const AIMessageMetadata({
++    required this.metadata,
++    required this.onSelectedMetadata,
++    super.key,
++  });
++
++  final List<ChatMessageMetadata> metadata;
++  final Function(ChatMessageMetadata metadata) onSelectedMetadata;
++  @override
++  Widget build(BuildContext context) {
++    final title = metadata.length == 1
++        ? LocaleKeys.chat_referenceSource.tr(args: [metadata.length.toString()])
++        : LocaleKeys.chat_referenceSources
++            .tr(args: [metadata.length.toString()]);
++    return Column(
++      crossAxisAlignment: CrossAxisAlignment.start,
++      children: [
++        if (metadata.isNotEmpty)
++          Opacity(
++            opacity: 0.5,
++            child: FlowyText(title, fontSize: 12),
++          ),
++        const VSpace(6),
++        Wrap(
++          spacing: 8.0,
++          runSpacing: 4.0,
++          children: metadata
++              .map(
++                (m) => SizedBox(
++                  height: 24,
++                  child: FlowyButton(
++                    margin: const EdgeInsets.symmetric(
++                      horizontal: 6,
++                      vertical: 4,
++                    ),
++                    useIntrinsicWidth: true,
++                    radius: BorderRadius.circular(6),
++                    text: FlowyText(
++                      m.source,
++                      fontSize: 14,
++                    ),
++                    onTap: () {
++                      onSelectedMetadata(m);
++                    },
++                  ),
++                ),
++              )
++              .toList(),
++        ),
++      ],
++    );
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_text_message.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_text_message.dart
+index 4aa615dc033f1..abe12d7a0a0af 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_text_message.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_text_message.dart
+@@ -1,5 +1,6 @@
+ import 'package:appflowy/generated/locale_keys.g.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_ai_message_bloc.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_bloc.dart';
+ import 'package:appflowy/plugins/ai_chat/presentation/chat_loading.dart';
+ import 'package:appflowy/plugins/ai_chat/presentation/message/ai_markdown_text.dart';
+ import 'package:easy_localization/easy_localization.dart';
+@@ -11,6 +12,8 @@ import 'package:flutter/material.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+ import 'package:flutter_chat_types/flutter_chat_types.dart';
+ 
++import 'ai_metadata.dart';
++
+ class ChatAITextMessageWidget extends StatelessWidget {
+   const ChatAITextMessageWidget({
+     super.key,
+@@ -19,6 +22,8 @@ class ChatAITextMessageWidget extends StatelessWidget {
+     required this.text,
+     required this.questionId,
+     required this.chatId,
++    required this.metadata,
++    required this.onSelectedMetadata,
+   });
+ 
+   final User user;
+@@ -26,12 +31,15 @@ class ChatAITextMessageWidget extends StatelessWidget {
+   final dynamic text;
+   final Int64? questionId;
+   final String chatId;
++  final String? metadata;
++  final void Function(ChatMessageMetadata metadata) onSelectedMetadata;
+ 
+   @override
+   Widget build(BuildContext context) {
+     return BlocProvider(
+       create: (context) => ChatAIMessageBloc(
+         message: text,
++        metadata: metadata,
+         chatId: chatId,
+         questionId: questionId,
+       )..add(const ChatAIMessageEvent.initial()),
+@@ -58,7 +66,16 @@ class ChatAITextMessageWidget extends StatelessWidget {
+               if (state.text.isEmpty) {
+                 return const ChatAILoading();
+               } else {
+-                return AIMarkdownText(markdown: state.text);
++                return Column(
++                  crossAxisAlignment: CrossAxisAlignment.start,
++                  children: [
++                    AIMarkdownText(markdown: state.text),
++                    AIMessageMetadata(
++                      metadata: state.metadata,
++                      onSelectedMetadata: onSelectedMetadata,
++                    ),
++                  ],
++                );
+               }
+             },
+             loading: () {
+diff --git a/frontend/appflowy_flutter/packages/flowy_infra/lib/platform_extension.dart b/frontend/appflowy_flutter/packages/flowy_infra/lib/platform_extension.dart
+new file mode 100644
+index 0000000000000..9e2085e3e4c1f
+--- /dev/null
++++ b/frontend/appflowy_flutter/packages/flowy_infra/lib/platform_extension.dart
+@@ -0,0 +1,57 @@
++import 'dart:io';
++
++import 'package:flutter/foundation.dart';
++
++extension PlatformExtension on Platform {
++  /// Returns true if the operating system is macOS and not running on Web platform.
++  static bool get isMacOS {
++    if (kIsWeb) {
++      return false;
++    }
++    return Platform.isMacOS;
++  }
++
++  /// Returns true if the operating system is Windows and not running on Web platform.
++  static bool get isWindows {
++    if (kIsWeb) {
++      return false;
++    }
++    return Platform.isWindows;
++  }
++
++  /// Returns true if the operating system is Linux and not running on Web platform.
++  static bool get isLinux {
++    if (kIsWeb) {
++      return false;
++    }
++    return Platform.isLinux;
++  }
++
++  static bool get isDesktopOrWeb {
++    if (kIsWeb) {
++      return true;
++    }
++    return isDesktop;
++  }
++
++  static bool get isDesktop {
++    if (kIsWeb) {
++      return false;
++    }
++    return Platform.isWindows || Platform.isLinux || Platform.isMacOS;
++  }
++
++  static bool get isMobile {
++    if (kIsWeb) {
++      return false;
++    }
++    return Platform.isAndroid || Platform.isIOS;
++  }
++
++  static bool get isNotMobile {
++    if (kIsWeb) {
++      return false;
++    }
++    return !isMobile;
++  }
++}
+diff --git a/frontend/appflowy_flutter/pubspec.lock b/frontend/appflowy_flutter/pubspec.lock
+index 8d6a97d800f31..b084b488969c7 100644
+--- a/frontend/appflowy_flutter/pubspec.lock
++++ b/frontend/appflowy_flutter/pubspec.lock
+@@ -538,6 +538,22 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "5.0.1"
++  extended_text_field:
++    dependency: "direct main"
++    description:
++      name: extended_text_field
++      sha256: "954c7eea1e82728a742f7ddf09b9a51cef087d4f52b716ba88cb3eb78ccd7c6e"
++      url: "https://pub.dev"
++    source: hosted
++    version: "15.0.0"
++  extended_text_library:
++    dependency: "direct main"
++    description:
++      name: extended_text_library
++      sha256: "55d09098ec56fab0d9a8a68950ca0bbf2efa1327937f7cec6af6dfa066234829"
++      url: "https://pub.dev"
++    source: hosted
++    version: "12.0.0"
+   fake_async:
+     dependency: transitive
+     description:
+@@ -1755,7 +1771,7 @@ packages:
+     source: hosted
+     version: "0.1.9"
+   scroll_to_index:
+-    dependency: transitive
++    dependency: "direct main"
+     description:
+       name: scroll_to_index
+       sha256: b707546e7500d9f070d63e5acf74fd437ec7eeeb68d3412ef7b0afada0b4f176
+diff --git a/frontend/appflowy_flutter/pubspec.yaml b/frontend/appflowy_flutter/pubspec.yaml
+index 39c9a493d83d5..28c70c087cedc 100644
+--- a/frontend/appflowy_flutter/pubspec.yaml
++++ b/frontend/appflowy_flutter/pubspec.yaml
+@@ -160,6 +160,9 @@ dependencies:
+   flutter_highlight: ^0.7.0
+   custom_sliding_segmented_control: ^1.8.3
+   toastification: ^2.0.0
++  scroll_to_index: ^3.0.1
++  extended_text_field: ^15.0.0
++  extended_text_library: ^12.0.0
+ 
+ dev_dependencies:
+   flutter_lints: ^3.0.1
+diff --git a/frontend/appflowy_tauri/src-tauri/Cargo.lock b/frontend/appflowy_tauri/src-tauri/Cargo.lock
+index f594230085a14..a95a7d2bd3c34 100644
+--- a/frontend/appflowy_tauri/src-tauri/Cargo.lock
++++ b/frontend/appflowy_tauri/src-tauri/Cargo.lock
+@@ -172,7 +172,7 @@ checksum = "b3d1d046238990b9cf5bcde22a3fb3584ee5cf65fb2765f454ed428c7a0063da"
+ [[package]]
+ name = "app-error"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "bincode",
+@@ -192,11 +192,12 @@ dependencies = [
+ [[package]]
+ name = "appflowy-ai-client"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "bytes",
+  "futures",
++ "pin-project",
+  "serde",
+  "serde_json",
+  "serde_repr",
+@@ -825,7 +826,7 @@ dependencies = [
+ [[package]]
+ name = "client-api"
+ version = "0.2.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "again",
+  "anyhow",
+@@ -875,7 +876,7 @@ dependencies = [
+ [[package]]
+ name = "client-api-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "collab-entity",
+  "collab-rt-entity",
+@@ -887,7 +888,7 @@ dependencies = [
+ [[package]]
+ name = "client-websocket"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "futures-channel",
+  "futures-util",
+@@ -1131,7 +1132,7 @@ dependencies = [
+ [[package]]
+ name = "collab-rt-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "bincode",
+@@ -1156,7 +1157,7 @@ dependencies = [
+ [[package]]
+ name = "collab-rt-protocol"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "async-trait",
+@@ -1531,7 +1532,7 @@ checksum = "c2e66c9d817f1720209181c316d28635c050fa304f9c79e47a520882661b7308"
+ [[package]]
+ name = "database-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "app-error",
+@@ -1974,6 +1975,7 @@ dependencies = [
+  "md5",
+  "notify",
+  "parking_lot 0.12.1",
++ "pin-project",
+  "protobuf",
+  "reqwest",
+  "serde",
+@@ -1999,6 +2001,7 @@ dependencies = [
+  "flowy-error",
+  "futures",
+  "lib-infra",
++ "serde_json",
+ ]
+ 
+ [[package]]
+@@ -2053,6 +2056,7 @@ name = "flowy-core"
+ version = "0.1.0"
+ dependencies = [
+  "anyhow",
++ "appflowy-local-ai",
+  "base64 0.21.5",
+  "bytes",
+  "client-api",
+@@ -3047,7 +3051,7 @@ dependencies = [
+ [[package]]
+ name = "gotrue"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "futures-util",
+@@ -3064,7 +3068,7 @@ dependencies = [
+ [[package]]
+ name = "gotrue-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "app-error",
+@@ -3496,7 +3500,7 @@ dependencies = [
+ [[package]]
+ name = "infra"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -6094,7 +6098,7 @@ dependencies = [
+ [[package]]
+ name = "shared-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "app-error",
+diff --git a/frontend/appflowy_tauri/src-tauri/Cargo.toml b/frontend/appflowy_tauri/src-tauri/Cargo.toml
+index add6956acc881..fcdc5490e02d0 100644
+--- a/frontend/appflowy_tauri/src-tauri/Cargo.toml
++++ b/frontend/appflowy_tauri/src-tauri/Cargo.toml
+@@ -53,7 +53,7 @@ collab-user = { version = "0.2" }
+ # Run the script:
+ # scripts/tool/update_client_api_rev.sh  new_rev_id
+ # ⚠️⚠️⚠️️
+-client-api = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "8f61e6d03469aac73b9ad88e37ac6898a691289d" }
++client-api = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "a371912c61d79fa946ec78f0cb852fdd7d391356" }
+ 
+ [dependencies]
+ serde_json.workspace = true
+diff --git a/frontend/appflowy_web_app/src-tauri/Cargo.lock b/frontend/appflowy_web_app/src-tauri/Cargo.lock
+index 028a347b69b6d..f44e96c08abc7 100644
+--- a/frontend/appflowy_web_app/src-tauri/Cargo.lock
++++ b/frontend/appflowy_web_app/src-tauri/Cargo.lock
+@@ -163,7 +163,7 @@ checksum = "b3d1d046238990b9cf5bcde22a3fb3584ee5cf65fb2765f454ed428c7a0063da"
+ [[package]]
+ name = "app-error"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "bincode",
+@@ -183,11 +183,12 @@ dependencies = [
+ [[package]]
+ name = "appflowy-ai-client"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "bytes",
+  "futures",
++ "pin-project",
+  "serde",
+  "serde_json",
+  "serde_repr",
+@@ -799,7 +800,7 @@ dependencies = [
+ [[package]]
+ name = "client-api"
+ version = "0.2.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "again",
+  "anyhow",
+@@ -849,7 +850,7 @@ dependencies = [
+ [[package]]
+ name = "client-api-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "collab-entity",
+  "collab-rt-entity",
+@@ -861,7 +862,7 @@ dependencies = [
+ [[package]]
+ name = "client-websocket"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "futures-channel",
+  "futures-util",
+@@ -1114,7 +1115,7 @@ dependencies = [
+ [[package]]
+ name = "collab-rt-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "bincode",
+@@ -1139,7 +1140,7 @@ dependencies = [
+ [[package]]
+ name = "collab-rt-protocol"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "async-trait",
+@@ -1521,7 +1522,7 @@ checksum = "7e962a19be5cfc3f3bf6dd8f61eb50107f356ad6270fbb3ed41476571db78be5"
+ [[package]]
+ name = "database-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "app-error",
+@@ -2004,6 +2005,7 @@ dependencies = [
+  "md5",
+  "notify",
+  "parking_lot 0.12.1",
++ "pin-project",
+  "protobuf",
+  "reqwest",
+  "serde",
+@@ -2029,6 +2031,7 @@ dependencies = [
+  "flowy-error",
+  "futures",
+  "lib-infra",
++ "serde_json",
+ ]
+ 
+ [[package]]
+@@ -2083,6 +2086,7 @@ name = "flowy-core"
+ version = "0.1.0"
+ dependencies = [
+  "anyhow",
++ "appflowy-local-ai",
+  "base64 0.21.7",
+  "bytes",
+  "client-api",
+@@ -3114,7 +3118,7 @@ dependencies = [
+ [[package]]
+ name = "gotrue"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "futures-util",
+@@ -3131,7 +3135,7 @@ dependencies = [
+ [[package]]
+ name = "gotrue-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "app-error",
+@@ -3568,7 +3572,7 @@ dependencies = [
+ [[package]]
+ name = "infra"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -6158,7 +6162,7 @@ dependencies = [
+ [[package]]
+ name = "shared-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "app-error",
+diff --git a/frontend/appflowy_web_app/src-tauri/Cargo.toml b/frontend/appflowy_web_app/src-tauri/Cargo.toml
+index aae0b746fe220..bd8c4f9defb49 100644
+--- a/frontend/appflowy_web_app/src-tauri/Cargo.toml
++++ b/frontend/appflowy_web_app/src-tauri/Cargo.toml
+@@ -52,7 +52,7 @@ collab-user = { version = "0.2" }
+ # Run the script:
+ # scripts/tool/update_client_api_rev.sh  new_rev_id
+ # ⚠️⚠️⚠️️
+-client-api = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "8f61e6d03469aac73b9ad88e37ac6898a691289d" }
++client-api = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "a371912c61d79fa946ec78f0cb852fdd7d391356" }
+ 
+ [dependencies]
+ serde_json.workspace = true
+diff --git a/frontend/resources/translations/en.json b/frontend/resources/translations/en.json
+index f496fecda5b0f..2619b0c488052 100644
+--- a/frontend/resources/translations/en.json
++++ b/frontend/resources/translations/en.json
+@@ -173,6 +173,10 @@
+     "aiMistakePrompt": "AI can make mistakes. Check important info.",
+     "chatWithFilePrompt": "Do you want to chat with the file?",
+     "indexFileSuccess": "Indexing file successfully",
++    "inputActionNoPages": "No page results",
++    "referenceSource": "{} source found",
++    "referenceSources": "{} sources found",
++    "clickToMention": "Click to mention a page",
+     "indexingFile": "Indexing {}"
+   },
+   "trash": {
+diff --git a/frontend/rust-lib/Cargo.lock b/frontend/rust-lib/Cargo.lock
+index 24b838922d649..a5098629f3f19 100644
+--- a/frontend/rust-lib/Cargo.lock
++++ b/frontend/rust-lib/Cargo.lock
+@@ -163,7 +163,7 @@ checksum = "b3d1d046238990b9cf5bcde22a3fb3584ee5cf65fb2765f454ed428c7a0063da"
+ [[package]]
+ name = "app-error"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "bincode",
+@@ -183,11 +183,12 @@ dependencies = [
+ [[package]]
+ name = "appflowy-ai-client"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "bytes",
+  "futures",
++ "pin-project",
+  "serde",
+  "serde_json",
+  "serde_repr",
+@@ -717,7 +718,7 @@ dependencies = [
+ [[package]]
+ name = "client-api"
+ version = "0.2.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "again",
+  "anyhow",
+@@ -767,7 +768,7 @@ dependencies = [
+ [[package]]
+ name = "client-api-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "collab-entity",
+  "collab-rt-entity",
+@@ -779,7 +780,7 @@ dependencies = [
+ [[package]]
+ name = "client-websocket"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "futures-channel",
+  "futures-util",
+@@ -992,7 +993,7 @@ dependencies = [
+ [[package]]
+ name = "collab-rt-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "bincode",
+@@ -1017,7 +1018,7 @@ dependencies = [
+ [[package]]
+ name = "collab-rt-protocol"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "async-trait",
+@@ -1355,7 +1356,7 @@ checksum = "c2e66c9d817f1720209181c316d28635c050fa304f9c79e47a520882661b7308"
+ [[package]]
+ name = "database-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "app-error",
+@@ -1798,6 +1799,7 @@ dependencies = [
+  "md5",
+  "notify",
+  "parking_lot 0.12.1",
++ "pin-project",
+  "protobuf",
+  "reqwest",
+  "serde",
+@@ -1825,6 +1827,7 @@ dependencies = [
+  "flowy-error",
+  "futures",
+  "lib-infra",
++ "serde_json",
+ ]
+ 
+ [[package]]
+@@ -2727,7 +2730,7 @@ dependencies = [
+ [[package]]
+ name = "gotrue"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "futures-util",
+@@ -2744,7 +2747,7 @@ dependencies = [
+ [[package]]
+ name = "gotrue-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "app-error",
+@@ -3109,7 +3112,7 @@ dependencies = [
+ [[package]]
+ name = "infra"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -5304,7 +5307,7 @@ dependencies = [
+ [[package]]
+ name = "shared-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=8f61e6d03469aac73b9ad88e37ac6898a691289d#8f61e6d03469aac73b9ad88e37ac6898a691289d"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=a371912c61d79fa946ec78f0cb852fdd7d391356#a371912c61d79fa946ec78f0cb852fdd7d391356"
+ dependencies = [
+  "anyhow",
+  "app-error",
+diff --git a/frontend/rust-lib/Cargo.toml b/frontend/rust-lib/Cargo.toml
+index ebf85f85c2d50..1611828c0c8eb 100644
+--- a/frontend/rust-lib/Cargo.toml
++++ b/frontend/rust-lib/Cargo.toml
+@@ -99,8 +99,8 @@ zip = "2.1.3"
+ # Run the script.add_workspace_members:
+ # scripts/tool/update_client_api_rev.sh  new_rev_id
+ # ⚠️⚠️⚠️️
+-client-api = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "8f61e6d03469aac73b9ad88e37ac6898a691289d" }
+-client-api-entity = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "8f61e6d03469aac73b9ad88e37ac6898a691289d" }
++client-api = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "a371912c61d79fa946ec78f0cb852fdd7d391356" }
++client-api-entity = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "a371912c61d79fa946ec78f0cb852fdd7d391356" }
+ 
+ [profile.dev]
+ opt-level = 0
+diff --git a/frontend/rust-lib/event-integration-test/src/document/document_event.rs b/frontend/rust-lib/event-integration-test/src/document/document_event.rs
+index 8c278084e3d31..a6cab721d7bad 100644
+--- a/frontend/rust-lib/event-integration-test/src/document/document_event.rs
++++ b/frontend/rust-lib/event-integration-test/src/document/document_event.rs
+@@ -42,7 +42,7 @@ impl DocumentEventTest {
+       .event_test
+       .appflowy_core
+       .document_manager
+-      .get_document(doc_id)
++      .get_opened_document(doc_id)
+       .await
+       .unwrap();
+     let guard = doc.lock();
+diff --git a/frontend/rust-lib/event-integration-test/tests/chat/chat_message_test.rs b/frontend/rust-lib/event-integration-test/tests/chat/chat_message_test.rs
+index 5967cfec27911..f6217f8d38265 100644
+--- a/frontend/rust-lib/event-integration-test/tests/chat/chat_message_test.rs
++++ b/frontend/rust-lib/event-integration-test/tests/chat/chat_message_test.rs
+@@ -20,11 +20,12 @@ async fn af_cloud_create_chat_message_test() {
+   let chat_service = test.server_provider.get_server().unwrap().chat_service();
+   for i in 0..10 {
+     let _ = chat_service
+-      .save_question(
++      .create_question(
+         &current_workspace.id,
+         &chat_id,
+         &format!("hello world {}", i),
+         ChatMessageType::System,
++        vec![],
+       )
+       .await
+       .unwrap();
+@@ -75,11 +76,12 @@ async fn af_cloud_load_remote_system_message_test() {
+   let chat_service = test.server_provider.get_server().unwrap().chat_service();
+   for i in 0..10 {
+     let _ = chat_service
+-      .save_question(
++      .create_question(
+         &current_workspace.id,
+         &chat_id,
+         &format!("hello server {}", i),
+         ChatMessageType::System,
++        vec![],
+       )
+       .await
+       .unwrap();
+diff --git a/frontend/rust-lib/flowy-ai-pub/Cargo.toml b/frontend/rust-lib/flowy-ai-pub/Cargo.toml
+index 426ec7b5e0ef1..f7ebbdf1bbf39 100644
+--- a/frontend/rust-lib/flowy-ai-pub/Cargo.toml
++++ b/frontend/rust-lib/flowy-ai-pub/Cargo.toml
+@@ -10,4 +10,5 @@ lib-infra = { workspace = true }
+ flowy-error = { workspace = true }
+ client-api = { workspace = true }
+ bytes.workspace = true
+-futures.workspace = true
+\ No newline at end of file
++futures.workspace = true
++serde_json.workspace = true
+\ No newline at end of file
+diff --git a/frontend/rust-lib/flowy-ai-pub/src/cloud.rs b/frontend/rust-lib/flowy-ai-pub/src/cloud.rs
+index abc1d97834d9c..8d7932dc01f9b 100644
+--- a/frontend/rust-lib/flowy-ai-pub/src/cloud.rs
++++ b/frontend/rust-lib/flowy-ai-pub/src/cloud.rs
+@@ -1,10 +1,11 @@
+ use bytes::Bytes;
+ pub use client_api::entity::ai_dto::{
+-  AppFlowyOfflineAI, CompletionType, LLMModel, LocalAIConfig, ModelInfo, RelatedQuestion,
+-  RepeatedRelatedQuestion, StringOrMessage,
++  AppFlowyOfflineAI, CompletionType, CreateTextChatContext, LLMModel, LocalAIConfig, ModelInfo,
++  RelatedQuestion, RepeatedRelatedQuestion, StringOrMessage,
+ };
+ pub use client_api::entity::{
+-  ChatAuthorType, ChatMessage, ChatMessageType, MessageCursor, QAChatMessage, RepeatedChatMessage,
++  ChatAuthorType, ChatMessage, ChatMessageMetadata, ChatMessageType, ChatMetadataData,
++  MessageCursor, QAChatMessage, QuestionStreamValue, RepeatedChatMessage,
+ };
+ use client_api::error::AppResponseError;
+ use flowy_error::FlowyError;
+@@ -14,7 +15,7 @@ use lib_infra::future::FutureResult;
+ use std::path::PathBuf;
+ 
+ pub type ChatMessageStream = BoxStream<'static, Result<ChatMessage, AppResponseError>>;
+-pub type StreamAnswer = BoxStream<'static, Result<Bytes, FlowyError>>;
++pub type StreamAnswer = BoxStream<'static, Result<QuestionStreamValue, FlowyError>>;
+ pub type StreamComplete = BoxStream<'static, Result<Bytes, FlowyError>>;
+ #[async_trait]
+ pub trait ChatCloudService: Send + Sync + 'static {
+@@ -25,30 +26,32 @@ pub trait ChatCloudService: Send + Sync + 'static {
+     chat_id: &str,
+   ) -> FutureResult<(), FlowyError>;
+ 
+-  fn save_question(
++  fn create_question(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+     message: &str,
+     message_type: ChatMessageType,
++    metadata: Vec<ChatMessageMetadata>,
+   ) -> FutureResult<ChatMessage, FlowyError>;
+ 
+-  fn save_answer(
++  fn create_answer(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+     message: &str,
+     question_id: i64,
++    metadata: Option<serde_json::Value>,
+   ) -> FutureResult<ChatMessage, FlowyError>;
+ 
+-  async fn ask_question(
++  async fn stream_answer(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+     message_id: i64,
+   ) -> Result<StreamAnswer, FlowyError>;
+ 
+-  async fn generate_answer(
++  async fn get_answer(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+@@ -85,4 +88,12 @@ pub trait ChatCloudService: Send + Sync + 'static {
+   ) -> Result<(), FlowyError>;
+ 
+   async fn get_local_ai_config(&self, workspace_id: &str) -> Result<LocalAIConfig, FlowyError>;
++
++  async fn create_chat_context(
++    &self,
++    _workspace_id: &str,
++    _chat_context: CreateTextChatContext,
++  ) -> Result<(), FlowyError> {
++    Ok(())
++  }
+ }
+diff --git a/frontend/rust-lib/flowy-ai/Cargo.toml b/frontend/rust-lib/flowy-ai/Cargo.toml
+index 750c912cf4895..8d7db1609fb9a 100644
+--- a/frontend/rust-lib/flowy-ai/Cargo.toml
++++ b/frontend/rust-lib/flowy-ai/Cargo.toml
+@@ -43,6 +43,7 @@ futures-util = "0.3.30"
+ md5 = "0.7.0"
+ zip = { workspace = true, features = ["deflate"] }
+ zip-extensions = "0.8.0"
++pin-project = "1.1.5"
+ 
+ [target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))'.dependencies]
+ notify = "6.1.1"
+diff --git a/frontend/rust-lib/flowy-ai/src/ai_manager.rs b/frontend/rust-lib/flowy-ai/src/ai_manager.rs
+index f1c2fc41910ba..c0ae334f9fad4 100644
+--- a/frontend/rust-lib/flowy-ai/src/ai_manager.rs
++++ b/frontend/rust-lib/flowy-ai/src/ai_manager.rs
+@@ -1,17 +1,22 @@
+ use crate::chat::Chat;
+-use crate::entities::{ChatMessageListPB, ChatMessagePB, RepeatedRelatedQuestionPB};
++use crate::entities::{
++  ChatMessageListPB, ChatMessagePB, CreateChatContextPB, RepeatedRelatedQuestionPB,
++};
+ use crate::local_ai::local_llm_chat::LocalAIController;
+ use crate::middleware::chat_service_mw::AICloudServiceMiddleware;
+ use crate::persistence::{insert_chat, ChatTable};
+ 
+ use appflowy_plugin::manager::PluginManager;
+ use dashmap::DashMap;
+-use flowy_ai_pub::cloud::{ChatCloudService, ChatMessageType};
++use flowy_ai_pub::cloud::{
++  ChatCloudService, ChatMessageMetadata, ChatMessageType, CreateTextChatContext,
++};
+ use flowy_error::{FlowyError, FlowyResult};
+ use flowy_sqlite::kv::KVStorePreferences;
+ use flowy_sqlite::DBConnection;
+ 
+ use lib_infra::util::timestamp;
++use serde_json::json;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+ use tracing::{info, trace};
+@@ -101,6 +106,27 @@ impl AIManager {
+     Ok(())
+   }
+ 
++  pub async fn create_chat_context(&self, context: CreateChatContextPB) -> FlowyResult<()> {
++    let workspace_id = self.user_service.workspace_id()?;
++    let context = CreateTextChatContext {
++      chat_id: context.chat_id,
++      content_type: context.content_type,
++      text: context.text,
++      chunk_size: 2000,
++      chunk_overlap: 20,
++      metadata: context
++        .metadata
++        .into_iter()
++        .map(|(k, v)| (k, json!(v)))
++        .collect(),
++    };
++    self
++      .cloud_service_wm
++      .create_chat_context(&workspace_id, context)
++      .await?;
++    Ok(())
++  }
++
+   pub async fn create_chat(&self, uid: &i64, chat_id: &str) -> Result<Arc<Chat>, FlowyError> {
+     let workspace_id = self.user_service.workspace_id()?;
+     self
+@@ -125,10 +151,11 @@ impl AIManager {
+     message: &str,
+     message_type: ChatMessageType,
+     text_stream_port: i64,
++    metadata: Vec<ChatMessageMetadata>,
+   ) -> Result<ChatMessagePB, FlowyError> {
+     let chat = self.get_or_create_chat_instance(chat_id).await?;
+     let question = chat
+-      .stream_chat_message(message, message_type, text_stream_port)
++      .stream_chat_message(message, message_type, text_stream_port, metadata)
+       .await?;
+     Ok(question)
+   }
+diff --git a/frontend/rust-lib/flowy-ai/src/chat.rs b/frontend/rust-lib/flowy-ai/src/chat.rs
+index af67d8ed83d80..e3b0808afd593 100644
+--- a/frontend/rust-lib/flowy-ai/src/chat.rs
++++ b/frontend/rust-lib/flowy-ai/src/chat.rs
+@@ -6,7 +6,10 @@ use crate::middleware::chat_service_mw::AICloudServiceMiddleware;
+ use crate::notification::{make_notification, ChatNotification};
+ use crate::persistence::{insert_chat_messages, select_chat_messages, ChatMessageTable};
+ use allo_isolate::Isolate;
+-use flowy_ai_pub::cloud::{ChatCloudService, ChatMessage, ChatMessageType, MessageCursor};
++use flowy_ai_pub::cloud::{
++  ChatCloudService, ChatMessage, ChatMessageMetadata, ChatMessageType, MessageCursor,
++  QuestionStreamValue,
++};
+ use flowy_error::{FlowyError, FlowyResult};
+ use flowy_sqlite::DBConnection;
+ use futures::{SinkExt, StreamExt};
+@@ -31,7 +34,7 @@ pub struct Chat {
+   prev_message_state: Arc<RwLock<PrevMessageState>>,
+   latest_message_id: Arc<AtomicI64>,
+   stop_stream: Arc<AtomicBool>,
+-  steam_buffer: Arc<Mutex<String>>,
++  stream_buffer: Arc<Mutex<StringBuffer>>,
+ }
+ 
+ impl Chat {
+@@ -49,7 +52,7 @@ impl Chat {
+       prev_message_state: Arc::new(RwLock::new(PrevMessageState::HasMore)),
+       latest_message_id: Default::default(),
+       stop_stream: Arc::new(AtomicBool::new(false)),
+-      steam_buffer: Arc::new(Mutex::new("".to_string())),
++      stream_buffer: Arc::new(Mutex::new(StringBuffer::default())),
+     }
+   }
+ 
+@@ -79,6 +82,7 @@ impl Chat {
+     message: &str,
+     message_type: ChatMessageType,
+     text_stream_port: i64,
++    metadata: Vec<ChatMessageMetadata>,
+   ) -> Result<ChatMessagePB, FlowyError> {
+     if message.len() > 2000 {
+       return Err(FlowyError::text_too_long().with_context("Exceeds maximum message 2000 length"));
+@@ -87,15 +91,21 @@ impl Chat {
+     self
+       .stop_stream
+       .store(false, std::sync::atomic::Ordering::SeqCst);
+-    self.steam_buffer.lock().await.clear();
++    self.stream_buffer.lock().await.clear();
+ 
+-    let stream_buffer = self.steam_buffer.clone();
++    let stream_buffer = self.stream_buffer.clone();
+     let uid = self.user_service.user_id()?;
+     let workspace_id = self.user_service.workspace_id()?;
+ 
+     let question = self
+       .chat_service
+-      .save_question(&workspace_id, &self.chat_id, message, message_type)
++      .create_question(
++        &workspace_id,
++        &self.chat_id,
++        message,
++        message_type,
++        metadata,
++      )
+       .await
+       .map_err(|err| {
+         error!("Failed to send question: {}", err);
+@@ -116,7 +126,7 @@ impl Chat {
+     tokio::spawn(async move {
+       let mut text_sink = IsolateSink::new(Isolate::new(text_stream_port));
+       match cloud_service
+-        .ask_question(&workspace_id, &chat_id, question_id)
++        .stream_answer(&workspace_id, &chat_id, question_id)
+         .await
+       {
+         Ok(mut stream) => {
+@@ -127,9 +137,18 @@ impl Chat {
+                   trace!("[Chat] stop streaming message");
+                   break;
+                 }
+-                let s = String::from_utf8(message.to_vec()).unwrap_or_default();
+-                stream_buffer.lock().await.push_str(&s);
+-                let _ = text_sink.send(format!("data:{}", s)).await;
++                match message {
++                  QuestionStreamValue::Answer { value } => {
++                    stream_buffer.lock().await.push_str(&value);
++                    let _ = text_sink.send(format!("data:{}", value)).await;
++                  },
++                  QuestionStreamValue::Metadata { value } => {
++                    if let Ok(s) = serde_json::to_string(&value) {
++                      stream_buffer.lock().await.set_metadata(value);
++                      let _ = text_sink.send(format!("metadata:{}", s)).await;
++                    }
++                  },
++                }
+               },
+               Err(err) => {
+                 error!("[Chat] failed to stream answer: {}", err);
+@@ -169,14 +188,11 @@ impl Chat {
+       if stream_buffer.lock().await.is_empty() {
+         return Ok(());
+       }
++      let content = stream_buffer.lock().await.take_content();
++      let metadata = stream_buffer.lock().await.take_metadata();
+ 
+       let answer = cloud_service
+-        .save_answer(
+-          &workspace_id,
+-          &chat_id,
+-          &stream_buffer.lock().await,
+-          question_id,
+-        )
++        .create_answer(&workspace_id, &chat_id, &content, question_id, metadata)
+         .await?;
+       Self::save_answer(uid, &chat_id, &user_service, answer)?;
+       Ok::<(), FlowyError>(())
+@@ -192,6 +208,7 @@ impl Chat {
+     user_service: &Arc<dyn AIUserService>,
+     answer: ChatMessage,
+   ) -> Result<(), FlowyError> {
++    trace!("[Chat] save answer: answer={:?}", answer);
+     save_chat_message(
+       user_service.sqlite_connection(uid)?,
+       chat_id,
+@@ -405,7 +422,7 @@ impl Chat {
+     let workspace_id = self.user_service.workspace_id()?;
+     let answer = self
+       .chat_service
+-      .generate_answer(&workspace_id, &self.chat_id, question_message_id)
++      .get_answer(&workspace_id, &self.chat_id, question_message_id)
+       .await?;
+ 
+     Self::save_answer(self.uid, &self.chat_id, &self.user_service, answer.clone())?;
+@@ -436,6 +453,7 @@ impl Chat {
+         author_type: record.author_type,
+         author_id: record.author_id,
+         reply_message_id: record.reply_message_id,
++        metadata: record.metadata,
+       })
+       .collect::<Vec<_>>();
+ 
+@@ -485,8 +503,42 @@ fn save_chat_message(
+       author_type: message.author.author_type as i64,
+       author_id: message.author.author_id.to_string(),
+       reply_message_id: message.reply_message_id,
++      metadata: Some(serde_json::to_string(&message.meta_data).unwrap_or_default()),
+     })
+     .collect::<Vec<_>>();
+   insert_chat_messages(conn, &records)?;
+   Ok(())
+ }
++
++#[derive(Debug, Default)]
++struct StringBuffer {
++  content: String,
++  metadata: Option<serde_json::Value>,
++}
++
++impl StringBuffer {
++  fn clear(&mut self) {
++    self.content.clear();
++    self.metadata = None;
++  }
++
++  fn push_str(&mut self, value: &str) {
++    self.content.push_str(value);
++  }
++
++  fn set_metadata(&mut self, value: serde_json::Value) {
++    self.metadata = Some(value);
++  }
++
++  fn is_empty(&self) -> bool {
++    self.content.is_empty()
++  }
++
++  fn take_metadata(&mut self) -> Option<serde_json::Value> {
++    self.metadata.take()
++  }
++
++  fn take_content(&mut self) -> String {
++    std::mem::take(&mut self.content)
++  }
++}
+diff --git a/frontend/rust-lib/flowy-ai/src/entities.rs b/frontend/rust-lib/flowy-ai/src/entities.rs
+index 05106ed99bd9d..21f17a0d987e1 100644
+--- a/frontend/rust-lib/flowy-ai/src/entities.rs
++++ b/frontend/rust-lib/flowy-ai/src/entities.rs
+@@ -1,5 +1,6 @@
+ use crate::local_ai::local_llm_chat::LLMModelInfo;
+ use appflowy_plugin::core::plugin::RunningState;
++use std::collections::HashMap;
+ 
+ use crate::local_ai::local_llm_resource::PendingResource;
+ use flowy_ai_pub::cloud::{
+@@ -38,6 +39,21 @@ pub struct StreamChatPayloadPB {
+ 
+   #[pb(index = 4)]
+   pub text_stream_port: i64,
++
++  #[pb(index = 5)]
++  pub metadata: Vec<ChatMessageMetaPB>,
++}
++
++#[derive(Default, ProtoBuf, Validate, Clone, Debug)]
++pub struct ChatMessageMetaPB {
++  #[pb(index = 1)]
++  pub id: String,
++
++  #[pb(index = 2)]
++  pub name: String,
++
++  #[pb(index = 3)]
++  pub text: String,
+ }
+ 
+ #[derive(Default, ProtoBuf, Validate, Clone, Debug)]
+@@ -127,6 +143,9 @@ pub struct ChatMessagePB {
+ 
+   #[pb(index = 6, one_of)]
+   pub reply_message_id: Option<i64>,
++
++  #[pb(index = 7, one_of)]
++  pub metadata: Option<String>,
+ }
+ 
+ #[derive(Debug, Clone, Default, ProtoBuf)]
+@@ -147,6 +166,7 @@ impl From<ChatMessage> for ChatMessagePB {
+       author_type: chat_message.author.author_type as i64,
+       author_id: chat_message.author.author_id.to_string(),
+       reply_message_id: None,
++      metadata: Some(serde_json::to_string(&chat_message.meta_data).unwrap_or_default()),
+     }
+   }
+ }
+@@ -445,3 +465,21 @@ pub struct OfflineAIPB {
+   #[pb(index = 1)]
+   pub link: String,
+ }
++
++#[derive(Default, ProtoBuf, Validate, Clone, Debug)]
++pub struct CreateChatContextPB {
++  #[pb(index = 1)]
++  #[validate(custom = "required_not_empty_str")]
++  pub content_type: String,
++
++  #[pb(index = 2)]
++  #[validate(custom = "required_not_empty_str")]
++  pub text: String,
++
++  #[pb(index = 3)]
++  pub metadata: HashMap<String, String>,
++
++  #[pb(index = 4)]
++  #[validate(custom = "required_not_empty_str")]
++  pub chat_id: String,
++}
+diff --git a/frontend/rust-lib/flowy-ai/src/event_handler.rs b/frontend/rust-lib/flowy-ai/src/event_handler.rs
+index 20ef4f9c03ee5..bb8af3f7a3e4e 100644
+--- a/frontend/rust-lib/flowy-ai/src/event_handler.rs
++++ b/frontend/rust-lib/flowy-ai/src/event_handler.rs
+@@ -1,20 +1,18 @@
+-use flowy_ai_pub::cloud::ChatMessageType;
+-
+ use std::path::PathBuf;
+ 
+-use allo_isolate::Isolate;
+-use std::sync::{Arc, Weak};
+-use tokio::sync::oneshot;
+-use validator::Validate;
+-
+ use crate::ai_manager::AIManager;
+ use crate::completion::AICompletion;
+ use crate::entities::*;
+ use crate::local_ai::local_llm_chat::LLMModelInfo;
+ use crate::notification::{make_notification, ChatNotification, APPFLOWY_AI_NOTIFICATION_KEY};
++use allo_isolate::Isolate;
++use flowy_ai_pub::cloud::{ChatMessageMetadata, ChatMessageType, ChatMetadataData};
+ use flowy_error::{ErrorCode, FlowyError, FlowyResult};
+ use lib_dispatch::prelude::{data_result_ok, AFPluginData, AFPluginState, DataResult};
+ use lib_infra::isolate_stream::IsolateSink;
++use std::sync::{Arc, Weak};
++use tokio::sync::oneshot;
++use validator::Validate;
+ 
+ fn upgrade_ai_manager(ai_manager: AFPluginState<Weak<AIManager>>) -> FlowyResult<Arc<AIManager>> {
+   let ai_manager = ai_manager
+@@ -37,12 +35,24 @@ pub(crate) async fn stream_chat_message_handler(
+     ChatMessageTypePB::User => ChatMessageType::User,
+   };
+ 
++  let metadata = data
++    .metadata
++    .into_iter()
++    .map(|metadata| ChatMessageMetadata {
++      data: ChatMetadataData::new_text(metadata.text),
++      id: metadata.id,
++      name: metadata.name.clone(),
++      source: metadata.name,
++    })
++    .collect::<Vec<_>>();
++
+   let question = ai_manager
+     .stream_chat_message(
+       &data.chat_id,
+       &data.message,
+       message_type,
+       data.text_stream_port,
++      metadata,
+     )
+     .await?;
+   data_result_ok(question)
+@@ -386,3 +396,13 @@ pub(crate) async fn get_offline_app_handler(
+   let link = rx.await??;
+   data_result_ok(OfflineAIPB { link })
+ }
++
++#[tracing::instrument(level = "debug", skip_all, err)]
++pub(crate) async fn create_chat_context_handler(
++  data: AFPluginData<CreateChatContextPB>,
++  _ai_manager: AFPluginState<Weak<AIManager>>,
++) -> Result<(), FlowyError> {
++  let _data = data.try_into_inner()?;
++
++  Ok(())
++}
+diff --git a/frontend/rust-lib/flowy-ai/src/event_map.rs b/frontend/rust-lib/flowy-ai/src/event_map.rs
+index 7c56b7ed6ec8d..e4e9d03b4c211 100644
+--- a/frontend/rust-lib/flowy-ai/src/event_map.rs
++++ b/frontend/rust-lib/flowy-ai/src/event_map.rs
+@@ -55,6 +55,7 @@ pub fn init(ai_manager: Weak<AIManager>) -> AFPlugin {
+       get_model_storage_directory_handler,
+     )
+     .event(AIEvent::GetOfflineAIAppLink, get_offline_app_handler)
++    .event(AIEvent::CreateChatContext, create_chat_context_handler)
+ }
+ 
+ #[derive(Clone, Copy, PartialEq, Eq, Debug, Display, Hash, ProtoBuf_Enum, Flowy_Event)]
+@@ -134,4 +135,7 @@ pub enum AIEvent {
+ 
+   #[event(output = "OfflineAIPB")]
+   GetOfflineAIAppLink = 22,
++
++  #[event(input = "CreateChatContextPB")]
++  CreateChatContext = 23,
+ }
+diff --git a/frontend/rust-lib/flowy-ai/src/local_ai/mod.rs b/frontend/rust-lib/flowy-ai/src/local_ai/mod.rs
+index d24e0ff35184e..da0b615e298ad 100644
+--- a/frontend/rust-lib/flowy-ai/src/local_ai/mod.rs
++++ b/frontend/rust-lib/flowy-ai/src/local_ai/mod.rs
+@@ -3,5 +3,6 @@ pub mod local_llm_resource;
+ mod model_request;
+ 
+ mod path;
++pub mod stream_util;
+ #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+ pub mod watch;
+diff --git a/frontend/rust-lib/flowy-ai/src/local_ai/stream_util.rs b/frontend/rust-lib/flowy-ai/src/local_ai/stream_util.rs
+new file mode 100644
+index 0000000000000..9043870af1d2e
+--- /dev/null
++++ b/frontend/rust-lib/flowy-ai/src/local_ai/stream_util.rs
+@@ -0,0 +1,42 @@
++use appflowy_plugin::error::PluginError;
++use bytes::Bytes;
++use flowy_ai_pub::cloud::QuestionStreamValue;
++use flowy_error::FlowyError;
++use futures::{ready, Stream};
++use pin_project::pin_project;
++use std::pin::Pin;
++use std::task::{Context, Poll};
++
++#[pin_project]
++pub struct LocalAIStreamAdaptor {
++  stream: Pin<Box<dyn Stream<Item = Result<Bytes, PluginError>> + Send>>,
++  buffer: Vec<u8>,
++}
++
++impl LocalAIStreamAdaptor {
++  pub fn new<S>(stream: S) -> Self
++  where
++    S: Stream<Item = Result<Bytes, PluginError>> + Send + 'static,
++  {
++    LocalAIStreamAdaptor {
++      stream: Box::pin(stream),
++      buffer: Vec::new(),
++    }
++  }
++}
++
++impl Stream for LocalAIStreamAdaptor {
++  type Item = Result<QuestionStreamValue, FlowyError>;
++
++  fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
++    let this = self.project();
++    return match ready!(this.stream.as_mut().poll_next(cx)) {
++      Some(Ok(bytes)) => match String::from_utf8(bytes.to_vec()) {
++        Ok(s) => Poll::Ready(Some(Ok(QuestionStreamValue::Answer { value: s }))),
++        Err(err) => Poll::Ready(Some(Err(FlowyError::internal().with_context(err)))),
++      },
++      Some(Err(err)) => Poll::Ready(Some(Err(FlowyError::local_ai().with_context(err)))),
++      None => Poll::Ready(None),
++    };
++  }
++}
+diff --git a/frontend/rust-lib/flowy-ai/src/middleware/chat_service_mw.rs b/frontend/rust-lib/flowy-ai/src/middleware/chat_service_mw.rs
+index 7c48283a1d0f4..712e452d39a94 100644
+--- a/frontend/rust-lib/flowy-ai/src/middleware/chat_service_mw.rs
++++ b/frontend/rust-lib/flowy-ai/src/middleware/chat_service_mw.rs
+@@ -6,14 +6,16 @@ use crate::persistence::select_single_message;
+ use appflowy_plugin::error::PluginError;
+ 
+ use flowy_ai_pub::cloud::{
+-  ChatCloudService, ChatMessage, ChatMessageType, CompletionType, LocalAIConfig, MessageCursor,
+-  RelatedQuestion, RepeatedChatMessage, RepeatedRelatedQuestion, StreamAnswer, StreamComplete,
++  ChatCloudService, ChatMessage, ChatMessageMetadata, ChatMessageType, CompletionType,
++  CreateTextChatContext, LocalAIConfig, MessageCursor, RelatedQuestion, RepeatedChatMessage,
++  RepeatedRelatedQuestion, StreamAnswer, StreamComplete,
+ };
+ use flowy_error::{FlowyError, FlowyResult};
+ use futures::{stream, StreamExt, TryStreamExt};
+ use lib_infra::async_trait::async_trait;
+ use lib_infra::future::FutureResult;
+ 
++use crate::local_ai::stream_util::LocalAIStreamAdaptor;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+ 
+@@ -77,31 +79,33 @@ impl ChatCloudService for AICloudServiceMiddleware {
+     self.cloud_service.create_chat(uid, workspace_id, chat_id)
+   }
+ 
+-  fn save_question(
++  fn create_question(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+     message: &str,
+     message_type: ChatMessageType,
++    metadata: Vec<ChatMessageMetadata>,
+   ) -> FutureResult<ChatMessage, FlowyError> {
+     self
+       .cloud_service
+-      .save_question(workspace_id, chat_id, message, message_type)
++      .create_question(workspace_id, chat_id, message, message_type, metadata)
+   }
+ 
+-  fn save_answer(
++  fn create_answer(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+     message: &str,
+     question_id: i64,
++    metadata: Option<serde_json::Value>,
+   ) -> FutureResult<ChatMessage, FlowyError> {
+     self
+       .cloud_service
+-      .save_answer(workspace_id, chat_id, message, question_id)
++      .create_answer(workspace_id, chat_id, message, question_id, metadata)
+   }
+ 
+-  async fn ask_question(
++  async fn stream_answer(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+@@ -114,11 +118,7 @@ impl ChatCloudService for AICloudServiceMiddleware {
+         .stream_question(chat_id, &content)
+         .await
+       {
+-        Ok(stream) => Ok(
+-          stream
+-            .map_err(|err| FlowyError::local_ai().with_context(err))
+-            .boxed(),
+-        ),
++        Ok(stream) => Ok(LocalAIStreamAdaptor::new(stream).boxed()),
+         Err(err) => {
+           self.handle_plugin_error(err);
+           Ok(stream::once(async { Err(FlowyError::local_ai_unavailable()) }).boxed())
+@@ -127,12 +127,12 @@ impl ChatCloudService for AICloudServiceMiddleware {
+     } else {
+       self
+         .cloud_service
+-        .ask_question(workspace_id, chat_id, message_id)
++        .stream_answer(workspace_id, chat_id, message_id)
+         .await
+     }
+   }
+ 
+-  async fn generate_answer(
++  async fn get_answer(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+@@ -146,9 +146,10 @@ impl ChatCloudService for AICloudServiceMiddleware {
+         .await
+       {
+         Ok(answer) => {
++          // TODO(nathan): metadata
+           let message = self
+             .cloud_service
+-            .save_answer(workspace_id, chat_id, &answer, question_message_id)
++            .create_answer(workspace_id, chat_id, &answer, question_message_id, None)
+             .await?;
+           Ok(message)
+         },
+@@ -160,7 +161,7 @@ impl ChatCloudService for AICloudServiceMiddleware {
+     } else {
+       self
+         .cloud_service
+-        .generate_answer(workspace_id, chat_id, question_message_id)
++        .get_answer(workspace_id, chat_id, question_message_id)
+         .await
+     }
+   }
+@@ -262,4 +263,20 @@ impl ChatCloudService for AICloudServiceMiddleware {
+   async fn get_local_ai_config(&self, workspace_id: &str) -> Result<LocalAIConfig, FlowyError> {
+     self.cloud_service.get_local_ai_config(workspace_id).await
+   }
++
++  async fn create_chat_context(
++    &self,
++    workspace_id: &str,
++    chat_context: CreateTextChatContext,
++  ) -> Result<(), FlowyError> {
++    if self.local_llm_controller.is_running() {
++      // TODO(nathan): support offline ai context
++      Ok(())
++    } else {
++      self
++        .cloud_service
++        .create_chat_context(workspace_id, chat_context)
++        .await
++    }
++  }
+ }
+diff --git a/frontend/rust-lib/flowy-ai/src/persistence/chat_message_sql.rs b/frontend/rust-lib/flowy-ai/src/persistence/chat_message_sql.rs
+index b7cb6579b7a0a..91a806730b15c 100644
+--- a/frontend/rust-lib/flowy-ai/src/persistence/chat_message_sql.rs
++++ b/frontend/rust-lib/flowy-ai/src/persistence/chat_message_sql.rs
+@@ -19,6 +19,7 @@ pub struct ChatMessageTable {
+   pub author_type: i64,
+   pub author_id: String,
+   pub reply_message_id: Option<i64>,
++  pub metadata: Option<String>,
+ }
+ 
+ pub fn insert_chat_messages(
+diff --git a/frontend/rust-lib/flowy-core/src/integrate/trait_impls.rs b/frontend/rust-lib/flowy-core/src/integrate/trait_impls.rs
+index fa1c8e4e0ae8c..0f6d4142332f6 100644
+--- a/frontend/rust-lib/flowy-core/src/integrate/trait_impls.rs
++++ b/frontend/rust-lib/flowy-core/src/integrate/trait_impls.rs
+@@ -19,8 +19,8 @@ use collab_integrate::collab_builder::{
+   CollabCloudPluginProvider, CollabPluginProviderContext, CollabPluginProviderType,
+ };
+ use flowy_ai_pub::cloud::{
+-  ChatCloudService, ChatMessage, LocalAIConfig, MessageCursor, RepeatedChatMessage, StreamAnswer,
+-  StreamComplete,
++  ChatCloudService, ChatMessage, ChatMessageMetadata, LocalAIConfig, MessageCursor,
++  RepeatedChatMessage, StreamAnswer, StreamComplete,
+ };
+ use flowy_database_pub::cloud::{
+   CollabDocStateByOid, DatabaseAIService, DatabaseCloudService, DatabaseSnapshot,
+@@ -611,12 +611,13 @@ impl ChatCloudService for ServerProvider {
+     })
+   }
+ 
+-  fn save_question(
++  fn create_question(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+     message: &str,
+     message_type: ChatMessageType,
++    metadata: Vec<ChatMessageMetadata>,
+   ) -> FutureResult<ChatMessage, FlowyError> {
+     let workspace_id = workspace_id.to_string();
+     let chat_id = chat_id.to_string();
+@@ -626,17 +627,18 @@ impl ChatCloudService for ServerProvider {
+     FutureResult::new(async move {
+       server?
+         .chat_service()
+-        .save_question(&workspace_id, &chat_id, &message, message_type)
++        .create_question(&workspace_id, &chat_id, &message, message_type, metadata)
+         .await
+     })
+   }
+ 
+-  fn save_answer(
++  fn create_answer(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+     message: &str,
+     question_id: i64,
++    metadata: Option<serde_json::Value>,
+   ) -> FutureResult<ChatMessage, FlowyError> {
+     let workspace_id = workspace_id.to_string();
+     let chat_id = chat_id.to_string();
+@@ -645,12 +647,12 @@ impl ChatCloudService for ServerProvider {
+     FutureResult::new(async move {
+       server?
+         .chat_service()
+-        .save_answer(&workspace_id, &chat_id, &message, question_id)
++        .create_answer(&workspace_id, &chat_id, &message, question_id, metadata)
+         .await
+     })
+   }
+ 
+-  async fn ask_question(
++  async fn stream_answer(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+@@ -661,7 +663,7 @@ impl ChatCloudService for ServerProvider {
+     let server = self.get_server()?;
+     server
+       .chat_service()
+-      .ask_question(&workspace_id, &chat_id, message_id)
++      .stream_answer(&workspace_id, &chat_id, message_id)
+       .await
+   }
+ 
+@@ -696,7 +698,7 @@ impl ChatCloudService for ServerProvider {
+       .await
+   }
+ 
+-  async fn generate_answer(
++  async fn get_answer(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+@@ -705,7 +707,7 @@ impl ChatCloudService for ServerProvider {
+     let server = self.get_server();
+     server?
+       .chat_service()
+-      .generate_answer(workspace_id, chat_id, question_message_id)
++      .get_answer(workspace_id, chat_id, question_message_id)
+       .await
+   }
+ 
+diff --git a/frontend/rust-lib/flowy-document/src/entities.rs b/frontend/rust-lib/flowy-document/src/entities.rs
+index 27f8f26f718c6..f408dbabca8e1 100644
+--- a/frontend/rust-lib/flowy-document/src/entities.rs
++++ b/frontend/rust-lib/flowy-document/src/entities.rs
+@@ -203,6 +203,11 @@ pub struct DocumentDataPB {
+   pub meta: MetaPB,
+ }
+ 
++#[derive(Default, Debug, ProtoBuf)]
++pub struct DocumentTextPB {
++  #[pb(index = 1)]
++  pub text: String,
++}
+ #[derive(Default, ProtoBuf, Debug, Clone)]
+ pub struct BlockPB {
+   #[pb(index = 1)]
+diff --git a/frontend/rust-lib/flowy-document/src/event_handler.rs b/frontend/rust-lib/flowy-document/src/event_handler.rs
+index bbba8c2d984f1..b99f51c8c5d56 100644
+--- a/frontend/rust-lib/flowy-document/src/event_handler.rs
++++ b/frontend/rust-lib/flowy-document/src/event_handler.rs
+@@ -74,7 +74,7 @@ pub(crate) async fn open_document_handler(
+   let doc_id = params.document_id;
+   manager.open_document(&doc_id).await?;
+ 
+-  let document = manager.get_document(&doc_id).await?;
++  let document = manager.get_opened_document(&doc_id).await?;
+   let document_data = document.lock().get_document_data()?;
+   data_result_ok(DocumentDataPB::from(document_data))
+ }
+@@ -103,6 +103,17 @@ pub(crate) async fn get_document_data_handler(
+   data_result_ok(DocumentDataPB::from(document_data))
+ }
+ 
++pub(crate) async fn get_document_text_handler(
++  data: AFPluginData<OpenDocumentPayloadPB>,
++  manager: AFPluginState<Weak<DocumentManager>>,
++) -> DataResult<DocumentTextPB, FlowyError> {
++  let manager = upgrade_document(manager)?;
++  let params: OpenDocumentParams = data.into_inner().try_into()?;
++  let doc_id = params.document_id;
++  let text = manager.get_document_text(&doc_id).await?;
++  data_result_ok(DocumentTextPB { text })
++}
++
+ // Handler for applying an action to a document
+ pub(crate) async fn apply_action_handler(
+   data: AFPluginData<ApplyActionPayloadPB>,
+@@ -111,7 +122,7 @@ pub(crate) async fn apply_action_handler(
+   let manager = upgrade_document(manager)?;
+   let params: ApplyActionParams = data.into_inner().try_into()?;
+   let doc_id = params.document_id;
+-  let document = manager.get_document(&doc_id).await?;
++  let document = manager.get_opened_document(&doc_id).await?;
+   let actions = params.actions;
+   if cfg!(feature = "verbose_log") {
+     tracing::trace!("{} applying actions: {:?}", doc_id, actions);
+@@ -128,7 +139,7 @@ pub(crate) async fn create_text_handler(
+   let manager = upgrade_document(manager)?;
+   let params: TextDeltaParams = data.into_inner().try_into()?;
+   let doc_id = params.document_id;
+-  let document = manager.get_document(&doc_id).await?;
++  let document = manager.get_opened_document(&doc_id).await?;
+   let document = document.lock();
+   document.create_text(&params.text_id, params.delta);
+   Ok(())
+@@ -142,7 +153,7 @@ pub(crate) async fn apply_text_delta_handler(
+   let manager = upgrade_document(manager)?;
+   let params: TextDeltaParams = data.into_inner().try_into()?;
+   let doc_id = params.document_id;
+-  let document = manager.get_document(&doc_id).await?;
++  let document = manager.get_opened_document(&doc_id).await?;
+   let text_id = params.text_id;
+   let delta = params.delta;
+   let document = document.lock();
+@@ -183,7 +194,7 @@ pub(crate) async fn redo_handler(
+   let manager = upgrade_document(manager)?;
+   let params: DocumentRedoUndoParams = data.into_inner().try_into()?;
+   let doc_id = params.document_id;
+-  let document = manager.get_document(&doc_id).await?;
++  let document = manager.get_opened_document(&doc_id).await?;
+   let document = document.lock();
+   let redo = document.redo();
+   let can_redo = document.can_redo();
+@@ -202,7 +213,7 @@ pub(crate) async fn undo_handler(
+   let manager = upgrade_document(manager)?;
+   let params: DocumentRedoUndoParams = data.into_inner().try_into()?;
+   let doc_id = params.document_id;
+-  let document = manager.get_document(&doc_id).await?;
++  let document = manager.get_opened_document(&doc_id).await?;
+   let document = document.lock();
+   let undo = document.undo();
+   let can_redo = document.can_redo();
+@@ -221,7 +232,7 @@ pub(crate) async fn can_undo_redo_handler(
+   let manager = upgrade_document(manager)?;
+   let params: DocumentRedoUndoParams = data.into_inner().try_into()?;
+   let doc_id = params.document_id;
+-  let document = manager.get_document(&doc_id).await?;
++  let document = manager.get_opened_document(&doc_id).await?;
+   let document = document.lock();
+   let can_redo = document.can_redo();
+   let can_undo = document.can_undo();
+@@ -377,7 +388,7 @@ pub async fn convert_document_handler(
+   let manager = upgrade_document(manager)?;
+   let params: ConvertDocumentParams = data.into_inner().try_into()?;
+ 
+-  let document = manager.get_document(&params.document_id).await?;
++  let document = manager.get_opened_document(&params.document_id).await?;
+   let document_data = document.lock().get_document_data()?;
+   let parser = DocumentDataParser::new(Arc::new(document_data), params.range);
+ 
+diff --git a/frontend/rust-lib/flowy-document/src/event_map.rs b/frontend/rust-lib/flowy-document/src/event_map.rs
+index 8cd619793bb9c..e05519d81e444 100644
+--- a/frontend/rust-lib/flowy-document/src/event_map.rs
++++ b/frontend/rust-lib/flowy-document/src/event_map.rs
+@@ -18,6 +18,7 @@ pub fn init(document_manager: Weak<DocumentManager>) -> AFPlugin {
+     .event(DocumentEvent::CloseDocument, close_document_handler)
+     .event(DocumentEvent::ApplyAction, apply_action_handler)
+     .event(DocumentEvent::GetDocumentData, get_document_data_handler)
++    .event(DocumentEvent::GetDocumentText, get_document_text_handler)
+     .event(
+       DocumentEvent::GetDocEncodedCollab,
+       get_encode_collab_handler,
+@@ -133,4 +134,7 @@ pub enum DocumentEvent {
+ 
+   #[event(input = "OpenDocumentPayloadPB", output = "EncodedCollabPB")]
+   GetDocEncodedCollab = 19,
++
++  #[event(input = "OpenDocumentPayloadPB", output = "DocumentTextPB")]
++  GetDocumentText = 20,
+ }
+diff --git a/frontend/rust-lib/flowy-document/src/manager.rs b/frontend/rust-lib/flowy-document/src/manager.rs
+index b284189f19dcb..7718eead4e895 100644
+--- a/frontend/rust-lib/flowy-document/src/manager.rs
++++ b/frontend/rust-lib/flowy-document/src/manager.rs
+@@ -6,6 +6,7 @@ use collab::core::origin::CollabOrigin;
+ use collab::entity::EncodedCollab;
+ use collab::preclude::Collab;
+ use collab_document::blocks::DocumentData;
++use collab_document::conversions::convert_document_to_plain_text;
+ use collab_document::document::Document;
+ use collab_document::document_awareness::DocumentAwarenessState;
+ use collab_document::document_awareness::DocumentAwarenessUser;
+@@ -151,7 +152,7 @@ impl DocumentManager {
+     }
+   }
+ 
+-  pub async fn get_document(&self, doc_id: &str) -> FlowyResult<Arc<MutexDocument>> {
++  pub async fn get_opened_document(&self, doc_id: &str) -> FlowyResult<Arc<MutexDocument>> {
+     if let Some(doc) = self.documents.get(doc_id).map(|item| item.value().clone()) {
+       return Ok(doc);
+     }
+@@ -166,7 +167,7 @@ impl DocumentManager {
+   /// If the document does not exist in local disk, try get the doc state from the cloud.
+   /// If the document exists, open the document and cache it
+   #[tracing::instrument(level = "info", skip(self), err)]
+-  async fn create_document_instance(&self, doc_id: &str) -> FlowyResult<Arc<MutexDocument>> {
++  async fn init_document_instance(&self, doc_id: &str) -> FlowyResult<Arc<MutexDocument>> {
+     if let Some(doc) = self.documents.get(doc_id).map(|item| item.value().clone()) {
+       return Ok(doc);
+     }
+@@ -220,6 +221,16 @@ impl DocumentManager {
+   }
+ 
+   pub async fn get_document_data(&self, doc_id: &str) -> FlowyResult<DocumentData> {
++    let document = self.get_document(doc_id).await?;
++    document.get_document_data().map_err(internal_error)
++  }
++  pub async fn get_document_text(&self, doc_id: &str) -> FlowyResult<String> {
++    let document = self.get_document(doc_id).await?;
++    let text = convert_document_to_plain_text(document)?;
++    Ok(text)
++  }
++
++  async fn get_document(&self, doc_id: &str) -> FlowyResult<Document> {
+     let mut doc_state = DataSource::Disk;
+     if !self.is_doc_exist(doc_id).await? {
+       doc_state = DataSource::DocStateV1(
+@@ -233,9 +244,8 @@ impl DocumentManager {
+     let collab = self
+       .collab_for_document(uid, doc_id, doc_state, false)
+       .await?;
+-    Document::open(collab)?
+-      .get_document_data()
+-      .map_err(internal_error)
++    let document = Document::open(collab)?;
++    Ok(document)
+   }
+ 
+   pub async fn open_document(&self, doc_id: &str) -> FlowyResult<()> {
+@@ -243,7 +253,7 @@ impl DocumentManager {
+       mutex_document.start_init_sync();
+     }
+ 
+-    let _ = self.create_document_instance(doc_id).await?;
++    let _ = self.init_document_instance(doc_id).await?;
+     Ok(())
+   }
+ 
+@@ -290,7 +300,7 @@ impl DocumentManager {
+   ) -> FlowyResult<bool> {
+     let uid = self.user_service.user_id()?;
+     let device_id = self.user_service.device_id()?;
+-    if let Ok(doc) = self.get_document(doc_id).await {
++    if let Ok(doc) = self.get_opened_document(doc_id).await {
+       if let Some(doc) = doc.try_lock() {
+         let user = DocumentAwarenessUser { uid, device_id };
+         let selection = state.selection.map(|s| s.into());
+diff --git a/frontend/rust-lib/flowy-document/tests/document/document_redo_undo_test.rs b/frontend/rust-lib/flowy-document/tests/document/document_redo_undo_test.rs
+index ad2fa54e3419a..ce97aa0bddf77 100644
+--- a/frontend/rust-lib/flowy-document/tests/document/document_redo_undo_test.rs
++++ b/frontend/rust-lib/flowy-document/tests/document/document_redo_undo_test.rs
+@@ -23,7 +23,7 @@ async fn undo_redo_test() {
+ 
+   // open a document
+   test.open_document(&doc_id).await.unwrap();
+-  let document = test.get_document(&doc_id).await.unwrap();
++  let document = test.get_opened_document(&doc_id).await.unwrap();
+   let document = document.lock();
+   let page_block = document.get_block(&data.page_id).unwrap();
+   let page_id = page_block.id;
+diff --git a/frontend/rust-lib/flowy-document/tests/document/document_test.rs b/frontend/rust-lib/flowy-document/tests/document/document_test.rs
+index 084e58693e9e0..8c57d9434665a 100644
+--- a/frontend/rust-lib/flowy-document/tests/document/document_test.rs
++++ b/frontend/rust-lib/flowy-document/tests/document/document_test.rs
+@@ -23,7 +23,7 @@ async fn restore_document() {
+   test.open_document(&doc_id).await.unwrap();
+ 
+   let data_b = test
+-    .get_document(&doc_id)
++    .get_opened_document(&doc_id)
+     .await
+     .unwrap()
+     .lock()
+@@ -37,7 +37,7 @@ async fn restore_document() {
+   _ = test.create_document(uid, &doc_id, Some(data.clone())).await;
+   // open a document
+   let data_b = test
+-    .get_document(&doc_id)
++    .get_opened_document(&doc_id)
+     .await
+     .unwrap()
+     .lock()
+@@ -61,7 +61,7 @@ async fn document_apply_insert_action() {
+ 
+   // open a document
+   test.open_document(&doc_id).await.unwrap();
+-  let document = test.get_document(&doc_id).await.unwrap();
++  let document = test.get_opened_document(&doc_id).await.unwrap();
+   let page_block = document.lock().get_block(&data.page_id).unwrap();
+ 
+   // insert a text block
+@@ -91,7 +91,7 @@ async fn document_apply_insert_action() {
+ 
+   // re-open the document
+   let data_b = test
+-    .get_document(&doc_id)
++    .get_opened_document(&doc_id)
+     .await
+     .unwrap()
+     .lock()
+@@ -115,7 +115,7 @@ async fn document_apply_update_page_action() {
+ 
+   // open a document
+   test.open_document(&doc_id).await.unwrap();
+-  let document = test.get_document(&doc_id).await.unwrap();
++  let document = test.get_opened_document(&doc_id).await.unwrap();
+   let page_block = document.lock().get_block(&data.page_id).unwrap();
+ 
+   let mut page_block_clone = page_block;
+@@ -141,7 +141,7 @@ async fn document_apply_update_page_action() {
+   _ = test.close_document(&doc_id).await;
+ 
+   // re-open the document
+-  let document = test.get_document(&doc_id).await.unwrap();
++  let document = test.get_opened_document(&doc_id).await.unwrap();
+   let page_block_new = document.lock().get_block(&data.page_id).unwrap();
+   assert_eq!(page_block_old, page_block_new);
+   assert!(page_block_new.data.contains_key("delta"));
+@@ -159,7 +159,7 @@ async fn document_apply_update_action() {
+ 
+   // open a document
+   test.open_document(&doc_id).await.unwrap();
+-  let document = test.get_document(&doc_id).await.unwrap();
++  let document = test.get_opened_document(&doc_id).await.unwrap();
+   let page_block = document.lock().get_block(&data.page_id).unwrap();
+ 
+   // insert a text block
+@@ -213,7 +213,7 @@ async fn document_apply_update_action() {
+   _ = test.close_document(&doc_id).await;
+ 
+   // re-open the document
+-  let document = test.get_document(&doc_id).await.unwrap();
++  let document = test.get_opened_document(&doc_id).await.unwrap();
+   let block = document.lock().get_block(&text_block_id).unwrap();
+   assert_eq!(block.data, updated_text_block_data);
+   // close a document
+diff --git a/frontend/rust-lib/flowy-document/tests/document/util.rs b/frontend/rust-lib/flowy-document/tests/document/util.rs
+index 075b8e62a8fbc..ae2351ddd9344 100644
+--- a/frontend/rust-lib/flowy-document/tests/document/util.rs
++++ b/frontend/rust-lib/flowy-document/tests/document/util.rs
+@@ -126,7 +126,7 @@ pub async fn create_and_open_empty_document() -> (DocumentTest, Arc<MutexDocumen
+     .unwrap();
+ 
+   test.open_document(&doc_id).await.unwrap();
+-  let document = test.get_document(&doc_id).await.unwrap();
++  let document = test.get_opened_document(&doc_id).await.unwrap();
+ 
+   (test, document, data.page_id)
+ }
+diff --git a/frontend/rust-lib/flowy-server/src/af_cloud/impls/chat.rs b/frontend/rust-lib/flowy-server/src/af_cloud/impls/chat.rs
+index dc0f9173bdd34..77a0198a97dc8 100644
+--- a/frontend/rust-lib/flowy-server/src/af_cloud/impls/chat.rs
++++ b/frontend/rust-lib/flowy-server/src/af_cloud/impls/chat.rs
+@@ -1,17 +1,21 @@
+ use crate::af_cloud::AFServer;
+-use client_api::entity::ai_dto::{CompleteTextParams, CompletionType, RepeatedRelatedQuestion};
++use client_api::entity::ai_dto::{
++  CompleteTextParams, CompletionType, CreateTextChatContext, RepeatedRelatedQuestion,
++};
+ use client_api::entity::{
+   CreateAnswerMessageParams, CreateChatMessageParams, CreateChatParams, MessageCursor,
+   RepeatedChatMessage,
+ };
+ use flowy_ai_pub::cloud::{
+-  ChatCloudService, ChatMessage, ChatMessageType, LocalAIConfig, StreamAnswer, StreamComplete,
++  ChatCloudService, ChatMessage, ChatMessageMetadata, ChatMessageType, LocalAIConfig, StreamAnswer,
++  StreamComplete,
+ };
+ use flowy_error::FlowyError;
+ use futures_util::{StreamExt, TryStreamExt};
+ use lib_infra::async_trait::async_trait;
+ use lib_infra::future::FutureResult;
+ use lib_infra::util::{get_operating_system, OperatingSystem};
++use serde_json::json;
+ use std::path::PathBuf;
+ 
+ pub(crate) struct AFCloudChatCloudServiceImpl<T> {
+@@ -48,12 +52,13 @@ where
+     })
+   }
+ 
+-  fn save_question(
++  fn create_question(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+     message: &str,
+     message_type: ChatMessageType,
++    metadata: Vec<ChatMessageMetadata>,
+   ) -> FutureResult<ChatMessage, FlowyError> {
+     let workspace_id = workspace_id.to_string();
+     let chat_id = chat_id.to_string();
+@@ -61,29 +66,32 @@ where
+     let params = CreateChatMessageParams {
+       content: message.to_string(),
+       message_type,
++      metadata: Some(json!(metadata)),
+     };
+ 
+     FutureResult::new(async move {
+       let message = try_get_client?
+-        .save_question(&workspace_id, &chat_id, params)
++        .create_question(&workspace_id, &chat_id, params)
+         .await
+         .map_err(FlowyError::from)?;
+       Ok(message)
+     })
+   }
+ 
+-  fn save_answer(
++  fn create_answer(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+     message: &str,
+     question_id: i64,
++    metadata: Option<serde_json::Value>,
+   ) -> FutureResult<ChatMessage, FlowyError> {
+     let workspace_id = workspace_id.to_string();
+     let chat_id = chat_id.to_string();
+     let try_get_client = self.inner.try_get_client();
+     let params = CreateAnswerMessageParams {
+       content: message.to_string(),
++      metadata,
+       question_message_id: question_id,
+     };
+ 
+@@ -96,7 +104,7 @@ where
+     })
+   }
+ 
+-  async fn ask_question(
++  async fn stream_answer(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+@@ -104,14 +112,14 @@ where
+   ) -> Result<StreamAnswer, FlowyError> {
+     let try_get_client = self.inner.try_get_client();
+     let stream = try_get_client?
+-      .ask_question(workspace_id, chat_id, message_id)
++      .stream_answer_v2(workspace_id, chat_id, message_id)
+       .await
+       .map_err(FlowyError::from)?
+       .map_err(FlowyError::from);
+     Ok(stream.boxed())
+   }
+ 
+-  async fn generate_answer(
++  async fn get_answer(
+     &self,
+     workspace_id: &str,
+     chat_id: &str,
+@@ -119,7 +127,7 @@ where
+   ) -> Result<ChatMessage, FlowyError> {
+     let try_get_client = self.inner.try_get_client();
+     let resp = try_get_client?
+-      .generate_answer(workspace_id, chat_id, question_message_id)
++      .get_answer(workspace_id, chat_id, question_message_id)
+       .await
+       .map_err(FlowyError::from)?;
+     Ok(resp)
+@@ -211,4 +219,17 @@ where
+       .await?;
+     Ok(config)
+   }
++
++  async fn create_chat_context(
++    &self,
++    workspace_id: &str,
++    chat_context: CreateTextChatContext,
++  ) -> Result<(), FlowyError> {
++    self
++      .inner
++      .try_get_client()?
++      .create_chat_context(workspace_id, chat_context)
++      .await?;
++    Ok(())
++  }
+ }
+diff --git a/frontend/rust-lib/flowy-server/src/default_impl.rs b/frontend/rust-lib/flowy-server/src/default_impl.rs
+index dacb5fea36339..c2fde180d8bd4 100644
+--- a/frontend/rust-lib/flowy-server/src/default_impl.rs
++++ b/frontend/rust-lib/flowy-server/src/default_impl.rs
+@@ -1,6 +1,8 @@
+ use client_api::entity::ai_dto::{CompletionType, LocalAIConfig, RepeatedRelatedQuestion};
+ use client_api::entity::{ChatMessageType, MessageCursor, RepeatedChatMessage};
+-use flowy_ai_pub::cloud::{ChatCloudService, ChatMessage, StreamAnswer, StreamComplete};
++use flowy_ai_pub::cloud::{
++  ChatCloudService, ChatMessage, ChatMessageMetadata, StreamAnswer, StreamComplete,
++};
+ use flowy_error::FlowyError;
+ use lib_infra::async_trait::async_trait;
+ use lib_infra::future::FutureResult;
+@@ -21,31 +23,33 @@ impl ChatCloudService for DefaultChatCloudServiceImpl {
+     })
+   }
+ 
+-  fn save_question(
++  fn create_question(
+     &self,
+     _workspace_id: &str,
+     _chat_id: &str,
+     _message: &str,
+     _message_type: ChatMessageType,
++    _metadata: Vec<ChatMessageMetadata>,
+   ) -> FutureResult<ChatMessage, FlowyError> {
+     FutureResult::new(async move {
+       Err(FlowyError::not_support().with_context("Chat is not supported in local server."))
+     })
+   }
+ 
+-  fn save_answer(
++  fn create_answer(
+     &self,
+     _workspace_id: &str,
+     _chat_id: &str,
+     _message: &str,
+     _question_id: i64,
++    _metadata: Option<serde_json::Value>,
+   ) -> FutureResult<ChatMessage, FlowyError> {
+     FutureResult::new(async move {
+       Err(FlowyError::not_support().with_context("Chat is not supported in local server."))
+     })
+   }
+ 
+-  async fn ask_question(
++  async fn stream_answer(
+     &self,
+     _workspace_id: &str,
+     _chat_id: &str,
+@@ -75,7 +79,7 @@ impl ChatCloudService for DefaultChatCloudServiceImpl {
+     Err(FlowyError::not_support().with_context("Chat is not supported in local server."))
+   }
+ 
+-  async fn generate_answer(
++  async fn get_answer(
+     &self,
+     _workspace_id: &str,
+     _chat_id: &str,
+diff --git a/frontend/rust-lib/flowy-sqlite/migrations/2024-08-05-024351_chat_message_metadata/down.sql b/frontend/rust-lib/flowy-sqlite/migrations/2024-08-05-024351_chat_message_metadata/down.sql
+new file mode 100644
+index 0000000000000..c19ec5e34e5eb
+--- /dev/null
++++ b/frontend/rust-lib/flowy-sqlite/migrations/2024-08-05-024351_chat_message_metadata/down.sql
+@@ -0,0 +1,3 @@
++-- This file should undo anything in `up.sql`
++ALTER TABLE chat_message_table DROP COLUMN metadata;
++
+diff --git a/frontend/rust-lib/flowy-sqlite/migrations/2024-08-05-024351_chat_message_metadata/up.sql b/frontend/rust-lib/flowy-sqlite/migrations/2024-08-05-024351_chat_message_metadata/up.sql
+new file mode 100644
+index 0000000000000..d184c20b6faeb
+--- /dev/null
++++ b/frontend/rust-lib/flowy-sqlite/migrations/2024-08-05-024351_chat_message_metadata/up.sql
+@@ -0,0 +1,2 @@
++-- Your SQL goes here
++ALTER TABLE chat_message_table ADD COLUMN metadata TEXT;
+diff --git a/frontend/rust-lib/flowy-sqlite/src/schema.rs b/frontend/rust-lib/flowy-sqlite/src/schema.rs
+index ee7f1aa546393..b65e026f6a083 100644
+--- a/frontend/rust-lib/flowy-sqlite/src/schema.rs
++++ b/frontend/rust-lib/flowy-sqlite/src/schema.rs
+@@ -17,6 +17,7 @@ diesel::table! {
+         author_type -> BigInt,
+         author_id -> Text,
+         reply_message_id -> Nullable<BigInt>,
++        metadata -> Nullable<Text>,
+     }
+ }
+ 

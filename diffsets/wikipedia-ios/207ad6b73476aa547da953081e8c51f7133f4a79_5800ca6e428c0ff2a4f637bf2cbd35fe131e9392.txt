@@ -1,0 +1,2463 @@
+diff --git a/MediaWikiKit/MediaWikiKit/MWKDataStore.h b/MediaWikiKit/MediaWikiKit/MWKDataStore.h
+index 8d2e8e96056..d9a277b9d6c 100644
+--- a/MediaWikiKit/MediaWikiKit/MWKDataStore.h
++++ b/MediaWikiKit/MediaWikiKit/MWKDataStore.h
+@@ -1,10 +1,3 @@
+-//
+-//  MWKDataStore.h
+-//  MediaWikiKit
+-//
+-//  Created by Brion on 10/21/14.
+-//  Copyright (c) 2014 Wikimedia Foundation. All rights reserved.
+-//
+ 
+ #import <Foundation/Foundation.h>
+ 
+diff --git a/MediaWikiKit/MediaWikiKit/MWKDataStore.m b/MediaWikiKit/MediaWikiKit/MWKDataStore.m
+index f1b4ff516df..6d4abdaec22 100644
+--- a/MediaWikiKit/MediaWikiKit/MWKDataStore.m
++++ b/MediaWikiKit/MediaWikiKit/MWKDataStore.m
+@@ -1,10 +1,3 @@
+-//
+-//  MWKDataStore.m
+-//  MediaWikiKit
+-//
+-//  Created by Brion on 10/21/14.
+-//  Copyright (c) 2014 Wikimedia Foundation. All rights reserved.
+-//
+ 
+ #import "MediaWikiKit.h"
+ 
+@@ -208,6 +201,11 @@ - (void)saveImage:(MWKImage*)image {
+ - (void)saveImageData:(NSData*)data image:(MWKImage*)image {
+     NSString* path     = [self pathForImage:image];
+     NSString* filename = [@"Image" stringByAppendingPathExtension:image.extension];
++
++    if ([image isLeadImage]) {
++        [image calculateFocalRectsBasedOnFaceDetectionWithImageData:data];
++    }
++
+     [self saveData:data path:path name:filename];
+ 
+     [image updateWithData:data];
+diff --git a/MediaWikiKit/MediaWikiKit/MWKImage.h b/MediaWikiKit/MediaWikiKit/MWKImage.h
+index 43c81a16be4..74d5f65f9c9 100644
+--- a/MediaWikiKit/MediaWikiKit/MWKImage.h
++++ b/MediaWikiKit/MediaWikiKit/MWKImage.h
+@@ -1,10 +1,3 @@
+-//
+-//  MWKImage.h
+-//  MediaWikiKit
+-//
+-//  Created by Brion on 10/7/14.
+-//  Copyright (c) 2014 Wikimedia Foundation. All rights reserved.
+-//
+ 
+ #import "UIKit/UIKit.h"
+ #import "MWKSiteDataObject.h"
+@@ -29,8 +22,11 @@
+ @property (copy) NSDate* dateLastAccessed;
+ @property (copy) NSDate* dateRetrieved;
+ @property (copy) NSString* mimeType;
++
+ @property (copy) NSNumber* width;
+ @property (copy) NSNumber* height;
++- (CGSize)size;
++
+ 
+ // Local storage status
+ @property (readonly) BOOL isCached;
+@@ -38,6 +34,41 @@
+ - (instancetype)initWithArticle:(MWKArticle*)article sourceURL:(NSString*)url;
+ - (instancetype)initWithArticle:(MWKArticle*)article dict:(NSDictionary*)dict;
+ 
++/**
++ *  Calculate focal rects
++ *
++ *  @param imageData optional, if you do not pass it the image data will be extracted from disk
++ */
++- (void)calculateFocalRectsBasedOnFaceDetectionWithImageData:(NSData*)imageData;
++
++/**
++ *  All focal rects as strings. Calculated via "calculateFocalRectsBasedOnFaceDetectionWithImageData"
++ * Normally you do not need to access this directly, instead use the methods
++ */
++@property (copy, readonly) NSArray* focalRectsInUnitCoordinatesAsStrings;
++
++/**
++ *  Returns the primary focal rect
++ *  If normalized is set to YES, the rect will be normailzed
++ *  to the image size. If set to NO, the rect will be in
++ *  terms of the unit rect coordinates (0…1)
++ *
++ *  @param normalized  Set YES to normalize to the image
++ *  @return The primary focal rect
++ */
++- (CGRect)primaryFocalRectNomrmalizedToImageSize:(BOOL)normalized;
++
++/**
++ *  Returns a rect enclosing all focal rects
++ *  If normalized is set to YES, the rect will be normailzed
++ *  to the image size. If set to NO, the rect will be in
++ *  terms of the unit rect coordinates (0…1)
++
++ *  @return The rect enclosing all focal rects
++ */
++- (CGRect)rectEnclosingAllFocalRectsNomrmalizedToImageSize:(BOOL)normalized;
++
++
+ - (void)importImageData:(NSData*)data;
+ 
+ - (BOOL)isEqualToImage:(MWKImage*)image;
+@@ -100,4 +131,6 @@
+ 
+ - (NSString*)fullImageBinaryPath;
+ 
++- (BOOL)isLeadImage;
++
+ @end
+diff --git a/MediaWikiKit/MediaWikiKit/MWKImage.m b/MediaWikiKit/MediaWikiKit/MWKImage.m
+index 96a0b49d3a5..c688925a0ee 100644
+--- a/MediaWikiKit/MediaWikiKit/MWKImage.m
++++ b/MediaWikiKit/MediaWikiKit/MWKImage.m
+@@ -1,15 +1,17 @@
+-//
+-//  MWKImage.m
+-//  MediaWikiKit
+-//
+-//  Created by Brion on 10/7/14.
+-//  Copyright (c) 2014 Wikimedia Foundation. All rights reserved.
+-//
+ 
+ #import "UIKit/UIKit.h"
+ #import "WikipediaAppUtils.h"
+ #import "MediaWikiKit.h"
+ #import "WMFImageURLParsing.h"
++#import "WMFFaceDetector.h"
++#import "WMFGeometry.h"
++#import <BlocksKit/BlocksKit.h>
++
++@interface MWKImage ()
++
++@property (copy, readwrite) NSArray* focalRectsInUnitCoordinatesAsStrings;
++
++@end
+ 
+ @implementation MWKImage
+ @synthesize fileNameNoSizePrefix = _fileNameNoSizePrefix;
+@@ -22,11 +24,12 @@ - (instancetype)initWithArticle:(MWKArticle*)article sourceURL:(NSString*)url {
+         // fileNameNoSizePrefix is lazily derived from this property, so be careful if _sourceURL needs to be re-set
+         _sourceURL = [url copy];
+ 
+-        _dateLastAccessed = nil;
+-        _dateRetrieved    = nil;
+-        _mimeType         = nil;
+-        _width            = nil;
+-        _height           = nil;
++        _dateLastAccessed                     = nil;
++        _dateRetrieved                        = nil;
++        _mimeType                             = nil;
++        _width                                = nil;
++        _height                               = nil;
++        _focalRectsInUnitCoordinatesAsStrings = @[];
+     }
+     return self;
+ }
+@@ -35,15 +38,83 @@ - (instancetype)initWithArticle:(MWKArticle*)article dict:(NSDictionary*)dict {
+     NSString* sourceURL = [self requiredString:@"sourceURL" dict:dict];
+     self = [self initWithArticle:article sourceURL:sourceURL];
+     if (self) {
+-        _dateLastAccessed = [self optionalDate:@"dateLastAccessed" dict:dict];
+-        _dateRetrieved    = [self optionalDate:@"dateRetrieved" dict:dict];
+-        _mimeType         = [self optionalString:@"mimeType" dict:dict];
+-        _width            = [self optionalNumber:@"width" dict:dict];
+-        _height           = [self optionalNumber:@"height" dict:dict];
++        _dateLastAccessed                     = [self optionalDate:@"dateLastAccessed" dict:dict];
++        _dateRetrieved                        = [self optionalDate:@"dateRetrieved" dict:dict];
++        _mimeType                             = [self optionalString:@"mimeType" dict:dict];
++        _width                                = [self optionalNumber:@"width" dict:dict];
++        _height                               = [self optionalNumber:@"height" dict:dict];
++        _focalRectsInUnitCoordinatesAsStrings = dict[@"focalRects"];
+     }
+     return self;
+ }
+ 
++#pragma mark - Focal Rects
++
++- (void)calculateFocalRectsBasedOnFaceDetectionWithImageData:(NSData*)imageData {
++    if ([self.focalRectsInUnitCoordinatesAsStrings count] == 0) {
++        if (!imageData) {
++            imageData = [self asNSData];
++        }
++
++        static WMFFaceDetector* faceDetector = nil;
++        if (!faceDetector) {
++            faceDetector = [[WMFFaceDetector alloc] init];
++        }
++        [faceDetector setImageWithData:imageData];
++        [faceDetector detectFaces];
++
++        self.focalRectsInUnitCoordinatesAsStrings = [faceDetector allFaceBoundsAsStringsNormalizedToUnitRect];
++    }
++}
++
++- (CGRect)normalizedRectFromRect:(CGRect)rect {
++    CGRect imageRect = CGRectZero;
++    imageRect.size = [self size];
++    CGRect normalized = WMFRectWithUnitRectInReferenceRect(rect, imageRect);
++    return normalized;
++}
++
++- (CGRect)primaryFocalRectNomrmalizedToImageSize:(BOOL)normalized {
++    if (self.focalRectsInUnitCoordinatesAsStrings.count == 0) {
++        return CGRectZero;
++    }
++
++    NSString* primary = [self.focalRectsInUnitCoordinatesAsStrings firstObject];
++    CGRect rect       = CGRectFromString(primary);
++
++    if (normalized) {
++        rect = [self normalizedRectFromRect:rect];
++    }
++
++    return rect;
++}
++
++- (CGRect)rectEnclosingAllFocalRectsNomrmalizedToImageSize:(BOOL)normalized {
++    __block CGRect enclosingRect = CGRectZero;
++
++    [self.focalRectsInUnitCoordinatesAsStrings enumerateObjectsUsingBlock:^(id obj, NSUInteger idx, BOOL* stop) {
++        CGRect rect = CGRectFromString(obj);
++
++        if (CGRectIsEmpty(enclosingRect)) {
++            enclosingRect = rect;
++        } else {
++            enclosingRect = CGRectUnion(enclosingRect, rect);
++        }
++    }];
++
++    if (normalized) {
++        enclosingRect = [self normalizedRectFromRect:enclosingRect];
++    }
++
++    return enclosingRect;
++}
++
++#pragma mark - Accessors
++
++- (CGSize)size {
++    return CGSizeMake([self.width floatValue], [self.height floatValue]);
++}
++
+ - (NSString*)extension {
+     return [self.sourceURL pathExtension];
+ }
+@@ -103,6 +174,9 @@ - (id)dataExport {
+     if (self.height) {
+         dict[@"height"] = self.height;
+     }
++    if (self.focalRectsInUnitCoordinatesAsStrings) {
++        dict[@"focalRects"] = self.focalRectsInUnitCoordinatesAsStrings;
++    }
+ 
+     return [dict copy];
+ }
+@@ -116,8 +190,6 @@ - (void)updateWithData:(NSData*)data {
+     _dateLastAccessed = [[NSDate alloc] init];
+     _mimeType         = [self getImageMimeTypeForExtension:self.extension];
+ 
+-    #warning FIXME: image inflation result not stored
+-    // Width / height may already be set, so only inflate image data to get these if necessary.
+     if (!_width || !_height) {
+         UIImage* img = [UIImage imageWithData:data];
+         _width  = [NSNumber numberWithInt:img.size.width];
+@@ -151,7 +223,7 @@ - (void)save {
+ }
+ 
+ - (UIImage*)asUIImage {
+-    NSData* imageData = [self.article.dataStore imageDataWithImage:self];
++    NSData* imageData = [self asNSData];
+ 
+     UIImage* image = [UIImage imageWithData:imageData];
+ 
+@@ -185,7 +257,7 @@ - (NSString*)estimatedSizeString {
+ /// @return @c YES if @c size is within @c points of <code>self.estimatedSize</code>, otherwise @c NO.
+ - (BOOL)isEstimatedSizeWithinPoints:(float)points ofSize:(CGSize)size {
+     CGSize estimatedSize = [self estimatedSize];
+-    return fabsf(estimatedSize.width - size.width) <= points
++    return fabs(estimatedSize.width - size.width) <= points
+            && fabs(estimatedSize.height - size.height) <= points;
+ }
+ 
+@@ -253,4 +325,8 @@ - (NSString*)fullImageBinaryPath {
+     return filePath;
+ }
+ 
++- (BOOL)isLeadImage {
++    return [self.article.image isEqualToImage:self];
++}
++
+ @end
+diff --git a/Wikipedia.xcodeproj/project.pbxproj b/Wikipedia.xcodeproj/project.pbxproj
+index df0f5784f7d..b58836ae518 100644
+--- a/Wikipedia.xcodeproj/project.pbxproj
++++ b/Wikipedia.xcodeproj/project.pbxproj
+@@ -60,6 +60,7 @@
+ 		04478633185145090050563B /* HistoryViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 04478624185145090050563B /* HistoryViewController.m */; };
+ 		0447863D185145090050563B /* WebViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 0447862E185145090050563B /* WebViewController.m */; };
+ 		0447866F1852B5010050563B /* SessionSingleton.m in Sources */ = {isa = PBXBuildFile; fileRef = 0447866E1852B5010050563B /* SessionSingleton.m */; };
++		04490FD51AF16A83009FAB52 /* WMFBundledImageProtocol.m in Sources */ = {isa = PBXBuildFile; fileRef = 04490FD41AF16A83009FAB52 /* WMFBundledImageProtocol.m */; };
+ 		0449E63518A9845C00D51524 /* LoginViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 0449E63418A9845C00D51524 /* LoginViewController.m */; };
+ 		0449E63918AAA26A00D51524 /* NSHTTPCookieStorage+CloneCookie.m in Sources */ = {isa = PBXBuildFile; fileRef = 0449E63818AAA26A00D51524 /* NSHTTPCookieStorage+CloneCookie.m */; };
+ 		044BD6B618849AD000FFE4BE /* SectionEditorViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 044BD6B418849AD000FFE4BE /* SectionEditorViewController.m */; };
+@@ -68,7 +69,6 @@
+ 		04530AF51935BF4D00022512 /* ModalMenuAndContentViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 04530AF41935BF4D00022512 /* ModalMenuAndContentViewController.m */; };
+ 		04530AF81935C07500022512 /* ModalContentViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 04530AF71935C07500022512 /* ModalContentViewController.m */; };
+ 		04530AFB1935C2B500022512 /* EmptySegue.m in Sources */ = {isa = PBXBuildFile; fileRef = 04530AFA1935C2B500022512 /* EmptySegue.m */; };
+-		045374881A35834D00CE1A56 /* LeadImageTitleAttributedString.m in Sources */ = {isa = PBXBuildFile; fileRef = 045374871A35834D00CE1A56 /* LeadImageTitleAttributedString.m */; };
+ 		045D872119FAD2FA0035C1F9 /* AboutViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 045D872019FAD2FA0035C1F9 /* AboutViewController.m */; };
+ 		04616DFC1AE706C600815BCE /* WMFLocalizationProtocol.m in Sources */ = {isa = PBXBuildFile; fileRef = 04616DFB1AE706C600815BCE /* WMFLocalizationProtocol.m */; };
+ 		0462A6D11A1FE016009412D4 /* SearchResultAttributedString.m in Sources */ = {isa = PBXBuildFile; fileRef = 0462A6D01A1FE016009412D4 /* SearchResultAttributedString.m */; };
+@@ -172,9 +172,6 @@
+ 		04D686FE1AB2949C0009B44A /* WikiGlyphLabel.m in Sources */ = {isa = PBXBuildFile; fileRef = 04D686F31AB2949C0009B44A /* WikiGlyphLabel.m */; };
+ 		04DB0BEA18BD37F900B4BCF3 /* UIScrollView+ScrollSubviewToLocation.m in Sources */ = {isa = PBXBuildFile; fileRef = 04DB0BE918BD37F900B4BCF3 /* UIScrollView+ScrollSubviewToLocation.m */; };
+ 		04DD89B118BFE63A00DD5DAD /* PreviewAndSaveViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 04DD89B018BFE63A00DD5DAD /* PreviewAndSaveViewController.m */; };
+-		04E106341A3560030046DC27 /* LeadImageContainer.m in Sources */ = {isa = PBXBuildFile; fileRef = 04E106321A3560030046DC27 /* LeadImageContainer.m */; };
+-		04E106351A3560030046DC27 /* LeadImageContainer.xib in Resources */ = {isa = PBXBuildFile; fileRef = 04E106331A3560030046DC27 /* LeadImageContainer.xib */; };
+-		04E106381A3560A90046DC27 /* LeadImageTitleLabel.m in Sources */ = {isa = PBXBuildFile; fileRef = 04E106371A3560A90046DC27 /* LeadImageTitleLabel.m */; };
+ 		04EDEE251A20788700798076 /* SearchResultPrototypeView.xib in Resources */ = {isa = PBXBuildFile; fileRef = 04EDEE241A20788600798076 /* SearchResultPrototypeView.xib */; };
+ 		04EDEE2A1A215DBC00798076 /* UITableView+DynamicCellHeight.m in Sources */ = {isa = PBXBuildFile; fileRef = 04EDEE291A215DBC00798076 /* UITableView+DynamicCellHeight.m */; };
+ 		04EDEE311A21CB4100798076 /* UIScreen+Extras.m in Sources */ = {isa = PBXBuildFile; fileRef = 04EDEE301A21CB4100798076 /* UIScreen+Extras.m */; };
+@@ -485,6 +482,8 @@
+ 		0447862E185145090050563B /* WebViewController.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; lineEnding = 0; path = WebViewController.m; sourceTree = "<group>"; xcLanguageSpecificationIdentifier = xcode.lang.objc; };
+ 		0447866D1852B5010050563B /* SessionSingleton.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = SessionSingleton.h; sourceTree = "<group>"; };
+ 		0447866E1852B5010050563B /* SessionSingleton.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = SessionSingleton.m; sourceTree = "<group>"; };
++		04490FD31AF16A83009FAB52 /* WMFBundledImageProtocol.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = WMFBundledImageProtocol.h; path = Wikipedia/Protocols/WMFBundledImageProtocol.h; sourceTree = SOURCE_ROOT; };
++		04490FD41AF16A83009FAB52 /* WMFBundledImageProtocol.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; name = WMFBundledImageProtocol.m; path = Wikipedia/Protocols/WMFBundledImageProtocol.m; sourceTree = SOURCE_ROOT; };
+ 		0449E63318A9845C00D51524 /* LoginViewController.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = LoginViewController.h; sourceTree = "<group>"; };
+ 		0449E63418A9845C00D51524 /* LoginViewController.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; lineEnding = 0; path = LoginViewController.m; sourceTree = "<group>"; xcLanguageSpecificationIdentifier = xcode.lang.objc; };
+ 		0449E63718AAA26A00D51524 /* NSHTTPCookieStorage+CloneCookie.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = "NSHTTPCookieStorage+CloneCookie.h"; sourceTree = "<group>"; };
+@@ -501,8 +500,6 @@
+ 		04530AF71935C07500022512 /* ModalContentViewController.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ModalContentViewController.m; sourceTree = "<group>"; };
+ 		04530AF91935C2B500022512 /* EmptySegue.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = EmptySegue.h; sourceTree = "<group>"; };
+ 		04530AFA1935C2B500022512 /* EmptySegue.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = EmptySegue.m; sourceTree = "<group>"; };
+-		045374861A35834D00CE1A56 /* LeadImageTitleAttributedString.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = LeadImageTitleAttributedString.h; sourceTree = "<group>"; };
+-		045374871A35834D00CE1A56 /* LeadImageTitleAttributedString.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = LeadImageTitleAttributedString.m; sourceTree = "<group>"; };
+ 		045D871F19FAD2FA0035C1F9 /* AboutViewController.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = AboutViewController.h; sourceTree = "<group>"; };
+ 		045D872019FAD2FA0035C1F9 /* AboutViewController.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = AboutViewController.m; sourceTree = "<group>"; };
+ 		04616DFA1AE706C600815BCE /* WMFLocalizationProtocol.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = WMFLocalizationProtocol.h; sourceTree = "<group>"; };
+@@ -693,11 +690,6 @@
+ 		04DB0BE918BD37F900B4BCF3 /* UIScrollView+ScrollSubviewToLocation.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = "UIScrollView+ScrollSubviewToLocation.m"; sourceTree = "<group>"; };
+ 		04DD89AF18BFE63A00DD5DAD /* PreviewAndSaveViewController.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = PreviewAndSaveViewController.h; sourceTree = "<group>"; };
+ 		04DD89B018BFE63A00DD5DAD /* PreviewAndSaveViewController.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; lineEnding = 0; path = PreviewAndSaveViewController.m; sourceTree = "<group>"; xcLanguageSpecificationIdentifier = xcode.lang.objc; };
+-		04E106311A3560030046DC27 /* LeadImageContainer.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = LeadImageContainer.h; sourceTree = "<group>"; };
+-		04E106321A3560030046DC27 /* LeadImageContainer.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = LeadImageContainer.m; sourceTree = "<group>"; };
+-		04E106331A3560030046DC27 /* LeadImageContainer.xib */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.xib; path = LeadImageContainer.xib; sourceTree = "<group>"; };
+-		04E106361A3560A90046DC27 /* LeadImageTitleLabel.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = LeadImageTitleLabel.h; sourceTree = "<group>"; };
+-		04E106371A3560A90046DC27 /* LeadImageTitleLabel.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = LeadImageTitleLabel.m; sourceTree = "<group>"; };
+ 		04E9A78218F73C7200F7ECF7 /* www */ = {isa = PBXFileReference; lastKnownFileType = folder; path = www; sourceTree = "<group>"; };
+ 		04EDEE241A20788600798076 /* SearchResultPrototypeView.xib */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.xib; path = SearchResultPrototypeView.xib; sourceTree = "<group>"; };
+ 		04EDEE281A215DBC00798076 /* UITableView+DynamicCellHeight.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = "UITableView+DynamicCellHeight.h"; sourceTree = "<group>"; };
+@@ -1472,6 +1464,8 @@
+ 			children = (
+ 				04616DFA1AE706C600815BCE /* WMFLocalizationProtocol.h */,
+ 				04616DFB1AE706C600815BCE /* WMFLocalizationProtocol.m */,
++				04490FD31AF16A83009FAB52 /* WMFBundledImageProtocol.h */,
++				04490FD41AF16A83009FAB52 /* WMFBundledImageProtocol.m */,
+ 			);
+ 			name = Protocols;
+ 			path = wikipedia/Protocols;
+@@ -1728,7 +1722,6 @@
+ 				08D631F11A69B17F00D87AD0 /* Image Gallery */,
+ 				041A3B5718E11ED90079FF1C /* Languages */,
+ 				0449E63218A9844000D51524 /* Login */,
+-				04E106301A3560030046DC27 /* LeadImage */,
+ 				04530AF21935BF2900022512 /* ModalOverlay */,
+ 				042A5B1419253D2A0095E172 /* Navigation */,
+ 				0485FEC71994CF8800141361 /* Nearby */,
+@@ -1977,20 +1970,6 @@
+ 			path = Preview;
+ 			sourceTree = "<group>";
+ 		};
+-		04E106301A3560030046DC27 /* LeadImage */ = {
+-			isa = PBXGroup;
+-			children = (
+-				04E106311A3560030046DC27 /* LeadImageContainer.h */,
+-				04E106321A3560030046DC27 /* LeadImageContainer.m */,
+-				04E106331A3560030046DC27 /* LeadImageContainer.xib */,
+-				04E106361A3560A90046DC27 /* LeadImageTitleLabel.h */,
+-				04E106371A3560A90046DC27 /* LeadImageTitleLabel.m */,
+-				045374861A35834D00CE1A56 /* LeadImageTitleAttributedString.h */,
+-				045374871A35834D00CE1A56 /* LeadImageTitleAttributedString.m */,
+-			);
+-			path = LeadImage;
+-			sourceTree = "<group>";
+-		};
+ 		04F27B6D18FE0F2E00EDD838 /* PageHistory */ = {
+ 			isa = PBXGroup;
+ 			children = (
+@@ -2723,7 +2702,6 @@
+ 				04F27B7618FE0F2E00EDD838 /* PageHistoryResultPrototypeView.xib in Resources */,
+ 				04B0EA47190B2319007458AF /* PreviewLicenseView.xib in Resources */,
+ 				04CCCFEF1935093A00E3F60C /* SecondaryMenuRowView.xib in Resources */,
+-				04E106351A3560030046DC27 /* LeadImageContainer.xib in Resources */,
+ 				0480AE911AA4E61000A9950C /* WMFReadMoreViewController.xib in Resources */,
+ 				047E74141860509000916964 /* SavedPagesResultPrototypeView.xib in Resources */,
+ 				C46FBA4B1A8530EE00C5730F /* Pods-acknowledgements.plist in Resources */,
+@@ -2978,7 +2956,6 @@
+ 				04D686F61AB2949C0009B44A /* MenuLabel.m in Sources */,
+ 				04D308281998A8AA0034F106 /* NearbyThumbnailView.m in Sources */,
+ 				042E3B931AA16D6700BF8D66 /* UIViewController+WMFChildViewController.m in Sources */,
+-				045374881A35834D00CE1A56 /* LeadImageTitleAttributedString.m in Sources */,
+ 				04292FF2185FBA70002A13FC /* SearchResultCell.m in Sources */,
+ 				04F0E2EA186EDC1A00468738 /* UIWebView+ElementLocation.m in Sources */,
+ 				C42D94871A937DE000A4871A /* WMFProgressLineView.m in Sources */,
+@@ -3018,7 +2995,6 @@
+ 				043DAC4B1901C3EE001CD17C /* CreditsViewController.m in Sources */,
+ 				D42E75EB18D11237002EA7E5 /* MWLanguageInfo.m in Sources */,
+ 				043F8BF21A11699A00D1AE44 /* UIView+WMFRoundCorners.m in Sources */,
+-				04E106341A3560030046DC27 /* LeadImageContainer.m in Sources */,
+ 				0487048019F8262600B7D307 /* AccountLogin.m in Sources */,
+ 				04D149DD18877343006B4104 /* AlertLabel.m in Sources */,
+ 				BCB669AE1A83F6C400C7B1FE /* MWKHistoryEntry.m in Sources */,
+@@ -3029,6 +3005,7 @@
+ 				047801BE18AE987900DBB747 /* UIButton+ColorMask.m in Sources */,
+ 				BC86B93D1A929CC500B4C039 /* UICollectionViewFlowLayout+NSCopying.m in Sources */,
+ 				04D686C91AB28FE40009B44A /* UIImage+WMFFocalImageDrawing.m in Sources */,
++				04490FD51AF16A83009FAB52 /* WMFBundledImageProtocol.m in Sources */,
+ 				0429300A18604898002A13FC /* SavedPagesResultCell.m in Sources */,
+ 				0487048419F8262600B7D307 /* CaptchaResetter.m in Sources */,
+ 				D407E6411A51DBDA00CCC8B1 /* SchemaConverter.m in Sources */,
+@@ -3085,7 +3062,6 @@
+ 				BCC185E81A9FA498005378F8 /* UICollectionViewFlowLayout+AttributeUtils.m in Sources */,
+ 				04D686F81AB2949C0009B44A /* PaddedLabel.m in Sources */,
+ 				04C695D218ED213000D9F2DA /* UIScrollView+NoHorizontalScrolling.m in Sources */,
+-				04E106381A3560A90046DC27 /* LeadImageTitleLabel.m in Sources */,
+ 				04F0E2EE186FB2D100468738 /* TOCSectionCellView.m in Sources */,
+ 				04D122321899B8AC006B9A30 /* AlertWebView.m in Sources */,
+ 				04B0E3EA1AE8252800379AE0 /* NSURL+WMFRest.m in Sources */,
+diff --git a/Wikipedia/C Methods/WMFArticleParsing.m b/Wikipedia/C Methods/WMFArticleParsing.m
+index 8bee6eadb4d..bae2a5a7d90 100644
+--- a/Wikipedia/C Methods/WMFArticleParsing.m	
++++ b/Wikipedia/C Methods/WMFArticleParsing.m	
+@@ -35,7 +35,8 @@
+ 
+ void WMFInjectArticleWithImagesFromSection(MWKArticle* article, NSString* sectionHTML, int sectionID) {
+     // Reduce to img tags only. Causes TFHpple parse time to drop by ~50%.
+-    NSString* sectionImageTags = WMFImgTagsFromHTML(sectionHTML);
++    // (conditionally prepend with the lead image so it goes through caching too)
++    NSString* sectionImageTags = (sectionID == 0) && article.imageURL ? [[NSString stringWithFormat : @"<img src=\"%@\">", article.imageURL] stringByAppendingString:WMFImgTagsFromHTML(sectionHTML)] : WMFImgTagsFromHTML(sectionHTML);
+ 
+     if (sectionImageTags.length == 0 || !article) {
+         return;
+@@ -46,17 +47,18 @@ void WMFInjectArticleWithImagesFromSection(MWKArticle* article, NSString* sectio
+ 
+     // Call *after* article record created but before section html sent across bridge.
+     TFHpple* sectionParser = [TFHpple hppleWithHTMLData:[sectionImageTags dataUsingEncoding:NSUTF8StringEncoding]];
+-    NSArray* imageNodes    = [sectionParser searchWithXPathQuery:@"//img[@src]"];
++    NSArray* imageNodes    = [sectionParser searchWithXPathQuery:@"//img[starts-with(@src, \"//upload.wikimedia.org/\")]"];
+ 
+     BOOL isRetinaAndAtLeastiOS8Device = ([[[UIDevice currentDevice] systemVersion] floatValue] >= 8.0) && ([UIScreen mainScreen].scale > 1.0f);
+ 
+     for (TFHppleElement* imageNode in imageNodes) {
+         NSString* imgHeight = imageNode.attributes[@"height"];
+-        if (imgHeight.integerValue < THUMBNAIL_MINIMUM_SIZE_TO_CACHE.height) {
++
++        if (imgHeight && imgHeight.integerValue < THUMBNAIL_MINIMUM_SIZE_TO_CACHE.height) {
+             continue;
+         }
+         NSString* imgWidth = imageNode.attributes[@"width"];
+-        if (imgWidth.integerValue < THUMBNAIL_MINIMUM_SIZE_TO_CACHE.width) {
++        if (imgWidth && imgWidth.integerValue < THUMBNAIL_MINIMUM_SIZE_TO_CACHE.width) {
+             continue;
+         }
+ 
+diff --git a/Wikipedia/C Methods/WMFGeometry.c b/Wikipedia/C Methods/WMFGeometry.c
+index 4a85b6ae1a4..588eb892f9b 100644
+--- a/Wikipedia/C Methods/WMFGeometry.c	
++++ b/Wikipedia/C Methods/WMFGeometry.c	
+@@ -2,24 +2,48 @@
+ //  Copyright (c) 2015 Wikimedia Foundation. Provided under MIT-style license; please copy and modify!
+ 
+ #import "WMFGeometry.h"
++#include <CoreGraphics/CGAffineTransform.h>
++
++/**
++ *  http://stackoverflow.com/a/16042543/48311
++ *
++ */
++CGRect WMFUnitRectWithReferenceRect(CGRect rect, CGRect referenceRect){
++    if (CGRectIsEmpty(referenceRect) || CGRectIsEmpty(rect)) {
++        return CGRectZero;
++    }
++    CGAffineTransform t = CGAffineTransformMakeScale(1.0f / referenceRect.size.width, 1.0f / referenceRect.size.height);
++    CGRect unitRect = CGRectApplyAffineTransform(rect, t);
++    return unitRect;
++}
++
++CGRect WMFRectWithUnitRectInReferenceRect(CGRect unitRect, CGRect referenceRect){
++    if (CGRectIsEmpty(referenceRect) || CGRectIsEmpty(unitRect)) {
++        return CGRectZero;
++    }
++
++    CGAffineTransform t = CGAffineTransformMakeScale(referenceRect.size.width, referenceRect.size.height);
++    CGRect rect = CGRectApplyAffineTransform(unitRect, t);
++    return rect;
++}
+ 
+ CGRect WMFUnitRectFromRectForReferenceSize(CGRect rect, CGSize refSize){
+     if (CGSizeEqualToSize(refSize, CGSizeZero) || CGRectIsEmpty(rect)) {
+         return CGRectZero;
+     }
+     return CGRectMake(
+-        CGRectGetMinX(rect) / refSize.width,
+-        CGRectGetMinY(rect) / refSize.height,
+-        CGRectGetWidth(rect) / refSize.width,
+-        CGRectGetHeight(rect) / refSize.height
+-        );
++                      CGRectGetMinX(rect) / refSize.width,
++                      CGRectGetMinY(rect) / refSize.height,
++                      CGRectGetWidth(rect) / refSize.width,
++                      CGRectGetHeight(rect) / refSize.height
++                      );
+ }
+ 
+ CGRect WMFRectFromUnitRectForReferenceSize(CGRect unitRect, CGSize refSize){
+     return CGRectMake(
+-        unitRect.origin.x * refSize.width,
+-        unitRect.origin.y * refSize.height,
+-        unitRect.size.width * refSize.width,
+-        unitRect.size.height * refSize.height
+-        );
++                      unitRect.origin.x * refSize.width,
++                      unitRect.origin.y * refSize.height,
++                      unitRect.size.width * refSize.width,
++                      unitRect.size.height * refSize.height
++                      );
+ }
+\ No newline at end of file
+diff --git a/Wikipedia/C Methods/WMFGeometry.h b/Wikipedia/C Methods/WMFGeometry.h
+index af9c4be67af..edecf23d75a 100644
+--- a/Wikipedia/C Methods/WMFGeometry.h	
++++ b/Wikipedia/C Methods/WMFGeometry.h	
+@@ -8,10 +8,16 @@
+ 
+ #import <CoreGraphics/CGGeometry.h>
+ 
++// Convert rect to a unit rect for reference size.
++CG_EXTERN CGRect WMFUnitRectWithReferenceRect(CGRect rect, CGRect referenceRect);
++
++// Convert unit rect back to rect for reference size.
++CG_EXTERN CGRect WMFRectWithUnitRectInReferenceRect(CGRect unitRect, CGRect referenceRect);
++
+ // Convert rect to a unit rect for reference size.
+ CG_EXTERN CGRect WMFUnitRectFromRectForReferenceSize(CGRect rect, CGSize referenceSize);
+ 
+ // Convert unit rect back to rect for reference size.
+ CG_EXTERN CGRect WMFRectFromUnitRectForReferenceSize(CGRect unitRect, CGSize referenceSize);
+ 
+-#endif /* defined(__Wikipedia__WMFGeometry__) */
++#endif
+diff --git a/Wikipedia/Categories/MWKSection+DisplayHtml.m b/Wikipedia/Categories/MWKSection+DisplayHtml.m
+index e338f886f38..6b00c8fd049 100644
+--- a/Wikipedia/Categories/MWKSection+DisplayHtml.m
++++ b/Wikipedia/Categories/MWKSection+DisplayHtml.m
+@@ -27,9 +27,7 @@ - (NSString*)getHeaderTag {
+ 
+     if (self.sectionId == 0) {
+         // Lead section.
+-        // The lead section is a special case because of the native component used
+-        // for lead image styling. The title text is now shown by the native component.
+-        return [[self getLeadImagePlaceholderDiv] stringByAppendingString:MWKSectionDisambigAndPageIssuesPlaceholderDiv];
++        return MWKSectionDisambigAndPageIssuesPlaceholderDiv;
+     } else {
+         // Non-lead section.
+         NSInteger headingTagSize = [self getHeadingTagSize];
+@@ -68,17 +66,4 @@ - (NSString*)getEditPencilAnchor {
+         ];
+ }
+ 
+-- (NSString*)getLeadImagePlaceholderDiv {
+-    // Placeholder div to reserve vertical space for the lead image native component.
+-
+-    // Its height needs to be set right away, here, so there's no flicker on load.
+-    CGFloat initialLeadImageHeight =
+-        (!self.article.imageURL) ? 0.0f : LEAD_IMAGE_CONTAINER_HEIGHT;
+-
+-    return
+-        [NSString stringWithFormat:@"<div id='lead_image_div' style='height:%fpx;background-color:white;'></div>",
+-         initialLeadImageHeight
+-        ];
+-}
+-
+ @end
+diff --git a/Wikipedia/Categories/NSURL+WMFRest.h b/Wikipedia/Categories/NSURL+WMFRest.h
+index 85a367900d6..1e305866c0c 100644
+--- a/Wikipedia/Categories/NSURL+WMFRest.h
++++ b/Wikipedia/Categories/NSURL+WMFRest.h
+@@ -6,5 +6,6 @@
+ @interface NSURL (WMFRest)
+ 
+ - (BOOL)wmf_conformsToScheme:(NSString*)scheme andHasKey:(NSString*)key;
++- (NSString*)wmf_getValue;
+ 
+ @end
+diff --git a/Wikipedia/Categories/NSURL+WMFRest.m b/Wikipedia/Categories/NSURL+WMFRest.m
+index 4eb26ac20af..7929d41fd22 100644
+--- a/Wikipedia/Categories/NSURL+WMFRest.m
++++ b/Wikipedia/Categories/NSURL+WMFRest.m
+@@ -10,4 +10,13 @@ - (BOOL)wmf_conformsToScheme:(NSString*)scheme andHasKey:(NSString*)key {
+     return ([[self scheme] wmf_isEqualToStringIgnoringCase:scheme] && [[self host] wmf_isEqualToStringIgnoringCase:key]);
+ }
+ 
++- (NSString*)wmf_getValue {
++    NSAssert(self.path.length > 1, @"wikipedia URLs must have a path: %@", self);
++    if (self.path.length > 1) {
++        return [self.path substringFromIndex:1];
++    } else {
++        return nil;
++    }
++}
++
+ @end
+diff --git a/Wikipedia/Categories/UIWebView+LoadAssetsHtml.h b/Wikipedia/Categories/UIWebView+LoadAssetsHtml.h
+index 2edd2d2b388..26264f1c841 100644
+--- a/Wikipedia/Categories/UIWebView+LoadAssetsHtml.h
++++ b/Wikipedia/Categories/UIWebView+LoadAssetsHtml.h
+@@ -11,6 +11,6 @@
+ // Loads html passed to it injected into html from fileName.
+ // Warning! Probably don't call this directly! Call the method of the same
+ // name on the CommunicationBridge object for reasons documented there.
+-- (void)loadHTML:(NSString*)string withAssetsFile:(NSString*)fileName;
++- (void)loadHTML:(NSString*)string withAssetsFile:(NSString*)fileName leadSectionHtml:(NSString*)leadSectionHtml;
+ 
+ @end
+diff --git a/Wikipedia/Categories/UIWebView+LoadAssetsHtml.m b/Wikipedia/Categories/UIWebView+LoadAssetsHtml.m
+index c14aaff0108..643a04437d5 100644
+--- a/Wikipedia/Categories/UIWebView+LoadAssetsHtml.m
++++ b/Wikipedia/Categories/UIWebView+LoadAssetsHtml.m
+@@ -15,28 +15,24 @@ - (void)loadHTMLFromAssetsFile:(NSString*)fileName {
+               baseURL:[NSURL URLWithString:filePath]];
+ }
+ 
+-- (void)loadHTML:(NSString*)string withAssetsFile:(NSString*)fileName {
++- (void)loadHTML:(NSString*)string withAssetsFile:(NSString*)fileName leadSectionHtml:(NSString*)leadSectionHtml {
+     if (!string) {
+         string = @"";
+     }
+ 
+-    NSString* path = [[self getAssetsPath] stringByAppendingPathComponent:fileName];
+-
+-    NSMutableString* fileContents =
+-        [NSMutableString stringWithContentsOfFile:path
+-                                         encoding:NSUTF8StringEncoding
+-                                            error:nil];
+-
+-    [fileContents replaceOccurrencesOfString:@"#INJECTION_POINT#"
+-                                  withString:string
+-                                     options:(NSLiteralSearch | NSBackwardsSearch)
+-                                       range:NSMakeRange(0, fileContents.length)];
++    static NSString* path = nil;
++    if (!path) {
++        path = [[self getAssetsPath] stringByAppendingPathComponent:fileName];
++    }
+ 
+-    // Seems audio/video tags can't be completely hidden via JS
+-    // for some reason. So brute-force hobble the tags for now.
+-    // [self disableAudioVideoTagsInString:fileContents];
++    static NSString* fileContents = nil;
++    if (!fileContents) {
++        fileContents = [NSMutableString stringWithContentsOfFile:path
++                                                        encoding:NSUTF8StringEncoding
++                                                           error:nil];
++    }
+ 
+-    [self loadHTMLString:fileContents
++    [self loadHTMLString:[NSString stringWithFormat:fileContents, leadSectionHtml, string]
+                  baseURL:[NSURL URLWithString:path]];
+ }
+ 
+@@ -45,13 +41,4 @@ - (NSString*)getAssetsPath {
+     return [[documentsPath firstObject] stringByAppendingPathComponent:@"assets"];
+ }
+ 
+-- (void)disableAudioVideoTagsInString:(NSMutableString*)mutableString {
+-    static NSString* pattern = @"(</?)(audio|video)(\\s|>)";
+-    static NSString* format  = @"$1$2_SNIP$3";
+-    [mutableString replaceOccurrencesOfString:pattern
+-                                   withString:format
+-                                      options:(NSRegularExpressionSearch | NSCaseInsensitiveSearch)
+-                                        range:NSMakeRange(0, mutableString.length)];
+-}
+-
+ @end
+diff --git a/Wikipedia/Custom Objects/WMFFaceDetector.h b/Wikipedia/Custom Objects/WMFFaceDetector.h
+index fe3773acaa4..5b91f7b5b28 100644
+--- a/Wikipedia/Custom Objects/WMFFaceDetector.h	
++++ b/Wikipedia/Custom Objects/WMFFaceDetector.h	
+@@ -1,21 +1,63 @@
+-//  Created by Monte Hurd on 12/17/14.
+-//  Copyright (c) 2014 Wikimedia Foundation. Provided under MIT-style license; please copy and modify!
+ 
+ #import <UIKit/UIKit.h>
+ 
+ @interface WMFFaceDetector : NSObject
+ 
+-@property (nonatomic, strong) UIImage* image;
++@property (nonatomic, strong) CIImage* image;
+ 
+-/*
+-   "detectFace" returns rect for largest face in "self.image".
++/**
++ *  Set the image property with UIImage
++ *  Useful if you didn't have a CIImage before hand
++ *  Will attempt to use image.CIImage first, then fallback to UIImagePNGRepresentation()
++ *
++ *  @param image the image to use
++ */
++- (void)setImageWithUIImage:(UIImage*)image;
++
++/**
++ *  Set the image property with NSData
++ *  Useful if you didn't have a CIImage before hand
++ *
++ *  @param data to create the image from
++ */
++- (void)setImageWithData:(NSData*)data;
++
++/**
++ *  Detect faces synchronously
++ */
++- (void)detectFaces;
+ 
+-   Subsequent calls to "detectFace" return next largest face rect,
+-   rolling back to first face after last face.
++/**
++ *  Detect faces async
++ *
++ *  @param completion fired when face detection is completed
++ */
++- (void)detectFacesWithCompletionBlock:(dispatch_block_t)completion;
++
++/**
++ *  All faces
++ *
++ *  @return An array of CIFaceFeature
++ */
++- (NSArray*)allFaces;
++
++/**
++ *  Get an array of the bounds of all the faces. Each bounds will be normalized
++ *  to the image size so values are between 0.0 and 1.0. This so it can be used
++ *  with any size thumbnail of the image. Finally all bounds are encoded as
++ *  NSStrings.
++ *
++ *  @return The array of NSStrings representing the normalized bounds of each face
++ */
++- (NSArray*)allFaceBoundsAsStringsNormalizedToUnitRect;
+ 
+-   It only actually runs face detection on the first call.
+-   Internally cached results are returned on subsequent calls.
++/**
++ *  Normaize a rect against the bounds of the image.
++ *
++ *  @param frame The frame to normalize
++ *
++ *  @return The normalized frame
+  */
+-- (CGRect)detectFace;
++- (CGRect)rectNormailzedToUnitRect:(CGRect)frame;
+ 
+ @end
+diff --git a/Wikipedia/Custom Objects/WMFFaceDetector.m b/Wikipedia/Custom Objects/WMFFaceDetector.m
+index b0acd6076b7..0bd81977264 100644
+--- a/Wikipedia/Custom Objects/WMFFaceDetector.m	
++++ b/Wikipedia/Custom Objects/WMFFaceDetector.m	
+@@ -2,13 +2,14 @@
+ //  Copyright (c) 2014 Wikimedia Foundation. Provided under MIT-style license; please copy and modify!
+ 
+ #import "WMFFaceDetector.h"
++#import <BlocksKit/BlocksKit.h>
++#import "WMFGeometry.h"
+ 
+ @interface WMFFaceDetector ()
+ 
+ @property (strong, atomic) CIDetector* detector;
+ @property (strong, atomic) NSArray* faces;
+-@property (atomic) NSInteger nextFaceIndex;
+-@property (atomic, readwrite) CGRect faceBounds;
++@property (assign, atomic) BOOL faceDetectionHasRan;
+ 
+ @end
+ 
+@@ -28,53 +29,62 @@ - (instancetype)init {
+     return self;
+ }
+ 
+-- (CGRect)detectFace {
+-    // Optimized for repeated calls (for easy cycle through all faces).
+-    if (!self.image) {
+-        return CGRectZero;
+-    }
+-
+-    // No need to set faces more than once (for repeated call cycling).
+-    if (!self.faces) {
+-        NSAssert(self.image.CIImage, @"Attempted to use a UIImage w/o CIImage backing: Create the UIImage with 'imageWithCIImage' so face detection doesn't have to alloc/init a new CIImage to run detection. See: http://stackoverflow.com/a/15651358/135557");
+-        self.faces = [self.detector featuresInImage:self.image.CIImage];
++- (void)setImageWithUIImage:(UIImage*)image {
++    if (image.CIImage) {
++        self.image = image.CIImage;
++    } else {
++        [self setImageWithData:UIImagePNGRepresentation(image)];
+     }
++}
+ 
+-    CGRect widestFaceRect = CGRectZero;
++- (void)setImageWithData:(NSData*)data {
++    CIImage* ciImage = [[CIImage alloc] initWithData:data];
++    self.image = ciImage;
++}
+ 
+-    // Index overrun protection.
+-    if (self.nextFaceIndex >= self.faces.count) {
+-        return CGRectZero;
++- (void)detectFaces {
++    if (!self.image) {
++        return;
+     }
+ 
+-    // Get face for nextFaceIndex.
+-    widestFaceRect = ((CIFaceFeature*)self.faces[self.nextFaceIndex]).bounds;
+-
+-    if (CGRectIsEmpty(widestFaceRect)) {
+-        return CGRectZero;
++    if (!self.faceDetectionHasRan) {
++        self.faces               = [self.detector featuresInImage:self.image];
++        self.faceDetectionHasRan = YES;
+     }
++}
+ 
+-    // Increment so next call will return next face.
+-    self.nextFaceIndex++;
++- (void)detectFacesWithCompletionBlock:(dispatch_block_t)completion {
++    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
++        [self detectFaces];
+ 
+-    // Reset if last face so next call shows first face.
+-    if (self.nextFaceIndex == self.faces.count) {
+-        self.nextFaceIndex = 0;
+-    }
++        if (completion) {
++            dispatch_async(dispatch_get_main_queue(), ^{
++                completion();
++            });
++        }
++    });
++}
+ 
+-    CGRect faceImageCoords =
+-        (CGRect){
+-        {widestFaceRect.origin.x, self.image.size.height - widestFaceRect.origin.y - widestFaceRect.size.height},
+-        widestFaceRect.size
+-    };
++- (void)setImage:(CIImage*)image {
++    _image                   = image;
++    self.faces               = nil;
++    self.faceDetectionHasRan = NO;
++}
++
++- (NSArray*)allFaces {
++    return self.faces;
++}
+ 
+-    return faceImageCoords;
++- (NSArray*)allFaceBoundsAsStringsNormalizedToUnitRect {
++    return [self.faces bk_map:^id (CIFaceFeature* obj) {
++        CGRect bounds = [obj bounds];
++        CGRect normalized = [self rectNormailzedToUnitRect:bounds];
++        return NSStringFromCGRect(normalized);
++    }];
+ }
+ 
+-- (void)setImage:(UIImage*)image {
+-    _image             = image;
+-    self.nextFaceIndex = 0;
+-    self.faces         = nil;
++- (CGRect)rectNormailzedToUnitRect:(CGRect)frame {
++    return WMFUnitRectWithReferenceRect(frame, [self.image extent]);
+ }
+ 
+ @end
+diff --git a/Wikipedia/Defines/Defines.h b/Wikipedia/Defines/Defines.h
+index c9b4eee342f..27cf9f5e2c4 100644
+--- a/Wikipedia/Defines/Defines.h
++++ b/Wikipedia/Defines/Defines.h
+@@ -51,4 +51,3 @@
+ 
+ // Reminder: For caching reasons, don't do "(scale * 320)" here.
+ #define LEAD_IMAGE_WIDTH (([UIScreen mainScreen].scale > 1) ? 640 : 320)
+-#define LEAD_IMAGE_CONTAINER_HEIGHT (roundf([UIScreen mainScreen].bounds.size.height * 0.353f))
+diff --git a/Wikipedia/Protocols/WMFBundledImageProtocol.h b/Wikipedia/Protocols/WMFBundledImageProtocol.h
+new file mode 100644
+index 00000000000..ab50f33ea3d
+--- /dev/null
++++ b/Wikipedia/Protocols/WMFBundledImageProtocol.h
+@@ -0,0 +1,8 @@
++//  Created by Monte Hurd on 4/29/15.
++//  Copyright (c) 2015 Wikimedia Foundation. Provided under MIT-style license; please copy and modify!
++
++#import <Foundation/Foundation.h>
++
++@interface WMFBundledImageProtocol : NSURLProtocol
++
++@end
+diff --git a/Wikipedia/Protocols/WMFBundledImageProtocol.m b/Wikipedia/Protocols/WMFBundledImageProtocol.m
+new file mode 100644
+index 00000000000..756649aba5b
+--- /dev/null
++++ b/Wikipedia/Protocols/WMFBundledImageProtocol.m
+@@ -0,0 +1,48 @@
++//  Created by Monte Hurd on 4/29/15.
++//  Copyright (c) 2015 Wikimedia Foundation. Provided under MIT-style license; please copy and modify!
++
++// Based on: http://stackoverflow.com/a/8288359/135557
++
++#import "WMFBundledImageProtocol.h"
++#import "NSURL+WMFRest.h"
++
++NSString* const kBundledImage = @"bundledImage";
++NSString* const kWMF          = @"wmf";
++NSString* const kImageSlash   = @"image/";
++
++__attribute__((constructor)) static void WMFRegisterBundledImageProtocol() {
++    [NSURLProtocol registerClass:[WMFBundledImageProtocol class]];
++}
++
++@implementation WMFBundledImageProtocol
++
+++ (BOOL)canInitWithRequest:(NSURLRequest*)request {
++    return [[request URL] wmf_conformsToScheme:kWMF andHasKey:kBundledImage];
++}
++
+++ (NSURLRequest*)canonicalRequestForRequest:(NSURLRequest*)theRequest {
++    return theRequest;
++}
++
++- (void)startLoading {
++    NSString* fileName = [self.request.URL wmf_getValue];
++
++    NSURLResponse* response = [[NSURLResponse alloc] initWithURL:self.request.URL
++                                                        MIMEType:[kImageSlash stringByAppendingString:[fileName pathExtension]]
++                                           expectedContentLength:-1
++                                                textEncodingName:nil];
++
++    NSString* imagePath = [[NSBundle mainBundle] pathForResource:[fileName stringByDeletingPathExtension]
++                                                          ofType:[fileName pathExtension]];
++
++    NSData* data = [NSData dataWithContentsOfFile:imagePath];
++
++    [[self client] URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
++    [[self client] URLProtocol:self didLoadData:data];
++    [[self client] URLProtocolDidFinishLoading:self];
++}
++
++- (void)stopLoading {
++}
++
++@end
+diff --git a/Wikipedia/Protocols/WMFLocalizationProtocol.m b/Wikipedia/Protocols/WMFLocalizationProtocol.m
+index 76d4b2b51c8..191ecf25da8 100644
+--- a/Wikipedia/Protocols/WMFLocalizationProtocol.m
++++ b/Wikipedia/Protocols/WMFLocalizationProtocol.m
+@@ -26,7 +26,7 @@ + (NSURLRequest*)canonicalRequestForRequest:(NSURLRequest*)request {
+ // Some handling below based on http://devmonologue.com/ios/tutorials/nsurlprotocol-tutorial/
+ 
+ - (void)startLoading {
+-    NSString* key         = [self getKeyFromURL:self.request.URL];
++    NSString* key         = [self.request.URL wmf_getValue];
+     NSString* translation = [self getTranslationForKey:key];
+ 
+     NSAssert(translation.length > 1, @"translation length is zero for key: %@", key);
+@@ -36,15 +36,6 @@ - (void)startLoading {
+     [self sendResponseWithData:localizationStringData];
+ }
+ 
+-- (NSString*)getKeyFromURL:(NSURL*)url {
+-    NSAssert(self.request.URL.path.length > 1, @"wikipedia URLs must have a path: %@", self.request.URL);
+-    if (self.request.URL.path.length > 1) {
+-        return [self.request.URL.path substringFromIndex:1];
+-    } else {
+-        return nil;
+-    }
+-}
+-
+ - (NSString*)getTranslationForKey:(NSString*)key {
+     return MWCurrentArticleLanguageLocalizedString(key, nil);
+ }
+diff --git a/Wikipedia/View Controllers/LeadImage/LeadImageContainer.h b/Wikipedia/View Controllers/LeadImage/LeadImageContainer.h
+deleted file mode 100644
+index 37a9269ada1..00000000000
+--- a/Wikipedia/View Controllers/LeadImage/LeadImageContainer.h	
++++ /dev/null
+@@ -1,18 +0,0 @@
+-//  Created by Monte Hurd on 12/4/14.
+-//  Copyright (c) 2014 Wikimedia Foundation. Provided under MIT-style license; please copy and modify!
+-
+-#import <UIKit/UIKit.h>
+-#import "ThumbnailFetcher.h"
+-
+-// Protocol for notifying delegate that lead image height changed.
+-@protocol LeadImageHeightDelegate <NSObject>
+-- (void)leadImageHeightChangedTo:(NSNumber*)height;
+-@end
+-
+-@interface LeadImageContainer : UIControl <FetchFinishedDelegate>
+-
+-- (void)showForArticle:(MWKArticle*)article;
+-
+-@property (nonatomic, weak) id <LeadImageHeightDelegate> delegate;
+-
+-@end
+diff --git a/Wikipedia/View Controllers/LeadImage/LeadImageContainer.m b/Wikipedia/View Controllers/LeadImage/LeadImageContainer.m
+deleted file mode 100644
+index 578aa3ec0c3..00000000000
+--- a/Wikipedia/View Controllers/LeadImage/LeadImageContainer.m	
++++ /dev/null
+@@ -1,501 +0,0 @@
+-//  Created by Monte Hurd on 12/4/14.
+-//  Copyright (c) 2014 Wikimedia Foundation. Provided under MIT-style license; please copy and modify!
+-
+-#import "LeadImageContainer.h"
+-#import "Defines.h"
+-#import "NSString+Extras.h"
+-#import "MWKSection+DisplayHtml.h"
+-#import "CommunicationBridge.h"
+-#import "NSObject+ConstraintsScale.h"
+-#import "LeadImageTitleLabel.h"
+-#import "UIScreen+Extras.h"
+-#import "QueuesSingleton.h"
+-#import "WMFFaceDetector.h"
+-#import "MWKArticle+isMain.h"
+-#import "UIView+Debugging.h"
+-#import "WebViewController.h"
+-#import "URLCache.h"
+-#import "WMFGeometry.h"
+-#import "UIImage+WMFFocalImageDrawing.h"
+-#import "MWKArticle+Convenience.h"
+-
+-static CGFloat const kPlaceHolderImageAlpha                   = 0.3f;
+-static CGFloat const kMinimumAcceptableCachedVariantThreshold = 0.6f;
+-
+-/*
+-   When YES this causes lead image faces to be highlighted in green and
+-   simulator "Command-Shift-M" taps to cycle through the faces, shifting
+-   the image to best center the currently hightlighted face.
+-   Do *not* leave this set to YES for release.
+- */
+-#if DEBUG
+-#define ENABLE_FACE_DETECTION_DEBUGGING 0
+-#else
+-// disable in release builds
+-#define ENABLE_FACE_DETECTION_DEBUGGING 0
+-#endif
+-
+-@interface LeadImageContainer ()
+-
+-#pragma mark - Private properties
+-
+-@property (weak, nonatomic) IBOutlet UIView* titleDescriptionContainer;
+-@property (weak, nonatomic) IBOutlet LeadImageTitleLabel* titleLabel;
+-@property (strong, nonatomic) UIImage* image;
+-@property(strong, nonatomic) MWKArticle* article;
+-@property (nonatomic) BOOL isPlaceholder;
+-@property(strong, nonatomic) id rotationObserver;
+-@property (nonatomic) CGFloat height;
+-@property (nonatomic) BOOL isFaceDetectionNeeded;
+-@property (strong, nonatomic) WMFFaceDetector* faceDetector;
+-@property (strong, nonatomic) NSData* placeholderImageData;
+-@property (nonatomic, strong) dispatch_queue_t serialFaceDetectionQueue;
+-@property (nonatomic) CGRect focalFaceBounds;
+-@property (nonatomic) BOOL shouldHighlightFace;
+-
+-@end
+-
+-@implementation LeadImageContainer
+-
+-#pragma mark - Setup
+-
+-- (void)awakeFromNib {
+-    [self setupSerialFaceDetectionQueue];
+-
+-    self.focalFaceBounds       = CGRectZero;
+-    self.shouldHighlightFace   = ENABLE_FACE_DETECTION_DEBUGGING;
+-    self.image                 = nil;
+-    self.faceDetector          = [[WMFFaceDetector alloc] init];
+-    self.isFaceDetectionNeeded = NO;
+-    self.height                = LEAD_IMAGE_CONTAINER_HEIGHT;
+-    self.isPlaceholder         = NO;
+-    self.clipsToBounds         = YES;
+-    self.backgroundColor       = [UIColor clearColor];
+-    self.placeholderImageData  = UIImagePNGRepresentation([UIImage imageNamed:@"lead-default"]);
+-    [self adjustConstraintsScaleForViews:@[self.titleLabel]];
+-
+-    self.rotationObserver =
+-        [[NSNotificationCenter defaultCenter] addObserverForName:UIDeviceOrientationDidChangeNotification
+-                                                          object:nil
+-                                                           queue:[NSOperationQueue mainQueue]
+-                                                      usingBlock:^(NSNotification* notification) {
+-        [self updateNonImageElements];
+-    }];
+-
+-    #if ENABLE_FACE_DETECTION_DEBUGGING
+-    [self debugSetupToggle];
+-    #endif
+-
+-    // Important! "clipsToBounds" must be "NO" so super long titles lay out properly!
+-    self.clipsToBounds = NO;
+-
+-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(webViewRetrievedAnImage:) name:@"SectionImageRetrieved" object:nil];
+-
+-    //[self randomlyColorSubviews];
+-}
+-
+-- (void)setupSerialFaceDetectionQueue {
+-    // Low priority serial dispatch queue. From http://stackoverflow.com/a/17690878/135557
+-    // Images intercepted from web view need to have face detection ran
+-    // serially to avoid running face detection more than necessary.
+-    self.serialFaceDetectionQueue = dispatch_queue_create("org.wikimedia.wikipedia.LeadImageContainer.faceDetector.queue", DISPATCH_QUEUE_SERIAL);
+-    dispatch_queue_t low = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0);
+-    dispatch_set_target_queue(self.serialFaceDetectionQueue, low);
+-}
+-
+-#pragma mark - WebView image retrieval interception
+-
+-- (void)webViewRetrievedAnImage:(NSNotification*)notification {
+-    // Notification received each time the web view retrieves an image.
+-
+-    if (![NAV.topViewController isMemberOfClass:[WebViewController class]]) {
+-        return;
+-    }
+-
+-    BOOL (^ notificationContainsImage)(NSNotification*) = ^BOOL (NSNotification* n) {
+-        return (
+-            n.userInfo[kURLCacheKeyFileNameNoSizePrefix]
+-            &&
+-            n.userInfo[kURLCacheKeyWidth]
+-            &&
+-            n.userInfo[kURLCacheKeyData]
+-            );
+-    };
+-
+-    if (notificationContainsImage(notification)) {
+-        if ([self isRetrievedImageVariantOfLeadImage:notification.userInfo[kURLCacheKeyFileNameNoSizePrefix]]) {
+-            if (self.isPlaceholder || [self isRetrievedImageWiderThanLeadImage:notification.userInfo[kURLCacheKeyWidth]]) {
+-                //NSLog(@"INTERCEPTED WEBVIEW IMAGE of width: %@", notification.userInfo[kURLCacheKeyWidth]);
+-                [self showImage:notification.userInfo[kURLCacheKeyData] isPlaceHolder:NO];
+-            }
+-        }
+-    }
+-}
+-
+-- (BOOL)isRetrievedImageWiderThanLeadImage:(NSString*)retrievedImageWidth {
+-    return (retrievedImageWidth.floatValue > self.image.size.width);
+-}
+-
+-- (BOOL)isRetrievedImageVariantOfLeadImage:(NSString*)retrievedImageNameNoSizePrefix {
+-    return ([self.article.image.fileNameNoSizePrefix isEqualToString:retrievedImageNameNoSizePrefix]);
+-}
+-
+-#pragma mark - Drawing
+-
+-- (void)drawRect:(CGRect)rect {
+-    [super drawRect:rect];
+-
+-    if ([self shouldHideImage]) {
+-        return;
+-    }
+-    if ((self.image.size.width == 0) || (self.image.size.height == 0)) {
+-        return;
+-    }
+-
+-    // Draw gradient first so when image is drawn with kCGBlendModeMultiply
+-    // the gradient will look smooth.
+-    [self drawGradientBackground];
+-
+-    CGFloat alpha = self.isPlaceholder ? kPlaceHolderImageAlpha : 1.0;
+-
+-    // Draw lead image, aspect fill, align top, vertically centering
+-    // focalFaceBounds face if necessary.
+-    [self.image wmf_drawInRect:rect
+-                   focalBounds:WMFRectFromUnitRectForReferenceSize(self.focalFaceBounds, self.image.size)
+-                focalHighlight:self.shouldHighlightFace
+-                     blendMode:kCGBlendModeMultiply
+-                         alpha:alpha];
+-}
+-
+-- (void)drawGradientBackground {
+-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+-    CGContextRef context       = UIGraphicsGetCurrentContext();
+-
+-    void (^ drawGradient)(CGFloat, CGFloat, CGRect) = ^void (CGFloat upperAlpha, CGFloat bottomAlpha, CGRect rect) {
+-        CGFloat locations[] = {
+-            0.0,  // Upper color stop.
+-            1.0   // Bottom color stop.
+-        };
+-        CGFloat colorComponents[8] = {
+-            0.0, 0.0, 0.0, upperAlpha,  // Upper color.
+-            0.0, 0.0, 0.0, bottomAlpha  // Bottom color.
+-        };
+-        CGGradientRef gradient =
+-            CGGradientCreateWithColorComponents(colorSpace, colorComponents, locations, 2);
+-        CGPoint startPoint = CGPointMake(CGRectGetMinX(rect), CGRectGetMinY(rect));
+-        CGPoint endPoint   = CGPointMake(CGRectGetMinX(rect), CGRectGetMaxY(rect));
+-        CGContextDrawLinearGradient(context, gradient, startPoint, endPoint, 0);
+-        CGGradientRelease(gradient);
+-    };
+-
+-    // Note: the gradient is purposely drawn in 2 parts. One part for the label, and one
+-    // for the part above the label. This is done instead of adding multiple locations
+-    // to a single gradient because it allows the part above the label to fade to
+-    // transparent at the top in a way that doesn't darken the part above the label as
+-    // much as a single multiple location gradient. If you tweak anything about this, be
+-    // sure to test before/after w/ light background images to make sure things aren't
+-    // darkened too much.
+-
+-    CGFloat alphaTop    = 0.0;
+-    CGFloat alphaMid    = 0.1;
+-    CGFloat alphaBottom = 0.5;
+-
+-    CGFloat aboveLabelY = self.frame.size.height - self.titleDescriptionContainer.frame.size.height;
+-
+-    // Shift the meeting point of the 2 gradients up a bit.
+-    CGFloat centerlineDrift = -aboveLabelY / 3.0;
+-
+-    CGFloat meetingY = aboveLabelY + centerlineDrift;
+-
+-    // Draw gradient fading black of alpha 0.0 at top of image to black at alpha 0.4 at top of label.
+-    CGRect topGradientRect =
+-        (CGRect){
+-        {0, 0},
+-        {self.titleDescriptionContainer.frame.size.width, meetingY}
+-    };
+-    drawGradient(alphaTop, alphaMid, topGradientRect);
+-
+-    // Draw gradient fading black of alpha 0.4 at top of label to black at alpha 1.0 at bottom of label.
+-    CGRect bottomGradientRect =
+-        (CGRect){
+-        {self.titleDescriptionContainer.frame.origin.x, meetingY},
+-        {self.titleDescriptionContainer.frame.size.width, self.titleDescriptionContainer.frame.size.height - centerlineDrift}
+-    };
+-    drawGradient(alphaMid, alphaBottom, bottomGradientRect);
+-
+-    CGColorSpaceRelease(colorSpace);
+-}
+-
+-#pragma mark - Layout
+-
+-- (void)updateNonImageElements {
+-    // Updates title/description text color.
+-    [self updateTitleColors];
+-
+-    // Updates height of this view and of the webView's placeholer div.
+-    [self updateHeights];
+-
+-    [self setNeedsDisplay];
+-}
+-
+-- (void)updateHeights {
+-    // First update title/description and container layout so correct
+-    // dimensions are available for current title and description text.
+-    [self.titleLabel layoutIfNeeded];
+-    [self.titleDescriptionContainer layoutIfNeeded];
+-
+-    self.height = ([self shouldHideImage]) ? self.titleDescriptionContainer.frame.size.height : LEAD_IMAGE_CONTAINER_HEIGHT;
+-
+-    // Notify the layout system that the height has changed.
+-    [self invalidateIntrinsicContentSize];
+-
+-    // Now notify the web view of the height change.
+-    [self.delegate leadImageHeightChangedTo:@(self.height)];
+-}
+-
+-- (CGSize)intrinsicContentSize {
+-    return CGSizeMake(UIViewNoIntrinsicMetric, self.height);
+-}
+-
+-- (void)updateTitleColors {
+-    UIColor* textColor   = [UIColor whiteColor];
+-    UIColor* shadowColor = [UIColor colorWithWhite:0.0f alpha:0.08];
+-    //shadowColor = [UIColor redColor]; // Use for testing shadow
+-
+-    if ([self shouldHideImage]) {
+-        textColor   = [UIColor blackColor];
+-        shadowColor = [UIColor clearColor];
+-    }
+-
+-    self.titleLabel.textColor   = textColor;
+-    self.titleLabel.shadowColor = shadowColor;
+-}
+-
+-#pragma mark - Flags
+-
+-- (BOOL)shouldHideImage {
+-    return
+-        UIInterfaceOrientationIsLandscape([[UIScreen mainScreen] interfaceOrientation])
+-        ||
+-        ![self imageExists];
+-}
+-
+-- (BOOL)imageExists {
+-    return (!self.article.isMain && self.article.imageURL && ![self isGifUrl:self.article.imageURL]) ? YES : NO;
+-}
+-
+-- (BOOL)isGifUrl:(NSString*)url {
+-    return (url.pathExtension && [url.pathExtension isEqualToString:@"gif"]) ? YES : NO;
+-}
+-
+-#pragma mark - Show
+-
+-- (void)showForArticle:(MWKArticle*)article {
+-    self.article                = article;
+-    self.focalFaceBounds        = CGRectZero;
+-    self.titleLabel.imageExists = [self imageExists];
+-    self.image                  = nil;
+-    self.isFaceDetectionNeeded  = YES;
+-
+-    if (self.article.isMain) {
+-        [self setTitle:@"" description:@""];
+-        return;
+-    } else {
+-        NSString* title = [self.article.displaytitle getStringWithoutHTML];
+-        [self setTitle:title description:[self getCurrentArticleDescription]];
+-    }
+-
+-    // Show largest cached variant of lead image, or placeholder, immediately.
+-    // This image is shown until the webview (potentially) retrieves higher resolution variants.
+-    MWKImage* largestCachedVariant = self.article.image.largestCachedVariant;
+-    if (largestCachedVariant) {
+-        //NSLog(@"SHOWING LARGEST CACHED VARIANT of width: %f", largestCachedVariant.width.floatValue);
+-        [self showImage:[largestCachedVariant asNSData] isPlaceHolder:NO];
+-    } else {
+-        [self showImage:self.placeholderImageData isPlaceHolder:YES];
+-    }
+-
+-    if (![self isLargestCachedVariantSufficient:largestCachedVariant]) {
+-        (void)[[ThumbnailFetcher alloc] initAndFetchThumbnailFromURL:[@"http:" stringByAppendingString:self.article.imageURL]
+-                                                         withManager:[QueuesSingleton sharedInstance].articleFetchManager
+-                                                  thenNotifyDelegate:self];
+-    }
+-}
+-
+-- (void)setTitle:(NSString*)title description:(NSString*)description {
+-    [self.titleLabel setTitle:title description:description];
+-    [self updateNonImageElements];
+-}
+-
+-- (BOOL)isLargestCachedVariantSufficient:(MWKImage*)largestCachedVariant {
+-    if (![largestCachedVariant isEqualToImage:self.article.image]) {
+-        CGFloat okMinimumWidth = LEAD_IMAGE_WIDTH * kMinimumAcceptableCachedVariantThreshold;
+-        if (largestCachedVariant.width.floatValue < okMinimumWidth) {
+-            if (self.article.imageURL) {
+-                NSInteger widestExpectedImageWidth = [self widthOfWidestVariantWebViewWillDownload];
+-                if ((widestExpectedImageWidth == NSNotFound) || (widestExpectedImageWidth < okMinimumWidth)) {
+-                    return NO;
+-                }
+-            }
+-        }
+-    }
+-    return YES;
+-}
+-
+-- (void)showImage:(NSData*)retrievedImageData isPlaceHolder:(BOOL)isPlaceHolder {
+-    self.isPlaceholder = isPlaceHolder;
+-
+-    // Face detection is faster if the UIImage has CIImage backing.
+-    CIImage* ciImage = [[CIImage alloc] initWithData:retrievedImageData];
+-    self.image = [UIImage imageWithCIImage:ciImage];
+-
+-    [self detectFaceWithCompletionBlock:^{
+-        [self updateNonImageElements];
+-    }];
+-}
+-
+-- (NSInteger)widthOfWidestVariantWebViewWillDownload {
+-    MWKImage* widestUncachedVariant = nil;
+-    NSArray* arr                    = [self.article.images imageSizeVariants:self.article.imageURL];
+-    for (NSString* variantURL in [arr reverseObjectEnumerator]) {
+-        MWKImage* image = [self.article imageWithURL:variantURL];
+-        // Must exclude article.image because it is not retrieved by the web view
+-        // (it's the thing we're deciding if we need to download!)
+-        if (![image isEqualToImage:self.article.image]) {
+-            if (!image.isCached) {
+-                widestUncachedVariant = image;
+-                break;
+-            }
+-        }
+-    }
+-    if (widestUncachedVariant) {
+-        // Parse the width out of the url - necessary because the image probably hasn't been
+-        // retrieved yet, so width and height properties won't be set yet.
+-        // Note: occasionally images don't have size prefix in their file name, so for these
+-        // images we won't be able to divine ahead of time whether among the images to be
+-        // downloaded by the webview there will be one of sufficient resolution. In these
+-        // cases it's ok because the higher res image will be fetched with the ThumbnailFetcher.
+-        return [MWKImage fileSizePrefix:widestUncachedVariant.sourceURL];
+-    }
+-    return NSNotFound;
+-}
+-
+-#pragma mark - Fetch finished
+-
+-- (void)fetchFinished:(id)sender
+-          fetchedData:(id)fetchedData
+-               status:(FetchFinalStatus)status
+-                error:(NSError*)error {
+-    if ([sender isKindOfClass:[ThumbnailFetcher class]]) {
+-        switch (status) {
+-            case FETCH_FINAL_STATUS_SUCCEEDED:
+-            {
+-                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+-                    // Associate the image retrieved with article.image.
+-                    ThumbnailFetcher* fetcher = (ThumbnailFetcher*)sender;
+-
+-                    MWKImage* articleImage = [self.article importImageURL:fetcher.url
+-                                                                imageData:fetchedData];
+-
+-                    //NSLog(@"FETCHED HIGHER RES VARIANT of width: %f", articleImage.width.floatValue);
+-
+-                    [self showImage:[articleImage asNSData] isPlaceHolder:NO];
+-                });
+-            }
+-            break;
+-            case FETCH_FINAL_STATUS_FAILED:
+-            {
+-            }
+-            break;
+-            case FETCH_FINAL_STATUS_CANCELLED:
+-            {
+-            }
+-            break;
+-        }
+-    }
+-}
+-
+-#pragma mark - Description
+-
+-- (NSString*)getCurrentArticleDescription {
+-    NSString* description = self.article.entityDescription;
+-    if (description) {
+-        description = [self.article.entityDescription getStringWithoutHTML];
+-        description = [description capitalizeFirstLetter];
+-    }
+-    return description;
+-}
+-
+-#pragma mark - Face detection
+-
+-- (void)detectFaceWithCompletionBlock:(void (^)())block {
+-    if (!self.isFaceDetectionNeeded || self.isPlaceholder) {
+-        [self asyncDispatchBlockToMainQueue:block];
+-        return;
+-    }
+-
+-    UIImage* imageToDetect = self.image; // Ensure async block is working on this size variant.
+-    dispatch_async(self.serialFaceDetectionQueue, ^{
+-        if (self.isFaceDetectionNeeded) { // Re-check in case it changed since block was dispatched.
+-            self.faceDetector.image = imageToDetect;
+-            CGRect faceBounds = [self.faceDetector detectFace];
+-
+-            BOOL faceDetected = !CGRectIsEmpty(faceBounds);
+-
+-            // Store as unit rect so we don't have to re-run face detection on subsequently retrieved size variants
+-            self.focalFaceBounds = WMFUnitRectFromRectForReferenceSize(faceBounds, imageToDetect.size);
+-
+-            if (faceDetected) {
+-                self.isFaceDetectionNeeded = NO;
+-            }
+-        }
+-        [self asyncDispatchBlockToMainQueue:block];
+-    });
+-}
+-
+-- (void)asyncDispatchBlockToMainQueue:(void (^)())block {
+-#warning TODO: - this should live in a "dispatch utilities" file, and not an ObjC instance method
+-
+-    if (block) {
+-        dispatch_async(dispatch_get_main_queue(), ^{
+-            block();
+-        });
+-    }
+-}
+-
+-#pragma mark - Easy face detection debugging
+-
+-- (void)debugSetupToggle {
+-    // Testing code so we can hit "Command-Shift-M" to toggle through focal images.
+-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
+-                                                      object:nil
+-                                                       queue:[NSOperationQueue mainQueue]
+-                                                  usingBlock:^(NSNotification* notification) {
+-        [self debugDetectNextFace];
+-    }];
+-}
+-
+-- (void)debugDetectNextFace {
+-    // Ensure detector is set to last image retrieved. Detector may have
+-    // successfully detected large face in an earlier low res image, but
+-    // current image may be higher res. See "Madonna del Granduca" enwiki
+-    // article. Without this only the mother's face available in cycle as
+-    // it is the only one detected when the first low-res variant is
+-    // retrieved.
+-    if (self.faceDetector.image != self.image) {
+-        self.faceDetector.image = self.image;
+-    }
+-
+-    // Repeated calls to detectNextFace returns next face bounds each time.
+-    self.focalFaceBounds = WMFUnitRectFromRectForReferenceSize([self.faceDetector detectFace], self.faceDetector.image.size);
+-    [self setNeedsDisplay];
+-}
+-
+-#pragma mark - Dealloc
+-
+-- (void)dealloc {
+-    [[NSNotificationCenter defaultCenter] removeObserver:self.rotationObserver];
+-    [[NSNotificationCenter defaultCenter] removeObserver:self];
+-}
+-
+-@end
+diff --git a/Wikipedia/View Controllers/LeadImage/LeadImageContainer.xib b/Wikipedia/View Controllers/LeadImage/LeadImageContainer.xib
+deleted file mode 100644
+index 4ea8f79a034..00000000000
+--- a/Wikipedia/View Controllers/LeadImage/LeadImageContainer.xib	
++++ /dev/null
+@@ -1,59 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+-<document type="com.apple.InterfaceBuilder3.CocoaTouch.XIB" version="3.0" toolsVersion="6254" systemVersion="14B25" targetRuntime="iOS.CocoaTouch" propertyAccessControl="none" useAutolayout="YES" useTraitCollections="YES">
+-    <dependencies>
+-        <deployment identifier="iOS"/>
+-        <plugIn identifier="com.apple.InterfaceBuilder.IBCocoaTouchPlugin" version="6247"/>
+-    </dependencies>
+-    <objects>
+-        <placeholder placeholderIdentifier="IBFilesOwner" id="-1" userLabel="File's Owner" customClass="LeadImageContainer"/>
+-        <placeholder placeholderIdentifier="IBFirstResponder" id="-2" customClass="UIResponder"/>
+-        <view contentMode="scaleToFill" restorationIdentifier="LeadImageContainer" id="iN0-l3-epB" customClass="LeadImageContainer">
+-            <rect key="frame" x="0.0" y="0.0" width="363" height="223"/>
+-            <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
+-            <subviews>
+-                <view userInteractionEnabled="NO" contentMode="scaleToFill" translatesAutoresizingMaskIntoConstraints="NO" id="QrQ-tJ-JFg" userLabel="Title Description Container">
+-                    <rect key="frame" x="0.0" y="158" width="363" height="65"/>
+-                    <subviews>
+-                        <label opaque="NO" contentMode="left" horizontalHuggingPriority="251" verticalHuggingPriority="251" text="" lineBreakMode="wordWrap" numberOfLines="0" baselineAdjustment="alignBaselines" adjustsFontSizeToFit="NO" translatesAutoresizingMaskIntoConstraints="NO" id="Mg1-h3-cDH" userLabel="Title Label" customClass="LeadImageTitleLabel">
+-                            <rect key="frame" x="0.0" y="0.0" width="363" height="65"/>
+-                            <color key="backgroundColor" white="0.0" alpha="0.0" colorSpace="calibratedWhite"/>
+-                            <constraints>
+-                                <constraint firstAttribute="height" constant="65" placeholder="YES" id="9Yl-WY-o6h"/>
+-                                <constraint firstAttribute="height" constant="65" placeholder="YES" id="iNw-iA-zEd"/>
+-                            </constraints>
+-                            <fontDescription key="fontDescription" type="system" pointSize="17"/>
+-                            <color key="textColor" cocoaTouchSystemColor="darkTextColor"/>
+-                            <nil key="highlightedColor"/>
+-                            <variation key="default">
+-                                <mask key="constraints">
+-                                    <exclude reference="iNw-iA-zEd"/>
+-                                </mask>
+-                            </variation>
+-                        </label>
+-                    </subviews>
+-                    <color key="backgroundColor" white="0.0" alpha="0.0" colorSpace="calibratedWhite"/>
+-                    <constraints>
+-                        <constraint firstItem="Mg1-h3-cDH" firstAttribute="leading" secondItem="QrQ-tJ-JFg" secondAttribute="leading" id="6aY-tt-dXo"/>
+-                        <constraint firstAttribute="bottom" secondItem="Mg1-h3-cDH" secondAttribute="bottom" id="A6o-Mr-wKz"/>
+-                        <constraint firstItem="Mg1-h3-cDH" firstAttribute="top" secondItem="QrQ-tJ-JFg" secondAttribute="top" id="PbZ-GC-lj6"/>
+-                        <constraint firstAttribute="trailing" secondItem="Mg1-h3-cDH" secondAttribute="trailing" id="vG3-o0-Vaq"/>
+-                    </constraints>
+-                </view>
+-            </subviews>
+-            <color key="backgroundColor" white="1" alpha="1" colorSpace="custom" customColorSpace="calibratedWhite"/>
+-            <gestureRecognizers/>
+-            <constraints>
+-                <constraint firstItem="QrQ-tJ-JFg" firstAttribute="leading" secondItem="iN0-l3-epB" secondAttribute="leading" id="PYF-36-bR4"/>
+-                <constraint firstAttribute="trailing" secondItem="QrQ-tJ-JFg" secondAttribute="trailing" id="RQe-yG-bqL"/>
+-                <constraint firstAttribute="bottom" secondItem="QrQ-tJ-JFg" secondAttribute="bottom" id="VE6-Jb-imC"/>
+-            </constraints>
+-            <nil key="simulatedStatusBarMetrics"/>
+-            <freeformSimulatedSizeMetrics key="simulatedDestinationMetrics"/>
+-            <connections>
+-                <outlet property="titleDescriptionContainer" destination="QrQ-tJ-JFg" id="d2x-lM-iX7"/>
+-                <outlet property="titleLabel" destination="Mg1-h3-cDH" id="xyG-Hr-pyj"/>
+-            </connections>
+-            <point key="canvasLocation" x="289.5" y="185.5"/>
+-        </view>
+-    </objects>
+-</document>
+diff --git a/Wikipedia/View Controllers/LeadImage/LeadImageTitleAttributedString.h b/Wikipedia/View Controllers/LeadImage/LeadImageTitleAttributedString.h
+deleted file mode 100644
+index 32b7c67ed40..00000000000
+--- a/Wikipedia/View Controllers/LeadImage/LeadImageTitleAttributedString.h	
++++ /dev/null
+@@ -1,9 +0,0 @@
+-//  Created by Monte Hurd on 12/7/14.
+-//  Copyright (c) 2014 Wikimedia Foundation. Provided under MIT-style license; please copy and modify!
+-
+-@interface LeadImageTitleAttributedString : NSObject
+-
+-+ (NSAttributedString*)attributedStringWithTitle:(NSString*)title
+-                                     description:(NSString*)description;
+-
+-@end
+diff --git a/Wikipedia/View Controllers/LeadImage/LeadImageTitleAttributedString.m b/Wikipedia/View Controllers/LeadImage/LeadImageTitleAttributedString.m
+deleted file mode 100644
+index cd6902f351c..00000000000
+--- a/Wikipedia/View Controllers/LeadImage/LeadImageTitleAttributedString.m	
++++ /dev/null
+@@ -1,88 +0,0 @@
+-//  Created by Monte Hurd on 12/7/14.
+-//  Copyright (c) 2014 Wikimedia Foundation. Provided under MIT-style license; please copy and modify!
+-
+-#import "LeadImageTitleAttributedString.h"
+-#import "NSString+FormattedAttributedString.h"
+-#import "Defines.h"
+-
+-#define FONT @"Times New Roman"
+-#define FONT_SIZE_TITLE (34.0f * MENUS_SCALE_MULTIPLIER)
+-#define FONT_SIZE_DESCRIPTION (17.0f * MENUS_SCALE_MULTIPLIER)
+-
+-#define LINE_SPACING_TITLE (-5.0f * MENUS_SCALE_MULTIPLIER)
+-#define LINE_SPACING_DESCRIPTION (2.0f * MENUS_SCALE_MULTIPLIER)
+-
+-#define SPACE_ABOVE_DESCRIPTION (4.0f * MENUS_SCALE_MULTIPLIER)
+-
+-@implementation LeadImageTitleAttributedString
+-
+-+ (NSAttributedString*)attributedStringWithTitle:(NSString*)title
+-                                     description:(NSString*)description {
+-    CGFloat shadowBlurRadius = 0.5;
+-
+-    NSShadow* shadow = [[NSShadow alloc] init];
+-
+-    [shadow setShadowOffset:CGSizeMake(0.0, 1.0)];
+-    [shadow setShadowBlurRadius:shadowBlurRadius];
+-
+-    CGFloat titleFontSizeMultiplier = [self getSizeReductionMultiplierForTitleOfLength:title.length];
+-
+-    CGFloat titleFontSize = floor(FONT_SIZE_TITLE * titleFontSizeMultiplier);
+-
+-    NSMutableParagraphStyle* titleParagraphStyle = [[NSMutableParagraphStyle alloc] init];
+-    titleParagraphStyle.lineSpacing = LINE_SPACING_TITLE;
+-
+-    NSMutableParagraphStyle* descParagraphStyle = [[NSMutableParagraphStyle alloc] init];
+-    descParagraphStyle.lineSpacing            = LINE_SPACING_DESCRIPTION;
+-    descParagraphStyle.paragraphSpacingBefore = SPACE_ABOVE_DESCRIPTION;
+-
+-    NSDictionary* titleAttribs =
+-        @{
+-        NSShadowAttributeName: shadow,
+-        NSFontAttributeName: [UIFont fontWithName:FONT size:titleFontSize],
+-        NSParagraphStyleAttributeName: titleParagraphStyle
+-    };
+-    NSDictionary* descripAttribs =
+-        @{
+-        NSShadowAttributeName: shadow,
+-        NSFontAttributeName: [UIFont fontWithName:FONT size:FONT_SIZE_DESCRIPTION],
+-        NSParagraphStyleAttributeName: descParagraphStyle
+-    };
+-
+-    NSString* lineBreak = (description.length == 0) ? @"" : @"\n";
+-    description = description ? description : @"";
+-
+-    return
+-        [@"$1$2$3" attributedStringWithAttributes:@{}
+-                              substitutionStrings:@[title, lineBreak, description]
+-                           substitutionAttributes:@[titleAttribs, @{}, descripAttribs]
+-        ];
+-}
+-
+-+ (CGFloat)getSizeReductionMultiplierForTitleOfLength:(NSUInteger)length {
+-    // Quick hack for shrinking long titles in rough proportion to their length.
+-
+-    CGFloat multiplier = 1.0f;
+-
+-    // Assume roughly title 28 chars per line. Note this doesn't take in to account
+-    // interface orientation, which means the reduction is really not strictly
+-    // in proportion to line count, rather to string length. This should be ok for
+-    // now. Search for "lopado" and you'll see an insanely long title in the search
+-    // results, which is nice for testing, and which this seems to handle.
+-    // Also search for "list of accidents" for lots of other long title articles,
+-    // many with lead images.
+-
+-    CGFloat charsPerLine = 28;
+-    CGFloat lines        = ceil(length / charsPerLine);
+-
+-    // For every 2 "lines" (after the first 2) reduce title text size by 10%.
+-    if (lines > 2) {
+-        CGFloat linesAfter2Lines = lines - 2;
+-        multiplier = 1.0f - (linesAfter2Lines * 0.1f);
+-    }
+-
+-    // Don't shrink below 60%.
+-    return MAX(multiplier, 0.6f);
+-}
+-
+-@end
+diff --git a/Wikipedia/View Controllers/LeadImage/LeadImageTitleLabel.h b/Wikipedia/View Controllers/LeadImage/LeadImageTitleLabel.h
+deleted file mode 100644
+index 03c23fb2bf1..00000000000
+--- a/Wikipedia/View Controllers/LeadImage/LeadImageTitleLabel.h	
++++ /dev/null
+@@ -1,13 +0,0 @@
+-//  Created by Monte Hurd on 12/7/14.
+-//  Copyright (c) 2014 Wikimedia Foundation. Provided under MIT-style license; please copy and modify!
+-
+-#import "PaddedLabel.h"
+-
+-@interface LeadImageTitleLabel : PaddedLabel
+-
+-@property (nonatomic) BOOL imageExists;
+-
+-- (void)setTitle:(NSString*)title
+-     description:(NSString*)description;
+-
+-@end
+diff --git a/Wikipedia/View Controllers/LeadImage/LeadImageTitleLabel.m b/Wikipedia/View Controllers/LeadImage/LeadImageTitleLabel.m
+deleted file mode 100644
+index 0ef1c818095..00000000000
+--- a/Wikipedia/View Controllers/LeadImage/LeadImageTitleLabel.m	
++++ /dev/null
+@@ -1,57 +0,0 @@
+-//  Created by Monte Hurd on 12/7/14.
+-//  Copyright (c) 2014 Wikimedia Foundation. Provided under MIT-style license; please copy and modify!
+-
+-#import "LeadImageTitleLabel.h"
+-#import "LeadImageTitleAttributedString.h"
+-#import "UIScreen+Extras.h"
+-
+-#define PADDING_BOTTOM_WHEN_IMAGE_PRESENT 17
+-#define PADDING_BOTTOM_WHEN_IMAGE_NOT_PRESENT 8
+-#define PADDING UIEdgeInsetsMake(16, 16, PADDING_BOTTOM_WHEN_IMAGE_NOT_PRESENT, 16)
+-
+-@interface LeadImageTitleLabel ()
+-
+-@property(strong, nonatomic) id rotationObserver;
+-
+-@end
+-
+-@implementation LeadImageTitleLabel
+-
+-- (void)awakeFromNib {
+-    self.padding = PADDING;
+-
+-    self.rotationObserver =
+-        [[NSNotificationCenter defaultCenter] addObserverForName:UIDeviceOrientationDidChangeNotification
+-                                                          object:nil
+-                                                           queue:[NSOperationQueue mainQueue]
+-                                                      usingBlock:^(NSNotification* notification) {
+-        // Update padding on rotation so padding beneath title goes away in landscape.
+-        [self updatePadding];
+-    }];
+-}
+-
+-- (void)dealloc {
+-    [[NSNotificationCenter defaultCenter] removeObserver:self.rotationObserver];
+-}
+-
+-- (void)setTitle:(NSString*)title
+-     description:(NSString*)description {
+-    self.attributedText =
+-        [LeadImageTitleAttributedString attributedStringWithTitle:title
+-                                                      description:description];
+-    [self updatePadding];
+-}
+-
+-- (void)updatePadding {
+-    CGFloat bottomPadding =
+-        (
+-            UIInterfaceOrientationIsPortrait([[UIScreen mainScreen] interfaceOrientation])
+-            &&
+-            self.imageExists
+-        )
+-        ? PADDING_BOTTOM_WHEN_IMAGE_PRESENT : PADDING_BOTTOM_WHEN_IMAGE_NOT_PRESENT;
+-
+-    self.padding = UIEdgeInsetsMake(PADDING.top, PADDING.left, bottomPadding, PADDING.right);
+-}
+-
+-@end
+diff --git a/Wikipedia/View Controllers/Preview/PreviewAndSaveViewController.m b/Wikipedia/View Controllers/Preview/PreviewAndSaveViewController.m
+index 6f161789726..d202f7f1662 100644
+--- a/Wikipedia/View Controllers/Preview/PreviewAndSaveViewController.m	
++++ b/Wikipedia/View Controllers/Preview/PreviewAndSaveViewController.m	
+@@ -436,7 +436,7 @@ - (void)fetchFinished:(id)sender
+             case FETCH_FINAL_STATUS_SUCCEEDED: {
+                 [self fadeAlert];
+ 
+-                [self.bridge loadHTML:fetchedData withAssetsFile:@"preview.html"];
++                [self.bridge loadHTML:fetchedData withAssetsFile:@"preview.html" leadSectionHtml:@""];
+ 
+                 [self.bridge sendMessage:@"setLanguage"
+                              withPayload:@{
+diff --git a/Wikipedia/View Controllers/ShareCard/WMFShareCardImageContainer.m b/Wikipedia/View Controllers/ShareCard/WMFShareCardImageContainer.m
+index 3dcf4f6994a..7383981cde1 100644
+--- a/Wikipedia/View Controllers/ShareCard/WMFShareCardImageContainer.m	
++++ b/Wikipedia/View Controllers/ShareCard/WMFShareCardImageContainer.m	
+@@ -22,9 +22,10 @@ - (instancetype)initWithCoder:(NSCoder*)coder {
+ }
+ 
+ - (void)setImage:(UIImage*)image {
+-    _image                  = image;
+-    self.faceDetector.image = image;
+-    self.faceBounds         = [self.faceDetector detectFace];
++    _image = image;
++    [self.faceDetector setImageWithUIImage:image];
++    [self.faceDetector detectFaces];
++    self.faceBounds = [[[self.faceDetector allFaces] firstObject] bounds];
+ }
+ 
+ - (void)drawRect:(CGRect)rect {
+diff --git a/Wikipedia/View Controllers/WebView/WebViewController.h b/Wikipedia/View Controllers/WebView/WebViewController.h
+index e67c69d19e0..95ecb5acd61 100644
+--- a/Wikipedia/View Controllers/WebView/WebViewController.h	
++++ b/Wikipedia/View Controllers/WebView/WebViewController.h	
+@@ -5,7 +5,6 @@
+ #import "CenterNavController.h"
+ #import "PullToRefreshViewController.h"
+ #import "ArticleFetcher.h"
+-#import "LeadImageContainer.h"
+ 
+ // TODO: rename the WebViewControllerVariableNames once we rename this class
+ extern NSString* const WebViewControllerTextWasHighlighted;
+@@ -15,7 +14,7 @@ extern NSString* const WebViewControllerShareSelectedText;
+ 
+ @class BottomMenuViewController, CommunicationBridge;
+ 
+-@interface WebViewController : PullToRefreshViewController <UIWebViewDelegate, UIScrollViewDelegate, UIGestureRecognizerDelegate, UIAlertViewDelegate, FetchFinishedDelegate, LeadImageHeightDelegate>
++@interface WebViewController : PullToRefreshViewController <UIWebViewDelegate, UIScrollViewDelegate, UIGestureRecognizerDelegate, UIAlertViewDelegate, FetchFinishedDelegate>
+ 
+ @property (weak, nonatomic) IBOutlet UIWebView* webView;
+ @property (nonatomic) BOOL bottomMenuHidden;
+diff --git a/Wikipedia/View Controllers/WebView/WebViewController.m b/Wikipedia/View Controllers/WebView/WebViewController.m
+index eeccf016064..87b0db31656 100644
+--- a/Wikipedia/View Controllers/WebView/WebViewController.m	
++++ b/Wikipedia/View Controllers/WebView/WebViewController.m	
+@@ -56,7 +56,6 @@ - (UIStatusBarAnimation)preferredStatusBarUpdateAnimation {
+ - (void)viewDidLoad {
+     [super viewDidLoad];
+ 
+-    [self setupLeadImageContainer];
+     [self setupTrackingFooter];
+ 
+     self.bottomNavHeightConstraint.constant = CHROME_MENUS_HEIGHT;
+@@ -78,10 +77,6 @@ - (void)viewDidLoad {
+     [self.bridge addListener:@"DOMContentLoaded" withBlock:^(NSString* type, NSDictionary* payload) {
+         [weakSelf jumpToFragmentIfNecessary];
+         [weakSelf autoScrollToLastScrollOffsetIfNecessary];
+-
+-        // Show lead image!
+-        [weakSelf.leadImageContainer showForArticle:[SessionSingleton sharedInstance].currentArticle];
+-
+         [weakSelf.loadingIndicatorOverlay setVisible:NO animated:YES];
+ 
+         dispatch_async(dispatch_get_main_queue(), ^{
+@@ -118,6 +113,11 @@ - (void)viewDidLoad {
+                                              selector:@selector(keyboardWillHide:)
+                                                  name:UIKeyboardWillHideNotification object:nil];
+ 
++    [[NSNotificationCenter defaultCenter] addObserver:self
++                                             selector:@selector(sectionImageRetrieved:)
++                                                 name:WMFURLCacheSectionImageRetrievedNotification
++                                               object:nil];
++
+     [self fadeAlert];
+ 
+     scrollViewDragBeganVerticalOffset_ = 0.0f;
+@@ -1538,7 +1538,137 @@ - (void)retrieveArticleForPageTitle:(MWKTitle*)pageTitle
+     }
+ }
+ 
+-#pragma mark Display article from core data
++#pragma mark Lead image
++
++- (NSString*)leadImageGetHtml {
++    // Get lead image html structured such that no JS bridge messages are needed for lead image presentation.
++    // Set everything here via css before the html payload is delivered to the web view.
++
++    MWKArticle* article = session.currentArticle;
++
++    if ([session articleIsAMainArticle:article]) {
++        return @"";
++    }
++
++    NSString* title       = article.displaytitle;
++    NSString* description = article.entityDescription ? [[article.entityDescription getStringWithoutHTML] capitalizeFirstLetter] : @"";
++
++    BOOL hasImage          = article.imageURL ? YES : NO;
++    CGFloat fontMultiplier = [self leadImageGetSizeReductionMultiplierForTitleOfLength:title.length];
++
++    // offsetY is percent to shift image vertically. 0 aligns top to top of lead_image_div,
++    // 50 centers it vertically, and 100 aligns bottom of image to bottom of lead_image_div.
++    NSInteger offsetY = 25;
++
++    if (hasImage) {
++        CGRect focalRect = [article.image primaryFocalRectNomrmalizedToImageSize:NO];
++        if (!CGRectEqualToRect(focalRect, CGRectZero)) {
++            offsetY = [self leadImageFocalOffsetYPercentageFromTopOfRect:focalRect];
++        }
++    }
++
++    NSString* leadImageDivStyleOverrides =
++        !hasImage ? @"" : [NSString stringWithFormat:
++                           @"background-image:-webkit-linear-gradient(top, rgba(0,0,0,0.0) 0%%, rgba(0,0,0,0.5) 100%%),"
++                           @"url('%@')"
++                           @"%@;"
++                           "background-position: calc(50%%) calc(%ld%%);",
++                           article.imageURL,
++                           [article.image isCached] ? @"" : @",url('wmf://bundledImage/lead-default.png')",
++                           offsetY];
++
++    NSString* leadImageHtml =
++        [NSString stringWithFormat:
++         @"<div id='lead_image_div' class='lead_image_div' style=\"%@\">"
++         "<div id='lead_image_text_container'>"
++         "<div id='lead_image_title' style='%@'>%@</div>"
++         "<div id='lead_image_description' style='%@'>%@</div>"
++         "</div>"
++         "</div>",
++         leadImageDivStyleOverrides,
++         [NSString stringWithFormat:@"font-size:%.02fpx;", 28.0f * fontMultiplier],
++         title,
++         [NSString stringWithFormat:@"font-size:%.02fpx;", 14.0f],
++         description
++        ];
++
++    if (!hasImage) {
++        leadImageHtml = [NSString stringWithFormat:@"<div id='lead_image_none'>%@</div>", leadImageHtml];
++    }
++
++    return leadImageHtml;
++}
++
++- (CGFloat)leadImageGetSizeReductionMultiplierForTitleOfLength:(NSUInteger)length {
++    // Quick hack for shrinking long titles in rough proportion to their length.
++
++    CGFloat multiplier = 1.0f;
++
++    // Assume roughly title 28 chars per line. Note this doesn't take in to account
++    // interface orientation, which means the reduction is really not strictly
++    // in proportion to line count, rather to string length. This should be ok for
++    // now. Search for "lopado" and you'll see an insanely long title in the search
++    // results, which is nice for testing, and which this seems to handle.
++    // Also search for "list of accidents" for lots of other long title articles,
++    // many with lead images.
++
++    CGFloat charsPerLine = 28;
++    CGFloat lines        = ceil(length / charsPerLine);
++
++    // For every 2 "lines" (after the first 2) reduce title text size by 10%.
++    if (lines > 2) {
++        CGFloat linesAfter2Lines = lines - 2;
++        multiplier = 1.0f - (linesAfter2Lines * 0.1f);
++    }
++
++    // Don't shrink below 60%.
++    return MAX(multiplier, 0.6f);
++}
++
++- (void)sectionImageRetrieved:(NSNotification*)notification {
++    NSDictionary* payload = notification.userInfo;
++    NSNumber* isLeadImage = payload[kURLCacheKeyIsLeadImage];
++    if (isLeadImage.boolValue) {
++        [self leadImageRetrieved:notification];
++    }
++}
++
++- (void)leadImageRetrieved:(NSNotification*)notification {
++    [self leadImageHidePlaceHolderAndCenterOnFaceIfNeeded:notification];
++}
++
++- (NSInteger)leadImageFocalOffsetYPercentageFromTopOfRect:(CGRect)rect {
++    float percentFromTop = 100.0f - (CGRectGetMidY(rect) * 100.0f);
++    return @(MAX(0, MIN(100, percentFromTop))).integerValue;
++}
++
++- (void)leadImageHidePlaceHolderAndCenterOnFaceIfNeeded:(NSNotification*)notification {
++    static NSString* hidePlaceholderJS = nil;
++    if (!hidePlaceholderJS) {
++        hidePlaceholderJS = @"document.getElementById('lead_image_div').style.backgroundImage = document.getElementById('lead_image_div').style.backgroundImage.replace('wmf://bundledImage/lead-default.png', 'wmf://bundledImage/empty.png');";
++    }
++
++    NSDictionary* payload = notification.userInfo;
++    NSString* stringRect  = payload[kURLCacheKeyPrimaryFocalUnitRectString];
++    CGRect rect           = CGRectFromString(stringRect);
++
++    NSString* applyFocalOffsetJS = @"";
++    if (!CGRectEqualToRect(rect, CGRectZero)) {
++        NSInteger yFocalOffset = [self leadImageFocalOffsetYPercentageFromTopOfRect:rect];
++        applyFocalOffsetJS = [NSString stringWithFormat:@"document.getElementById('lead_image_div').style.backgroundPosition = 'calc(100%%) calc(%ld%%)';", yFocalOffset];
++    }
++
++    static NSString* animationCss = nil;
++    if (!animationCss) {
++        animationCss =
++            @"document.getElementById('lead_image_div').style.transition = 'background-position 0.8s';";
++    }
++
++    NSString* js = [NSString stringWithFormat:@"%@%@%@", animationCss, hidePlaceholderJS, applyFocalOffsetJS];
++    [self.webView stringByEvaluatingJavaScriptFromString:js];
++}
++
++#pragma mark Display article from data store
+ 
+ - (void)displayArticle:(MWKTitle*)title {
+     MWKArticle* article = [session.dataStore articleWithTitle:title];
+@@ -1633,7 +1763,7 @@ - (void)displayArticle:(MWKTitle*)title {
+         return;
+     }
+ 
+-    [self.bridge loadHTML:htmlStr withAssetsFile:@"index.html"];
++    [self.bridge loadHTML:htmlStr withAssetsFile:@"index.html" leadSectionHtml:[self leadImageGetHtml]];
+ 
+     // NSLog(@"languageInfo = %@", languageInfo.code);
+     [self.bridge sendMessage:@"setLanguage"
+@@ -1683,6 +1813,7 @@ - (void)didRotateFromInterfaceOrientation:(UIInterfaceOrientation)fromInterfaceO
+ - (void)scrollToElementOnScreenBeforeRotate {
+     NSString* js = @"(function() {"
+                    @"    if (_topElement) {"
++                   @"    if (_topElement.id && (_topElement.id === 'lead_image_div')) return 0;"
+                    @"        var rect = _topElement.getBoundingClientRect();"
+                    @"        return (window.scrollY + rect.top) - (%f * rect.height);"
+                    @"    } else {"
+@@ -1957,33 +2088,6 @@ - (void)loadingIndicatorAdd {
+     }];
+ }
+ 
+-#pragma mark Lead image
+-
+-- (void)setupLeadImageContainer {
+-    self.leadImageContainer = [[[NSBundle mainBundle] loadNibNamed:@"LeadImageContainer"
+-                                                             owner:nil
+-                                                           options:nil] firstObject];
+-
+-    self.leadImageContainer.delegate = self;
+-
+-    [self.leadImageContainer addTarget:self
+-                                action:@selector(didTouchLeadImage:)
+-                      forControlEvents:UIControlEventTouchUpInside];
+-
+-    [self.webView wmf_addTrackingView:self.leadImageContainer
+-                           atLocation:WMFTrackingViewLocationTop];
+-}
+-
+-- (void)leadImageHeightChangedTo:(NSNumber*)height {
+-    // Let the html spacer div adjust to the new height of the lead image container.
+-    [self.bridge sendMessage:@"setLeadImageDivHeight"
+-                 withPayload:@{ @"height": height }];
+-}
+-
+-- (void)didTouchLeadImage:(id)sender {
+-    [self presentGalleryForArticle:session.currentArticle showingImage:session.currentArticle.image];
+-}
+-
+ #pragma mark Sharing
+ 
+ - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+diff --git a/Wikipedia/View Controllers/WebView/WebViewController_Private.h b/Wikipedia/View Controllers/WebView/WebViewController_Private.h
+index 32eb9eefbba..22966c66505 100644
+--- a/Wikipedia/View Controllers/WebView/WebViewController_Private.h	
++++ b/Wikipedia/View Controllers/WebView/WebViewController_Private.h	
+@@ -55,7 +55,6 @@
+ #import "ArticleFetcher.h"
+ #import "AssetsFileFetcher.h"
+ 
+-#import "LeadImageContainer.h"
+ #import "DataMigrationProgressViewController.h"
+ #import "UIFont+WMFStyle.h"
+ #import "WebViewController+ImageGalleryPresentation.h"
+@@ -70,6 +69,8 @@
+ 
+ #import "WMFLoadingIndicatorOverlay.h"
+ 
++#import "URLCache.h"
++
+ //#import "UIView+Debugging.h"
+ 
+ #define TOC_TOGGLE_ANIMATION_DURATION @0.225f
+@@ -149,8 +150,6 @@ static int const kMinimumTextSelectionLength = 2;
+ 
+ @property (strong, nonatomic) WMFLoadingIndicatorOverlay* loadingIndicatorOverlay;
+ 
+-@property (strong, nonatomic) LeadImageContainer* leadImageContainer;
+-
+ @property (strong, nonatomic) WMFWebViewFooterContainerView* footerContainer;
+ @property (strong, nonatomic) WMFWebViewFooterViewController* footerViewController;
+ 
+diff --git a/Wikipedia/Web Image Interception/URLCache.h b/Wikipedia/Web Image Interception/URLCache.h
+index 148fdef2781..2cfc1f15505 100644
+--- a/Wikipedia/Web Image Interception/URLCache.h	
++++ b/Wikipedia/Web Image Interception/URLCache.h	
+@@ -3,12 +3,22 @@
+ 
+ #import <Foundation/Foundation.h>
+ 
++/**
++ *  Get notified when a section image is loaded
++ */
++extern NSString* const WMFURLCacheSectionImageRetrievedNotification;
++
++/**
++ *  Keys passed in the WMFURLCacheSectionImageRetrievedNotification
++ */
+ extern NSString* const kURLCacheKeyFileName;
+ extern NSString* const kURLCacheKeyData;
+ extern NSString* const kURLCacheKeyWidth;
+ extern NSString* const kURLCacheKeyHeight;
+ extern NSString* const kURLCacheKeyURL;
+ extern NSString* const kURLCacheKeyFileNameNoSizePrefix;
++extern NSString* const kURLCacheKeyIsLeadImage;
++extern NSString* const kURLCacheKeyPrimaryFocalUnitRectString;
+ 
+ @interface URLCache : NSURLCache
+ 
+diff --git a/Wikipedia/Web Image Interception/URLCache.m b/Wikipedia/Web Image Interception/URLCache.m
+index c93bb859206..8e9669a5b2b 100644
+--- a/Wikipedia/Web Image Interception/URLCache.m	
++++ b/Wikipedia/Web Image Interception/URLCache.m	
+@@ -5,12 +5,17 @@
+ #import "NSString+Extras.h"
+ #import "SessionSingleton.h"
+ 
+-NSString* const kURLCacheKeyFileName             = @"fileName";
+-NSString* const kURLCacheKeyData                 = @"data";
+-NSString* const kURLCacheKeyWidth                = @"width";
+-NSString* const kURLCacheKeyHeight               = @"height";
+-NSString* const kURLCacheKeyURL                  = @"url";
+-NSString* const kURLCacheKeyFileNameNoSizePrefix = @"fileNameNoSizePrefix";
++NSString* const WMFURLCacheSectionImageRetrievedNotification = @"WMFSectionImageRetrieved";
++
++NSString* const kURLCacheKeyFileName                   = @"fileName";
++NSString* const kURLCacheKeyData                       = @"data";
++NSString* const kURLCacheKeyWidth                      = @"width";
++NSString* const kURLCacheKeyHeight                     = @"height";
++NSString* const kURLCacheKeyURL                        = @"url";
++NSString* const kURLCacheKeyFileNameNoSizePrefix       = @"fileNameNoSizePrefix";
++NSString* const kURLCacheKeyIsLeadImage                = @"isLeadImage";
++NSString* const kURLCacheKeyPrimaryFocalUnitRectString = @"primaryFocalUnitRectString";
++
+ 
+ #if 0
+ #define URLCacheLog(...) NSLog(__VA_ARGS__)
+@@ -84,7 +89,6 @@ - (void)storeCachedResponse:(NSCachedURLResponse*)cachedResponse forRequest:(NSU
+     }
+ 
+     // Placeholder record found, so route image data to article data store.
+-
+     NSData* imageDataToUse = cachedResponse.data;
+ 
+     @try {
+@@ -97,7 +101,7 @@ - (void)storeCachedResponse:(NSCachedURLResponse*)cachedResponse forRequest:(NSU
+ 
+     // Broadcast the image data so things like the table of contents can update
+     // itself as images arrive.
+-    [[NSNotificationCenter defaultCenter] postNotificationName:@"SectionImageRetrieved"
++    [[NSNotificationCenter defaultCenter] postNotificationName:WMFURLCacheSectionImageRetrievedNotification
+                                                         object:nil
+                                                       userInfo:@{
+          kURLCacheKeyFileName: image.fileName,
+@@ -105,7 +109,9 @@ - (void)storeCachedResponse:(NSCachedURLResponse*)cachedResponse forRequest:(NSU
+          kURLCacheKeyWidth: image.width,
+          kURLCacheKeyHeight: image.height,
+          kURLCacheKeyURL: image.sourceURL,
+-         kURLCacheKeyFileNameNoSizePrefix: image.fileNameNoSizePrefix
++         kURLCacheKeyFileNameNoSizePrefix: image.fileNameNoSizePrefix,
++         kURLCacheKeyIsLeadImage: @([image isLeadImage]),
++         kURLCacheKeyPrimaryFocalUnitRectString: NSStringFromCGRect([image primaryFocalRectNomrmalizedToImageSize:NO])
+      }];
+ }
+ 
+diff --git a/Wikipedia/assets/bundle.js b/Wikipedia/assets/bundle.js
+index 80c2c8d352f..38914361eaf 100644
+--- a/Wikipedia/assets/bundle.js
++++ b/Wikipedia/assets/bundle.js
+@@ -245,6 +245,10 @@ function touchEndedWithoutDragging(event){
+     }
+ }
+ 
++function getUrlFromBackgroundStyle(element) {
++    return element.style.background.match(/(?:url\(['|"]?)(.*?)(?:['|"]?\))/)[1];
++}
++
+ /**
+  * Attempts to send a bridge message which corresponds to `hrefTarget`, based on various attributes.
+  * @return `true` if a message was sent, otherwise `false`.
+@@ -276,7 +280,8 @@ function maybeSendMessageForTarget(event, hrefTarget){
+             document.getElementById( href.substring( 1 ) ).scrollIntoView();
+         }
+     } else if (typeof hrefClass === 'string' && hrefClass.indexOf('image') !== -1) {
+-        bridge.sendMessage('imageClicked', { 'url': event.target.getAttribute('src') });
++         var url = (event.target.id === 'lead_image_div') ? getUrlFromBackgroundStyle(event.target) : event.target.getAttribute('src');
++        bridge.sendMessage('imageClicked', { 'url': url });
+     } else if (href) {
+         bridge.sendMessage( 'linkClicked', { 'href': href });
+     } else {
+@@ -287,12 +292,6 @@ function maybeSendMessageForTarget(event, hrefTarget){
+ 
+ document.addEventListener("touchend", handleTouchEnded, false);
+ 
+-bridge.registerListener( "setLeadImageDivHeight", function( payload ) {
+-    var div = document.getElementById( "lead_image_div" );
+-    if (payload.height == div.offsetHeight) return;
+-    div.style.height = payload.height + 'px';
+-});
+-
+ })();
+ 
+ },{"./bridge":1,"./refs":5,"./transformer":6,"./transforms/collapsePageIssuesAndDisambig":9}],4:[function(require,module,exports){
+diff --git a/Wikipedia/assets/index.html b/Wikipedia/assets/index.html
+index 7c6b7990863..7e7c9a37085 100644
+--- a/Wikipedia/assets/index.html
++++ b/Wikipedia/assets/index.html
+@@ -11,9 +11,10 @@
+     <base href="https://wikipedia.org">
+ 
+     </head>
+-    <body class="stable">
++    <body class="stable">        
+         <div class="content" id="content">
+-            #INJECTION_POINT#
++            %@
++            %@
+         </div>
+     </body>
+ </html>
+diff --git a/Wikipedia/assets/preview.html b/Wikipedia/assets/preview.html
+index 57161831fa9..2f1aad46741 100644
+--- a/Wikipedia/assets/preview.html
++++ b/Wikipedia/assets/preview.html
+@@ -12,7 +12,8 @@
+     </head>
+     <body class="stable">
+         <div class="content" id="content">
+-            #INJECTION_POINT#
++            <!-- %@ don't remove unless removed from index.html too -->
++            %@
+         </div>
+     </body>
+ </html>
+\ No newline at end of file
+diff --git a/Wikipedia/assets/styleoverrides.css b/Wikipedia/assets/styleoverrides.css
+index 64e25fb82da..571c261020c 100644
+--- a/Wikipedia/assets/styleoverrides.css
++++ b/Wikipedia/assets/styleoverrides.css
+@@ -1 +1 @@
+-a:hover{text-decoration:none !important}.content{margin-top:0px}.content_block,.image_overflow_x_container{clear:both;overflow-x:auto}#edit_section_button_0{margin-top:6px}#section_heading_and_content_block_0{margin-top:13px}.ios-disambiguation-item-anchor{display:block;padding-top:8px;padding-bottom:8px}.ios-issue-item{padding-top:8px;padding-bottom:8px}.ios-issue-item *{font-weight:normal !important}#disambig_sub_container,#issues_sub_container{background-color:#fff !important;border-bottom:1px solid #ccc;padding-top:6px;padding-bottom:12px;margin-bottom:12px}#issues_container_close_button{color:#333;display:none;font-weight:bold;padding:4px 20px 4px 20px}a.issues_button,a.disambig_button{padding:4px 0px 4px 0px !important}span.issues_separator{padding-top:4px!important;padding-bottom:4px!important}div.issues_container{margin-bottom:1.8em !important}
+\ No newline at end of file
++a:hover{text-decoration:none !important}.content{margin-top:0px}.lead_image_div{margin-left:-16px !important;margin-right:-16px !important;transition-timing-function:ease-in-out}div#lead_image_none div.lead_image_div{height:auto !important}#lead_image_text_container{padding:16px;pointer-events:none !important}div#lead_image_none div#lead_image_text_container{position:relative !important;padding-bottom:0px !important;padding-top:0px !important}#lead_image_title,#lead_image_description{font-family:Times New Roman;pointer-events:none !important}#lead_image_title{padding-top:4px;line-height:100%;margin-top:6px;margin-bottom:6px}div#lead_image_none div#lead_image_title{color:#000 !important;text-shadow:none !important}#lead_image_description{line-height:115%}div#lead_image_none div#lead_image_description{color:#000 !important;text-shadow:none !important}@media (orientation:portrait){.lead_image_div{height:35vh;background-repeat:no-repeat;background-size:cover;color:#fff;position:relative}#lead_image_text_container{position:absolute;bottom:0px}#lead_image_title,#lead_image_description{text-shadow:0 1px .5px rgba(0,0,0,0.25)}}@media (orientation:landscape){.lead_image_div{background-size:0 0;height:auto;color:#000;padding-bottom:0px;padding-top:0px}#lead_image_text_container{padding-bottom:0px;padding-top:0px}}.content_block,.image_overflow_x_container{clear:both;overflow-x:auto}#edit_section_button_0{margin-top:6px}#section_heading_and_content_block_0{margin-top:13px}.ios-disambiguation-item-anchor{display:block;padding-top:8px;padding-bottom:8px}.ios-issue-item{padding-top:8px;padding-bottom:8px}.ios-issue-item *{font-weight:normal !important}#disambig_sub_container,#issues_sub_container{background-color:#fff !important;border-bottom:1px solid #ccc;padding-top:6px;padding-bottom:12px;margin-bottom:12px}#issues_container_close_button{color:#333;display:none;font-weight:bold;padding:4px 20px 4px 20px}a.issues_button,a.disambig_button{padding:4px 0px 4px 0px !important}span.issues_separator{padding-top:4px!important;padding-bottom:4px!important}div.issues_container{margin-bottom:1.8em !important}
+\ No newline at end of file
+diff --git a/Wikipedia/mw-bridge/CommunicationBridge.h b/Wikipedia/mw-bridge/CommunicationBridge.h
+index 3a6ced65c21..450da406914 100644
+--- a/Wikipedia/mw-bridge/CommunicationBridge.h
++++ b/Wikipedia/mw-bridge/CommunicationBridge.h
+@@ -18,6 +18,6 @@ typedef void (^ JSListener)(NSString*, NSDictionary*);
+ // This method calls the "loadHTML:withAssetsFile:" category method on
+ // UIWebView, but first it enables message queueing so subsequent calls
+ // to "sendMessage:withPayload:" are queued until the html load completes.
+-- (void)loadHTML:(NSString*)string withAssetsFile:(NSString*)fileName;
++- (void)loadHTML:(NSString*)string withAssetsFile:(NSString*)fileName leadSectionHtml:(NSString*)leadSectionHtml;
+ 
+ @end
+diff --git a/Wikipedia/mw-bridge/CommunicationBridge.m b/Wikipedia/mw-bridge/CommunicationBridge.m
+index 72bbeba85cb..62433424c44 100644
+--- a/Wikipedia/mw-bridge/CommunicationBridge.m
++++ b/Wikipedia/mw-bridge/CommunicationBridge.m
+@@ -143,9 +143,9 @@ - (void)disableQueueingAndRemoveQueuedMessages {
+     [self.queuedMessages removeAllObjects];
+ }
+ 
+-- (void)loadHTML:(NSString*)string withAssetsFile:(NSString*)fileName {
++- (void)loadHTML:(NSString*)string withAssetsFile:(NSString*)fileName leadSectionHtml:(NSString*)leadSectionHtml {
+     self.shouldQueueMessages = YES;
+-    [self.webView loadHTML:string withAssetsFile:fileName];
++    [self.webView loadHTML:string withAssetsFile:fileName leadSectionHtml:leadSectionHtml];
+ }
+ 
+ @end
+diff --git a/www/index.html b/www/index.html
+index 7c6b7990863..7e7c9a37085 100644
+--- a/www/index.html
++++ b/www/index.html
+@@ -11,9 +11,10 @@
+     <base href="https://wikipedia.org">
+ 
+     </head>
+-    <body class="stable">
++    <body class="stable">        
+         <div class="content" id="content">
+-            #INJECTION_POINT#
++            %@
++            %@
+         </div>
+     </body>
+ </html>
+diff --git a/www/js/listeners.js b/www/js/listeners.js
+index c9d8afb891e..9d0bff65b79 100644
+--- a/www/js/listeners.js
++++ b/www/js/listeners.js
+@@ -144,6 +144,10 @@ function touchEndedWithoutDragging(event){
+     }
+ }
+ 
++function getUrlFromBackgroundStyle(element) {
++    return element.style.background.match(/(?:url\(['|"]?)(.*?)(?:['|"]?\))/)[1];
++}
++
+ /**
+  * Attempts to send a bridge message which corresponds to `hrefTarget`, based on various attributes.
+  * @return `true` if a message was sent, otherwise `false`.
+@@ -175,7 +179,8 @@ function maybeSendMessageForTarget(event, hrefTarget){
+             document.getElementById( href.substring( 1 ) ).scrollIntoView();
+         }
+     } else if (typeof hrefClass === 'string' && hrefClass.indexOf('image') !== -1) {
+-        bridge.sendMessage('imageClicked', { 'url': event.target.getAttribute('src') });
++         var url = (event.target.id === 'lead_image_div') ? getUrlFromBackgroundStyle(event.target) : event.target.getAttribute('src');
++        bridge.sendMessage('imageClicked', { 'url': url });
+     } else if (href) {
+         bridge.sendMessage( 'linkClicked', { 'href': href });
+     } else {
+@@ -186,10 +191,4 @@ function maybeSendMessageForTarget(event, hrefTarget){
+ 
+ document.addEventListener("touchend", handleTouchEnded, false);
+ 
+-bridge.registerListener( "setLeadImageDivHeight", function( payload ) {
+-    var div = document.getElementById( "lead_image_div" );
+-    if (payload.height == div.offsetHeight) return;
+-    div.style.height = payload.height + 'px';
+-});
+-
+ })();
+diff --git a/www/less/styleoverrides.less b/www/less/styleoverrides.less
+index cab126ab2f7..5d5f1ea2b37 100644
+--- a/www/less/styleoverrides.less
++++ b/www/less/styleoverrides.less
+@@ -12,12 +12,109 @@ a:hover {
+ 
+ 
+ 
+-/* Lead Image Styling overrides */
+ 
+ 
++
++
++
++
++
++/* Lead Image Styling overrides */
++
+ /* Override the top margin - needed so the lead image spacer can control top margin. */
+ .content {margin-top:0px;}
+ 
++.lead_image_div {
++    margin-left:-16px !important;
++    margin-right:-16px !important;
++    transition-timing-function: ease-in-out;
++}
++
++div#lead_image_none div.lead_image_div {
++    height:auto !important;
++}
++
++#lead_image_text_container {
++    padding:16px;
++    pointer-events: none !important;
++}
++
++div#lead_image_none div#lead_image_text_container {
++    position: relative !important;
++    padding-bottom:0px !important;
++    padding-top:0px !important;
++}
++
++#lead_image_title, #lead_image_description {
++    font-family: Times New Roman;
++    pointer-events: none !important;
++}
++
++#lead_image_title {
++    padding-top:4px;
++    line-height:100%;
++    margin-top:6px;
++    margin-bottom:6px;
++}
++
++div#lead_image_none div#lead_image_title {
++    color:#000 !important;
++    text-shadow:none !important;
++}
++
++#lead_image_description {
++    line-height:115%;
++}
++
++div#lead_image_none div#lead_image_description {
++    color:#000 !important;
++    text-shadow:none !important;
++}
++
++@media (orientation: portrait) {
++    .lead_image_div {
++        height:35vh;
++        background-repeat: no-repeat;
++        background-size:cover;
++        color:#fff;
++        position: relative;
++    }
++
++    #lead_image_text_container {
++        position: absolute;
++        bottom: 0px;
++    }
++
++    #lead_image_title, #lead_image_description {
++        text-shadow: 0px 1px 0.5px rgba(0, 0, 0, 0.25);
++    }
++}
++
++@media (orientation: landscape) {
++    .lead_image_div {
++        background-size:0 0;
++        height:auto;
++        color:#000;
++        padding-bottom:0px;
++        padding-top:0px;
++    }
++
++    #lead_image_text_container {
++        padding-bottom:0px;
++        padding-top:0px;
++    }
++}
++
++
++
++
++
++
++
++
++
++
++
+ 
+ 
+ 
+diff --git a/www/preview.html b/www/preview.html
+index 57161831fa9..2f1aad46741 100644
+--- a/www/preview.html
++++ b/www/preview.html
+@@ -12,7 +12,8 @@
+     </head>
+     <body class="stable">
+         <div class="content" id="content">
+-            #INJECTION_POINT#
++            <!-- %@ don't remove unless removed from index.html too -->
++            %@
+         </div>
+     </body>
+ </html>
+\ No newline at end of file

@@ -1,0 +1,295 @@
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsPreferences.kt b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsPreferences.kt
+index a8436ec974c5..e80879324042 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsPreferences.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsPreferences.kt
+@@ -1,5 +1,7 @@
+ package org.mozilla.focus.searchsuggestions
+ 
++import android.arch.lifecycle.LiveData
++import android.arch.lifecycle.MutableLiveData
+ import android.content.Context
+ import android.preference.PreferenceManager
+ import mozilla.components.browser.search.SearchEngine
+@@ -10,10 +12,21 @@ class SearchSuggestionsPreferences(private val context: Context) {
+     private val settings = Settings.getInstance(context)
+     private val preferences = PreferenceManager.getDefaultSharedPreferences(context)
+ 
+-    fun searchSuggestionsEnabled(): Boolean = settings.shouldShowSearchSuggestions()
++    private val _searchSuggestionsEnabled = MutableLiveData<Boolean>()
++    val searchSuggestionsEnabled: LiveData<Boolean> = _searchSuggestionsEnabled
++
++    init {
++        refresh()
++    }
++
++    fun hasUserToggledSearchSuggestions(): Boolean = settings.userHasToggledSearchSuggestions()
+ 
+     fun getSearchEngine(): SearchEngine {
+         return Components.searchEngineManager.getDefaultSearchEngine(
+                 context, settings.defaultSearchEngineName)
+     }
++
++    fun refresh() {
++        _searchSuggestionsEnabled.value = settings.shouldShowSearchSuggestions()
++    }
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsService.kt b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsService.kt
+index b57e54fda90c..d5b9d2bdf52e 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsService.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsService.kt
+@@ -14,8 +14,8 @@ class SearchSuggestionsService(searchEngine: SearchEngine) {
+     private lateinit var client: SearchSuggestionClient
+     private var httpClient = OkHttpClient()
+ 
+-    private val _canProvideSearchSuggestions = MutableLiveData<Boolean>()
+-    val canProvideSearchSuggestions: LiveData<Boolean> = _canProvideSearchSuggestions
++    var canProvideSearchSuggestions = false
++        private set
+ 
+     init {
+         updateSearchEngine(searchEngine)
+@@ -51,7 +51,7 @@ class SearchSuggestionsService(searchEngine: SearchEngine) {
+     }
+ 
+     fun updateSearchEngine(searchEngine: SearchEngine) {
+-        _canProvideSearchSuggestions.value = searchEngine.canProvideSearchSuggestions
++        canProvideSearchSuggestions = searchEngine.canProvideSearchSuggestions
+         client = SearchSuggestionClient(searchEngine, { fetch(it) })
+     }
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsViewModel.kt b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsViewModel.kt
+index 6c080484d884..f123edeaa337 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsViewModel.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/SearchSuggestionsViewModel.kt
+@@ -13,25 +13,35 @@ import android.text.SpannableStringBuilder
+ import android.text.style.StyleSpan
+ import android.util.Log
+ 
+-
++sealed class State {
++    data class Disabled(val givePrompt: Boolean): State()
++    class NoSuggestionsAPI: State()
++    class ReadyForSuggestions: State()
++}
+ class SearchSuggestionsViewModel(
+         private val service: SearchSuggestionsService,
+         private val searchSuggestionsPreferences: SearchSuggestionsPreferences) : ViewModel() {
+     private val _selectedSearchSuggestion = MutableLiveData<String>()
+     private val _searchQuery = MutableLiveData<String>()
+-    private val _promptUserToEnableSearchSuggestions = MutableLiveData<Boolean>()
+ 
+-    val canRequestSearchSuggestions = service.canProvideSearchSuggestions
+     val selectedSearchSuggestion: LiveData<String> = _selectedSearchSuggestion
+     val searchQuery: LiveData<String> = _searchQuery
+-    val promptUserToEnableSearchSuggestions: LiveData<Boolean> = _promptUserToEnableSearchSuggestions
+ 
+-    val suggestions = switchMap(searchQuery) {
+-        val canFetchSearchSuggestions = searchSuggestionsPreferences.searchSuggestionsEnabled()
+-            && (canRequestSearchSuggestions.value == true)
++    val state: LiveData<State> = map(searchSuggestionsPreferences.searchSuggestionsEnabled) { enabled ->
++        return@map if (enabled) {
++            if (service.canProvideSearchSuggestions) {
++                State.ReadyForSuggestions()
++            } else {
++                State.NoSuggestionsAPI()
++            }
++        } else {
++            val givePrompt = !searchSuggestionsPreferences.hasUserToggledSearchSuggestions()
++            State.Disabled(givePrompt)
++        }
++    }
+ 
+-        Log.e("enabled", "${searchSuggestionsPreferences.searchSuggestionsEnabled()}")
+-        if (!canFetchSearchSuggestions) { return@switchMap null }
++    val suggestions = switchMap(searchQuery) {
++        if (state.value !is State.ReadyForSuggestions) { return@switchMap null }
+ 
+         val data = service.getSuggestions(it)
+ 
+@@ -61,6 +71,7 @@ class SearchSuggestionsViewModel(
+ 
+     fun refresh() {
+         service.updateSearchEngine(searchSuggestionsPreferences.getSearchEngine())
++        searchSuggestionsPreferences.refresh()
+     }
+ 
+     class Factory(private val context: Context) : ViewModelProvider.NewInstanceFactory() {
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/ui/SearchSuggestionsFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/ui/SearchSuggestionsFragment.kt
+index ad901b9440ab..165e19965870 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/ui/SearchSuggestionsFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/searchsuggestions/ui/SearchSuggestionsFragment.kt
+@@ -7,6 +7,7 @@ import android.support.v4.app.Fragment
+ import android.support.v7.widget.LinearLayoutManager
+ import android.support.v7.widget.RecyclerView
+ import android.text.SpannableStringBuilder
++import android.util.Log
+ import android.view.LayoutInflater
+ import android.view.View
+ import android.view.ViewGroup
+@@ -15,6 +16,7 @@ import kotlinx.android.synthetic.main.fragment_search_suggestions.*
+ 
+ import org.mozilla.focus.R
+ import org.mozilla.focus.searchsuggestions.SearchSuggestionsViewModel
++import org.mozilla.focus.searchsuggestions.State
+ 
+ class SearchSuggestionsFragment : Fragment() {
+     private lateinit var searchSuggestionsViewModel: SearchSuggestionsViewModel
+@@ -37,8 +39,15 @@ class SearchSuggestionsFragment : Fragment() {
+             suggestions?.apply { (suggestionList.adapter as SuggestionsAdapter).refresh(this) }
+         })
+ 
+-        searchSuggestionsViewModel.promptUserToEnableSearchSuggestions.observe(this, Observer {
+-            enable_search_suggestions_container.visibility = if (it == true)  View.VISIBLE else View.GONE
++        searchSuggestionsViewModel.state.observe(this, Observer { state ->
++            enable_search_suggestions_container.visibility = View.GONE
++            suggestionList.visibility = View.GONE
++
++            when (state) {
++                is State.ReadyForSuggestions -> suggestionList.visibility = View.VISIBLE
++                is State.NoSuggestionsAPI -> Log.e("foo", "bar") // noop
++                is State.Disabled -> enable_search_suggestions_container.visibility = if (state.givePrompt)  View.VISIBLE else View.GONE
++            }
+         })
+     }
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/utils/Settings.kt b/focus-android/app/src/main/java/org/mozilla/focus/utils/Settings.kt
+index 982ea22418b0..ae65d636a908 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/utils/Settings.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/utils/Settings.kt
+@@ -129,6 +129,11 @@ class Settings private constructor(context: Context) {
+                     getPreferenceKey(R.string.pref_key_privacy_block_other),
+                     false)
+ 
++    fun userHasToggledSearchSuggestions(): Boolean =
++            preferences.getBoolean(
++                    getPreferenceKey(R.string.pref_key_user_toggled_search_suggestions),
++                    false)
++
+     private fun getPreferenceKey(resourceId: Int): String =
+             resources.getString(resourceId)
+ }
+diff --git a/focus-android/app/src/main/res/drawable/background_search_suggestion_section.xml b/focus-android/app/src/main/res/drawable/background_search_suggestion_section.xml
+new file mode 100644
+index 000000000000..77457ae5dfa6
+--- /dev/null
++++ b/focus-android/app/src/main/res/drawable/background_search_suggestion_section.xml
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8"?>
++<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
++    <item android:top="-2dp" android:left="-2dp" android:right="-2dp">
++        <shape android:shape="rectangle">
++            <stroke android:width="0.5dp" android:color="@color/searchSuggestionPromptBorderColor" />
++            <solid android:color="@color/searchSuggestionPromptBackground" />
++        </shape>
++    </item>
++</layer-list>
+\ No newline at end of file
+diff --git a/focus-android/app/src/main/res/layout/fragment_search_suggestions.xml b/focus-android/app/src/main/res/layout/fragment_search_suggestions.xml
+index bdb30beac194..48ec26293ad0 100644
+--- a/focus-android/app/src/main/res/layout/fragment_search_suggestions.xml
++++ b/focus-android/app/src/main/res/layout/fragment_search_suggestions.xml
+@@ -1,33 +1,54 @@
+ <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
+     xmlns:tools="http://schemas.android.com/tools"
+     android:layout_width="match_parent"
+     android:layout_height="match_parent"
+     android:orientation="vertical"
+     tools:context="org.mozilla.focus.searchsuggestions.ui.SearchSuggestionsFragment">
+-    <LinearLayout
++    <android.support.constraint.ConstraintLayout
+         android:id="@+id/enable_search_suggestions_container"
++        android:background="@drawable/background_search_suggestion_section"
+         android:layout_width="match_parent"
+         android:layout_height="wrap_content"
+-        android:padding="16dp"
+-        android:orientation="horizontal"
+-        android:visibility="gone">
++        android:padding="16dp">
+ 
+         <TextView
+-            android:layout_width="200dp"
++            android:id="@+id/textView"
++            android:textColor="@color/searchSuggestionPromptTextColor"
++            android:layout_width="0dp"
+             android:layout_height="wrap_content"
++            android:layout_marginTop="8dp"
+             android:text="@string/enable_search_suggestion_label"
+-            android:maxLines="2" />
++            app:layout_constraintEnd_toStartOf="@id/button2"
++            app:layout_constraintStart_toStartOf="parent"
++            app:layout_constraintTop_toTopOf="parent" />
+ 
+         <Button
++            android:id="@+id/button2"
++            android:background="?android:attr/selectableItemBackgroundBorderless"
++            android:minWidth="48dp"
+             android:layout_width="wrap_content"
+             android:layout_height="wrap_content"
+-            android:text="@string/enable_search_suggestions_no"  />
++            android:layout_marginEnd="8dp"
++            android:text="@string/enable_search_suggestions_no"
++            android:textColor="@color/searchSuggestionPromptButtonTextColor"
++            app:layout_constraintEnd_toStartOf="@+id/button3"
++            app:layout_constraintTop_toTopOf="parent"
++            app:layout_constraintBottom_toBottomOf="parent" />
+ 
+         <Button
++            android:id="@+id/button3"
++            android:background="?android:attr/selectableItemBackgroundBorderless"
++            android:minWidth="48dp"
+             android:layout_width="wrap_content"
+             android:layout_height="wrap_content"
+-            android:text="@string/enable_search_suggestions_yes"  />
+-    </LinearLayout>
++            android:layout_marginEnd="4dp"
++            android:text="@string/enable_search_suggestions_yes"
++            android:textColor="@color/searchSuggestionPromptButtonTextColor"
++            app:layout_constraintEnd_toEndOf="parent"
++            app:layout_constraintTop_toTopOf="parent"
++            app:layout_constraintBottom_toBottomOf="parent" />
++    </android.support.constraint.ConstraintLayout>
+     <TextView
+         android:id="@+id/searchView"
+         android:layout_width="match_parent"
+diff --git a/focus-android/app/src/main/res/values/colors.xml b/focus-android/app/src/main/res/values/colors.xml
+index cd2ddaf2cb78..af5f22efafb7 100644
+--- a/focus-android/app/src/main/res/values/colors.xml
++++ b/focus-android/app/src/main/res/values/colors.xml
+@@ -50,6 +50,11 @@
+     <color name="snackbarTextColor">#ffffffff</color>
+     <color name="snackbarActionText">@color/photonBlue50</color>
+ 
++    <color name="searchSuggestionPromptBackground">@color/photonInk80</color>
++    <color name="searchSuggestionPromptTextColor">@color/photonGrey10</color>
++    <color name="searchSuggestionPromptBorderColor">#19f9f9fa</color>
++    <color name="searchSuggestionPromptButtonTextColor">@color/photonMagenta70</color>
++
+     <color name="searchHintTextColor">#ffffffff</color>
+     <color name="searchHintBackgroundColor">@color/photonInk80</color>
+     <color name="urlBarInactiveBackgroundColor">#480f1126</color>
+diff --git a/focus-android/app/src/main/res/values/preference_keys.xml b/focus-android/app/src/main/res/values/preference_keys.xml
+index 9200fb9cd910..bbe9ce66b8d1 100644
+--- a/focus-android/app/src/main/res/values/preference_keys.xml
++++ b/focus-android/app/src/main/res/values/preference_keys.xml
+@@ -2,6 +2,7 @@
+ <resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
+     <string name="pref_key_search_engine" translatable="false"><xliff:g id="preference_key">pref_search_engine</xliff:g></string>
+     <string name="pref_key_show_search_suggestions" translatable="false"><xliff:g id="preference_key">pref_show_search_suggestions</xliff:g></string>
++    <string name="pref_key_user_toggled_search_suggestions" translatable="false"><xliff:g id="preference_key">pref_user_toggled_search_suggestions</xliff:g></string>
+     <string name="pref_key_manual_add_search_engine" translatable="false"><xliff:g id="preference_key">pref_manual_add_search_engine</xliff:g></string>
+     <string name="pref_key_radio_search_engine_list" translatable="false">pref_radio_search_engine_list</string>
+     <string name="pref_key_multiselect_search_engine_list" translatable="false">pref_multiselect_search_engine_list</string>
+diff --git a/focus-android/app/src/main/res/values/strings.xml b/focus-android/app/src/main/res/values/strings.xml
+index cbd139be1dce..80217509a074 100644
+--- a/focus-android/app/src/main/res/values/strings.xml
++++ b/focus-android/app/src/main/res/values/strings.xml
+@@ -653,7 +653,7 @@ be temporary, and you can try again later.</li>
+     This is displayed during the authentication flow as the app launches.-->
+     <string name="biometric_auth_moved_too_quickly">Finger moved too fast. Try again.</string>
+ 
+-    <string name="enable_search_suggestion_label">Would you like to turn on search suggestions?</string>
++    <string name="enable_search_suggestion_label">Would you like to turn on search suggestions? (To get search suggestions, Focus needs to send what you type in the address bar to the search engine you\'ve chosen. Learn more)</string>
+     <string name="enable_search_suggestions_no">NO</string>
+     <string name="enable_search_suggestions_yes">YES</string>
+ </resources>

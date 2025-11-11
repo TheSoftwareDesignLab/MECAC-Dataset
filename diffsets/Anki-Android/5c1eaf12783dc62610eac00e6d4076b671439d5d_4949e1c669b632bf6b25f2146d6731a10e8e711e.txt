@@ -1,0 +1,982 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/customstudy/CustomStudyDialog.kt b/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/customstudy/CustomStudyDialog.kt
+index c29149da7f05..8b881aac199f 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/customstudy/CustomStudyDialog.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/customstudy/CustomStudyDialog.kt
+@@ -25,6 +25,7 @@ import android.os.Parcelable
+ import android.util.TypedValue
+ import android.view.WindowManager
+ import android.view.inputmethod.EditorInfo
++import android.widget.AdapterView
+ import android.widget.ArrayAdapter
+ import android.widget.EditText
+ import android.widget.FrameLayout
+@@ -56,20 +57,17 @@ import com.ichi2.anki.dialogs.customstudy.CustomStudyDialog.ContextMenuOption.ST
+ import com.ichi2.anki.dialogs.customstudy.CustomStudyDialog.ContextMenuOption.STUDY_PREVIEW
+ import com.ichi2.anki.dialogs.customstudy.CustomStudyDialog.ContextMenuOption.STUDY_TAGS
+ import com.ichi2.anki.dialogs.customstudy.CustomStudyDialog.CustomStudyDefaults.Companion.toDomainModel
+-import com.ichi2.anki.dialogs.tags.TagsDialog
+-import com.ichi2.anki.dialogs.tags.TagsDialogListener
++import com.ichi2.anki.dialogs.customstudy.TagLimitFragment.Companion.KEY_EXCLUDED_TAGS
++import com.ichi2.anki.dialogs.customstudy.TagLimitFragment.Companion.KEY_INCLUDED_TAGS
++import com.ichi2.anki.dialogs.customstudy.TagLimitFragment.Companion.REQUEST_CUSTOM_STUDY_TAGS
+ import com.ichi2.anki.launchCatchingTask
+-import com.ichi2.anki.model.CardStateFilter
+ import com.ichi2.anki.preferences.sharedPrefs
+-import com.ichi2.anki.showThemedToast
+ import com.ichi2.anki.ui.internationalization.toSentenceCase
+ import com.ichi2.anki.utils.ext.dismissAllDialogFragments
+ import com.ichi2.anki.utils.ext.sharedPrefs
+ import com.ichi2.anki.utils.ext.showDialogFragment
+ import com.ichi2.anki.withProgress
+ import com.ichi2.annotations.NeedsTest
+-import com.ichi2.libanki.Consts
+-import com.ichi2.libanki.Consts.DynPriority
+ import com.ichi2.libanki.Deck
+ import com.ichi2.libanki.DeckId
+ import com.ichi2.libanki.undoableOp
+@@ -85,29 +83,23 @@ import com.ichi2.utils.textAsIntOrNull
+ import com.ichi2.utils.title
+ import kotlinx.coroutines.runBlocking
+ import kotlinx.parcelize.Parcelize
+-import net.ankiweb.rsdroid.exceptions.BackendDeckIsFilteredException
+-import org.json.JSONObject
+ import timber.log.Timber
+ 
+ /**
+  * Implements custom studying either by:
+- * 1. modifying the limits of the current selected deck for when the user has reached the daily deck limits and wishes to study more
++ * 1. modifying the limits of the current selected deck for when the user has reached the daily
++ *    deck limits and wishes to study more
+  * 2. creating a filtered "Custom study deck" where a user can study outside the typical schedule
+  *
+  *
+  * ## UI
+  * [CustomStudyDialog] represents either:
+- * * A [main menu][buildContextMenu], offering [methods of custom study][ContextMenuOption]:
++ * * A [main menu][buildContextMenu], offering [methods of custom study][ContextMenuOption]
+  * * An [input dialog][buildInputDialog] to input additional constraints for a [ContextMenuOption]
+- *   * Example: changing the number of new cards
++ *    * Example: changing the number of new cards
+  *
+- * #### Not Implemented
+- * Anki Desktop contains the following items which are not yet implemented
+- * * Study by card state or tags
+- *   * New cards only
+- *   * Due cards only
+- *   * All review cards in random order
+- *   * All cards in random order (don't reschedule)
++ * Note: when studying by tags the input dialog will also display a state selector and on user
++ * action will show one extra dialog(for actual tag selection, see [TagLimitFragment])
+  *
+  * ## Nomenclature
+  * Filtered decks were previously known as 'dynamic' decks, and before that: 'cram' decks
+@@ -119,11 +111,12 @@ import timber.log.Timber
+  * * [com.ichi2.libanki.sched.Scheduler.customStudy]
+  *     * [sched.proto: CustomStudyRequest](https://github.com/search?q=repo%3Aankitects%2Fanki+CustomStudyRequest+language%3A%22Protocol+Buffer%22&type=code&l=Protocol+Buffer)
+  * * [https://github.com/ankitects/anki/blob/main/qt/aqt/customstudy.py](https://github.com/ankitects/anki/blob/main/qt/aqt/customstudy.py)
++ * * [https://github.com/ankitects/anki/blob/main/qt/aqt/taglimit](https://github.com/ankitects/anki/blob/main/qt/aqt/taglimit.py)
++ *
++ * @see TagLimitFragment
+  */
+ @KotlinCleanup("remove 'runBlocking' calls'")
+-class CustomStudyDialog :
+-    AnalyticsDialogFragment(),
+-    TagsDialogListener {
++class CustomStudyDialog : AnalyticsDialogFragment() {
+     /** ID of the [Deck] which this dialog was created for */
+     private val dialogDeckId: DeckId
+         get() = requireArguments().getLong(ARG_DID)
+@@ -135,12 +128,39 @@ class CustomStudyDialog :
+     private val selectedSubDialog: ContextMenuOption?
+         get() = requireArguments().getNullableInt(ARG_SUB_DIALOG_ID)?.let { ContextMenuOption.entries[it] }
+ 
++    private val selectedStatePosition: Int
++        get() =
++            dialog
++                ?.findViewById<Spinner>(R.id.cards_state_selector)
++                ?.selectedItemPosition ?: AdapterView.INVALID_POSITION
++    private val userInputValue: Int?
++        get() =
++            dialog
++                ?.findViewById<EditText>(R.id.custom_study_details_edittext2)
++                ?.textAsIntOrNull()
++
+     /** @see CustomStudyDefaults */
+     private lateinit var defaults: CustomStudyDefaults
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+-        registerFragmentResultReceiver()
++        parentFragmentManager.setFragmentResultListener(REQUEST_CUSTOM_STUDY_TAGS, this) { _, bundle ->
++            val tagsToInclude = bundle.getStringArrayList(KEY_INCLUDED_TAGS) ?: emptyList<String>()
++            val tagsToExclude = bundle.getStringArrayList(KEY_EXCLUDED_TAGS) ?: emptyList<String>()
++            val option = selectedSubDialog ?: return@setFragmentResultListener
++            if (selectedStatePosition == AdapterView.INVALID_POSITION) return@setFragmentResultListener
++            val kind = CustomStudyCardState.entries[selectedStatePosition].kind
++            val cardsAmount = userInputValue ?: 100 // the default value
++            requireActivity().launchCatchingTask {
++                withProgress {
++                    try {
++                        customStudy(option, cardsAmount, kind, tagsToInclude, tagsToExclude)
++                    } finally {
++                        requireActivity().dismissAllDialogFragments()
++                    }
++                }
++            }
++        }
+     }
+ 
+     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
+@@ -159,38 +179,13 @@ class CustomStudyDialog :
+     }
+ 
+     /**
+-     * Handles selecting an item from the main menu of the dialog
++     * Continues the custom study process by showing an input dialog where the user can enter an
++     * amount specific to that type of custom study(eg. cards, days etc).
+      */
+-    private fun onMenuItemSelected(item: ContextMenuOption) =
+-        launchCatchingTask {
+-            when (item) {
+-                STUDY_TAGS -> {
+-            /*
+-             * This is a special Dialog for CUSTOM STUDY, where instead of only collecting a
+-             * number, it is necessary to collect a list of tags. This case handles the creation
+-             * of that Dialog.
+-             */
+-                    val dialogFragment =
+-                        TagsDialog().withArguments(
+-                            context = requireContext(),
+-                            type = TagsDialog.DialogType.CUSTOM_STUDY_TAGS,
+-                            checkedTags = ArrayList(),
+-                            allTags = ArrayList(withCol { tags.byDeck(dialogDeckId) }),
+-                        )
+-                    requireActivity().showDialogFragment(dialogFragment)
+-                }
+-                EXTEND_NEW,
+-                EXTEND_REV,
+-                STUDY_FORGOT,
+-                STUDY_AHEAD,
+-                STUDY_PREVIEW,
+-                -> {
+-                    // User asked for a standard custom study option
+-                    val dialog: CustomStudyDialog = createInstance(dialogDeckId, item)
+-                    requireActivity().showDialogFragment(dialog)
+-                }
+-            }
+-        }
++    private fun onMenuItemSelected(item: ContextMenuOption) {
++        val dialog: CustomStudyDialog = createInstance(dialogDeckId, item)
++        requireActivity().showDialogFragment(dialog)
++    }
+ 
+     private fun buildContextMenu(): AlertDialog {
+         val customMenuView = ScrollView(requireContext())
+@@ -286,11 +281,18 @@ class CustomStudyDialog :
+ 
+         // Set material dialog parameters
+         @Suppress("RedundantValueArgument") // click = null
++        val horizontalPadding = 32.dp.toPx(requireContext())
++        val verticalPadding = 16.dp.toPx(requireContext())
+         val dialog =
+             AlertDialog
+                 .Builder(requireActivity())
+-                .customView(view = v, paddingStart = 64, paddingEnd = 64, paddingTop = 32, paddingBottom = 32)
+-                .positiveButton(text = positiveBtnLabel, click = null)
++                .customView(
++                    view = v,
++                    paddingStart = horizontalPadding,
++                    paddingEnd = horizontalPadding,
++                    paddingTop = verticalPadding,
++                    paddingBottom = verticalPadding,
++                ).positiveButton(text = positiveBtnLabel, click = null)
+                 .negativeButton(R.string.dialog_cancel) {
+                     requireActivity().dismissAllDialogFragments()
+                 }.create()
+@@ -313,12 +315,21 @@ class CustomStudyDialog :
+                         allowSubmit = true
+                         return@setOnClickListener
+                     }
+-
++                if (contextMenuOption == STUDY_TAGS) {
++                    // mark allowSubmit as true because, if the user cancels TagLimitFragment, when
++                    // we come back we wouldn't be able to trigger again TagLimitFragment
++                    allowSubmit = true
++                    val tagsSelectionDialog = TagLimitFragment.newInstance(dialogDeckId)
++                    tagsSelectionDialog.show(parentFragmentManager, TagLimitFragment.TAG)
++                    return@setOnClickListener
++                }
+                 requireActivity().launchCatchingTask {
+-                    try {
+-                        customStudy(contextMenuOption, n)
+-                    } finally {
+-                        requireActivity().dismissAllDialogFragments()
++                    withProgress {
++                        try {
++                            customStudy(contextMenuOption, n)
++                        } finally {
++                            requireActivity().dismissAllDialogFragments()
++                        }
+                     }
+                 }
+             }
+@@ -333,6 +344,8 @@ class CustomStudyDialog :
+         return dialog
+     }
+ 
++    // TODO cram kind and the included/excluded tags lists are only relevant for STUDY_TAGS and
++    //  should be included in the option to not leak in the method's api
+     private suspend fun customStudy(
+         contextMenuOption: ContextMenuOption,
+         userEntry: Int,
+@@ -385,37 +398,6 @@ class CustomStudyDialog :
+         }
+     }
+ 
+-    /**
+-     * Gathers the final selection of tags and type of cards,
+-     * Generates the search screen for the custom study deck.
+-     */
+-    @NeedsTest("14537: limit to particular tags")
+-    override fun onSelectedTags(
+-        selectedTags: List<String>,
+-        indeterminateTags: List<String>,
+-        stateFilter: CardStateFilter,
+-    ) {
+-        val sb = StringBuilder(stateFilter.toSearch)
+-        val arr: MutableList<String?> = ArrayList(selectedTags.size)
+-        if (selectedTags.isNotEmpty()) {
+-            for (tag in selectedTags) {
+-                arr.add("tag:\"$tag\"")
+-            }
+-            sb.append("(").append(arr.joinToString(" or ")).append(")")
+-        }
+-        activity?.launchCatchingTask {
+-            withProgress {
+-                createTagsCustomStudySession(
+-                    arrayOf(
+-                        sb.toString(),
+-                        Consts.DYN_MAX_SIZE,
+-                        Consts.DYN_RANDOM,
+-                    ),
+-                )
+-            }
+-        }
+-    }
+-
+     /** Line 1 of the number entry dialog */
+     private val text1: String
+         get() =
+@@ -455,70 +437,13 @@ class CustomStudyDialog :
+                 STUDY_FORGOT -> prefs.getInt("forgottenDays", 1).toString()
+                 STUDY_AHEAD -> prefs.getInt("aheadDays", 1).toString()
+                 STUDY_PREVIEW -> prefs.getInt("previewDays", 1).toString()
++                // currently(as of Anki 25.02) not upstream
+                 STUDY_TAGS -> prefs.getInt("amountOfCards", 100).toString()
+                 null,
+                 -> ""
+             }
+         }
+ 
+-    /**
+-     * Create a custom study session
+-     * @param terms search terms
+-     */
+-    private suspend fun createTagsCustomStudySession(terms: Array<Any>) {
+-        val dyn: Deck
+-
+-        val deckToStudyName = withCol { decks.name(dialogDeckId) }
+-        val customStudyDeck = resources.getString(R.string.custom_study_deck_name)
+-        val cur = withCol { decks.byName(customStudyDeck) }
+-        if (cur != null) {
+-            Timber.i("Found deck: '%s'", customStudyDeck)
+-            if (cur.isNormal) {
+-                Timber.w("Deck: '%s' was non-dynamic", customStudyDeck)
+-                showThemedToast(requireContext(), getString(R.string.custom_study_deck_exists), true)
+-                return
+-            } else {
+-                Timber.i("Emptying dynamic deck '%s' for custom study", customStudyDeck)
+-                // safe to empty
+-                withCol { sched.emptyDyn(cur.getLong("id")) }
+-                // reuse; don't delete as it may have children
+-                dyn = cur
+-                withCol { decks.select(cur.getLong("id")) }
+-            }
+-        } else {
+-            Timber.i("Creating Dynamic Deck '%s' for custom study", customStudyDeck)
+-            dyn =
+-                try {
+-                    withCol { decks.get(decks.newFiltered(customStudyDeck))!! }
+-                } catch (ex: BackendDeckIsFilteredException) {
+-                    showThemedToast(requireActivity(), ex.localizedMessage ?: ex.message ?: "", true)
+-                    return
+-                }
+-        }
+-        // and then set various options
+-        dyn.put("delays", JSONObject.NULL)
+-        val ar = dyn.getJSONArray("terms")
+-        ar.getJSONArray(0).put(0, """deck:"$deckToStudyName" ${terms[0]}""")
+-        ar.getJSONArray(0).put(1, terms[1])
+-        @DynPriority val priority = terms[2] as Int
+-        ar.getJSONArray(0).put(2, priority)
+-        dyn.put("resched", true)
+-        // Rebuild the filtered deck
+-        Timber.i("Rebuilding Custom Study Deck")
+-        // PERF: Should be in background
+-        withCol { decks.save(dyn) }
+-        Timber.d("Rebuilding dynamic deck...")
+-        withCol { sched.rebuildDyn(decks.selected()) }
+-        setFragmentResult(
+-            CustomStudyAction.REQUEST_KEY,
+-            bundleOf(
+-                CustomStudyAction.BUNDLE_KEY to CustomStudyAction.CUSTOM_STUDY_SESSION.ordinal,
+-            ),
+-        )
+-        // Hide the dialogs (required due to a DeckPicker issue)
+-        requireActivity().dismissAllDialogFragments()
+-    }
+-
+     /**
+      * Represents actions for managing custom study sessions and extending study limits.
+      * These actions are passed between fragments and activities via the FragmentResult API.
+@@ -563,7 +488,7 @@ class CustomStudyDialog :
+         STUDY_PREVIEW({ TR.customStudyPreviewNewCards() }),
+ 
+         /** Limit to particular tags */
+-        STUDY_TAGS({ getString(R.string.custom_study_limit_tags) }),
++        STUDY_TAGS({ TR.customStudyStudyByCardStateOrTag() }),
+     }
+ 
+     @Parcelize
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/customstudy/IncludedExcludedTagsAdapter.kt b/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/customstudy/IncludedExcludedTagsAdapter.kt
+new file mode 100644
+index 000000000000..e6b21199c081
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/customstudy/IncludedExcludedTagsAdapter.kt
+@@ -0,0 +1,143 @@
++/****************************************************************************************
++ * Copyright (c) 2025 lukstbit <52494258+lukstbit@users.noreply.github.com>             *
++ *                                                                                      *
++ * This program is free software; you can redistribute it and/or modify it under        *
++ * the terms of the GNU General Public License as published by the Free Software        *
++ * Foundation; either version 3 of the License, or (at your option) any later           *
++ * version.                                                                             *
++ *                                                                                      *
++ * This program is distributed in the hope that it will be useful, but WITHOUT ANY      *
++ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A      *
++ * PARTICULAR PURPOSE. See the GNU General Public License for more details.             *
++ *                                                                                      *
++ * You should have received a copy of the GNU General Public License along with         *
++ * this program.  If not, see <http://www.gnu.org/licenses/>.                           *
++ ****************************************************************************************/
++package com.ichi2.anki.dialogs.customstudy
++
++import android.annotation.SuppressLint
++import android.content.Context
++import android.graphics.Color
++import android.view.LayoutInflater
++import android.view.View
++import android.view.ViewGroup
++import android.widget.TextView
++import androidx.annotation.ColorRes
++import androidx.recyclerview.widget.RecyclerView
++import anki.scheduler.CustomStudyDefaultsResponse
++import com.ichi2.anki.R
++import com.ichi2.anki.dialogs.customstudy.IncludedExcludedTagsAdapter.TagsSelectionMode.Exclude
++import com.ichi2.anki.dialogs.customstudy.IncludedExcludedTagsAdapter.TagsSelectionMode.Include
++import com.ichi2.anki.utils.ext.findViewById
++
++/**
++ * Shows a simple list of tags from which the user can select for a custom study session. For
++ * simplicity this adapter is used for both types of lists.
++ *
++ * @param mode determines how the tags in the list backing this adapter are to be handled(either as
++ * included or excluded tags for the custom study)
++ *
++ * @see TagLimitFragment
++ * @see TagIncludedExcluded
++ */
++@SuppressLint("UseKtx") // properties initialization issues when using the extension function
++class IncludedExcludedTagsAdapter(
++    context: Context,
++    val mode: TagsSelectionMode,
++) : RecyclerView.Adapter<IncludedExcludedTagsAdapter.RequireExcludeTagsViewHolder>() {
++    private val inflater = LayoutInflater.from(context)
++    var tags: MutableList<TagIncludedExcluded> = mutableListOf()
++        set(value) {
++            field = value
++            notifyDataSetChanged()
++        }
++
++    /**
++     * Included tags are enabled only if the relevant checkbox is checked.
++     */
++    var isEnabled = false
++        set(value) {
++            field = value
++            notifyDataSetChanged()
++        }
++
++    /** Default background for a tag that is not selected. */
++    private val selectableItemBackground: Int
++
++    /** Background color for a tag that is selected(references R.attr.colorPrimary). */
++    // TODO implement a ripple effect or combine the two backgrounds into one background drawable
++    @ColorRes
++    private val selectedItemBackground: Int
++
++    init {
++        val ta =
++            context.obtainStyledAttributes(
++                intArrayOf(android.R.attr.selectableItemBackground, com.google.android.material.R.attr.colorPrimary),
++            )
++        selectableItemBackground = ta.getResourceId(0, 0)
++        selectedItemBackground = ta.getColor(1, Color.BLUE)
++        ta.recycle()
++    }
++
++    override fun onCreateViewHolder(
++        parent: ViewGroup,
++        viewType: Int,
++    ): RequireExcludeTagsViewHolder =
++        RequireExcludeTagsViewHolder(
++            inflater.inflate(
++                R.layout.item_require_exclude_tag,
++                parent,
++                false,
++            ),
++        )
++
++    override fun getItemCount(): Int = tags.size
++
++    override fun onBindViewHolder(
++        holder: RequireExcludeTagsViewHolder,
++        position: Int,
++    ) {
++        val model = tags[position]
++        holder.tagView.text = model.userFacingLabel
++        val isSelected =
++            when (mode) {
++                Include -> model.isIncluded
++                Exclude -> model.isExcluded
++            }
++        if (isSelected) {
++            holder.tagView.setBackgroundColor(selectedItemBackground)
++        } else {
++            holder.tagView.setBackgroundResource(selectableItemBackground)
++        }
++        // "included" tags are allowed only if the relevant checkbox is checked
++        holder.tagView.isEnabled = !(mode == Include && !isEnabled)
++        holder.tagView.setOnClickListener {
++            when (mode) {
++                Include -> tags[position].isIncluded = !tags[position].isIncluded
++                Exclude -> tags[position].isExcluded = !tags[position].isExcluded
++            }
++            notifyDataSetChanged()
++        }
++    }
++
++    inner class RequireExcludeTagsViewHolder(
++        rowView: View,
++    ) : RecyclerView.ViewHolder(rowView) {
++        val tagView: TextView = findViewById(R.id.tag)
++    }
++
++    enum class TagsSelectionMode {
++        Include,
++        Exclude,
++    }
++}
++
++/** @see [CustomStudyDefaultsResponse.Tag] */
++data class TagIncludedExcluded(
++    val name: String,
++    var isIncluded: Boolean = false,
++    var isExcluded: Boolean = false,
++) {
++    val userFacingLabel: String
++        get() = name.replace("_", " ")
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/customstudy/TagLimitFragment.kt b/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/customstudy/TagLimitFragment.kt
+new file mode 100644
+index 000000000000..7505d6a2534f
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/dialogs/customstudy/TagLimitFragment.kt
+@@ -0,0 +1,168 @@
++/****************************************************************************************
++ * Copyright (c) 2025 lukstbit <52494258+lukstbit@users.noreply.github.com>             *
++ *                                                                                      *
++ * This program is free software; you can redistribute it and/or modify it under        *
++ * the terms of the GNU General Public License as published by the Free Software        *
++ * Foundation; either version 3 of the License, or (at your option) any later           *
++ * version.                                                                             *
++ *                                                                                      *
++ * This program is distributed in the hope that it will be useful, but WITHOUT ANY      *
++ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A      *
++ * PARTICULAR PURPOSE. See the GNU General Public License for more details.             *
++ *                                                                                      *
++ * You should have received a copy of the GNU General Public License along with         *
++ * this program.  If not, see <http://www.gnu.org/licenses/>.                           *
++ ****************************************************************************************/
++package com.ichi2.anki.dialogs.customstudy
++
++import android.app.Dialog
++import android.content.Context
++import android.os.Bundle
++import android.widget.CheckBox
++import android.widget.LinearLayout
++import android.widget.TextView
++import androidx.appcompat.app.AlertDialog
++import androidx.constraintlayout.widget.Group
++import androidx.core.os.bundleOf
++import androidx.core.view.isVisible
++import androidx.fragment.app.DialogFragment
++import androidx.fragment.app.setFragmentResult
++import androidx.lifecycle.lifecycleScope
++import androidx.recyclerview.widget.RecyclerView
++import com.ichi2.anki.CollectionManager.TR
++import com.ichi2.anki.CollectionManager.withCol
++import com.ichi2.anki.R
++import com.ichi2.anki.dialogs.customstudy.IncludedExcludedTagsAdapter.TagsSelectionMode.Exclude
++import com.ichi2.anki.dialogs.customstudy.IncludedExcludedTagsAdapter.TagsSelectionMode.Include
++import com.ichi2.anki.snackbar.showSnackbar
++import com.ichi2.anki.ui.internationalization.toSentenceCase
++import com.ichi2.libanki.DeckId
++import com.ichi2.utils.customView
++import com.ichi2.utils.negativeButton
++import com.ichi2.utils.positiveButton
++import com.ichi2.utils.title
++import kotlinx.coroutines.launch
++
++/**
++ * Fragment that allows the user to select tags to include and/or exclude for the custom study
++ * session that is being created. Similar to the desktop TagLimit class.
++ * https://github.com/ankitects/anki/blob/main/qt/aqt/taglimit.py#L17
++ *
++ * Will return, as a fragment result, two lists of tags(as Strings) representing the included and
++ * excluded tags for custom studying.
++ *
++ * @see CustomStudyDialog
++ */
++class TagLimitFragment : DialogFragment() {
++    private val loadingViews: Group?
++        get() = dialog?.findViewById(R.id.loading_views_group)
++    private val contentViews: LinearLayout?
++        get() = dialog?.findViewById(R.id.content_views)
++    private val deckId
++        get() = requireArguments().getLong(ARG_DECK_ID)
++    private lateinit var tagsIncludedAdapter: IncludedExcludedTagsAdapter
++    private lateinit var tagsExcludedAdapter: IncludedExcludedTagsAdapter
++
++    override fun onAttach(context: Context) {
++        super.onAttach(context)
++        tagsIncludedAdapter = IncludedExcludedTagsAdapter(context, Include)
++        tagsExcludedAdapter = IncludedExcludedTagsAdapter(context, Exclude)
++    }
++
++    override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
++        val dialogView = layoutInflater.inflate(R.layout.fragment_tag_limit, null)
++        dialogView.findViewById<RecyclerView>(R.id.tags_included)?.adapter = tagsIncludedAdapter
++        dialogView.findViewById<RecyclerView>(R.id.tags_excluded)?.adapter = tagsExcludedAdapter
++        val includeCheck =
++            dialogView.findViewById<CheckBox>(R.id.tag_selection_require_check).apply {
++                text = TR.customStudyRequireOneOrMoreOfThese()
++                setOnCheckedChangeListener { _, isChecked ->
++                    tagsIncludedAdapter.isEnabled = isChecked
++                }
++            }
++        dialogView.findViewById<TextView>(R.id.tag_selection_exclude_label).text =
++            TR.customStudySelectTagsToExclude()
++        val title =
++            TR
++                .customStudySelectiveStudy()
++                .toSentenceCase(requireContext(), R.string.sentence_selective_study)
++        val dialog =
++            AlertDialog
++                .Builder(requireContext())
++                .title(text = title)
++                .customView(dialogView)
++                .negativeButton(R.string.dialog_cancel)
++                .positiveButton(R.string.dialog_ok, null)
++                .create()
++
++        var allowSubmit = true
++        // we set the listener here so 'ok' doesn't immediately close the dialog because we don't
++        // allow more than 100 tags combined to be selected. In this situation we don't close the
++        // dialog(so the user can still act to fix this) and show a Snackbar
++        dialog.setOnShowListener {
++            dialog.positiveButton.setOnClickListener {
++                // prevent race conditions
++                if (!allowSubmit) return@setOnClickListener
++                allowSubmit = false
++                // take the selection only if the require checkbox is currently checked
++                val tagsToInclude =
++                    if (includeCheck.isChecked) {
++                        tagsIncludedAdapter.tags.filter { it.isIncluded }.map { it.name }
++                    } else {
++                        emptyList()
++                    }
++                val tagsToExclude =
++                    tagsExcludedAdapter.tags.filter { it.isExcluded }.map { it.name }
++                if (tagsToInclude.size + tagsToExclude.size > 100) {
++                    showSnackbar(TR.errors100TagsMax().withCollapsedWhitespace())
++                    return@setOnClickListener
++                }
++                // send the selection to the custom study dialog to setup the session
++                setFragmentResult(
++                    REQUEST_CUSTOM_STUDY_TAGS,
++                    bundleOf(
++                        KEY_INCLUDED_TAGS to tagsToInclude,
++                        KEY_EXCLUDED_TAGS to tagsToExclude,
++                    ),
++                )
++                dismiss()
++            }
++        }
++        return dialog
++    }
++
++    // https://github.com/ankitects/anki/blob/main/pylib/anki/lang.py#L243
++    private fun String.withCollapsedWhitespace(): String = replace("\\s+", " ")
++
++    override fun onStart() {
++        super.onStart()
++        lifecycleScope.launch {
++            loadingViews?.isVisible = true
++            contentViews?.isVisible = false
++            val customStudyDefaults = withCol { sched.customStudyDefaults(deckId) }
++            dialog?.findViewById<CheckBox>(R.id.tag_selection_require_check)?.isChecked =
++                customStudyDefaults.tagsList.any { tag -> tag.include }
++            val tags =
++                customStudyDefaults.tagsList.map { backendTag ->
++                    TagIncludedExcluded(backendTag.name, backendTag.include, backendTag.exclude)
++                }
++            tagsIncludedAdapter.tags = tags.toMutableList() // make a copy
++            tagsExcludedAdapter.tags = tags.toMutableList() // make a copy
++            loadingViews?.isVisible = false
++            contentViews?.isVisible = true
++        }
++    }
++
++    companion object {
++        const val TAG = "TagLimitFragment"
++        const val REQUEST_CUSTOM_STUDY_TAGS = "request_custom_study_tags"
++        const val KEY_INCLUDED_TAGS = "key_included_tags"
++        const val KEY_EXCLUDED_TAGS = "key_excluded_tags"
++        private const val ARG_DECK_ID = "arg_deck_id"
++
++        fun newInstance(deckId: DeckId) =
++            TagLimitFragment().apply {
++                arguments = bundleOf(ARG_DECK_ID to deckId)
++            }
++    }
++}
+diff --git a/AnkiDroid/src/main/res/drawable/list_border.xml b/AnkiDroid/src/main/res/drawable/list_border.xml
+new file mode 100644
+index 000000000000..fd5253ff5970
+--- /dev/null
++++ b/AnkiDroid/src/main/res/drawable/list_border.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<shape xmlns:android="http://schemas.android.com/apk/res/android">
++    <stroke android:width="1dp" android:color="?attr/currentDeckBackgroundColor"/>
++</shape>
+\ No newline at end of file
+diff --git a/AnkiDroid/src/main/res/layout-land/fragment_tag_limit.xml b/AnkiDroid/src/main/res/layout-land/fragment_tag_limit.xml
+new file mode 100644
+index 000000000000..52deae2745f6
+--- /dev/null
++++ b/AnkiDroid/src/main/res/layout-land/fragment_tag_limit.xml
+@@ -0,0 +1,114 @@
++<?xml version="1.0" encoding="utf-8"?><!--
++  ~  Copyright (c) 2025 lukstbit <52494258+lukstbit@users.noreply.github.com>
++  ~
++  ~  This program is free software; you can redistribute it and/or modify it under
++  ~  the terms of the GNU General Public License as published by the Free Software
++  ~  Foundation; either version 3 of the License, or (at your option) any later
++  ~  version.
++  ~
++  ~  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++  ~  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++  ~  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++  ~
++  ~  You should have received a copy of the GNU General Public License along with
++  ~  this program.  If not, see <http://www.gnu.org/licenses/>.
++  -->
++<androidx.constraintlayout.widget.ConstraintLayout
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:padding="16dp"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools">
++
++    <LinearLayout
++        android:id="@+id/content_views"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:orientation="horizontal">
++
++        <LinearLayout
++            android:layout_width="0dp"
++            android:layout_weight="1"
++            android:layout_marginEnd="8dp"
++            android:layout_height="wrap_content"
++            android:orientation="vertical">
++
++            <CheckBox
++                android:id="@+id/tag_selection_require_check"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:checked="false"
++                tools:text="Require one or more of these tags:"/>
++
++            <androidx.recyclerview.widget.RecyclerView
++                android:id="@+id/tags_included"
++                android:background="@drawable/list_border"
++                android:layout_width="match_parent"
++                android:layout_height="0dp"
++                android:layout_weight="1"
++                android:scrollbars="vertical"
++                android:minHeight="?attr/listPreferredItemHeightSmall"
++                app:layoutManager="androidx.recyclerview.widget.LinearLayoutManager"
++                android:layout_marginTop="4dp"
++                android:layout_marginStart="6dp"
++                tools:listitem="@layout/item_require_exclude_tag"/>
++        </LinearLayout>
++
++        <LinearLayout
++            android:layout_width="0dp"
++            android:layout_weight="1"
++            android:layout_height="wrap_content"
++            android:orientation="vertical">
++            <TextView
++                android:id="@+id/tag_selection_exclude_label"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:layout_marginTop="4dp"
++                android:textAppearance="?textAppearanceTitleMedium"
++                tools:text="Select tags to exclude:"/>
++
++            <androidx.recyclerview.widget.RecyclerView
++                android:id="@+id/tags_excluded"
++                android:background="@drawable/list_border"
++                android:layout_width="match_parent"
++                android:layout_height="0dp"
++                android:layout_weight="1"
++                android:scrollbars="vertical"
++                app:layoutManager="androidx.recyclerview.widget.LinearLayoutManager"
++                android:minHeight="?attr/listPreferredItemHeightSmall"
++                android:layout_marginTop="8dp"
++                tools:listitem="@layout/item_require_exclude_tag"/>
++        </LinearLayout>
++    </LinearLayout>
++
++    <com.google.android.material.progressindicator.CircularProgressIndicator
++        android:id="@+id/loading_indicator"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:indeterminate="true"
++        style="@style/Widget.Material3.CircularProgressIndicator"
++        app:layout_constraintTop_toTopOf="@id/loading_label"
++        app:layout_constraintBottom_toBottomOf="@id/loading_label"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintEnd_toStartOf="@id/loading_label"
++        app:layout_constraintHorizontal_chainStyle="packed"/>
++
++    <TextView
++        android:id="@+id/loading_label"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        app:layout_constraintTop_toTopOf="parent"
++        android:layout_marginVertical="24dp"
++        android:layout_marginStart="12dp"
++        app:layout_constraintBottom_toBottomOf="parent"
++        app:layout_constraintStart_toEndOf="@+id/loading_indicator"
++        app:layout_constraintEnd_toEndOf="parent"
++        android:text="@string/custom_study_loading_tags"/>
++
++    <androidx.constraintlayout.widget.Group
++        android:id="@+id/loading_views_group"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        app:constraint_referenced_ids="loading_indicator,loading_label"/>
++</androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/AnkiDroid/src/main/res/layout/fragment_tag_limit.xml b/AnkiDroid/src/main/res/layout/fragment_tag_limit.xml
+new file mode 100644
+index 000000000000..229355ba4404
+--- /dev/null
++++ b/AnkiDroid/src/main/res/layout/fragment_tag_limit.xml
+@@ -0,0 +1,103 @@
++<?xml version="1.0" encoding="utf-8"?><!--
++  ~  Copyright (c) 2025 lukstbit <52494258+lukstbit@users.noreply.github.com>
++  ~
++  ~  This program is free software; you can redistribute it and/or modify it under
++  ~  the terms of the GNU General Public License as published by the Free Software
++  ~  Foundation; either version 3 of the License, or (at your option) any later
++  ~  version.
++  ~
++  ~  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++  ~  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++  ~  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++  ~
++  ~  You should have received a copy of the GNU General Public License along with
++  ~  this program.  If not, see <http://www.gnu.org/licenses/>.
++  -->
++<androidx.constraintlayout.widget.ConstraintLayout
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:padding="16dp"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools">
++
++    <LinearLayout
++        android:id="@+id/content_views"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:orientation="vertical">
++
++        <CheckBox
++            android:id="@+id/tag_selection_require_check"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:checked="false"
++            tools:text="Require one or more of these tags:"/>
++
++        <androidx.recyclerview.widget.RecyclerView
++            android:id="@+id/tags_included"
++            android:background="@drawable/list_border"
++            android:layout_width="match_parent"
++            android:layout_height="0dp"
++            android:layout_weight="1"
++            android:scrollbars="vertical"
++            android:layout_marginHorizontal="6dp"
++            android:minHeight="?attr/listPreferredItemHeightSmall"
++            app:layoutManager="androidx.recyclerview.widget.LinearLayoutManager"
++            android:layout_marginTop="4dp"
++            tools:listitem="@layout/item_require_exclude_tag"/>
++
++        <TextView
++            android:id="@+id/tag_selection_exclude_label"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:minHeight="48dp"
++            android:gravity="center_vertical"
++            android:paddingStart="6dp"
++            android:textAppearance="?textAppearanceTitleMedium"
++            tools:text="Select tags to exclude:"/>
++
++        <androidx.recyclerview.widget.RecyclerView
++            android:id="@+id/tags_excluded"
++            android:background="@drawable/list_border"
++            android:layout_width="match_parent"
++            android:layout_height="0dp"
++            android:layout_weight="1"
++            android:scrollbars="vertical"
++            android:layout_marginHorizontal="6dp"
++            app:layoutManager="androidx.recyclerview.widget.LinearLayoutManager"
++            android:minHeight="?attr/listPreferredItemHeightSmall"
++            android:layout_marginTop="4dp"
++            tools:listitem="@layout/item_require_exclude_tag"/>
++    </LinearLayout>
++
++    <com.google.android.material.progressindicator.CircularProgressIndicator
++        android:id="@+id/loading_indicator"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:indeterminate="true"
++        style="@style/Widget.Material3.CircularProgressIndicator"
++        app:layout_constraintTop_toTopOf="@id/loading_label"
++        app:layout_constraintBottom_toBottomOf="@id/loading_label"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintEnd_toStartOf="@id/loading_label"
++        app:layout_constraintHorizontal_chainStyle="packed"/>
++
++    <TextView
++        android:id="@+id/loading_label"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        app:layout_constraintTop_toTopOf="parent"
++        android:layout_marginVertical="24dp"
++        android:layout_marginStart="12dp"
++        app:layout_constraintBottom_toBottomOf="parent"
++        app:layout_constraintStart_toEndOf="@+id/loading_indicator"
++        app:layout_constraintEnd_toEndOf="parent"
++        android:text="@string/custom_study_loading_tags"/>
++
++    <androidx.constraintlayout.widget.Group
++        android:id="@+id/loading_views_group"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        app:constraint_referenced_ids="loading_indicator,loading_label"/>
++</androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/AnkiDroid/src/main/res/layout/item_require_exclude_tag.xml b/AnkiDroid/src/main/res/layout/item_require_exclude_tag.xml
+new file mode 100644
+index 000000000000..810ebfed87ca
+--- /dev/null
++++ b/AnkiDroid/src/main/res/layout/item_require_exclude_tag.xml
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++<TextView xmlns:android="http://schemas.android.com/apk/res/android"
++    android:id="@+id/tag"
++    android:minHeight="?attr/listPreferredItemHeightSmall"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:gravity="center_vertical"
++    android:paddingHorizontal="8dp"
++    android:background="?attr/selectableItemBackground"
++    tools:text="Tag entry"/>
+diff --git a/AnkiDroid/src/main/res/layout/styled_custom_study_details_dialog.xml b/AnkiDroid/src/main/res/layout/styled_custom_study_details_dialog.xml
+index d795bb7b774b..6a88fffe73cf 100644
+--- a/AnkiDroid/src/main/res/layout/styled_custom_study_details_dialog.xml
++++ b/AnkiDroid/src/main/res/layout/styled_custom_study_details_dialog.xml
+@@ -56,8 +56,6 @@
+         android:layout_width="match_parent"
+         android:layout_height="wrap_content"
+         android:layout_marginBottom="16dip"
+-        android:layout_marginLeft="4dip"
+-        android:layout_marginRight="4dip"
+         android:layout_weight="1"
+         android:gravity="start|bottom"
+         android:inputType="number"
+diff --git a/AnkiDroid/src/main/res/values/01-core.xml b/AnkiDroid/src/main/res/values/01-core.xml
+index 9884c5152e72..3150b13299fe 100644
+--- a/AnkiDroid/src/main/res/values/01-core.xml
++++ b/AnkiDroid/src/main/res/values/01-core.xml
+@@ -103,8 +103,6 @@
+     <string name="empty_cram_label" maxLength="28">Empty</string>
+     <string name="create_subdeck">Create subdeck</string>
+     <string name="empty_filtered_deck">Emptying filtered deck…</string>
+-    <string name="custom_study_deck_name">Custom study session</string>
+-    <string name="custom_study_deck_exists">Rename the existing custom study deck first</string>
+     <string name="search_deck" comment="Deck search for selecting it">Deck Search</string>
+     <string name="empty_deck">This deck is empty</string>
+     <string name="search_for_download_deck" comment="Deck search value for downloading deck" maxLength="28">Deck Search</string>
+diff --git a/AnkiDroid/src/main/res/values/02-strings.xml b/AnkiDroid/src/main/res/values/02-strings.xml
+index ada62bdaac83..38ba77b4fd44 100644
+--- a/AnkiDroid/src/main/res/values/02-strings.xml
++++ b/AnkiDroid/src/main/res/values/02-strings.xml
+@@ -62,7 +62,8 @@
+     <string name="filter_by_flags" maxLength="41">Flags</string>
+ 
+     <!-- Custom study options -->
+-    <string name="custom_study_limit_tags">Limit to particular tags</string>
++    <string name="custom_study_loading_tags">Building list of tags&#8230;</string>
++    <!-- Study options -->
+     <plurals name="studyoptions_buried_count">
+         <item quantity="other">+%d buried</item>
+     </plurals>
+diff --git a/AnkiDroid/src/main/res/values/sentence-case.xml b/AnkiDroid/src/main/res/values/sentence-case.xml
+index 97334e9ba59b..ae94c680ff03 100644
+--- a/AnkiDroid/src/main/res/values/sentence-case.xml
++++ b/AnkiDroid/src/main/res/values/sentence-case.xml
+@@ -48,5 +48,6 @@ undoActionUndone()
+     <string name="sentence_all_fields">All fields</string>
+     <string name="sentence_check_media_delete_unused">Delete unused</string>
+     <string name="sentence_choose_tags">Choose tags</string>
++    <string name="sentence_selective_study">Selective study</string>
+ 
+ </resources>
+\ No newline at end of file

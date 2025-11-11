@@ -1,0 +1,181 @@
+diff --git a/Wikipedia/UI-V5/WMFSearchDataSource.m b/Wikipedia/UI-V5/WMFSearchDataSource.m
+index a2797696e9a..c72a3d96c2e 100644
+--- a/Wikipedia/UI-V5/WMFSearchDataSource.m
++++ b/Wikipedia/UI-V5/WMFSearchDataSource.m
+@@ -30,7 +30,7 @@ - (nonnull instancetype)initWithSearchSite:(MWKSite*)site searchResults:(WMFSear
+     NSParameterAssert(site);
+     NSParameterAssert(searchResults);
+     NSParameterAssert(savedPages);
+-    self = [super initWithItems:searchResults.results];
++    self = [super initWithTarget:searchResults keyPath:WMF_SAFE_KEYPATH(searchResults, results)];
+     if (self) {
+         self.searchSite    = site;
+         self.searchResults = searchResults;
+@@ -54,9 +54,9 @@ - (nonnull instancetype)initWithSearchSite:(MWKSite*)site searchResults:(WMFSear
+     return self;
+ }
+ 
+-- (NSString*)descriptionForSearchResult:(MWKSearchResult*)result{
++- (NSString*)descriptionForSearchResult:(MWKSearchResult*)result {
+     MWKSearchRedirectMapping* mapping = [self redirectMappingForResult:result];
+-    if(!mapping){
++    if (!mapping) {
+         return result.wikidataDescription;
+     }
+     NSString* description = result.wikidataDescription ? [@"\n" stringByAppendingString : [result.wikidataDescription wmf_stringByCapitalizingFirstCharacter]] : @"";
+diff --git a/Wikipedia/UI-V5/WMFSearchFetcher.m b/Wikipedia/UI-V5/WMFSearchFetcher.m
+index e6fdd63aac8..d9f9319125b 100644
+--- a/Wikipedia/UI-V5/WMFSearchFetcher.m
++++ b/Wikipedia/UI-V5/WMFSearchFetcher.m
+@@ -91,17 +91,14 @@ - (void)fetchArticlesForSearchTerm:(NSString*)searchTerm
+         WMFSearchResults* searchResults = response;
+         searchResults.searchTerm = searchTerm;
+ 
+-        if (previousResults) {
+-            NSArray* results = [searchResults.results bk_reject:^BOOL (MWKSearchResult* obj) {
+-                return ([previousResults.results containsObject:obj]);
+-            }];
+-
+-            results = [previousResults.results arrayByAddingObjectsFromArray:results];
+-            //Grab the previous search suggestion if none is returned
+-            NSString* searchSuggestion = searchResults.searchSuggestion.length > 0 ? searchResults.searchSuggestion : previousResults.searchSuggestion;
+-            searchResults = [[WMFSearchResults alloc] initWithSearchTerm:searchResults.searchTerm results:results searchSuggestion:searchSuggestion];
++        if (!previousResults) {
++            resolve(searchResults);
++            return;
+         }
+-        resolve(searchResults);
++
++        [previousResults mergeValuesForKeysFromModel:searchResults];
++
++        resolve(previousResults);
+     }
+                        failure:^(AFHTTPRequestOperation* operation, NSError* error) {
+         if ([url isEqual:[site mobileApiEndpoint]] && [error wmf_shouldFallbackToDesktopURLError]) {
+diff --git a/Wikipedia/UI-V5/WMFSearchResults.h b/Wikipedia/UI-V5/WMFSearchResults.h
+index ca84c095d41..1aa9a1f36fc 100644
+--- a/Wikipedia/UI-V5/WMFSearchResults.h
++++ b/Wikipedia/UI-V5/WMFSearchResults.h
+@@ -16,6 +16,7 @@ NS_ASSUME_NONNULL_BEGIN
+ - (instancetype)initWithSearchTerm:(NSString*)searchTerm
+                            results:(nullable NSArray*)results
+                   searchSuggestion:(nullable NSString*)suggestion;
++
+ @end
+ 
+ NS_ASSUME_NONNULL_END
+\ No newline at end of file
+diff --git a/Wikipedia/UI-V5/WMFSearchResults.m b/Wikipedia/UI-V5/WMFSearchResults.m
+index 486ca86a292..ef7bd8a5c2f 100644
+--- a/Wikipedia/UI-V5/WMFSearchResults.m
++++ b/Wikipedia/UI-V5/WMFSearchResults.m
+@@ -10,10 +10,13 @@
+ NS_ASSUME_NONNULL_BEGIN
+ 
+ @interface WMFSearchResults ()
++{
++    NSMutableArray<MWKSearchResult*>* _mutableResults;
++}
+ 
+ @property (nonatomic, copy, readwrite) NSString* searchTerm;
+ @property (nonatomic, copy, nullable, readwrite) NSString* searchSuggestion;
+-@property (nonatomic, strong, readwrite) NSArray* results;
++@property (nonatomic, strong, readwrite) NSArray<MWKSearchResult*>* results;
+ 
+ @end
+ 
+@@ -31,6 +34,17 @@ - (instancetype)initWithSearchTerm:(NSString*)searchTerm
+     return self;
+ }
+ 
++- (void)setResults:(NSArray<MWKSearchResult*>* _Nonnull)results {
++    if (_mutableResults == results) {
++        return;
++    }
++    _mutableResults = [results mutableCopy];
++}
++
++- (NSArray*)results {
++    return _mutableResults;
++}
++
+ + (NSValueTransformer*)resultsJSONTransformer {
+     return [MTLValueTransformer transformerUsingForwardBlock:^id (NSDictionary* value, BOOL* success, NSError* __autoreleasing* error) {
+         NSArray* pages = [value allValues];
+@@ -60,6 +74,19 @@ + (NSDictionary*)JSONKeyPathsByPropertyKey {
+     };
+ }
+ 
++- (void)mergeResultsFromModel:(WMFSearchResults*)searchResults {
++    NSArray* newResults = [searchResults.results bk_reject:^BOOL (MWKSearchResult* obj) {
++        return [self.results containsObject:obj];
++    }];
++
++    [_mutableResults addObjectsFromArray:newResults];
++}
++
++- (void)mergeSearchSuggestionFromModel:(WMFSearchResults*)searchResults {
++    // preserve current search suggestion if there is one
++    self.searchSuggestion = searchResults.searchSuggestion.length ? searchResults.searchSuggestion : self.searchSuggestion;
++}
++
+ @end
+ 
+ NS_ASSUME_NONNULL_END
+diff --git a/Wikipedia/UI-V5/WMFSearchViewController.m b/Wikipedia/UI-V5/WMFSearchViewController.m
+index 8bdb1c07f2c..87235c2477f 100644
+--- a/Wikipedia/UI-V5/WMFSearchViewController.m
++++ b/Wikipedia/UI-V5/WMFSearchViewController.m
+@@ -314,7 +314,10 @@ - (void)searchForSearchTerm:(NSString*)searchTerm {
+            collection view, meaning there's a chance the collectionView accesses deallocated memory during an animation
+          */
+ 
+-        WMFSearchDataSource* dataSource = [[WMFSearchDataSource alloc] initWithSearchSite:self.searchSite searchResults:results savedPages:self.dataStore.userDataStore.savedPageList];
++        WMFSearchDataSource* dataSource =
++            [[WMFSearchDataSource alloc] initWithSearchSite:self.searchSite
++                                              searchResults:results
++                                                 savedPages:self.dataStore.userDataStore.savedPageList];
+ 
+         self.resultsListController.dataSource = dataSource;
+ 
+@@ -323,7 +326,11 @@ - (void)searchForSearchTerm:(NSString*)searchTerm {
+         }];
+ 
+         if ([results.results count] < kWMFMinResultsBeforeAutoFullTextSearch) {
+-            return [self.fetcher fetchArticlesForSearchTerm:searchTerm site:self.searchSite resultLimit:WMFMaxSearchResultLimit fullTextSearch:YES appendToPreviousResults:results];
++            return [self.fetcher fetchArticlesForSearchTerm:searchTerm
++                                                       site:self.searchSite
++                                                resultLimit:WMFMaxSearchResultLimit
++                                             fullTextSearch:YES
++                                    appendToPreviousResults:results];
+         }
+         return [AnyPromise promiseWithValue:results];
+     }).then(^(WMFSearchResults* results){
+@@ -331,18 +338,18 @@ - (void)searchForSearchTerm:(NSString*)searchTerm {
+             if (results.results.count == 0) {
+                 [self showAlert:MWLocalizedString(@"search-no-matches", nil) type:ALERT_TYPE_TOP duration:2.0];
+             }
+-
+-            WMFSearchDataSource* dataSource = [[WMFSearchDataSource alloc] initWithSearchSite:self.searchSite searchResults:results savedPages:self.dataStore.userDataStore.savedPageList];
+-
+-            self.resultsListController.dataSource = dataSource;
+-        }
+-        if (results.results.count == 0) {
+-            [self showAlert:MWLocalizedString(@"search-no-matches", nil) type:ALERT_TYPE_TOP duration:2.0];
+         }
++
++        // change recent search visibility if no prefix results returned, and update suggestion if needed
++        [UIView animateWithDuration:0.25 animations:^{
++            [self updateUIWithResults:results];
++        }];
+     }).catch(^(NSError* error){
+         @strongify(self);
+-        [self showAlert:error.userInfo[NSLocalizedDescriptionKey] type:ALERT_TYPE_TOP duration:2.0];
+-        DDLogError(@"Encountered search error: %@", error);
++        if ([searchTerm isEqualToString:self.searchField.text]) {
++            [self showAlert:error.userInfo[NSLocalizedDescriptionKey] type:ALERT_TYPE_TOP duration:2.0];
++            DDLogError(@"Encountered search error: %@", error);
++        }
+     });
+ }
+ 

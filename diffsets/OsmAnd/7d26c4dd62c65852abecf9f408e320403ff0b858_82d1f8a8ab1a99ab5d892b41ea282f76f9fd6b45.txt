@@ -1,0 +1,307 @@
+diff --git a/OsmAnd/src/net/osmand/plus/base/MapViewTrackingUtilities.java b/OsmAnd/src/net/osmand/plus/base/MapViewTrackingUtilities.java
+index 3fc77dc0072..e0752e0aa5d 100644
+--- a/OsmAnd/src/net/osmand/plus/base/MapViewTrackingUtilities.java
++++ b/OsmAnd/src/net/osmand/plus/base/MapViewTrackingUtilities.java
+@@ -14,6 +14,7 @@
+ import net.osmand.CallbackWithObject;
+ import net.osmand.Location;
+ import net.osmand.StateChangedListener;
++import net.osmand.core.android.MapRendererView;
+ import net.osmand.data.LatLon;
+ import net.osmand.data.RotatedTileBox;
+ import net.osmand.map.IMapLocationListener;
+@@ -41,6 +42,8 @@
+ import net.osmand.plus.views.AnimateDraggingMapThread;
+ import net.osmand.plus.views.AutoZoomBySpeedUtils;
+ import net.osmand.plus.views.OsmandMapTileView;
++import net.osmand.plus.views.Zoom;
++import net.osmand.plus.views.Zoom.ComplexZoom;
+ import net.osmand.util.MapUtils;
+ 
+ import java.text.SimpleDateFormat;
+@@ -219,23 +222,17 @@ public void updateLocation(Location location) {
+ 			}
+ 		}
+ 		if (mapView != null) {
++			MapRendererView mapRenderer = mapView.getMapRenderer();
+ 			RotatedTileBox tb = mapView.getCurrentRotatedTileBox().copy();
+ 			if (isMapLinkedToLocation() && location != null) {
+-				Pair<Integer, Double> zoom = null;
+ 				Float rotation = null;
+ 				boolean pendingRotation = false;
+-				if (shouldAutoZoom(location)) {
+-					zoom = AutoZoomBySpeedUtils.calculateAutoZoomBySpeed(app, tb, location.getSpeed());
+-					if (zoom != null) {
+-						lastTimeAutoZooming = System.currentTimeMillis();
+-					}
+-				}
+ 				int currentMapRotation = settings.ROTATE_MAP.get();
+ 				boolean smallSpeedForCompass = isSmallSpeedForCompass(location);
+ 				boolean smallSpeedForAnimation = isSmallSpeedForAnimation(location);
+ 
+ 				showViewAngle = (!location.hasBearing() || smallSpeedForCompass) && (tb != null &&
+-						NativeUtilities.containsLatLon(mapView.getMapRenderer(), tb, location.getLatitude(), location.getLongitude()));
++						NativeUtilities.containsLatLon(mapRenderer, tb, location.getLatitude(), location.getLongitude()));
+ 				if (currentMapRotation == OsmandSettings.ROTATE_MAP_BEARING) {
+ 					// special case when bearing equals to zero (we don't change anything)
+ 					if (location.hasBearing() && location.getBearing() != 0f) {
+@@ -257,25 +254,46 @@ public void updateLocation(Location location) {
+ 					pendingRotation = true;
+ 				}
+ 				registerUnregisterSensor(location, smallSpeedForCompass);
++
++				ComplexZoom autoZoom = null;
++				if (shouldAutoZoom(location)) {
++					autoZoom = mapRenderer != null
++							? AutoZoomBySpeedUtils.autoZoomBySpeed(app, tb, location.getSpeed())
++							: AutoZoomBySpeedUtils.calculateAutoZoomBySpeed(app, tb, location.getSpeed());
++					if (autoZoom != null) {
++						lastTimeAutoZooming = System.currentTimeMillis();
++					}
++				}
++
+ 				if (settings.ANIMATE_MY_LOCATION.get() && !smallSpeedForAnimation && !movingToMyLocation) {
++					mapView.getAnimatedDraggingThread().stopAnimatingSync();
++					Pair<ComplexZoom, Long> zoomParams = null;
++					if (autoZoom != null) {
++						zoomParams = mapRenderer != null
++								? smoothenAutoZoom(mapRenderer, autoZoom, movingTime)
++								: new Pair<>(autoZoom, AutoZoomBySpeedUtils.FIXED_ZOOM_DURATION_MILLIS);
++					}
+ 					mapView.getAnimatedDraggingThread().startMoving(
+-							location.getLatitude(), location.getLongitude(), zoom,
++							location.getLatitude(), location.getLongitude(), zoomParams,
+ 							pendingRotation, rotation, movingTime, false,
+ 							() -> movingToMyLocation = false);
+ 				} else {
+-					if (mapView.hasMapRenderer()) {
++					if (mapRenderer != null) {
+ 						movingTime = movingToMyLocation
+ 								? (long) Math.min(movingTime * 0.7, MOVE_ANIMATION_TIME) : MOVE_ANIMATION_TIME;
+ 						if (mapView.getSettings().DO_NOT_USE_ANIMATIONS.get()) {
+ 							movingTime = 0;
+ 						}
++						Pair<ComplexZoom, Long> zoomParams = autoZoom != null
++								? new Pair<>(autoZoom, AutoZoomBySpeedUtils.FIXED_ZOOM_DURATION_MILLIS)
++								: null;
+ 						mapView.getAnimatedDraggingThread().startMoving(
+-								location.getLatitude(), location.getLongitude(), zoom,
++								location.getLatitude(), location.getLongitude(), zoomParams,
+ 								pendingRotation, rotation, movingTime, false,
+ 								() -> movingToMyLocation = false);
+ 					} else {
+-						if (zoom != null && zoom.first != null && zoom.second != null) {
+-							mapView.getAnimatedDraggingThread().startZooming(zoom.first, zoom.second, null, false);
++						if (autoZoom != null) {
++							mapView.getAnimatedDraggingThread().startZooming(autoZoom.base, autoZoom.floatPart, null, false);
+ 						}
+ 						if (rotation != null) {
+ 							mapView.setRotate(rotation, false);
+@@ -285,7 +303,7 @@ public void updateLocation(Location location) {
+ 				}
+ 			} else if (location != null) {
+ 				showViewAngle = (!location.hasBearing() || isSmallSpeedForCompass(location)) && (tb != null &&
+-						NativeUtilities.containsLatLon(mapView.getMapRenderer(), tb, location.getLatitude(), location.getLongitude()));
++						NativeUtilities.containsLatLon(mapRenderer, tb, location.getLatitude(), location.getLongitude()));
+ 				registerUnregisterSensor(location, false);
+ 			}
+ 			this.showViewAngle = showViewAngle;
+@@ -313,6 +331,18 @@ public static boolean isSmallSpeedForAnimation(Location location) {
+ 		return !location.hasSpeed() || Float.isNaN(location.getSpeed()) || location.getSpeed() < 1.5;
+ 	}
+ 
++	@NonNull
++	private Pair<ComplexZoom, Long> smoothenAutoZoom(@NonNull MapRendererView mapRenderer,
++	                                                 @NonNull ComplexZoom autoZoom,
++	                                                 long maxDuration) {
++		float currentZoom = mapRenderer.getFlatZoomLevel().ordinal() + Zoom.visualToFloatPart(mapRenderer.getFlatVisualZoom());
++		float zoomDelta = autoZoom.fullZoom() - currentZoom;
++		long zoomingTime = Math.min(maxDuration, (long) (Math.abs(zoomDelta) / AutoZoomBySpeedUtils.ZOOM_PER_SECOND * 1000));
++		float boundedZoomDelta = Math.signum(zoomDelta) * AutoZoomBySpeedUtils.ZOOM_PER_SECOND * (zoomingTime / 1000f);
++		ComplexZoom boundedAutoZoom = ComplexZoom.fromPreferredBase(currentZoom + boundedZoomDelta, mapRenderer.getFlatZoomLevel().ordinal());
++		return new Pair<>(boundedAutoZoom, zoomingTime);
++	}
++
+ 	public boolean isShowViewAngle() {
+ 		return showViewAngle;
+ 	}
+diff --git a/OsmAnd/src/net/osmand/plus/views/AnimateDraggingMapThread.java b/OsmAnd/src/net/osmand/plus/views/AnimateDraggingMapThread.java
+index f740a800e8b..a4860ecd56c 100644
+--- a/OsmAnd/src/net/osmand/plus/views/AnimateDraggingMapThread.java
++++ b/OsmAnd/src/net/osmand/plus/views/AnimateDraggingMapThread.java
+@@ -20,6 +20,7 @@
+ import net.osmand.data.RotatedTileBox;
+ import net.osmand.plus.OsmandApplication;
+ import net.osmand.plus.utils.NativeUtilities;
++import net.osmand.plus.views.Zoom.ComplexZoom;
+ import net.osmand.util.MapUtils;
+ 
+ import org.apache.commons.logging.Log;
+@@ -214,7 +215,7 @@ public synchronized void startThreadAnimating(@NonNull Runnable runnable) {
+ 		t.start();
+ 	}
+ 
+-	public void startMoving(double finalLat, double finalLon, Pair<Integer, Double> finalZoom,
++	public void startMoving(double finalLat, double finalLon, @Nullable Pair<ComplexZoom, Long> zoomParams,
+ 	                        boolean pendingRotation, Float finalRotation, long movingTime,
+ 	                        boolean notifyListener, @Nullable Runnable finishAnimationCallback) {
+ 		if (animationsDisabled)
+@@ -232,9 +233,9 @@ public void startMoving(double finalLat, double finalLon, Pair<Integer, Double>
+ 		int zoom;
+ 		double zoomFP;
+ 		float rotation;
+-		if (finalZoom != null && finalZoom.first != null && finalZoom.second != null) {
+-			zoom = finalZoom.first;
+-			zoomFP = finalZoom.second;
++		if (zoomParams != null) {
++			zoom = zoomParams.first.base;
++			zoomFP = zoomParams.first.floatPart;
+ 		} else {
+ 			zoom = startZoom;
+ 			zoomFP = startZoomFP;
+@@ -272,7 +273,7 @@ public void startMoving(double finalLat, double finalLon, Pair<Integer, Double>
+ 
+ 		float animationDuration = Math.max(movingTime, NAV_ANIMATION_TIME / 4);
+ 
+-		boolean animateZoom = finalZoom != null && (zoom != startZoom || startZoomFP != 0);
++		boolean animateZoom = zoomParams != null && (zoom != startZoom || startZoomFP != 0);
+ 		float rotationDiff = finalRotation != null
+ 				? Math.abs(MapUtils.unifyRotationDiff(rotation, startRotation)) : 0;
+ 		boolean animateRotation = rotationDiff > 0.1;
+@@ -320,7 +321,7 @@ public void startMoving(double finalLat, double finalLon, Pair<Integer, Double>
+ 
+ 			if (animateZoom)
+ 			{
+-				animator.animateZoomTo(zoom + (float) zoomFP, NAV_ANIMATION_TIME / 1000f,
++				animator.animateZoomTo(zoom + (float) zoomFP, zoomParams.second / 1000f,
+ 						TimingFunction.EaseOutQuadratic, locationServicesAnimationKey);
+ 			}
+ 			if (!animateZoom) {
+@@ -359,7 +360,7 @@ public void startMoving(double finalLat, double finalLon, Pair<Integer, Double>
+ 				}
+ 			} else {
+ 				if (animateZoom) {
+-					animatingZoomInThread(startZoom, startZoomFP, zoom, zoomFP, NAV_ANIMATION_TIME, notifyListener);
++					animatingZoomInThread(startZoom, startZoomFP, zoom, zoomFP, zoomParams.second, notifyListener);
+ 				}
+ 
+ 				if (pendingRotation) {
+diff --git a/OsmAnd/src/net/osmand/plus/views/AutoZoomBySpeedUtils.java b/OsmAnd/src/net/osmand/plus/views/AutoZoomBySpeedUtils.java
+index 7cae69356f2..38a204b4830 100644
+--- a/OsmAnd/src/net/osmand/plus/views/AutoZoomBySpeedUtils.java
++++ b/OsmAnd/src/net/osmand/plus/views/AutoZoomBySpeedUtils.java
+@@ -18,23 +18,22 @@
+ import net.osmand.plus.settings.enums.AutoZoomMap;
+ import net.osmand.plus.utils.ColorUtilities;
+ import net.osmand.plus.utils.OsmAndFormatter;
+-import net.osmand.plus.utils.OsmAndFormatter.FormattedValue;
+-import net.osmand.util.Algorithms;
++import net.osmand.plus.views.Zoom.ComplexZoom;
+ 
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+-import androidx.core.util.Pair;
+ 
+ public class AutoZoomBySpeedUtils {
+ 
+-	private static final float ZOOM_PER_SECOND = 0.25f;
++	public static final float ZOOM_PER_SECOND = 0.25f;
++	public static final long FIXED_ZOOM_DURATION_MILLIS = 1000;
+ 	private static final int SHOW_DRIVING_SECONDS = 60;
+ 
+ 	@Nullable
+-	public static Pair<Integer, Double> calculateAutoZoomBySpeed(@NonNull OsmandApplication app, @NonNull RotatedTileBox tb, float speed) {
++	public static ComplexZoom calculateAutoZoomBySpeed(@NonNull OsmandApplication app, @NonNull RotatedTileBox tb, float speed) {
+ 		OsmandSettings settings = app.getSettings();
+ 
+ 		float zoomProximityCoeff = settings.AUTO_ZOOM_MAP_SCALE.get().coefficient;
+@@ -51,8 +50,8 @@ public static Pair<Integer, Double> calculateAutoZoomBySpeed(@NonNull OsmandAppl
+ 		double targetZoom = Math.min(tb.getZoom() + tb.getZoomFloatPart() + zoomDelta, settings.AUTO_ZOOM_MAP_SCALE.get().maxZoom);
+ 		targetZoom = Math.round(targetZoom * 3) / 3f;
+ 		int newIntegerZoom = (int) Math.round(targetZoom);
+-		double zPart = targetZoom - newIntegerZoom;
+-		return newIntegerZoom > 0 ? new Pair<>(newIntegerZoom, zPart) : null;
++		float zPart = (float) (targetZoom - newIntegerZoom);
++		return newIntegerZoom > 0 ? new ComplexZoom(newIntegerZoom, zPart) : null;
+ 	}
+ 
+ 	private static float defineZoomFromSpeed(@NonNull RotatedTileBox tb, float speed, float zoomProximityCoeff) {
+@@ -66,9 +65,10 @@ private static float defineZoomFromSpeed(@NonNull RotatedTileBox tb, float speed
+ 		return Zoom.fromDistanceRatio(visibleDist, distToSee, currentZoom);
+ 	}
+ 
+-	public static float autoZoomBySpeed(@NonNull OsmandApplication app, @NonNull RotatedTileBox tileBox, float speed) {
++	@Nullable
++	public static ComplexZoom autoZoomBySpeed(@NonNull OsmandApplication app, @NonNull RotatedTileBox tileBox, float speed) {
+ 		if (speed < 7 / 3.6) {
+-			return Float.NaN;
++			return null;
+ 		}
+ 
+ 		OsmandMapTileView mapView = app.getOsmandMap().getMapView();
+@@ -82,7 +82,7 @@ public static float autoZoomBySpeed(@NonNull OsmandApplication app, @NonNull Rot
+ 		int minZoom = mapView.getMinZoom();
+ 		int maxZoom = Math.min(mapView.getMaxZoom(), autoZoomScale.maxZoom);
+ 		Zoom boundedZoom = Zoom.checkZoomBounds(expectedZoom, minZoom, maxZoom);
+-		return boundedZoom.getBaseZoom() + boundedZoom.getZoomFloatPart();
++		return new ComplexZoom(boundedZoom.getBaseZoom(), boundedZoom.getZoomFloatPart());
+ 	}
+ 
+ 	@Nullable
+@@ -96,10 +96,10 @@ public static TrackPointsAnalyser getTrackPointsAnalyser(@NonNull OsmandApplicat
+ 		}
+ 
+ 		return (analysis, point, attributes) -> {
+-			float autoZoom = AutoZoomBySpeedUtils.autoZoomBySpeed(app, tileBox, attributes.speed);
++			ComplexZoom autoZoom = AutoZoomBySpeedUtils.autoZoomBySpeed(app, tileBox, attributes.speed);
+ 
+-			if (!Float.isNaN(autoZoom)) {
+-				tileBox.setZoomAndAnimation((int) autoZoom, 0.0, autoZoom - (int) autoZoom);
++			if (autoZoom != null) {
++				tileBox.setZoomAndAnimation(autoZoom.base, 0.0, autoZoom.floatPart);
+ 			}
+ 
+ 			float expectedZoom = (float) (tileBox.getZoom() + tileBox.getZoomFloatPart() + tileBox.getZoomAnimation());
+diff --git a/OsmAnd/src/net/osmand/plus/views/Zoom.java b/OsmAnd/src/net/osmand/plus/views/Zoom.java
+index 41a77fc3f10..c3ef0fef3e0 100644
+--- a/OsmAnd/src/net/osmand/plus/views/Zoom.java
++++ b/OsmAnd/src/net/osmand/plus/views/Zoom.java
+@@ -151,4 +151,34 @@ public static float visualToFloatPart(float visualZoom) {
+ 				? visualZoom - 1.0f
+ 				: (visualZoom - 1.0f) * 2.0f;
+ 	}
++
++	public static class ComplexZoom {
++		public int base;
++		public float floatPart;
++
++		public ComplexZoom(float zoom) {
++			this(Math.round(zoom), zoom - Math.round(zoom));
++		}
++
++		public ComplexZoom(int base, float floatPart) {
++			this.base = base;
++			this.floatPart = floatPart;
++		}
++
++		public float fullZoom() {
++			return base + floatPart;
++		}
++
++		@NonNull
++		public static ComplexZoom fromPreferredBase(float zoom, int preferredZoomBase) {
++			float floatPart = zoom - (int) zoom;
++			if (floatPart >= 0.4f && (int) zoom + 1 == preferredZoomBase) {
++				return new ComplexZoom(preferredZoomBase, zoom - preferredZoomBase);
++			} else if (floatPart < 0.6f && (int) zoom == preferredZoomBase) {
++				return new ComplexZoom(preferredZoomBase, zoom - preferredZoomBase);
++			} else {
++				return new ComplexZoom(zoom);
++			}
++		}
++	}
+ }
+\ No newline at end of file

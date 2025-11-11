@@ -1,0 +1,268 @@
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngine.java b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngine.java
+index 85cb268fd4c5..cefc52d6a88d 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngine.java
++++ b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngine.java
+@@ -5,18 +5,25 @@
+ 
+ package org.mozilla.focus.search;
+ 
++import android.content.Context;
++import android.content.SharedPreferences;
+ import android.graphics.Bitmap;
+ import android.net.Uri;
+ import android.util.Log;
+ 
++import org.mozilla.focus.shortcut.IconGenerator;
++import org.mozilla.focus.utils.BitmapUtils;
+ import org.w3c.dom.Document;
+ import org.w3c.dom.Element;
+ 
+ import java.io.StringWriter;
+ import java.io.Writer;
+ import java.util.ArrayList;
++import java.util.Collections;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Set;
+ 
+ import javax.xml.parsers.DocumentBuilderFactory;
+ import javax.xml.parsers.ParserConfigurationException;
+@@ -32,6 +39,10 @@
+ 
+ public class SearchEngine {
+     private static final String LOGTAG = "SearchEngine";
++    public static final String PREF_FILE_SEARCH_ENGINES = "custom-search-engines";
++    public static final String PREF_KEY_CUSTOM_SEARCH_ENGINES = "pref_custom_search_engines";
++    private static final String PREF_KEY_CUSTOM_SEARCH_VERSION = "pref_custom_search_version";
++    private static final int CUSTOM_SEARCH_VERSION = 1;
+ 
+     // Parameters copied from nsSearchService.js
+     private static final String MOZ_PARAM_LOCALE = "\\{moz:locale\\}";
+@@ -120,7 +131,25 @@ private String paramSubstitution(String template, String query) {
+         return template;
+     }
+ 
+-    public static String buildSearchEngineXML(String engineName, String searchString) {
++    public static boolean addSearchEngine(SharedPreferences sharedPreferences, Context context, String engineName, String searchQuery) {
++        final Bitmap iconBitmap = IconGenerator.generateLauncherIcon(context, searchQuery);
++        final String searchEngineXml = buildSearchEngineXML(engineName, searchQuery, iconBitmap);
++        if (searchEngineXml == null) {
++            return false;
++        }
++        final Set<String> existingEngines = sharedPreferences.getStringSet(PREF_KEY_CUSTOM_SEARCH_ENGINES, Collections.<String>emptySet());
++        final Set<String> newEngines = new LinkedHashSet<>();
++        newEngines.addAll(existingEngines);
++        newEngines.add(engineName);
++
++        sharedPreferences.edit().putInt(PREF_KEY_CUSTOM_SEARCH_VERSION, CUSTOM_SEARCH_VERSION)
++                .putStringSet(PREF_KEY_CUSTOM_SEARCH_ENGINES, newEngines)
++                .putString(engineName, searchEngineXml)
++                .apply();
++        return true;
++    }
++
++    public static String buildSearchEngineXML(String engineName, String searchQuery, Bitmap iconBitmap) {
+         Document document = null;
+         try {
+             document = DocumentBuilderFactory.newInstance().newDocumentBuilder().newDocument();
+@@ -132,13 +161,20 @@ public static String buildSearchEngineXML(String engineName, String searchString
+             shortNameElement.setTextContent(engineName);
+             rootElement.appendChild(shortNameElement);
+ 
++            final Element imageElement = document.createElement("Image");
++            imageElement.setAttribute("width", "16");
++            imageElement.setAttribute("height", "16");
++            imageElement.setTextContent(BitmapUtils.getBase64EncodedDataUriFromBitmap(iconBitmap));
++            rootElement.appendChild(imageElement);
++
+             final Element descriptionElement = document.createElement("Description");
+             descriptionElement.setTextContent(engineName);
+             rootElement.appendChild(descriptionElement);
+ 
+             final Element urlElement = document.createElement("Url");
+             urlElement.setAttribute("type", "text/html");
+-            final String templateSearchString = searchString.substring(0, searchString.length() - 2) + "{searchTerms}";
++            // Simple implementation that assumes "%s" terminator from UrlUtils.isValidSearchEngineQueryUrl
++            final String templateSearchString = searchQuery.substring(0, searchQuery.length() - 2) + "{searchTerms}";
+             urlElement.setAttribute("template", templateSearchString);
+             rootElement.appendChild(urlElement);
+ 
+@@ -158,7 +194,6 @@ private static String XMLtoString(Document doc) {
+         try {
+             final Transformer tf = TransformerFactory.newInstance().newTransformer();
+             tf.setOutputProperty(OutputKeys.ENCODING, "UTF-8");
+-            tf.setOutputProperty(OutputKeys.INDENT, "yes");
+             tf.transform(new DOMSource(doc), new StreamResult(writer));
+         } catch (TransformerConfigurationException e) {
+             return null;
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineManager.java b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineManager.java
+index 9f6df2b79d3d..5d1a1496cb6a 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineManager.java
++++ b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineManager.java
+@@ -9,6 +9,7 @@
+ import android.content.Context;
+ import android.content.Intent;
+ import android.content.IntentFilter;
++import android.content.SharedPreferences;
+ import android.content.res.AssetManager;
+ import android.support.annotation.WorkerThread;
+ import android.util.Log;
+@@ -19,12 +20,19 @@
+ import org.mozilla.focus.ext.AssetManagerKt;
+ import org.mozilla.focus.locale.Locales;
+ import org.mozilla.focus.utils.Settings;
++import org.xmlpull.v1.XmlPullParserException;
+ 
++import java.io.ByteArrayInputStream;
+ import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Collections;
++import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Set;
+ 
+ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+ 
+@@ -109,12 +117,30 @@ private synchronized void loadFromDisk(Context context) {
+         } catch (JSONException e) {
+             throw new AssertionError("Reading search engine failed: ", e);
+         } finally {
++            searchEngines.addAll(loadCustomSearchEngines(context));
+             this.searchEngines = searchEngines;
+ 
+             notifyAll();
+         }
+     }
+ 
++    private List<SearchEngine> loadCustomSearchEngines(Context context) {
++        final List<SearchEngine> searchEngines = new LinkedList<>();
++        final SharedPreferences prefs = context.getSharedPreferences(SearchEngine.PREF_FILE_SEARCH_ENGINES, Context.MODE_PRIVATE);
++        final Set<String> engines = prefs.getStringSet(SearchEngine.PREF_KEY_CUSTOM_SEARCH_ENGINES, Collections.<String>emptySet());
++        try {
++            for (String engine : engines) {
++                final InputStream engineInputStream = new ByteArrayInputStream(prefs.getString(engine, "").getBytes(StandardCharsets.UTF_8));
++                searchEngines.add(SearchEngineParser.load(engine, engineInputStream));
++            }
++        } catch (IOException e) {
++            Log.e(LOG_TAG, "IOException whil loading custom search engines", e);
++        } catch (XmlPullParserException e) {
++            Log.e(LOG_TAG, "Couldn't load custom search engines", e);
++        }
++        return searchEngines;
++    }
++
+     private JSONArray loadSearchEngineListForLocale(Context context) throws IOException {
+         try {
+             final Locale locale = Locale.getDefault();
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineParser.java b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineParser.java
+index a43372964880..4dc31c7f25d8 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineParser.java
++++ b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineParser.java
+@@ -8,7 +8,6 @@
+ import android.content.res.AssetManager;
+ import android.graphics.BitmapFactory;
+ import android.net.Uri;
+-import android.support.annotation.VisibleForTesting;
+ import android.util.Base64;
+ 
+ import org.xmlpull.v1.XmlPullParser;
+@@ -39,7 +38,7 @@ public static SearchEngine load(AssetManager assetManager, String identifier, St
+         }
+     }
+ 
+-    @VisibleForTesting static SearchEngine load(String identifier, InputStream stream) throws IOException, XmlPullParserException {
++    public static SearchEngine load(String identifier, InputStream stream) throws IOException, XmlPullParserException {
+         final SearchEngine searchEngine = new SearchEngine(identifier);
+ 
+         XmlPullParser parser = XmlPullParserFactory.newInstance().newPullParser();
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/settings/ManualAddSearchEngineSettingsFragment.java b/focus-android/app/src/main/java/org/mozilla/focus/settings/ManualAddSearchEngineSettingsFragment.java
+index 027aa233500f..f09c679c520c 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/settings/ManualAddSearchEngineSettingsFragment.java
++++ b/focus-android/app/src/main/java/org/mozilla/focus/settings/ManualAddSearchEngineSettingsFragment.java
+@@ -4,6 +4,8 @@
+ 
+ package org.mozilla.focus.settings;
+ 
++import android.content.Context;
++import android.content.SharedPreferences;
+ import android.os.Bundle;
+ import android.support.annotation.Nullable;
+ import android.support.design.widget.Snackbar;
+@@ -15,8 +17,11 @@
+ import android.widget.EditText;
+ 
+ import org.mozilla.focus.R;
++import org.mozilla.focus.search.SearchEngine;
+ import org.mozilla.focus.utils.UrlUtils;
+ 
++import java.util.Collections;
++
+ public class ManualAddSearchEngineSettingsFragment extends SettingsFragment {
+     public static final int FRAGMENT_CLASS_TYPE = 1; // Unique SettingsFragment identifier
+ 
+@@ -51,9 +56,16 @@ public boolean onOptionsItemSelected(MenuItem item) {
+             case R.id.menu_save_search_engine:
+                 final View rootView = getView();
+                 final String engineName = ((EditText) rootView.findViewById(R.id.edit_engine_name)).getText().toString();
+-                final String searchString = ((EditText) rootView.findViewById(R.id.edit_search_string)).getText().toString();
+-                if (!validateSearchFields(engineName, searchString)) {
++                final String searchQuery = ((EditText) rootView.findViewById(R.id.edit_search_string)).getText().toString();
++
++                final SharedPreferences sharedPreferences = getActivity()
++                        .getSharedPreferences(SearchEngine.PREF_FILE_SEARCH_ENGINES, Context.MODE_PRIVATE);
++                if (!validateSearchFields(engineName, searchQuery, sharedPreferences)) {
+                     Snackbar.make(rootView, R.string.search_add_error, Snackbar.LENGTH_SHORT).show();
++                } else {
++                    SearchEngine.addSearchEngine(sharedPreferences, getActivity(), engineName, searchQuery);
++                    Snackbar.make(rootView, R.string.search_add_confirmation, Snackbar.LENGTH_SHORT).show();
++                    getActivity().onBackPressed();
+                 }
+                 return true;
+             default:
+@@ -61,11 +73,16 @@ public boolean onOptionsItemSelected(MenuItem item) {
+         }
+     }
+ 
+-    private static boolean validateSearchFields(String engineName, String searchString) {
++    private static boolean validateSearchFields(String engineName, String searchString, SharedPreferences sharedPreferences) {
+         if (TextUtils.isEmpty(engineName)) {
+             return false;
+         }
+ 
++        if (sharedPreferences.getStringSet(SearchEngine.PREF_KEY_CUSTOM_SEARCH_ENGINES,
++                Collections.<String>emptySet()).contains(engineName)) {
++            return false;
++        }
++
+         return UrlUtils.isValidSearchQueryUrl(searchString);
+     }
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/utils/BitmapUtils.java b/focus-android/app/src/main/java/org/mozilla/focus/utils/BitmapUtils.java
+new file mode 100644
+index 000000000000..71ab3e8875bc
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/utils/BitmapUtils.java
+@@ -0,0 +1,18 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++package org.mozilla.focus.utils;
++
++import android.graphics.Bitmap;
++import android.util.Base64;
++
++import java.io.ByteArrayOutputStream;
++
++public class BitmapUtils {
++    public static String getBase64EncodedDataUriFromBitmap(Bitmap bitmap) {
++        final ByteArrayOutputStream stream = new ByteArrayOutputStream();
++        bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream);
++        final String encodedImage = Base64.encodeToString(stream.toByteArray(), Base64.DEFAULT);
++        return "data:image/png;base64," + encodedImage;
++    }
++}

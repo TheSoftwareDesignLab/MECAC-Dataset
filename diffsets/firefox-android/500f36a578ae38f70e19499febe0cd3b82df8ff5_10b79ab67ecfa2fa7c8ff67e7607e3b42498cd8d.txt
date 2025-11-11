@@ -1,0 +1,432 @@
+diff --git a/android-components/components/concept/sync/src/main/java/mozilla/components/concept/sync/OAuthAccount.kt b/android-components/components/concept/sync/src/main/java/mozilla/components/concept/sync/OAuthAccount.kt
+index 74c039f63f19..455a9c18b462 100644
+--- a/android-components/components/concept/sync/src/main/java/mozilla/components/concept/sync/OAuthAccount.kt
++++ b/android-components/components/concept/sync/src/main/java/mozilla/components/concept/sync/OAuthAccount.kt
+@@ -89,6 +89,11 @@ interface AccountObserver {
+      */
+     fun onProfileUpdated(profile: Profile)
+ 
++    /**
++     * Account needs to be re-authenticated (e.g. due to a password change).
++     */
++    fun onAuthenticationProblems()
++
+     /**
+      * Account manager encountered an error. Inspect [error] for details.
+      * @param error A specific error encountered.
+diff --git a/android-components/components/feature/sync/src/main/java/mozilla/components/feature/sync/BackgroundSyncManager.kt b/android-components/components/feature/sync/src/main/java/mozilla/components/feature/sync/BackgroundSyncManager.kt
+index 11680fde97ce..4564b6b8b580 100644
+--- a/android-components/components/feature/sync/src/main/java/mozilla/components/feature/sync/BackgroundSyncManager.kt
++++ b/android-components/components/feature/sync/src/main/java/mozilla/components/feature/sync/BackgroundSyncManager.kt
+@@ -140,6 +140,11 @@ abstract class GeneralSyncManager : SyncManager, Observable<SyncStatusObserver>
+ 
+     override fun loggedOut() = synchronized(this) {
+         logger.debug("Logging out")
++        // We might have never had a chance to initialize the account/dispatcher (e.g. during auth
++        // problems while restoring an account on startup). Bail out.
++        if (account == null) {
++            return@synchronized
++        }
+         account = null
+         syncDispatcher!!.stopPeriodicSync()
+         syncDispatcher!!.close()
+diff --git a/android-components/components/feature/sync/src/test/java/mozilla/components/feature/sync/GeneralSyncManagerTest.kt b/android-components/components/feature/sync/src/test/java/mozilla/components/feature/sync/GeneralSyncManagerTest.kt
+index 587c8526124c..9487aede849a 100644
+--- a/android-components/components/feature/sync/src/test/java/mozilla/components/feature/sync/GeneralSyncManagerTest.kt
++++ b/android-components/components/feature/sync/src/test/java/mozilla/components/feature/sync/GeneralSyncManagerTest.kt
+@@ -99,14 +99,6 @@ class GeneralSyncManagerTest {
+ //        verify(dispatcher, times(4)).startPeriodicSync(any(), any())
+     }
+ 
+-    @Test(expected = KotlinNullPointerException::class)
+-    fun `logging out before being authenticated is a mistake`() {
+-        val manager = TestSyncManager(mock()) { _, _ ->
+-            fail()
+-        }
+-        manager.loggedOut()
+-    }
+-
+     @Test
+     fun `logging out should reset an account and clean up the dispatcher`() {
+         val dispatcher: SyncDispatcher = mock()
+@@ -123,16 +115,6 @@ class GeneralSyncManagerTest {
+         verify(dispatcher).close()
+     }
+ 
+-    @Test(expected = KotlinNullPointerException::class)
+-    fun `logging out twice is a mistake`() {
+-        val account: OAuthAccount = mock()
+-        val manager = TestSyncManager(mock()) { _, _ -> }
+-
+-        manager.authenticated(account)
+-        manager.loggedOut()
+-        manager.loggedOut()
+-    }
+-
+     @Test
+     fun `logging in after logging out should be possible with the same account`() {
+         val mockAccount: OAuthAccount = mock()
+diff --git a/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/FxaAccountManager.kt b/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/FxaAccountManager.kt
+index 95b5f2cf5407..85f7c00da298 100644
+--- a/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/FxaAccountManager.kt
++++ b/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/FxaAccountManager.kt
+@@ -13,7 +13,10 @@ import kotlinx.coroutines.Deferred
+ import kotlinx.coroutines.SupervisorJob
+ import kotlinx.coroutines.asCoroutineDispatcher
+ import kotlinx.coroutines.async
++import kotlinx.coroutines.launch
+ import mozilla.components.concept.sync.AccountObserver
++import mozilla.components.concept.sync.AuthException
++import mozilla.components.concept.sync.AuthExceptionType
+ import mozilla.components.concept.sync.DeviceCapability
+ import mozilla.components.concept.sync.DeviceEvent
+ import mozilla.components.concept.sync.DeviceType
+@@ -26,6 +29,8 @@ import mozilla.components.service.fxa.AccountStorage
+ import mozilla.components.service.fxa.Config
+ import mozilla.components.service.fxa.FirefoxAccount
+ import mozilla.components.service.fxa.FxaException
++import mozilla.components.service.fxa.FxaPanicException
++import mozilla.components.service.fxa.FxaUnauthorizedException
+ import mozilla.components.service.fxa.SharedPrefAccountStorage
+ import java.util.concurrent.ConcurrentLinkedQueue
+ import kotlin.coroutines.CoroutineContext
+@@ -46,6 +51,20 @@ import java.util.concurrent.Executors
+  */
+ class FailedToLoadAccountException(cause: Exception?) : Exception(cause)
+ 
++/**
++ * A global registry for propagating [AuthException] errors. Components such as [SyncManager] and
++ * [FxaDeviceRefreshManager] may encounter authentication problems during their normal operation, and
++ * this registry is how they inform [FxaAccountManager] that these errors happened.
++ *
++ * [FxaAccountManager] monitors this registry, adjusts internal state accordingly, and notifies
++ * registered [AccountObserver] that account needs re-authentication.
++ */
++val authErrorRegistry = ObserverRegistry<AuthErrorObserver>()
++
++interface AuthErrorObserver {
++    fun onAuthError(e: AuthException)
++}
++
+ /**
+  * Observer interface which lets its consumers respond to authentication requests.
+  */
+@@ -95,6 +114,14 @@ open class FxaAccountManager(
+ 
+     init {
+         syncManager?.let { this.register(SyncManagerIntegration(it)) }
++
++        authErrorRegistry.register(object : AuthErrorObserver {
++            override fun onAuthError(e: AuthException) {
++                CoroutineScope(coroutineContext).launch {
++                    processQueueAsync(Event.AuthenticationError(e)).await()
++                }
++            }
++        })
+     }
+ 
+     private class FxaStatePersistenceCallback(
+@@ -139,6 +166,7 @@ open class FxaAccountManager(
+                 }
+                 AccountState.AuthenticatedNoProfile -> {
+                     when (event) {
++                        is Event.AuthenticationError -> AccountState.AuthenticationProblems
+                         Event.FetchProfile -> AccountState.AuthenticatedNoProfile
+                         Event.FetchedProfile -> AccountState.AuthenticatedWithProfile
+                         Event.FailedToFetchProfile -> AccountState.AuthenticatedNoProfile
+@@ -148,6 +176,16 @@ open class FxaAccountManager(
+                 }
+                 AccountState.AuthenticatedWithProfile -> {
+                     when (event) {
++                        is Event.AuthenticationError -> AccountState.AuthenticationProblems
++                        Event.Logout -> AccountState.NotAuthenticated
++                        else -> null
++                    }
++                }
++                AccountState.AuthenticationProblems -> {
++                    when (event) {
++                        Event.Authenticate -> AccountState.AuthenticationProblems
++                        Event.FailedToAuthenticate -> AccountState.AuthenticationProblems
++                        is Event.Authenticated -> AccountState.AuthenticatedNoProfile
+                         Event.Logout -> AccountState.NotAuthenticated
+                         else -> null
+                     }
+@@ -183,6 +221,10 @@ open class FxaAccountManager(
+         return processQueueAsync(Event.Init)
+     }
+ 
++    /**
++     * Main point for interaction with an [OAuthAccount] instance.
++     * @return [OAuthAccount] if we're in an authenticated state, null otherwise.
++     */
+     fun authenticatedAccount(): OAuthAccount? {
+         return when (state) {
+             AccountState.AuthenticatedWithProfile,
+@@ -191,6 +233,19 @@ open class FxaAccountManager(
+         }
+     }
+ 
++    /**
++     * Indicates if account needs to be re-authenticated via [beginAuthenticationAsync].
++     * Most common reason for an account to need re-authentication is a password change.
++     *
++     * @return A boolean flag indicating if account needs to be re-authenticated.
++     */
++    fun accountNeedsReauth(): Boolean {
++        return when (state) {
++            AccountState.AuthenticationProblems -> true
++            else -> false
++        }
++    }
++
+     fun accountProfile(): Profile? {
+         return when (state) {
+             AccountState.AuthenticatedWithProfile -> profile
+@@ -283,6 +338,9 @@ open class FxaAccountManager(
+                         // Locally corrupt accounts are simply treated as 'absent'.
+                         val savedAccount = try {
+                             getAccountStorage().read()
++                        } catch (e: FxaPanicException) {
++                            // Don't swallow panics from the underlying library.
++                            throw e
+                         } catch (e: FxaException) {
+                             logger.error("Failed to load saved account.", e)
+ 
+@@ -324,18 +382,14 @@ open class FxaAccountManager(
+                         null
+                     }
+                     Event.Authenticate -> {
+-                        val url = try {
+-                            account.beginOAuthFlow(scopes, true).await()
+-                        } catch (e: FxaException) {
+-                            oauthObservers.notifyObservers { onError(e) }
+-                            return Event.FailedToAuthenticate
+-                        }
+-                        oauthObservers.notifyObservers { onBeginOAuthFlow(url) }
+-                        null
++                        return doAuthenticate()
+                     }
+                     is Event.Pair -> {
+                         val url = try {
+                             account.beginPairingFlow(via.pairingUrl, scopes).await()
++                        } catch (e: FxaPanicException) {
++                            // Don't swallow panics from the underlying library.
++                            throw e
+                         } catch (e: FxaException) {
+                             oauthObservers.notifyObservers { onError(e) }
+                             return Event.FailedToAuthenticate
+@@ -379,7 +433,16 @@ open class FxaAccountManager(
+                         account.deviceConstellation().register(deviceEventsIntegration)
+ 
+                         logger.info("Ensuring device capabilities")
+-                        account.deviceConstellation().ensureCapabilitiesAsync(deviceTuple.capabilities).await()
++                        try {
++                            account.deviceConstellation().ensureCapabilitiesAsync(deviceTuple.capabilities).await()
++                        } catch (e: FxaPanicException) {
++                            // Don't swallow panics from the underlying library.
++                            throw e
++                        } catch (e: FxaUnauthorizedException) {
++                            return Event.AuthenticationError(AuthException(AuthExceptionType.UNAUTHORIZED, e))
++                        } catch (e: FxaException) {
++                            logger.warn("Failed to ensure device capabilities", e)
++                        }
+ 
+                         logger.info("Starting periodic refresh of the device constellation")
+                         account.deviceConstellation().startPeriodicRefresh()
+@@ -392,15 +455,19 @@ open class FxaAccountManager(
+                         // Profile fetching and account authentication issues:
+                         // https://github.com/mozilla/application-services/issues/483
+                         logger.info("Fetching profile...")
++
+                         profile = try {
+                             account.getProfile(true).await()
++                        } catch (e: FxaPanicException) {
++                            // Don't swallow panics from the underlying library.
++                            throw e
++                        } catch (e: FxaUnauthorizedException) {
++                            return Event.AuthenticationError(AuthException(AuthExceptionType.UNAUTHORIZED, e))
+                         } catch (e: FxaException) {
+                             logger.error("Failed to get profile for authenticated account", e)
+-
+-                            notifyObservers { onError(e) }
+-
+                             return Event.FailedToFetchProfile
+                         }
++
+                         Event.FetchedProfile
+                     }
+                     else -> null
+@@ -417,9 +484,35 @@ open class FxaAccountManager(
+                     else -> null
+                 }
+             }
++            AccountState.AuthenticationProblems -> {
++                when (via) {
++                    Event.Authenticate -> {
++                        return doAuthenticate()
++                    }
++                    is Event.AuthenticationError -> {
++                        notifyObservers { onAuthenticationProblems() }
++                        null
++                    }
++                    else -> null
++                }
++            }
+         }
+     }
+ 
++    private suspend fun doAuthenticate(): Event? {
++        val url = try {
++            account.beginOAuthFlow(scopes, true).await()
++        } catch (e: FxaPanicException) {
++            // Don't swallow panics from the underlying library.
++            throw e
++        } catch (e: FxaException) {
++            oauthObservers.notifyObservers { onError(e) }
++            return Event.FailedToAuthenticate
++        }
++        oauthObservers.notifyObservers { onBeginOAuthFlow(url) }
++        return null
++    }
++
+     @VisibleForTesting
+     open fun createAccount(config: Config): OAuthAccount {
+         return FirefoxAccount(config)
+@@ -460,6 +553,10 @@ open class FxaAccountManager(
+             // In the future, we might kick-off an immediate sync here.
+         }
+ 
++        override fun onAuthenticationProblems() {
++            syncManager.loggedOut()
++        }
++
+         override fun onError(error: Exception) {
+             // TODO deal with FxaUnauthorizedException this at the state machine level.
+             // This exception should cause a "logged out" transition.
+diff --git a/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/State.kt b/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/State.kt
+index bc4d6d4cc776..938823b47596 100644
+--- a/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/State.kt
++++ b/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/manager/State.kt
+@@ -4,12 +4,15 @@
+ 
+ package mozilla.components.service.fxa.manager
+ 
++import mozilla.components.concept.sync.AuthException
++
+ /**
+  * States of the [FxaAccountManager].
+  */
+ enum class AccountState {
+     Start,
+     NotAuthenticated,
++    AuthenticationProblems,
+     AuthenticatedNoProfile,
+     AuthenticatedWithProfile
+ }
+@@ -37,6 +40,11 @@ internal sealed class Event {
+             return this.javaClass.simpleName
+         }
+     }
++    data class AuthenticationError(val error: AuthException) : Event() {
++        override fun toString(): String {
++            return this.javaClass.simpleName
++        }
++    }
+     object FetchProfile : Event()
+     object FetchedProfile : Event()
+ 
+diff --git a/android-components/components/service/firefox-accounts/src/test/java/mozilla/components/service/fxa/FxaAccountManagerTest.kt b/android-components/components/service/firefox-accounts/src/test/java/mozilla/components/service/fxa/FxaAccountManagerTest.kt
+index 66fcce3548dc..324cd7b511fe 100644
+--- a/android-components/components/service/firefox-accounts/src/test/java/mozilla/components/service/fxa/FxaAccountManagerTest.kt
++++ b/android-components/components/service/firefox-accounts/src/test/java/mozilla/components/service/fxa/FxaAccountManagerTest.kt
+@@ -8,9 +8,12 @@ import android.content.Context
+ import androidx.test.core.app.ApplicationProvider
+ import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.Deferred
++import kotlinx.coroutines.isActive
+ import kotlinx.coroutines.runBlocking
+ import mozilla.components.concept.sync.AccessTokenInfo
+ import mozilla.components.concept.sync.AccountObserver
++import mozilla.components.concept.sync.AuthException
++import mozilla.components.concept.sync.AuthExceptionType
+ import mozilla.components.concept.sync.DeviceCapability
+ import mozilla.components.concept.sync.DeviceConstellation
+ import mozilla.components.concept.sync.DeviceType
+@@ -22,6 +25,7 @@ import mozilla.components.service.fxa.manager.DeviceTuple
+ import mozilla.components.service.fxa.manager.Event
+ import mozilla.components.service.fxa.manager.FailedToLoadAccountException
+ import mozilla.components.service.fxa.manager.FxaAccountManager
++import mozilla.components.service.fxa.manager.authErrorRegistry
+ import mozilla.components.support.test.any
+ import mozilla.components.support.test.argumentCaptor
+ import mozilla.components.support.test.eq
+@@ -84,6 +88,7 @@ class FxaAccountManagerTest {
+         assertNull(FxaAccountManager.nextState(state, Event.FailedToFetchProfile))
+         assertNull(FxaAccountManager.nextState(state, Event.FailedToAuthenticate))
+         assertNull(FxaAccountManager.nextState(state, Event.Logout))
++        assertNull(FxaAccountManager.nextState(state, Event.AuthenticationError(AuthException(AuthExceptionType.UNAUTHORIZED))))
+ 
+         // State 'NotAuthenticated'.
+         state = AccountState.NotAuthenticated
+@@ -98,6 +103,7 @@ class FxaAccountManagerTest {
+         assertNull(FxaAccountManager.nextState(state, Event.FailedToFetchProfile))
+         assertEquals(AccountState.NotAuthenticated, FxaAccountManager.nextState(state, Event.FailedToAuthenticate))
+         assertNull(FxaAccountManager.nextState(state, Event.Logout))
++        assertNull(FxaAccountManager.nextState(state, Event.AuthenticationError(AuthException(AuthExceptionType.UNAUTHORIZED))))
+ 
+         // State 'AuthenticatedNoProfile'.
+         state = AccountState.AuthenticatedNoProfile
+@@ -111,6 +117,7 @@ class FxaAccountManagerTest {
+         assertEquals(AccountState.AuthenticatedNoProfile, FxaAccountManager.nextState(state, Event.FailedToFetchProfile))
+         assertNull(FxaAccountManager.nextState(state, Event.FailedToAuthenticate))
+         assertEquals(AccountState.NotAuthenticated, FxaAccountManager.nextState(state, Event.Logout))
++        assertEquals(AccountState.AuthenticationProblems, FxaAccountManager.nextState(state, Event.AuthenticationError(AuthException(AuthExceptionType.UNAUTHORIZED))))
+ 
+         // State 'AuthenticatedWithProfile'.
+         state = AccountState.AuthenticatedWithProfile
+@@ -124,6 +131,21 @@ class FxaAccountManagerTest {
+         assertNull(FxaAccountManager.nextState(state, Event.FailedToFetchProfile))
+         assertNull(FxaAccountManager.nextState(state, Event.FailedToAuthenticate))
+         assertEquals(AccountState.NotAuthenticated, FxaAccountManager.nextState(state, Event.Logout))
++        assertEquals(AccountState.AuthenticationProblems, FxaAccountManager.nextState(state, Event.AuthenticationError(AuthException(AuthExceptionType.UNAUTHORIZED))))
++
++        // State 'AuthenticationProblems'.
++        state = AccountState.AuthenticationProblems
++        assertNull(FxaAccountManager.nextState(state, Event.Init))
++        assertNull(FxaAccountManager.nextState(state, Event.AccountNotFound))
++        assertNull(FxaAccountManager.nextState(state, Event.AccountRestored))
++        assertEquals(AccountState.AuthenticationProblems, FxaAccountManager.nextState(state, Event.Authenticate))
++        assertEquals(AccountState.AuthenticatedNoProfile, FxaAccountManager.nextState(state, Event.Authenticated("code", "state")))
++        assertNull(FxaAccountManager.nextState(state, Event.FetchProfile))
++        assertNull(FxaAccountManager.nextState(state, Event.FetchedProfile))
++        assertNull(FxaAccountManager.nextState(state, Event.FailedToFetchProfile))
++        assertEquals(AccountState.AuthenticationProblems, FxaAccountManager.nextState(state, Event.FailedToAuthenticate))
++        assertEquals(AccountState.NotAuthenticated, FxaAccountManager.nextState(state, Event.Logout))
++        assertNull(FxaAccountManager.nextState(state, Event.AuthenticationError(AuthException(AuthExceptionType.UNAUTHORIZED))))
+     }
+ 
+     @Test
+@@ -297,6 +319,10 @@ class FxaAccountManagerTest {
+                 fail()
+             }
+ 
++            override fun onAuthenticationProblems() {
++                fail()
++            }
++
+             override fun onProfileUpdated(profile: Profile) {
+                 fail()
+             }
+@@ -659,9 +685,9 @@ class FxaAccountManagerTest {
+         verify(accountStorage, times(1)).read()
+         verify(accountStorage, never()).clear()
+ 
+-        val captor = argumentCaptor<FxaException>()
+-        verify(accountObserver, times(1)).onError(captor.capture())
+-        assertEquals(fxaException.message, captor.value.message)
++//        val captor = argumentCaptor<FxaException>()
++//        verify(accountObserver, times(1)).onError(captor.capture())
++//        assertEquals(fxaException.message, captor.value.message)
+ 
+         verify(accountObserver, times(1)).onAuthenticated(mockAccount)
+         verify(accountObserver, never()).onProfileUpdated(any())

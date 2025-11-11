@@ -1,0 +1,462 @@
+diff --git a/test/api/v3/integration/groups/GET-groups_groupId_invites.test.js b/test/api/v3/integration/groups/GET-groups_groupId_invites.test.js
+index 1b7c172d94e..2e6a612102e 100644
+--- a/test/api/v3/integration/groups/GET-groups_groupId_invites.test.js
++++ b/test/api/v3/integration/groups/GET-groups_groupId_invites.test.js
+@@ -63,15 +63,17 @@ describe('GET /groups/:groupId/invites', () => {
+   });
+ 
+   it('returns only first 30 invites', async () => {
+-    let group = await generateGroup(user, {type: 'party', name: generateUUID()});
++    let leader = await generateUser({balance: 4});
++    let group = await generateGroup(leader, {type: 'guild', privacy: 'public', name: generateUUID()});
++
+     let invitesToGenerate = [];
+     for (let i = 0; i < 31; i++) {
+       invitesToGenerate.push(generateUser());
+     }
+     let generatedInvites = await Promise.all(invitesToGenerate);
+-    await user.post(`/groups/${group._id}/invite`, {uuids: generatedInvites.map(invite => invite._id)});
++    await leader.post(`/groups/${group._id}/invite`, {uuids: generatedInvites.map(invite => invite._id)});
+ 
+-    let res = await user.get('/groups/party/invites');
++    let res = await leader.get(`/groups/${group._id}/invites`);
+     expect(res.length).to.equal(30);
+     res.forEach(member => {
+       expect(member).to.have.all.keys(['_id', 'id', 'profile']);
+diff --git a/test/api/v3/integration/groups/POST-groups_invite.test.js b/test/api/v3/integration/groups/POST-groups_invite.test.js
+index 522fa120435..ecaea4c74fb 100644
+--- a/test/api/v3/integration/groups/POST-groups_invite.test.js
++++ b/test/api/v3/integration/groups/POST-groups_invite.test.js
+@@ -6,6 +6,7 @@ import {
+ import { v4 as generateUUID } from 'uuid';
+ 
+ const INVITES_LIMIT = 100;
++const PARTY_LIMIT_MEMBERS = 30;
+ 
+ describe('Post /groups/:groupId/invite', () => {
+   let inviter;
+@@ -321,6 +322,19 @@ describe('Post /groups/:groupId/invite', () => {
+       });
+     });
+ 
++    it('allows 30+ members in a guild', async () => {
++      let invitesToGenerate = [];
++      // Generate 30 users to invite (30 + leader = 31 members)
++      for (let i = 0; i < PARTY_LIMIT_MEMBERS; i++) {
++        invitesToGenerate.push(generateUser());
++      }
++      let generatedInvites = await Promise.all(invitesToGenerate);
++      // Invite users
++      expect(await inviter.post(`/groups/${group._id}/invite`, {
++        uuids: generatedInvites.map(invite => invite._id),
++      })).to.be.an('array');
++    });
++
+     // @TODO: Add this after we are able to mock the group plan route
+     xit('returns an error when a non-leader invites to a group plan', async () => {
+       let userToInvite = await generateUser();
+@@ -410,5 +424,36 @@ describe('Post /groups/:groupId/invite', () => {
+       });
+       expect((await userToInvite.get('/user')).invitations.party.id).to.equal(party._id);
+     });
++
++    it('allows 30 members in a party', async () => {
++      let invitesToGenerate = [];
++      // Generate 29 users to invite (29 + leader = 30 members)
++      for (let i = 0; i < PARTY_LIMIT_MEMBERS - 1; i++) {
++        invitesToGenerate.push(generateUser());
++      }
++      let generatedInvites = await Promise.all(invitesToGenerate);
++      // Invite users
++      expect(await inviter.post(`/groups/${party._id}/invite`, {
++        uuids: generatedInvites.map(invite => invite._id),
++      })).to.be.an('array');
++    });
++
++    it('does not allow 30+ members in a party', async () => {
++      let invitesToGenerate = [];
++      // Generate 30 users to invite (30 + leader = 31 members)
++      for (let i = 0; i < PARTY_LIMIT_MEMBERS; i++) {
++        invitesToGenerate.push(generateUser());
++      }
++      let generatedInvites = await Promise.all(invitesToGenerate);
++      // Invite users
++      await expect(inviter.post(`/groups/${party._id}/invite`, {
++        uuids: generatedInvites.map(invite => invite._id),
++      }))
++      .to.eventually.be.rejected.and.eql({
++        code: 400,
++        error: 'BadRequest',
++        message: t('partyExceedsMembersLimit', {maxMembersParty: PARTY_LIMIT_MEMBERS}),
++      });
++    });
+   });
+ });
+diff --git a/test/api/v3/unit/models/group.test.js b/test/api/v3/unit/models/group.test.js
+index 1fa1000d9c2..1ce52544619 100644
+--- a/test/api/v3/unit/models/group.test.js
++++ b/test/api/v3/unit/models/group.test.js
+@@ -4,9 +4,6 @@ import validator from 'validator';
+ import { sleep } from '../../../../helpers/api-unit.helper';
+ import { model as Group, INVITES_LIMIT } from '../../../../../website/server/models/group';
+ import { model as User } from '../../../../../website/server/models/user';
+-import {
+-  BadRequest,
+- } from '../../../../../website/server/libs/errors';
+ import { quests as questScrolls } from '../../../../../website/common/script/content';
+ import { groupChatReceivedWebhook } from '../../../../../website/server/libs/webhook';
+ import * as email from '../../../../../website/server/libs/email';
+@@ -460,73 +457,67 @@ describe('Group Model', () => {
+         };
+       });
+ 
+-      it('throws an error if no uuids or emails are passed in', (done) => {
+-        try {
+-          Group.validateInvitations(null, null, res);
+-        } catch (err) {
+-          expect(err).to.be.an.instanceof(BadRequest);
+-          expect(res.t).to.be.calledOnce;
+-          expect(res.t).to.be.calledWith('canOnlyInviteEmailUuid');
+-          done();
+-        }
++      it('throws an error if no uuids or emails are passed in', async () => {
++        await expect(Group.validateInvitations(null, null, res)).to.eventually.be.rejected.and.eql({
++          httpCode: 400,
++          message: 'Bad request.',
++          name: 'BadRequest',
++        });
++        expect(res.t).to.be.calledOnce;
++        expect(res.t).to.be.calledWith('canOnlyInviteEmailUuid');
+       });
+ 
+-      it('throws an error if only uuids are passed in, but they are not an array', (done) => {
+-        try {
+-          Group.validateInvitations({ uuid: 'user-id'}, null, res);
+-        } catch (err) {
+-          expect(err).to.be.an.instanceof(BadRequest);
+-          expect(res.t).to.be.calledOnce;
+-          expect(res.t).to.be.calledWith('uuidsMustBeAnArray');
+-          done();
+-        }
++      it('throws an error if only uuids are passed in, but they are not an array', async () => {
++        await expect(Group.validateInvitations({ uuid: 'user-id'}, null, res)).to.eventually.be.rejected.and.eql({
++          httpCode: 400,
++          message: 'Bad request.',
++          name: 'BadRequest',
++        });
++        expect(res.t).to.be.calledOnce;
++        expect(res.t).to.be.calledWith('uuidsMustBeAnArray');
+       });
+ 
+-      it('throws an error if only emails are passed in, but they are not an array', (done) => {
+-        try {
+-          Group.validateInvitations(null, { emails: 'user@example.com'}, res);
+-        } catch (err) {
+-          expect(err).to.be.an.instanceof(BadRequest);
+-          expect(res.t).to.be.calledOnce;
+-          expect(res.t).to.be.calledWith('emailsMustBeAnArray');
+-          done();
+-        }
++      it('throws an error if only emails are passed in, but they are not an array', async () => {
++        await expect(Group.validateInvitations(null, { emails: 'user@example.com'}, res)).to.eventually.be.rejected.and.eql({
++          httpCode: 400,
++          message: 'Bad request.',
++          name: 'BadRequest',
++        });
++        expect(res.t).to.be.calledOnce;
++        expect(res.t).to.be.calledWith('emailsMustBeAnArray');
+       });
+ 
+-      it('throws an error if emails are not passed in, and uuid array is empty', (done) => {
+-        try {
+-          Group.validateInvitations([], null, res);
+-        } catch (err) {
+-          expect(err).to.be.an.instanceof(BadRequest);
+-          expect(res.t).to.be.calledOnce;
+-          expect(res.t).to.be.calledWith('inviteMissingUuid');
+-          done();
+-        }
++      it('throws an error if emails are not passed in, and uuid array is empty', async () => {
++        await expect(Group.validateInvitations([], null, res)).to.eventually.be.rejected.and.eql({
++          httpCode: 400,
++          message: 'Bad request.',
++          name: 'BadRequest',
++        });
++        expect(res.t).to.be.calledOnce;
++        expect(res.t).to.be.calledWith('inviteMissingUuid');
+       });
+ 
+-      it('throws an error if uuids are not passed in, and email array is empty', (done) => {
+-        try {
+-          Group.validateInvitations(null, [], res);
+-        } catch (err) {
+-          expect(err).to.be.an.instanceof(BadRequest);
+-          expect(res.t).to.be.calledOnce;
+-          expect(res.t).to.be.calledWith('inviteMissingEmail');
+-          done();
+-        }
++      it('throws an error if uuids are not passed in, and email array is empty', async () => {
++        await expect(Group.validateInvitations(null, [], res)).to.eventually.be.rejected.and.eql({
++          httpCode: 400,
++          message: 'Bad request.',
++          name: 'BadRequest',
++        });
++        expect(res.t).to.be.calledOnce;
++        expect(res.t).to.be.calledWith('inviteMissingEmail');
+       });
+ 
+-      it('throws an error if uuids and emails are passed in as empty arrays', (done) => {
+-        try {
+-          Group.validateInvitations([], [], res);
+-        } catch (err) {
+-          expect(err).to.be.an.instanceof(BadRequest);
+-          expect(res.t).to.be.calledOnce;
+-          expect(res.t).to.be.calledWith('inviteMustNotBeEmpty');
+-          done();
+-        }
++      it('throws an error if uuids and emails are passed in as empty arrays', async () => {
++        await expect(Group.validateInvitations([], [], res)).to.eventually.be.rejected.and.eql({
++          httpCode: 400,
++          message: 'Bad request.',
++          name: 'BadRequest',
++        });
++        expect(res.t).to.be.calledOnce;
++        expect(res.t).to.be.calledWith('inviteMustNotBeEmpty');
+       });
+ 
+-      it('throws an error if total invites exceed max invite constant', (done) => {
++      it('throws an error if total invites exceed max invite constant', async () => {
+         let uuids = [];
+         let emails = [];
+ 
+@@ -537,17 +528,16 @@ describe('Group Model', () => {
+ 
+         uuids.push('one-more-uuid'); // to put it over the limit
+ 
+-        try {
+-          Group.validateInvitations(uuids, emails, res);
+-        } catch (err) {
+-          expect(err).to.be.an.instanceof(BadRequest);
+-          expect(res.t).to.be.calledOnce;
+-          expect(res.t).to.be.calledWith('canOnlyInviteMaxInvites', {maxInvites: INVITES_LIMIT });
+-          done();
+-        }
++        await expect(Group.validateInvitations(uuids, emails, res)).to.eventually.be.rejected.and.eql({
++          httpCode: 400,
++          message: 'Bad request.',
++          name: 'BadRequest',
++        });
++        expect(res.t).to.be.calledOnce;
++        expect(res.t).to.be.calledWith('canOnlyInviteMaxInvites', {maxInvites: INVITES_LIMIT });
+       });
+ 
+-      it('does not throw error if number of invites matches max invite limit', () => {
++      it('does not throw error if number of invites matches max invite limit', async () => {
+         let uuids = [];
+         let emails = [];
+ 
+@@ -556,49 +546,33 @@ describe('Group Model', () => {
+           emails.push(`user-${i}@example.com`);
+         }
+ 
+-        expect(function () {
+-          Group.validateInvitations(uuids, emails, res);
+-        }).to.not.throw();
++        await Group.validateInvitations(uuids, emails, res);
++        expect(res.t).to.not.be.called;
+       });
+ 
+ 
+-      it('does not throw an error if only user ids are passed in', () => {
+-        expect(function () {
+-          Group.validateInvitations(['user-id', 'user-id2'], null, res);
+-        }).to.not.throw();
+-
++      it('does not throw an error if only user ids are passed in', async () => {
++        await Group.validateInvitations(['user-id', 'user-id2'], null, res);
+         expect(res.t).to.not.be.called;
+       });
+ 
+-      it('does not throw an error if only emails are passed in', () => {
+-        expect(function () {
+-          Group.validateInvitations(null, ['user1@example.com', 'user2@example.com'], res);
+-        }).to.not.throw();
+-
++      it('does not throw an error if only emails are passed in', async () => {
++        await Group.validateInvitations(null, ['user1@example.com', 'user2@example.com'], res);
+         expect(res.t).to.not.be.called;
+       });
+ 
+-      it('does not throw an error if both uuids and emails are passed in', () => {
+-        expect(function () {
+-          Group.validateInvitations(['user-id', 'user-id2'], ['user1@example.com', 'user2@example.com'], res);
+-        }).to.not.throw();
+-
++      it('does not throw an error if both uuids and emails are passed in', async () => {
++        await Group.validateInvitations(['user-id', 'user-id2'], ['user1@example.com', 'user2@example.com'], res);
+         expect(res.t).to.not.be.called;
+       });
+ 
+-      it('does not throw an error if uuids are passed in and emails are an empty array', () => {
+-        expect(function () {
+-          Group.validateInvitations(['user-id', 'user-id2'], [], res);
+-        }).to.not.throw();
+-
++      it('does not throw an error if uuids are passed in and emails are an empty array', async () => {
++        await Group.validateInvitations(['user-id', 'user-id2'], [], res);
+         expect(res.t).to.not.be.called;
+       });
+ 
+-      it('does not throw an error if emails are passed in and uuids are an empty array', () => {
+-        expect(function () {
+-          Group.validateInvitations([], ['user1@example.com', 'user2@example.com'], res);
+-        }).to.not.throw();
+-
++      it('does not throw an error if emails are passed in and uuids are an empty array', async () => {
++        await Group.validateInvitations([], ['user1@example.com', 'user2@example.com'], res);
+         expect(res.t).to.not.be.called;
+       });
+     });
+diff --git a/website/client-old/js/controllers/groupsCtrl.js b/website/client-old/js/controllers/groupsCtrl.js
+index d6595e17caf..26870b09bc3 100644
+--- a/website/client-old/js/controllers/groupsCtrl.js
++++ b/website/client-old/js/controllers/groupsCtrl.js
+@@ -2,6 +2,8 @@
+ 
+ habitrpg.controller("GroupsCtrl", ['$scope', '$rootScope', 'Shared', 'Groups', '$http', '$q', 'User', 'Members', '$state', 'Notification',
+   function($scope, $rootScope, Shared, Groups, $http, $q, User, Members, $state, Notification) {
++    $scope.PARTY_LIMIT_MEMBERS = Shared.constants.PARTY_LIMIT_MEMBERS;
++
+     $scope.inviteOrStartParty = Groups.inviteOrStartParty;
+     $scope.isMemberOfPendingQuest = function (userid, group) {
+       if (!group.quest || !group.quest.members) return false;
+diff --git a/website/common/locales/en/groups.json b/website/common/locales/en/groups.json
+index 9d3e016268e..ee0ab2f6241 100644
+--- a/website/common/locales/en/groups.json
++++ b/website/common/locales/en/groups.json
+@@ -135,6 +135,7 @@
+   "leaderOnlyChallenges": "Only group leader can create challenges",
+   "sendGift": "Send Gift",
+   "inviteFriends": "Invite Friends",
++  "partyMembersInfo": "Your party currently has <%= memberCount %> members and <%= invitationCount %> pending invitations. The limit of members in a party is <%= limitMembers %>. Invitations above this limit cannot be sent.",
+   "inviteByEmail": "Invite by Email",
+   "inviteByEmailExplanation": "If a friend joins Habitica via your email, they'll automatically be invited to your party!",
+   "inviteFriendsNow": "Invite Friends Now",
+@@ -201,6 +202,7 @@
+   "uuidsMustBeAnArray": "User ID invites must be an array.",
+   "emailsMustBeAnArray": "Email address invites must be an array.",
+   "canOnlyInviteMaxInvites": "You can only invite \"<%= maxInvites %>\" at a time",
++  "partyExceedsMembersLimit": "Party size is limited to <%= maxMembersParty %> members",
+   "onlyCreatorOrAdminCanDeleteChat": "Not authorized to delete this message!",
+   "onlyGroupLeaderCanEditTasks": "Not authorized to manage tasks!",
+   "onlyGroupTasksCanBeAssigned": "Only group tasks can be assigned",
+diff --git a/website/common/script/constants.js b/website/common/script/constants.js
+index b09edc627b0..7381d2cf237 100644
+--- a/website/common/script/constants.js
++++ b/website/common/script/constants.js
+@@ -12,4 +12,6 @@ export const SUPPORTED_SOCIAL_NETWORKS = [
+   {key: 'google', name: 'Google'},
+ ];
+ 
+-export const GUILDS_PER_PAGE = 30; // number of guilds to return per page when using pagination
+\ No newline at end of file
++export const GUILDS_PER_PAGE = 30; // number of guilds to return per page when using pagination
++
++export const PARTY_LIMIT_MEMBERS = 30;
+diff --git a/website/common/script/index.js b/website/common/script/index.js
+index 816ddfb7beb..dd5590149a1 100644
+--- a/website/common/script/index.js
++++ b/website/common/script/index.js
+@@ -27,6 +27,7 @@ import {
+   LARGE_GROUP_COUNT_MESSAGE_CUTOFF,
+   SUPPORTED_SOCIAL_NETWORKS,
+   GUILDS_PER_PAGE,
++  PARTY_LIMIT_MEMBERS,
+ } from './constants';
+ 
+ api.constants = {
+@@ -34,6 +35,7 @@ api.constants = {
+   LARGE_GROUP_COUNT_MESSAGE_CUTOFF,
+   SUPPORTED_SOCIAL_NETWORKS,
+   GUILDS_PER_PAGE,
++  PARTY_LIMIT_MEMBERS,
+ };
+ // TODO Move these under api.constants
+ api.maxLevel = MAX_LEVEL;
+diff --git a/website/server/controllers/api-v3/groups.js b/website/server/controllers/api-v3/groups.js
+index 1a0d6445a16..cc4997384e0 100644
+--- a/website/server/controllers/api-v3/groups.js
++++ b/website/server/controllers/api-v3/groups.js
+@@ -1038,6 +1038,7 @@ async function _inviteByEmail (invite, group, inviter, req, res) {
+  * @apiError (400) {BadRequest} MustBeArray The `uuids` or `emails` body param was not an array.
+  * @apiError (400) {BadRequest} TooManyInvites A max of 100 invites (combined emails and user ids) can
+  * be sent out at a time.
++ * @apiError (400) {BadRequest} ExceedsMembersLimit A max of 30 members can join a party.
+  *
+  * @apiError (401) {NotAuthorized} UserAlreadyInvited The user has already been invited to the group.
+  * @apiError (401) {NotAuthorized} UserAlreadyInGroup The user is already a member of the group.
+@@ -1066,7 +1067,7 @@ api.inviteToGroup = {
+     let uuids = req.body.uuids;
+     let emails = req.body.emails;
+ 
+-    Group.validateInvitations(uuids, emails, res);
++    await Group.validateInvitations(uuids, emails, res, group);
+ 
+     let results = [];
+ 
+diff --git a/website/server/models/group.js b/website/server/models/group.js
+index 7a81904d1f3..24002432847 100644
+--- a/website/server/models/group.js
++++ b/website/server/models/group.js
+@@ -300,7 +300,7 @@ schema.statics.toJSONCleanChat = function groupToJSONCleanChat (group, user) {
+  * @param  res  Express res object for use with translations
+  * @throws BadRequest An error describing the issue with the invitations
+  */
+-schema.statics.validateInvitations = function getInvitationError (uuids, emails, res) {
++schema.statics.validateInvitations = async function getInvitationError (uuids, emails, res, group = null) {
+   let uuidsIsArray = Array.isArray(uuids);
+   let emailsIsArray = Array.isArray(emails);
+   let emptyEmails = emailsIsArray && emails.length < 1;
+@@ -339,6 +339,27 @@ schema.statics.validateInvitations = function getInvitationError (uuids, emails,
+   if (totalInvites > INVITES_LIMIT) {
+     throw new BadRequest(res.t('canOnlyInviteMaxInvites', {maxInvites: INVITES_LIMIT}));
+   }
++
++  // If party, check the limit of members
++  if (group && group.type === 'party') {
++    let memberCount = 0;
++
++    // Counting the members that already joined the party
++    memberCount += group.memberCount;
++
++    // Count how many invitations currently exist in the party
++    let query = {};
++    query['invitations.party.id'] = group._id;
++    let groupInvites = await User.count(query).exec();
++    memberCount += groupInvites;
++
++    // Counting the members that are going to be invited by email and uuids
++    memberCount += totalInvites;
++
++    if (memberCount > shared.constants.PARTY_LIMIT_MEMBERS) {
++      throw new BadRequest(res.t('partyExceedsMembersLimit', {maxMembersParty: shared.constants.PARTY_LIMIT_MEMBERS}));
++    }
++  }
+ };
+ 
+ schema.methods.getParticipatingQuestMembers = function getParticipatingQuestMembers () {
+diff --git a/website/views/options/social/group.jade b/website/views/options/social/group.jade
+index d782b1740a7..05296ca3a8f 100644
+--- a/website/views/options/social/group.jade
++++ b/website/views/options/social/group.jade
+@@ -87,7 +87,9 @@ a.pull-right.gem-wallet(ng-if='group.type!="party"', popover-trigger='mouseenter
+             h3.panel-title
+               =env.t('members')
+               span(ng-if='group.type=="party" && (group.onlineUsers || group.onlineUsers == 0)')= ' (' + env.t('onlineCount', {count: "{{group.onlineUsers}}"}) + ')'
+-              button.pull-right.btn.btn-primary(ng-click="inviteOrStartParty(group)")=env.t("inviteFriends")
++              button.pull-right.btn.btn-primary(ng-if='group.type=="party" && group.memberCount + group.invites.length < PARTY_LIMIT_MEMBERS' ng-click="inviteOrStartParty(group)")=env.t("inviteFriends")
++          .panel-heading
++            p(ng-if='group.type=="party"')=env.t('partyMembersInfo', {memberCount: "{{group.memberCount}}", invitationCount:"{{group.invites.length}}", limitMembers:"{{PARTY_LIMIT_MEMBERS}}"})
+ 
+           .panel-body.modal-fixed-height
+             h4(ng-show='::group.memberCount === 1 && group.type === "party"')=env.t('partyEmpty')

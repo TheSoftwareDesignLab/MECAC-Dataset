@@ -1,0 +1,198 @@
+diff --git a/web/apps/photos/src/components/Upload/Uploader.tsx b/web/apps/photos/src/components/Upload/Uploader.tsx
+index 84fd9b5c974..731b9b5f435 100644
+--- a/web/apps/photos/src/components/Upload/Uploader.tsx
++++ b/web/apps/photos/src/components/Upload/Uploader.tsx
+@@ -1,3 +1,4 @@
++import { ensureElectron } from "@/next/electron";
+ import log from "@/next/log";
+ import type { CollectionMapping, Electron } from "@/next/types/ipc";
+ import { CustomError } from "@ente/shared/error";
+@@ -176,12 +177,20 @@ export default function Uploader(props: Props) {
+         }
+ 
+         if (isElectron()) {
+-            ImportService.getPendingUploads().then(
+-                ({ files: electronFiles, collectionName, type }) => {
+-                    log.info(`found pending desktop upload, resuming uploads`);
+-                    resumeDesktopUpload(type, electronFiles, collectionName);
+-                },
+-            );
++            ensureElectron()
++                .pendingUploads()
++                .then((pending) => {
++                    if (pending) {
++                        log.info("Resuming pending desktop upload", pending);
++                        resumeDesktopUpload(
++                            pending.type == "files"
++                                ? PICKED_UPLOAD_TYPE.FILES
++                                : PICKED_UPLOAD_TYPE.ZIPS,
++                            pending.files,
++                            pending.collectionName,
++                        );
++                    }
++                });
+             watcher.init(
+                 setElectronFiles,
+                 setCollectionName,
+@@ -505,6 +514,7 @@ export default function Uploader(props: Props) {
+                 !watcher.isUploadRunning()
+             ) {
+                 await ImportService.setToUploadCollection(collections);
++                // TODO (MR): What happens when we have both?
+                 if (zipPaths.current) {
+                     await electron.setToUploadFiles(
+                         PICKED_UPLOAD_TYPE.ZIPS,
+diff --git a/web/apps/photos/src/services/importService.ts b/web/apps/photos/src/services/importService.ts
+index 6d2c46a85b5..de5e4cfa6b9 100644
+--- a/web/apps/photos/src/services/importService.ts
++++ b/web/apps/photos/src/services/importService.ts
+@@ -1,31 +1,8 @@
+ import { ensureElectron } from "@/next/electron";
+-import log from "@/next/log";
+-import { PICKED_UPLOAD_TYPE } from "constants/upload";
+ import { Collection } from "types/collection";
+ import { ElectronFile, FileWithCollection } from "types/upload";
+ 
+-interface PendingUploads {
+-    files: ElectronFile[];
+-    collectionName: string;
+-    type: PICKED_UPLOAD_TYPE;
+-}
+-
+ class ImportService {
+-    async getPendingUploads(): Promise<PendingUploads> {
+-        try {
+-            const pendingUploads =
+-                (await ensureElectron().getPendingUploads()) as PendingUploads;
+-            return pendingUploads;
+-        } catch (e) {
+-            if (e?.message?.includes("ENOENT: no such file or directory")) {
+-                // ignore
+-            } else {
+-                log.error("failed to getPendingUploads ", e);
+-            }
+-            return { files: [], collectionName: null, type: null };
+-        }
+-    }
+-
+     async setToUploadCollection(collections: Collection[]) {
+         let collectionName: string = null;
+         /* collection being one suggest one of two things
+@@ -40,7 +17,7 @@ class ImportService {
+         if (collections.length === 1) {
+             collectionName = collections[0].name;
+         }
+-        await ensureElectron().setToUploadCollection(collectionName);
++        await ensureElectron().setPendingUploadCollection(collectionName);
+     }
+ 
+     async updatePendingUploads(files: FileWithCollection[]) {
+@@ -57,17 +34,14 @@ class ImportService {
+                 filePaths.push((fileWithCollection.file as ElectronFile).path);
+             }
+         }
+-        await ensureElectron().setToUploadFiles(
+-            PICKED_UPLOAD_TYPE.FILES,
+-            filePaths,
+-        );
++        await ensureElectron().setPendingUploadFiles("files", filePaths);
+     }
+ 
+     async cancelRemainingUploads() {
+         const electron = ensureElectron();
+-        await electron.setToUploadCollection(null);
+-        await electron.setToUploadFiles(PICKED_UPLOAD_TYPE.ZIPS, []);
+-        await electron.setToUploadFiles(PICKED_UPLOAD_TYPE.FILES, []);
++        await electron.setPendingUploadCollection(undefined);
++        await electron.setPendingUploadFiles("zips", []);
++        await electron.setPendingUploadFiles("files", []);
+     }
+ }
+ 
+diff --git a/web/packages/next/types/ipc.ts b/web/packages/next/types/ipc.ts
+index 85dcc870e02..ccdf4b6d501 100644
+--- a/web/packages/next/types/ipc.ts
++++ b/web/packages/next/types/ipc.ts
+@@ -10,17 +10,6 @@ export interface AppUpdateInfo {
+     version: string;
+ }
+ 
+-export enum FILE_PATH_TYPE {
+-    FILES = "files",
+-    ZIPS = "zips",
+-}
+-
+-export enum PICKED_UPLOAD_TYPE {
+-    FILES = "files",
+-    FOLDERS = "folders",
+-    ZIPS = "zips",
+-}
+-
+ /**
+  * Extra APIs provided by our Node.js layer when our code is running inside our
+  * desktop (Electron) app.
+@@ -355,21 +344,37 @@ export interface Electron {
+ 
+     // - Upload
+ 
+-    getPendingUploads: () => Promise<{
+-        files: ElectronFile[];
+-        collectionName: string;
+-        type: string;
+-    }>;
+-    setToUploadFiles: (
+-        /** TODO(MR): This is the actual type */
+-        // type: FILE_PATH_TYPE,
+-        type: PICKED_UPLOAD_TYPE,
++    /**
++     * Return any pending uploads that were previously enqueued but haven't yet
++     * been completed.
++     *
++     * The state of pending uploads is persisted in the Node.js layer.
++     *
++     * Note that we might have both outstanding zip and regular file uploads at
++     * the same time. In such cases, the zip file ones get precedence.
++     */
++    pendingUploads: () => Promise<PendingUploads | undefined>;
++
++    /**
++     * Set or clear the name of the collection where the pending upload is
++     * directed to.
++     */
++    setPendingUploadCollection: (collectionName: string) => Promise<void>;
++
++    /**
++     * Update the list of files (of {@link type}) associated with the pending
++     * upload.
++     */
++    setPendingUploadFiles: (
++        type: PendingUploads["type"],
+         filePaths: string[],
+     ) => Promise<void>;
++
++    // -
++
+     getElectronFilesFromGoogleZip: (
+         filePath: string,
+     ) => Promise<ElectronFile[]>;
+-    setToUploadCollection: (collectionName: string) => Promise<void>;
+     getDirFiles: (dirPath: string) => Promise<ElectronFile[]>;
+ }
+ 
+@@ -414,3 +419,16 @@ export interface FolderWatchSyncedFile {
+     uploadedFileID: number;
+     collectionID: number;
+ }
++
++/**
++ * When the user starts an upload, we remember the files they'd selected or drag
++ * and dropped so that we can resume (if needed) when the app restarts after
++ * being stopped in the middle of the uploads.
++ */
++export interface PendingUploads {
++    /** The collection to which we're uploading */
++    collectionName: string;
++    /* The upload can be either of a Google Takeout zip, or regular files */
++    type: "files" | "zips";
++    files: ElectronFile[];
++}

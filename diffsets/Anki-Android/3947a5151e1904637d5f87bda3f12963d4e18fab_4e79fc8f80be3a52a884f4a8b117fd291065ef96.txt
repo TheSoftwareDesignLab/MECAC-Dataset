@@ -1,0 +1,375 @@
+diff --git a/AnkiDroid/build.gradle b/AnkiDroid/build.gradle
+index 56de5ca3fd2d..77f60509c441 100644
+--- a/AnkiDroid/build.gradle
++++ b/AnkiDroid/build.gradle
+@@ -62,6 +62,7 @@ dependencies {
+     compile 'ch.acra:acra:4.6.2'
+     compile 'com.jakewharton.timber:timber:2.7.1'
+     compile 'com.google.code.gson:gson:2.4'
++    compile 'org.jsoup:jsoup:1.10.3'
+     compile project(":api")
+ 
+     testCompile 'junit:junit:4.12'
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.java b/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.java
+index 89e2bd2262ee..948686e7f2f2 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.java
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.java
+@@ -2257,23 +2257,25 @@ protected void playSounds(boolean doAudioReplay) {
+         }
+     }
+ 
+-
+     /**
+      * Reads the text (using TTS) for the given side of a card.
+      *
+-     * @param card The card to play TTS for
++     * @param card     The card to play TTS for
+      * @param cardSide The side of the current card to play TTS for
+      */
+     private static void readCardText(final Card card, final int cardSide) {
++        final String cardSideContent;
+         if (Sound.SOUNDS_QUESTION == cardSide) {
+-            ReadText.textToSpeech(Utils.stripHTML(card.q(true)), getDeckIdForCard(card), card.getOrd(),
+-                    Sound.SOUNDS_QUESTION);
++            cardSideContent = card.q(true);
+         } else if (Sound.SOUNDS_ANSWER == cardSide) {
+-            ReadText.textToSpeech(Utils.stripHTML(card.getPureAnswer()), getDeckIdForCard(card),
+-                    card.getOrd(), Sound.SOUNDS_ANSWER);
++            cardSideContent = card.getPureAnswer();
++        } else {
++            Timber.w("Unrecognised cardSide");
++            return;
+         }
+-    }
+ 
++        ReadText.readCardSide(cardSide, cardSideContent, getDeckIdForCard(card), card.getOrd());
++    }
+ 
+     /**
+      * Shows the dialogue for selecting TTS for the current card and cardside.
+@@ -2283,8 +2285,7 @@ protected void showSelectTtsDialogue() {
+             if (!sDisplayAnswer) {
+                 ReadText.selectTts(Utils.stripHTML(mCurrentCard.q(true)), getDeckIdForCard(mCurrentCard), mCurrentCard.getOrd(),
+                         Sound.SOUNDS_QUESTION);
+-            }
+-            else {
++            } else {
+                 ReadText.selectTts(Utils.stripHTML(mCurrentCard.getPureAnswer()), getDeckIdForCard(mCurrentCard),
+                         mCurrentCard.getOrd(), Sound.SOUNDS_ANSWER);
+             }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/ReadText.java b/AnkiDroid/src/main/java/com/ichi2/anki/ReadText.java
+index efe48bdb2a6b..e1e02af238d3 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/ReadText.java
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/ReadText.java
+@@ -49,20 +49,20 @@ public class ReadText {
+ 
+     // private boolean mTtsReady = false;
+ 
+-    public static void speak(String text, String loc) {
+-        int result = mTts.setLanguage(new Locale(loc));
++    public static void speak(String text, String loc, int queueMode) {
++        int result = mTts.setLanguage(localeFromStringIgnoringScriptAndExtensions(loc));
+         if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+             Toast.makeText(mReviewer.get(), mReviewer.get().getString(R.string.no_tts_available_message)
+                     +" ("+loc+")", Toast.LENGTH_LONG).show();
+             Timber.e("Error loading locale " + loc);
+         } else {
+-            if (mTts.isSpeaking()) {
++            if (mTts.isSpeaking() && queueMode == TextToSpeech.QUEUE_FLUSH) {
+                 Timber.d("tts engine appears to be busy... clearing queue");
+                 stopTts();
+                 //sTextQueue.add(new String[] { text, loc });
+             }
+             Timber.d("tts text '%s' to be played for locale (%s)",text, loc);
+-            mTts.speak(mTextToSpeak, TextToSpeech.QUEUE_FLUSH, mTtsParams);
++            mTts.speak(mTextToSpeak, queueMode, mTtsParams);
+         }
+     }
+ 
+@@ -76,9 +76,9 @@ public static String getLanguage(long did, int ord, int qa) {
+      * Ask the user what language they want.
+      *
+      * @param text The text to be read
+-     * @param did The deck id
+-     * @param ord The card template ordinal
+-     * @param qa The card question or card answer
++     * @param did  The deck id
++     * @param ord  The card template ordinal
++     * @param qa   The card question or card answer
+      */
+     public static void selectTts(String text, long did, int ord, int qa) {
+         mTextToSpeak = text;
+@@ -118,7 +118,7 @@ public void onSelection(MaterialDialog materialDialog, View view, int which,
+                             String locale = dialogIds.get(which);
+                             Timber.d("ReadText.selectTts() user chose locale '%s'", locale);
+                             if (!locale.equals(NO_TTS)) {
+-                                speak(mTextToSpeak, locale);
++                                speak(mTextToSpeak, locale, TextToSpeech.QUEUE_FLUSH);
+                             }
+                             String language = getLanguage(mDid, mOrd, mQuestionAnswer);
+                             if (language.equals("")) { // No language stored
+@@ -141,35 +141,129 @@ public void run() {
+         }, delay);
+     }
+ 
++    /**
++     * Read a card side using a TTS service.
++     *
++     * @param cardSide         Card side to be read; Sound.SOUNDS_QUESTION or Sound.SOUNDS_ANSWER.
++     * @param cardSideContents Contents of the card side to be read, in HTML format. If it contains
++     *                         any &lt;tts service="android"&gt; elements, only their contents is
++     *                         read; otherwise, all text is read. See TtsParser for more details.
++     * @param did              Index of the deck containing the card.
++     * @param ord              The card template ordinal.
++     */
++    public static void readCardSide(int cardSide, String cardSideContents, long did, int ord) {
++        boolean isFirstText = true;
++        for (TtsParser.LocalisedText textToRead : TtsParser.getTextsToRead(cardSideContents)) {
++            if (!textToRead.getText().isEmpty()) {
++                textToSpeech(textToRead.getText(), did, ord, cardSide,
++                        textToRead.getLocaleCode(),
++                        isFirstText ? TextToSpeech.QUEUE_FLUSH : TextToSpeech.QUEUE_ADD);
++                isFirstText = false;
++            }
++        }
++    }
+ 
+-    public static void textToSpeech(String text, long did, int ord, int qa) {
++    /**
++     * Read the given text using an appropriate TTS voice.
++     * <p>
++     * The voice is chosen as follows:
++     * <p>
++     * 1. If localeCode is a non-empty string representing a locale in the format returned
++     *    by Locale.toString(), and a voice matching the language of this locale (and ideally,
++     *    but not necessarily, also the country and variant of the locale) is available, then this
++     *    voice is used.
++     * 2. Otherwise, if the database contains a saved language for the given 'did', 'ord' and 'qa'
++     *    arguments, and a TTS voice matching that language is available, then this voice is used
++     *    (unless the saved language is NO_TTS, in which case the text is not read at all).
++     * 3. Otherwise, the user is asked to select a language from among those for which a voice is
++     *    available.
++     *
++     * @param queueMode TextToSpeech.QUEUE_ADD or TextToSpeech.QUEUE_FLUSH.
++     */
++    private static void textToSpeech(String text, long did, int ord, int qa, String localeCode,
++                                     int queueMode) {
+         mTextToSpeak = text;
+         mQuestionAnswer = qa;
+         mDid = did;
+         mOrd = ord;
+-        Timber.d("ReadText.textToSpeech() method started for string '%s'", text);
+-        // get the user's existing language preference
+-        String language = getLanguage(mDid, mOrd, mQuestionAnswer);
+-        Timber.d("ReadText.textToSpeech() method found language choice '%s'", language);
+-        // rebuild the language list if it's empty
+-        if (availableTtsLocales.isEmpty()) {
+-            buildAvailableLanguages();
+-        }
+-        // Check, if stored language is available
+-        for (int i = 0; i < availableTtsLocales.size(); i++) {
+-            if (language.equals(NO_TTS)) {
+-                // user has chosen not to read the text
+-                return;
+-            } else if (language.equals(availableTtsLocales.get(i).getISO3Language())) {
+-                speak(mTextToSpeak, language);
+-                return;
++        Timber.d("ReadText.textToSpeech() method started for string '%s', locale '%s'", text, localeCode);
++
++        final String originalLocaleCode = localeCode;
++
++        if (!localeCode.isEmpty()) {
++            if (!isLanguageAvailable(localeCode)) {
++                localeCode = "";
+             }
+         }
++        if (localeCode.isEmpty()) {
++            // get the user's existing language preference
++            localeCode = getLanguage(mDid, mOrd, mQuestionAnswer);
++            Timber.d("ReadText.textToSpeech() method found language choice '%s'", localeCode);
++        }
++
++        if (localeCode.equals(NO_TTS)) {
++            // user has chosen not to read the text
++            return;
++        }
++        if (!localeCode.isEmpty() && isLanguageAvailable(localeCode)) {
++            speak(mTextToSpeak, localeCode, queueMode);
++            return;
++        }
+ 
+         // Otherwise ask the user what language they want to use
++        if (!originalLocaleCode.isEmpty()) {
++            // (after notifying them first that no TTS voice was found for the locale
++            // they originally requested)
++            Toast.makeText(mReviewer.get(), mReviewer.get().getString(R.string.no_tts_available_message)
++                    + " (" + originalLocaleCode + ")", Toast.LENGTH_LONG).show();
++        }
+         selectTts(mTextToSpeak, mDid, mOrd, mQuestionAnswer);
+     }
+ 
++    /**
++     * Convert a string representation of a locale, in the format returned by Locale.toString(),
++     * into a Locale object, disregarding any script and extensions fields (i.e. using solely the
++     * language, country and variant fields).
++     * <p>
++     * Returns a Locale object constructed from an empty string if the input string is null, empty
++     * or contains more than 3 fields separated by underscores.
++     */
++    private static Locale localeFromStringIgnoringScriptAndExtensions(String localeCode) {
++        if (localeCode == null) {
++            return new Locale("");
++        }
++
++        localeCode = stripScriptAndExtensions(localeCode);
++
++        String[] fields = localeCode.split("_");
++        switch (fields.length) {
++            case 1:
++                return new Locale(fields[0]);
++            case 2:
++                return new Locale(fields[0], fields[1]);
++            case 3:
++                return new Locale(fields[0], fields[1], fields[2]);
++            default:
++                return new Locale("");
++        }
++    }
++
++    private static String stripScriptAndExtensions(String localeCode) {
++        int hashPos = localeCode.indexOf('#');
++        if (hashPos >= 0) {
++            localeCode = localeCode.substring(0, hashPos);
++        }
++        return localeCode;
++    }
++
++    /**
++     * Returns true if the TTS engine supports the language of the locale represented by localeCode
++     * (which should be in the format returned by Locale.toString()), false otherwise.
++     */
++    private static boolean isLanguageAvailable(String localeCode) {
++        return mTts.isLanguageAvailable(localeFromStringIgnoringScriptAndExtensions(localeCode)) >=
++                TextToSpeech.LANG_AVAILABLE;
++    }
+ 
+     public static void initializeTts(Context context) {
+         // Store weak reference to Activity to prevent memory leak
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/TtsParser.java b/AnkiDroid/src/main/java/com/ichi2/anki/TtsParser.java
+new file mode 100644
+index 000000000000..7f10eb93e274
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/TtsParser.java
+@@ -0,0 +1,86 @@
++package com.ichi2.anki;
++
++import org.jsoup.Jsoup;
++import org.jsoup.nodes.Element;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * Parse card sides, extracting text snippets that should be read using a text-to-speech engine.
++ */
++public final class TtsParser {
++    /**
++     * Returns the list of text snippets contained in the given HTML fragment that should be read
++     * using the Android text-to-speech engine, together with the languages they are in.
++     * <p>
++     * Each returned LocalisedText object contains the text extracted from a &lt;tts&gt; element
++     * whose 'service' attribute is set to 'android', and the localeCode taken from the 'voice'
++     * attribute of that element. This holds unless the HTML fragment contains no such &lt;tts&gt;
++     * elements; in that case the function returns a single LocalisedText object containing the
++     * text extracted from the whole HTML fragment, with the localeCode set to an empty string.
++     */
++    public static List<LocalisedText> getTextsToRead(String html) {
++        List<LocalisedText> textsToRead = new ArrayList<>();
++
++        Element elem = Jsoup.parseBodyFragment(html).body();
++        parseTtsElements(elem, textsToRead);
++        if (textsToRead.size() == 0) {
++            // No <tts service="android"> elements found: return the text of the whole HTML fragment
++            textsToRead.add(new LocalisedText(elem.text()));
++        }
++
++        return textsToRead;
++    }
++
++    private static void parseTtsElements(Element element, List<LocalisedText> textsToRead) {
++        if (element.tagName().equalsIgnoreCase("tts") &&
++                element.attr("service").equalsIgnoreCase("android")) {
++            textsToRead.add(new LocalisedText(element.text(), element.attr("voice")));
++            return; // ignore any children
++        }
++
++        for (Element child : element.children()) {
++            parseTtsElements(child, textsToRead);
++        }
++    }
++
++    // ----------------------------------------------------------------------------
++    // INNER CLASSES
++    // ----------------------------------------------------------------------------
++
++    /**
++     * Snippet of text accompanied by its locale code (if known).
++     */
++    public static final class LocalisedText {
++        private String mText;
++        private String mLocaleCode;
++
++        /**
++         * Construct an object representing a snippet of text in an unknown locale.
++         */
++        public LocalisedText(String text) {
++            mText = text;
++            mLocaleCode = "";
++        }
++
++        /**
++         * Construct an object representing a snippet of text in a particular locale.
++         *
++         * @param localeCode A string representation of a locale in the format returned by
++         *                   Locale.toString().
++         */
++        public LocalisedText(String text, String localeCode) {
++            mText = text;
++            mLocaleCode = localeCode;
++        }
++
++        public String getText() {
++            return mText;
++        }
++
++        public String getLocaleCode() {
++            return mLocaleCode;
++        }
++    }
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/compat/CompatV10.java b/AnkiDroid/src/main/java/com/ichi2/compat/CompatV10.java
+index 859e57061722..73b5dbb38f88 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/compat/CompatV10.java
++++ b/AnkiDroid/src/main/java/com/ichi2/compat/CompatV10.java
+@@ -62,7 +62,7 @@ public void setTtsOnUtteranceProgressListener(TextToSpeech tts) {
+             public void onUtteranceCompleted(String utteranceId) {
+                 if (ReadText.sTextQueue.size() > 0) {
+                     String[] text = ReadText.sTextQueue.remove(0);
+-                    ReadText.speak(text[0], text[1]);
++                    ReadText.speak(text[0], text[1], TextToSpeech.QUEUE_FLUSH);
+                 }
+             }
+         });
+diff --git a/AnkiDroid/src/main/java/com/ichi2/compat/CompatV15.java b/AnkiDroid/src/main/java/com/ichi2/compat/CompatV15.java
+index b7bdf7a5a344..32be987d3d7c 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/compat/CompatV15.java
++++ b/AnkiDroid/src/main/java/com/ichi2/compat/CompatV15.java
+@@ -17,7 +17,7 @@ public void setTtsOnUtteranceProgressListener(TextToSpeech tts) {
+             public void onDone(String arg0) {
+                 if (ReadText.sTextQueue.size() > 0) {
+                     String[] text = ReadText.sTextQueue.remove(0);
+-                    ReadText.speak(text[0], text[1]);
++                    ReadText.speak(text[0], text[1], TextToSpeech.QUEUE_FLUSH);
+                 }
+             }
+             @Override

@@ -1,0 +1,1018 @@
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_ai_message_bloc.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_ai_message_bloc.dart
+index d6f3e64d554dc..aeccb1a3ca387 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_ai_message_bloc.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_ai_message_bloc.dart
+@@ -1,5 +1,3 @@
+-import 'dart:async';
+-
+ import 'package:appflowy/plugins/ai_chat/application/chat_entity.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_message_stream.dart';
+ import 'package:appflowy_backend/dispatch/dispatch.dart';
+@@ -25,39 +23,23 @@ class ChatAIMessageBloc extends Bloc<ChatAIMessageEvent, ChatAIMessageState> {
+             parseMetadata(refSourceJsonString),
+           ),
+         ) {
++    _dispatch();
++
+     if (state.stream != null) {
+-      state.stream!.listen(
+-        onData: (text) {
+-          if (!isClosed) {
+-            add(ChatAIMessageEvent.updateText(text));
+-          }
+-        },
+-        onError: (error) {
+-          if (!isClosed) {
+-            add(ChatAIMessageEvent.receiveError(error.toString()));
+-          }
+-        },
+-        onAIResponseLimit: () {
+-          if (!isClosed) {
+-            add(const ChatAIMessageEvent.onAIResponseLimit());
+-          }
+-        },
+-        onMetadata: (metadata) {
+-          if (!isClosed) {
+-            add(ChatAIMessageEvent.receiveMetadata(metadata));
+-          }
+-        },
+-      );
++      _startListening();
+ 
+-      if (state.stream!.error != null) {
+-        Future.delayed(const Duration(milliseconds: 300), () {
+-          if (!isClosed) {
+-            add(ChatAIMessageEvent.receiveError(state.stream!.error!));
+-          }
+-        });
++      if (state.stream!.aiLimitReached) {
++        add(const ChatAIMessageEvent.onAIResponseLimit());
++      } else if (state.stream!.error != null) {
++        add(ChatAIMessageEvent.receiveError(state.stream!.error!));
+       }
+     }
++  }
+ 
++  final String chatId;
++  final Int64? questionId;
++
++  void _dispatch() {
+     on<ChatAIMessageEvent>(
+       (event, emit) {
+         event.when(
+@@ -130,8 +112,30 @@ class ChatAIMessageBloc extends Bloc<ChatAIMessageEvent, ChatAIMessageState> {
+     );
+   }
+ 
+-  final String chatId;
+-  final Int64? questionId;
++  void _startListening() {
++    state.stream!.listen(
++      onData: (text) {
++        if (!isClosed) {
++          add(ChatAIMessageEvent.updateText(text));
++        }
++      },
++      onError: (error) {
++        if (!isClosed) {
++          add(ChatAIMessageEvent.receiveError(error.toString()));
++        }
++      },
++      onAIResponseLimit: () {
++        if (!isClosed) {
++          add(const ChatAIMessageEvent.onAIResponseLimit());
++        }
++      },
++      onMetadata: (metadata) {
++        if (!isClosed) {
++          add(ChatAIMessageEvent.receiveMetadata(metadata));
++        }
++      },
++    );
++  }
+ }
+ 
+ @freezed
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_bloc.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_bloc.dart
+index ac9b1353e98f6..5c0cdabe67137 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_bloc.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_bloc.dart
+@@ -119,15 +119,19 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
+               return;
+             }
+ 
+-            final metatdata = OnetimeShotType.relatedQuestion.toMap();
+-            metatdata['questions'] = questions;
++            final metadata = {
++              onetimeShotType: OnetimeShotType.relatedQuestion,
++              'questions': questions,
++            };
++
++            final createdAt = DateTime.now();
+ 
+             final message = TextMessage(
++              id: "related_question_$createdAt",
+               text: '',
+-              metadata: metatdata,
++              metadata: metadata,
+               author: const User(id: systemUserId),
+-              id: systemUserId,
+-              createdAt: DateTime.now(),
++              createdAt: createdAt,
+             );
+ 
+             chatController.insert(message);
+@@ -147,12 +151,13 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
+           ) {
+             numSendMessage += 1;
+ 
+-            final relatedQuestionMessages = chatController.messages.where(
+-              (message) {
+-                return onetimeMessageTypeFromMeta(message.metadata) ==
+-                    OnetimeShotType.relatedQuestion;
+-              },
+-            ).toList();
++            final relatedQuestionMessages = chatController.messages
++                .where(
++                  (message) =>
++                      onetimeMessageTypeFromMeta(message.metadata) ==
++                      OnetimeShotType.relatedQuestion,
++                )
++                .toList();
+ 
+             for (final message in relatedQuestionMessages) {
+               chatController.remove(message);
+@@ -378,20 +383,23 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
+     await AIEventStreamMessage(payload).send().fold(
+       (question) {
+         if (!isClosed) {
+-          add(ChatEvent.finishSending(question));
++          final streamAnswer = _createAnswerStreamMessage(
++            answerStream!,
++            question.messageId,
++          );
+ 
+-          final streamAnswer =
+-              _createAnswerStreamMessage(answerStream!, question.messageId);
++          add(ChatEvent.finishSending(question));
+           add(ChatEvent.startAnswerStreaming(streamAnswer));
+         }
+       },
+       (err) {
+         if (!isClosed) {
+           Log.error("Failed to send message: ${err.msg}");
+-          final metadata = OnetimeShotType.invalidSendMesssage.toMap();
+-          if (err.code != ErrorCode.Internal) {
+-            metadata[sendMessageErrorKey] = err.msg;
+-          }
++
++          final metadata = {
++            onetimeShotType: OnetimeShotType.error,
++            if (err.code != ErrorCode.Internal) errorMessageTextKey: err.msg,
++          };
+ 
+           final error = TextMessage(
+             text: '',
+@@ -412,19 +420,18 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
+     AnswerStream stream,
+     Int64 questionMessageId,
+   ) {
+-    final streamMessageId = (questionMessageId + 1).toString();
+-    answerStreamMessageId = streamMessageId;
++    answerStreamMessageId = (questionMessageId + 1).toString();
+ 
+     return TextMessage(
++      id: answerStreamMessageId,
++      text: '',
+       author: User(id: "streamId:${nanoid()}"),
+       metadata: {
+         "$AnswerStream": stream,
+         messageQuestionIdKey: questionMessageId,
+         "chatId": chatId,
+       },
+-      id: streamMessageId,
+       createdAt: DateTime.now(),
+-      text: '',
+     );
+   }
+ 
+@@ -433,17 +440,16 @@ class ChatBloc extends Bloc<ChatEvent, ChatState> {
+     Map<String, dynamic>? sentMetadata,
+   ) {
+     final now = DateTime.now();
+-    questionStreamMessageId = (now.millisecondsSinceEpoch ~/ 1000).toString();
+ 
+-    final Map<String, dynamic> metadata = {
+-      "$QuestionStream": stream,
+-      "chatId": chatId,
+-      messageChatFileListKey: chatFilesFromMessageMetadata(sentMetadata),
+-    };
++    questionStreamMessageId = (now.millisecondsSinceEpoch ~/ 1000).toString();
+ 
+     return TextMessage(
+       author: User(id: userId),
+-      metadata: metadata,
++      metadata: {
++        "$QuestionStream": stream,
++        "chatId": chatId,
++        messageChatFileListKey: chatFilesFromMessageMetadata(sentMetadata),
++      },
+       id: questionStreamMessageId,
+       createdAt: now,
+       text: '',
+@@ -481,27 +487,28 @@ class ChatEvent with _$ChatEvent {
+       _FinishSendMessage;
+   const factory ChatEvent.failedSending() = _FailSendMessage;
+ 
+-  // receive message
++  // streaming answer
+   const factory ChatEvent.startAnswerStreaming(Message message) =
+       _StartAnswerStreaming;
+-  const factory ChatEvent.receiveMessage(Message message) = _ReceiveMessage;
++  const factory ChatEvent.stopStream() = _StopStream;
+   const factory ChatEvent.didFinishAnswerStream() = _DidFinishAnswerStream;
+ 
++  // receive message
++  const factory ChatEvent.receiveMessage(Message message) = _ReceiveMessage;
++
+   // loading messages
++  const factory ChatEvent.didLoadLatestMessages(List<Message> messages) =
++      _DidLoadMessages;
+   const factory ChatEvent.loadPreviousMessages() = _LoadPreviousMessages;
+   const factory ChatEvent.didLoadPreviousMessages(
+     List<Message> messages,
+     bool hasMore,
+   ) = _DidLoadPreviousMessages;
+-  const factory ChatEvent.didLoadLatestMessages(List<Message> messages) =
+-      _DidLoadMessages;
+ 
+   // related questions
+   const factory ChatEvent.didReceiveRelatedQuestions(
+     List<String> questions,
+   ) = _DidReceiveRelatedQueston;
+-
+-  const factory ChatEvent.stopStream() = _StopStream;
+ }
+ 
+ @freezed
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_entity.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_entity.dart
+index c900e6c3eedd2..9f5f02f8fe01b 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_entity.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_entity.dart
+@@ -1,6 +1,5 @@
+ import 'dart:io';
+ 
+-import 'package:appflowy_backend/log.dart';
+ import 'package:appflowy_backend/protobuf/flowy-ai/entities.pbenum.dart';
+ import 'package:appflowy_backend/protobuf/flowy-error/errors.pb.dart';
+ import 'package:equatable/equatable.dart';
+@@ -10,7 +9,7 @@ import 'package:path/path.dart' as path;
+ part 'chat_entity.g.dart';
+ part 'chat_entity.freezed.dart';
+ 
+-const sendMessageErrorKey = "sendMessageError";
++const errorMessageTextKey = "errorMessageText";
+ const systemUserId = "system";
+ const aiResponseUserId = "0";
+ 
+@@ -121,45 +120,13 @@ extension ChatLoadingStateExtension on ChatLoadingState {
+ }
+ 
+ enum OnetimeShotType {
+-  unknown,
+   sendingMessage,
+   relatedQuestion,
+-  invalidSendMesssage,
++  error,
+ }
+ 
+ const onetimeShotType = "OnetimeShotType";
+ 
+-extension OnetimeMessageTypeExtension on OnetimeShotType {
+-  static OnetimeShotType fromString(String value) {
+-    switch (value) {
+-      case 'OnetimeShotType.sendingMessage':
+-        return OnetimeShotType.sendingMessage;
+-      case 'OnetimeShotType.relatedQuestion':
+-        return OnetimeShotType.relatedQuestion;
+-      case 'OnetimeShotType.invalidSendMesssage':
+-        return OnetimeShotType.invalidSendMesssage;
+-      default:
+-        Log.error('Unknown OnetimeShotType: $value');
+-        return OnetimeShotType.unknown;
+-    }
+-  }
+-
+-  Map<String, dynamic> toMap() {
+-    return {
+-      onetimeShotType: toString(),
+-    };
+-  }
+-}
+-
+ OnetimeShotType? onetimeMessageTypeFromMeta(Map<String, dynamic>? metadata) {
+-  if (metadata == null) {
+-    return null;
+-  }
+-
+-  for (final entry in metadata.entries) {
+-    if (entry.key == onetimeShotType) {
+-      return OnetimeMessageTypeExtension.fromString(entry.value as String);
+-    }
+-  }
+-  return null;
++  return metadata?[onetimeShotType];
+ }
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_stream.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_stream.dart
+index 12fe69b4cfd42..fc63a7ac82bfb 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_stream.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_stream.dart
+@@ -13,34 +13,25 @@ class AnswerStream {
+           _hasStarted = true;
+           final newText = event.substring(5);
+           _text += newText;
+-          if (_onData != null) {
+-            _onData!(_text);
+-          }
++          _onData?.call(_text);
+         } else if (event.startsWith("error:")) {
+           _error = event.substring(5);
+-          if (_onError != null) {
+-            _onError!(_error!);
+-          }
++          _onError?.call(_error!);
+         } else if (event.startsWith("metadata:")) {
+           if (_onMetadata != null) {
+             final s = event.substring(9);
+             _onMetadata!(parseMetadata(s));
+           }
+         } else if (event == "AI_RESPONSE_LIMIT") {
+-          if (_onAIResponseLimit != null) {
+-            _onAIResponseLimit!();
+-          }
++          _aiLimitReached = true;
++          _onAIResponseLimit?.call();
+         }
+       },
+       onDone: () {
+-        if (_onEnd != null) {
+-          _onEnd!();
+-        }
++        _onEnd?.call();
+       },
+       onError: (error) {
+-        if (_onError != null) {
+-          _onError!(error.toString());
+-        }
++        _onError?.call(error.toString());
+       },
+     );
+   }
+@@ -49,6 +40,7 @@ class AnswerStream {
+   final StreamController<String> _controller = StreamController.broadcast();
+   late StreamSubscription<String> _subscription;
+   bool _hasStarted = false;
++  bool _aiLimitReached = false;
+   String? _error;
+   String _text = "";
+ 
+@@ -62,6 +54,7 @@ class AnswerStream {
+ 
+   int get nativePort => _port.sendPort.nativePort;
+   bool get hasStarted => _hasStarted;
++  bool get aiLimitReached => _aiLimitReached;
+   String? get error => _error;
+   String get text => _text;
+ 
+@@ -86,9 +79,7 @@ class AnswerStream {
+     _onAIResponseLimit = onAIResponseLimit;
+     _onMetadata = onMetadata;
+ 
+-    if (_onStart != null) {
+-      _onStart!();
+-    }
++    _onStart?.call();
+   }
+ }
+ 
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
+index 9c73d4012640b..72cd3b65f9b32 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
+@@ -23,10 +23,10 @@ import 'presentation/animated_chat_list.dart';
+ import 'presentation/chat_input/desktop_ai_prompt_input.dart';
+ import 'presentation/chat_input/mobile_ai_prompt_input.dart';
+ import 'presentation/chat_side_panel.dart';
+-import 'presentation/chat_user_invalid_message.dart';
+ import 'presentation/chat_welcome_page.dart';
+ import 'presentation/layout_define.dart';
+ import 'presentation/message/ai_text_message.dart';
++import 'presentation/message/error_text_message.dart';
+ import 'presentation/message/user_text_message.dart';
+ import 'presentation/scroll_to_bottom.dart';
+ 
+@@ -218,9 +218,9 @@ class _ChatContentPage extends StatelessWidget {
+       message.metadata,
+     );
+ 
+-    if (messageType == OnetimeShotType.invalidSendMesssage) {
+-      return ChatInvalidUserMessage(
+-        message: message,
++    if (messageType == OnetimeShotType.error) {
++      return ChatErrorMessageWidget(
++        errorMessage: message.metadata?[errorMessageTextKey] ?? "",
+       );
+     }
+ 
+@@ -259,19 +259,8 @@ class _ChatContentPage extends StatelessWidget {
+     return BlocSelector<ChatBloc, ChatState, bool>(
+       selector: (state) {
+         final chatController = context.read<ChatBloc>().chatController;
+-        final messages = chatController.messages.where((e) {
+-          final oneTimeMessageType = onetimeMessageTypeFromMeta(e.metadata);
+-          if (oneTimeMessageType == null) {
+-            return true;
+-          }
+-          if (oneTimeMessageType
+-              case OnetimeShotType.relatedQuestion ||
+-                  OnetimeShotType.sendingMessage ||
+-                  OnetimeShotType.invalidSendMesssage) {
+-            return false;
+-          }
+-          return true;
+-        });
++        final messages = chatController.messages
++            .where((e) => onetimeMessageTypeFromMeta(e.metadata) == null);
+         return messages.isEmpty ? false : messages.last.id == message.id;
+       },
+       builder: (context, isLastMessage) {
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/animated_chat_list.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/animated_chat_list.dart
+index 123786aa86d39..e9d7b940b3005 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/animated_chat_list.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/animated_chat_list.dart
+@@ -283,21 +283,24 @@ class ChatAnimatedListReversedState extends State<ChatAnimatedListReversed>
+   }
+ 
+   void _handleToggleScrollToBottom() {
+-    if (!_isScrollingToBottom) {
+-      _scrollToBottomShowTimer?.cancel();
+-      if (widget.scrollController.offset >
+-          widget.scrollController.position.minScrollExtent) {
+-        _scrollToBottomShowTimer =
+-            Timer(widget.scrollToBottomAppearanceDelay, () {
+-          if (mounted) {
+-            _scrollToBottomController.forward();
+-          }
+-        });
+-      } else {
+-        if (_scrollToBottomController.status == AnimationStatus.completed) {
+-          _scrollToBottomController.reverse();
++    if (_isScrollingToBottom) {
++      return;
++    }
++
++    _scrollToBottomShowTimer?.cancel();
++    if (widget.scrollController.offset >
++        widget.scrollController.position.minScrollExtent) {
++      _scrollToBottomShowTimer =
++          Timer(widget.scrollToBottomAppearanceDelay, () {
++        if (mounted) {
++          _scrollToBottomController.forward();
+         }
++      });
++    } else {
++      if (_scrollToBottomController.status != AnimationStatus.completed) {
++        _scrollToBottomController.stop();
+       }
++      _scrollToBottomController.reverse();
+     }
+   }
+ 
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_related_question.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_related_question.dart
+index 79ade697490ad..fd937cc27f402 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_related_question.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_related_question.dart
+@@ -7,6 +7,8 @@ import 'package:flowy_infra_ui/widget/spacing.dart';
+ import 'package:flutter/material.dart';
+ import 'package:universal_platform/universal_platform.dart';
+ 
++import 'layout_define.dart';
++
+ class RelatedQuestionList extends StatelessWidget {
+   const RelatedQuestionList({
+     super.key,
+@@ -23,10 +25,8 @@ class RelatedQuestionList extends StatelessWidget {
+       shrinkWrap: true,
+       physics: const NeverScrollableScrollPhysics(),
+       itemCount: relatedQuestions.length + 1,
+-      padding: const EdgeInsets.only(bottom: 8.0) +
+-          (UniversalPlatform.isMobile
+-              ? const EdgeInsets.symmetric(horizontal: 16)
+-              : EdgeInsets.zero),
++      padding:
++          const EdgeInsets.only(bottom: 8.0) + AIChatUILayout.messageMargin,
+       separatorBuilder: (context, index) => const VSpace(4.0),
+       itemBuilder: (context, index) {
+         if (index == 0) {
+@@ -39,9 +39,12 @@ class RelatedQuestionList extends StatelessWidget {
+             ),
+           );
+         } else {
+-          return RelatedQuestionItem(
+-            question: relatedQuestions[index - 1],
+-            onQuestionSelected: onQuestionSelected,
++          return Align(
++            alignment: AlignmentDirectional.centerStart,
++            child: RelatedQuestionItem(
++              question: relatedQuestions[index - 1],
++              onQuestionSelected: onQuestionSelected,
++            ),
+           );
+         }
+       },
+@@ -62,11 +65,15 @@ class RelatedQuestionItem extends StatelessWidget {
+   @override
+   Widget build(BuildContext context) {
+     return FlowyButton(
+-      text: FlowyText(
+-        question,
+-        lineHeight: 1.4,
+-        overflow: TextOverflow.ellipsis,
++      mainAxisAlignment: MainAxisAlignment.start,
++      text: Flexible(
++        child: FlowyText(
++          question,
++          lineHeight: 1.4,
++          overflow: TextOverflow.ellipsis,
++        ),
+       ),
++      expandText: false,
+       margin: UniversalPlatform.isMobile
+           ? const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0)
+           : const EdgeInsets.all(8.0),
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_user_invalid_message.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_user_invalid_message.dart
+deleted file mode 100644
+index a60955c2f394e..0000000000000
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_user_invalid_message.dart
++++ /dev/null
+@@ -1,52 +0,0 @@
+-import 'package:appflowy/generated/flowy_svgs.g.dart';
+-import 'package:appflowy/plugins/ai_chat/application/chat_entity.dart';
+-import 'package:appflowy/util/theme_extension.dart';
+-import 'package:flowy_infra_ui/flowy_infra_ui.dart';
+-import 'package:flutter/material.dart';
+-import 'package:flutter_chat_core/flutter_chat_core.dart';
+-import 'package:universal_platform/universal_platform.dart';
+-
+-class ChatInvalidUserMessage extends StatelessWidget {
+-  const ChatInvalidUserMessage({
+-    required this.message,
+-    super.key,
+-  });
+-
+-  final Message message;
+-  @override
+-  Widget build(BuildContext context) {
+-    final errorMessage = message.metadata?[sendMessageErrorKey] ?? "";
+-    return Center(
+-      child: Container(
+-        margin: const EdgeInsets.only(top: 16.0, bottom: 24.0),
+-        constraints: UniversalPlatform.isDesktop
+-            ? const BoxConstraints(maxWidth: 480)
+-            : const BoxConstraints(),
+-        padding: const EdgeInsets.all(8.0),
+-        decoration: BoxDecoration(
+-          color: Theme.of(context).isLightMode
+-              ? const Color(0x80FFE7EE)
+-              : const Color(0x80591734),
+-          borderRadius: const BorderRadius.all(Radius.circular(8.0)),
+-        ),
+-        child: Row(
+-          mainAxisSize: MainAxisSize.min,
+-          children: [
+-            const FlowySvg(
+-              FlowySvgs.warning_filled_s,
+-              blendMode: null,
+-            ),
+-            const HSpace(8.0),
+-            Flexible(
+-              child: FlowyText(
+-                errorMessage,
+-                lineHeight: 1.4,
+-                maxLines: null,
+-              ),
+-            ),
+-          ],
+-        ),
+-      ),
+-    );
+-  }
+-}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/layout_define.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/layout_define.dart
+index 871146a7e7af6..b43fde69bcb06 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/layout_define.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/layout_define.dart
+@@ -13,6 +13,10 @@ class AIChatUILayout {
+           )
+         : const EdgeInsets.only(bottom: 16);
+   }
++
++  static EdgeInsets get messageMargin => UniversalPlatform.isMobile
++      ? const EdgeInsets.symmetric(horizontal: 16)
++      : EdgeInsets.zero;
+ }
+ 
+ class DesktopAIPromptSizes {
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_metadata.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_metadata.dart
+index e0a5d3177f2cd..8b827cfbcb8f7 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_metadata.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_metadata.dart
+@@ -17,7 +17,7 @@ class AIMessageMetadata extends StatefulWidget {
+   });
+ 
+   final List<ChatMessageRefSource> sources;
+-  final void Function(ChatMessageRefSource metadata) onSelectedMetadata;
++  final void Function(ChatMessageRefSource metadata)? onSelectedMetadata;
+ 
+   @override
+   State<AIMessageMetadata> createState() => _AIMessageMetadataState();
+@@ -92,7 +92,7 @@ class _AIMessageMetadataState extends State<AIMessageMetadata> {
+                         if (m.source != appflowySource) {
+                           return;
+                         }
+-                        widget.onSelectedMetadata(m);
++                        widget.onSelectedMetadata?.call(m);
+                       },
+                     ),
+                   );
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_text_message.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_text_message.dart
+index 21d61f3ab5eda..69b7ec102a224 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_text_message.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_text_message.dart
+@@ -1,23 +1,20 @@
+-import 'package:appflowy/generated/flowy_svgs.g.dart';
+ import 'package:appflowy/generated/locale_keys.g.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_ai_message_bloc.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_entity.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_message_stream.dart';
+-import 'package:appflowy/plugins/ai_chat/presentation/chat_loading.dart';
+-import 'package:appflowy/plugins/ai_chat/presentation/message/ai_markdown_text.dart';
+-import 'package:appflowy/util/theme_extension.dart';
+ import 'package:easy_localization/easy_localization.dart';
+ import 'package:fixnum/fixnum.dart';
+-import 'package:flowy_infra_ui/style_widget/text.dart';
+-import 'package:flowy_infra_ui/widget/spacing.dart';
+-import 'package:flutter/gestures.dart';
++import 'package:flowy_infra_ui/flowy_infra_ui.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+ import 'package:flutter_chat_core/flutter_chat_core.dart';
+-import 'package:universal_platform/universal_platform.dart';
+ 
++import '../chat_loading.dart';
++import '../layout_define.dart';
++import 'ai_markdown_text.dart';
+ import 'ai_message_bubble.dart';
+ import 'ai_metadata.dart';
++import 'error_text_message.dart';
+ 
+ /// [ChatAIMessageWidget] includes both the text of the AI response as well as
+ /// the avatar, decorations and hover effects that are also rendered. This is
+@@ -34,7 +31,7 @@ class ChatAIMessageWidget extends StatelessWidget {
+     required this.questionId,
+     required this.chatId,
+     required this.refSourceJsonString,
+-    required this.onSelectedMetadata,
++    this.onSelectedMetadata,
+     this.isLastMessage = false,
+   });
+ 
+@@ -46,7 +43,7 @@ class ChatAIMessageWidget extends StatelessWidget {
+   final Int64? questionId;
+   final String chatId;
+   final String? refSourceJsonString;
+-  final void Function(ChatMessageRefSource metadata) onSelectedMetadata;
++  final void Function(ChatMessageRefSource metadata)? onSelectedMetadata;
+   final bool isLastMessage;
+ 
+   @override
+@@ -61,17 +58,13 @@ class ChatAIMessageWidget extends StatelessWidget {
+       child: BlocBuilder<ChatAIMessageBloc, ChatAIMessageState>(
+         builder: (context, state) {
+           return Padding(
+-            padding: UniversalPlatform.isMobile
+-                ? const EdgeInsets.symmetric(horizontal: 16)
+-                : EdgeInsets.zero,
++            padding: AIChatUILayout.messageMargin,
+             child: state.messageState.when(
+-              loading: () {
+-                return ChatAIMessageBubble(
+-                  message: message,
+-                  showActions: false,
+-                  child: const ChatAILoading(),
+-                );
+-              },
++              loading: () => ChatAIMessageBubble(
++                message: message,
++                showActions: false,
++                child: const ChatAILoading(),
++              ),
+               ready: () {
+                 return state.text.isEmpty
+                     ? ChatAIMessageBubble(
+@@ -92,12 +85,15 @@ class ChatAIMessageWidget extends StatelessWidget {
+                                 sources: state.sources,
+                                 onSelectedMetadata: onSelectedMetadata,
+                               ),
++                            if (state.sources.isNotEmpty && !isLastMessage)
++                              const VSpace(16.0),
+                           ],
+                         ),
+                       );
+               },
+-              onError: (err) {
+-                return StreamingError(
++              onError: (error) {
++                return ChatErrorMessageWidget(
++                  errorMessage: LocaleKeys.chat_aiServerUnavailable.tr(),
+                   onRetry: () {
+                     context
+                         .read<ChatAIMessageBloc>()
+@@ -106,7 +102,10 @@ class ChatAIMessageWidget extends StatelessWidget {
+                 );
+               },
+               onAIResponseLimit: () {
+-                return const AIResponseLimitReachedError();
++                return ChatErrorMessageWidget(
++                  errorMessage:
++                      LocaleKeys.sideBar_askOwnerToUpgradeToAIMax.tr(),
++                );
+               },
+             ),
+           );
+@@ -115,129 +114,3 @@ class ChatAIMessageWidget extends StatelessWidget {
+     );
+   }
+ }
+-
+-class StreamingError extends StatefulWidget {
+-  const StreamingError({
+-    required this.onRetry,
+-    super.key,
+-  });
+-
+-  final VoidCallback onRetry;
+-
+-  @override
+-  State<StreamingError> createState() => _StreamingErrorState();
+-}
+-
+-class _StreamingErrorState extends State<StreamingError> {
+-  late final TapGestureRecognizer recognizer;
+-
+-  @override
+-  void initState() {
+-    super.initState();
+-    recognizer = TapGestureRecognizer()..onTap = widget.onRetry;
+-  }
+-
+-  @override
+-  void dispose() {
+-    recognizer.dispose();
+-    super.dispose();
+-  }
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    return Center(
+-      child: Container(
+-        margin: const EdgeInsets.only(top: 16.0, bottom: 24.0),
+-        padding: const EdgeInsets.all(8.0),
+-        decoration: BoxDecoration(
+-          color: Theme.of(context).isLightMode
+-              ? const Color(0x80FFE7EE)
+-              : const Color(0x80591734),
+-          borderRadius: const BorderRadius.all(Radius.circular(8.0)),
+-        ),
+-        constraints: _errorConstraints(),
+-        child: Row(
+-          mainAxisSize: MainAxisSize.min,
+-          children: [
+-            const FlowySvg(
+-              FlowySvgs.warning_filled_s,
+-              blendMode: null,
+-            ),
+-            const HSpace(8.0),
+-            Flexible(
+-              child: RichText(
+-                text: TextSpan(
+-                  children: [
+-                    TextSpan(
+-                      text: LocaleKeys.chat_aiServerUnavailable.tr(),
+-                      style: Theme.of(context).textTheme.bodyMedium,
+-                    ),
+-                    TextSpan(
+-                      text: " ",
+-                      style: Theme.of(context).textTheme.bodyMedium,
+-                    ),
+-                    TextSpan(
+-                      text: LocaleKeys.chat_retry.tr(),
+-                      recognizer: recognizer,
+-                      mouseCursor: SystemMouseCursors.click,
+-                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+-                            fontWeight: FontWeight.w600,
+-                            decoration: TextDecoration.underline,
+-                          ),
+-                    ),
+-                  ],
+-                ),
+-              ),
+-            ),
+-          ],
+-        ),
+-      ),
+-    );
+-  }
+-}
+-
+-class AIResponseLimitReachedError extends StatelessWidget {
+-  const AIResponseLimitReachedError({
+-    super.key,
+-  });
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    return Center(
+-      child: Container(
+-        margin: const EdgeInsets.only(top: 16.0, bottom: 24.0),
+-        constraints: _errorConstraints(),
+-        padding: const EdgeInsets.all(8.0),
+-        decoration: BoxDecoration(
+-          color: Theme.of(context).isLightMode
+-              ? const Color(0x80FFE7EE)
+-              : const Color(0x80591734),
+-          borderRadius: const BorderRadius.all(Radius.circular(8.0)),
+-        ),
+-        child: Row(
+-          mainAxisSize: MainAxisSize.min,
+-          children: [
+-            const FlowySvg(
+-              FlowySvgs.warning_filled_s,
+-              blendMode: null,
+-            ),
+-            const HSpace(8.0),
+-            Flexible(
+-              child: FlowyText(
+-                LocaleKeys.sideBar_askOwnerToUpgradeToAIMax.tr(),
+-                lineHeight: 1.4,
+-                maxLines: null,
+-              ),
+-            ),
+-          ],
+-        ),
+-      ),
+-    );
+-  }
+-}
+-
+-BoxConstraints _errorConstraints() {
+-  return UniversalPlatform.isDesktop
+-      ? const BoxConstraints(maxWidth: 480)
+-      : const BoxConstraints();
+-}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/error_text_message.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/error_text_message.dart
+new file mode 100644
+index 0000000000000..66b39fe3083b4
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/error_text_message.dart
+@@ -0,0 +1,107 @@
++import 'package:appflowy/generated/flowy_svgs.g.dart';
++import 'package:appflowy/generated/locale_keys.g.dart';
++import 'package:appflowy/util/theme_extension.dart';
++import 'package:easy_localization/easy_localization.dart';
++import 'package:flowy_infra_ui/flowy_infra_ui.dart';
++import 'package:flutter/gestures.dart';
++import 'package:flutter/material.dart';
++import 'package:universal_platform/universal_platform.dart';
++
++class ChatErrorMessageWidget extends StatefulWidget {
++  const ChatErrorMessageWidget({
++    super.key,
++    required this.errorMessage,
++    this.onRetry,
++  });
++
++  final String errorMessage;
++  final VoidCallback? onRetry;
++
++  @override
++  State<ChatErrorMessageWidget> createState() => _ChatErrorMessageWidgetState();
++}
++
++class _ChatErrorMessageWidgetState extends State<ChatErrorMessageWidget> {
++  late final TapGestureRecognizer recognizer;
++
++  @override
++  void initState() {
++    super.initState();
++    recognizer = TapGestureRecognizer()..onTap = widget.onRetry;
++  }
++
++  @override
++  void dispose() {
++    recognizer.dispose();
++    super.dispose();
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return Center(
++      child: Container(
++        margin: const EdgeInsets.only(top: 16.0, bottom: 24.0) +
++            (UniversalPlatform.isMobile
++                ? const EdgeInsets.symmetric(horizontal: 16)
++                : EdgeInsets.zero),
++        padding: const EdgeInsets.all(8.0),
++        decoration: BoxDecoration(
++          color: Theme.of(context).isLightMode
++              ? const Color(0x80FFE7EE)
++              : const Color(0x80591734),
++          borderRadius: const BorderRadius.all(Radius.circular(8.0)),
++        ),
++        constraints: UniversalPlatform.isDesktop
++            ? const BoxConstraints(maxWidth: 480)
++            : null,
++        child: Row(
++          mainAxisSize: MainAxisSize.min,
++          children: [
++            const FlowySvg(
++              FlowySvgs.warning_filled_s,
++              blendMode: null,
++            ),
++            const HSpace(8.0),
++            Flexible(
++              child: _buildText(),
++            ),
++          ],
++        ),
++      ),
++    );
++  }
++
++  Widget _buildText() {
++    final errorMessage = widget.errorMessage;
++
++    return widget.onRetry != null
++        ? RichText(
++            text: TextSpan(
++              children: [
++                TextSpan(
++                  text: errorMessage,
++                  style: Theme.of(context).textTheme.bodyMedium,
++                ),
++                TextSpan(
++                  text: ' ',
++                  style: Theme.of(context).textTheme.bodyMedium,
++                ),
++                TextSpan(
++                  text: LocaleKeys.chat_retry.tr(),
++                  recognizer: recognizer,
++                  mouseCursor: SystemMouseCursors.click,
++                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
++                        fontWeight: FontWeight.w600,
++                        decoration: TextDecoration.underline,
++                      ),
++                ),
++              ],
++            ),
++          )
++        : FlowyText(
++            errorMessage,
++            lineHeight: 1.4,
++            maxLines: null,
++          );
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/user_message_bubble.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/user_message_bubble.dart
+index e860df872963f..778ca3d0e9d9d 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/user_message_bubble.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/user_message_bubble.dart
+@@ -6,7 +6,6 @@ import 'package:flowy_infra_ui/widget/spacing.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+ import 'package:flutter_chat_core/flutter_chat_core.dart';
+-import 'package:universal_platform/universal_platform.dart';
+ 
+ import '../chat_avatar.dart';
+ import '../layout_define.dart';
+@@ -32,9 +31,7 @@ class ChatUserMessageBubble extends StatelessWidget {
+         .add(ChatMemberEvent.getMemberInfo(message.author.id));
+ 
+     return Padding(
+-      padding: UniversalPlatform.isMobile
+-          ? const EdgeInsets.symmetric(horizontal: 16)
+-          : EdgeInsets.zero,
++      padding: AIChatUILayout.messageMargin,
+       child: Column(
+         mainAxisSize: MainAxisSize.min,
+         crossAxisAlignment: CrossAxisAlignment.end,

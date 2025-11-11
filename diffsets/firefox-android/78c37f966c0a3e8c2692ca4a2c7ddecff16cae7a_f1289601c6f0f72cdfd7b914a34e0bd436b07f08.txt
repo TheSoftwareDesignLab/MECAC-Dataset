@@ -1,0 +1,519 @@
+diff --git a/focus-android/app/build.gradle b/focus-android/app/build.gradle
+index 4cdd4e255a3f..a5a78f5d43ce 100644
+--- a/focus-android/app/build.gradle
++++ b/focus-android/app/build.gradle
+@@ -19,7 +19,7 @@ android {
+         targetSdkVersion 28
+         versionCode 11 // This versionCode is "frozen" for local builds. For "release" builds we
+                        // override this with a generated versionCode at build time.
+-        versionName "8.0.8"
++        versionName "8.0.9"
+         testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+ 
+         multiDexEnabled true
+@@ -198,6 +198,7 @@ dependencies {
+     implementation "org.mozilla.components:support-ktx:$mozilla_components_version"
+     implementation "org.mozilla.components:support-utils:$mozilla_components_version"
+     implementation "org.mozilla.components:lib-crash:$mozilla_components_version"
++    implementation "org.mozilla.components:lib-fetch-httpurlconnection:$mozilla_components_version"
+ 
+     implementation 'com.squareup.okhttp3:okhttp:3.11.0'
+ 
+@@ -208,9 +209,9 @@ dependencies {
+     focusImplementation 'com.adjust.sdk:adjust-android:4.11.4'
+     focusImplementation 'com.android.installreferrer:installreferrer:1.0' // Required by Adjust
+ 
+-    armImplementation "org.mozilla.geckoview:geckoview-armeabi-v7a:${geckoview_version}"
+-    x86Implementation "org.mozilla.geckoview:geckoview-x86:${geckoview_version}"
+-    aarch64Implementation "org.mozilla.geckoview:geckoview-arm64-v8a:${geckoview_version}"
++    armImplementation "org.mozilla.geckoview:geckoview-nightly-armeabi-v7a:${geckoview_version}"
++    x86Implementation "org.mozilla.geckoview:geckoview-nightly-x86:${geckoview_version}"
++    aarch64Implementation "org.mozilla.geckoview:geckoview-nightly-arm64-v8a:${geckoview_version}"
+     implementation "com.android.support:palette-v7:$support_libraries_version"
+ 
+     testImplementation "org.junit.jupiter:junit-jupiter-api:5.3.1"
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/Components.kt b/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
+index cedc329a0a5a..8dd2976073dc 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
+@@ -11,11 +11,8 @@ import mozilla.components.browser.search.provider.AssetsSearchEngineProvider
+ import mozilla.components.browser.search.provider.localization.LocaleSearchLocalizationProvider
+ import mozilla.components.browser.session.Session
+ import mozilla.components.browser.session.SessionManager
+-import mozilla.components.concept.engine.DefaultSettings
+-import mozilla.components.concept.engine.Engine
+-import mozilla.components.concept.engine.EngineSession
+-import mozilla.components.concept.engine.EngineView
+-import mozilla.components.concept.engine.Settings
++import mozilla.components.concept.engine.*
++import org.json.JSONObject
+ import org.mozilla.focus.search.BingSearchEngineFilter
+ import org.mozilla.focus.search.CustomSearchEngineProvider
+ import org.mozilla.focus.search.HiddenSearchEngineFilter
+@@ -53,6 +50,10 @@ private class DummyEngine : Engine {
+         throw NotImplementedError()
+     }
+ 
++    override fun createSessionState(json: JSONObject): EngineSessionState {
++        throw NotImplementedError()
++    }
++
+     override fun createView(context: Context, attrs: AttributeSet?): EngineView {
+         throw NotImplementedError()
+     }
+@@ -60,6 +61,10 @@ private class DummyEngine : Engine {
+     override fun name(): String {
+         throw NotImplementedError()
+     }
++
++    override fun speculativeConnect(url: String) {
++        throw NotImplementedError()
++    }
+ }
+ 
+ /**
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt b/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
+index 04bb63326724..5b491017ea9d 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
+@@ -13,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Dispatchers.IO
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.launch
++import mozilla.components.lib.fetch.httpurlconnection.HttpURLConnectionClient
+ import mozilla.components.service.fretboard.Fretboard
+ import mozilla.components.service.fretboard.ValuesProvider
+ import mozilla.components.service.fretboard.source.kinto.KintoExperimentSource
+@@ -89,7 +90,7 @@ class FocusApplication : LocaleAwareApplication(), CoroutineScope {
+     private fun loadExperiments() {
+         val experimentsFile = File(filesDir, EXPERIMENTS_JSON_FILENAME)
+         val experimentSource = KintoExperimentSource(
+-            EXPERIMENTS_BASE_URL, EXPERIMENTS_BUCKET_NAME, EXPERIMENTS_COLLECTION_NAME
++            EXPERIMENTS_BASE_URL, EXPERIMENTS_BUCKET_NAME, EXPERIMENTS_COLLECTION_NAME, HttpURLConnectionClient()
+         )
+         fretboard = Fretboard(experimentSource, FlatFileExperimentStorage(experimentsFile),
+             object : ValuesProvider() {
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt
+index 20db76038fc0..6914165ce6eb 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt
+@@ -32,7 +32,8 @@ import kotlinx.coroutines.Dispatchers.IO
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.launch
+ import mozilla.components.browser.domains.CustomDomains
+-import mozilla.components.browser.domains.DomainAutoCompleteProvider
++import mozilla.components.browser.domains.autocomplete.CustomDomainsProvider
++import mozilla.components.browser.domains.autocomplete.ShippedDomainsProvider
+ import mozilla.components.browser.session.Session
+ import mozilla.components.support.utils.ThreadUtils
+ import mozilla.components.ui.autocomplete.InlineAutocompleteEditText
+@@ -50,14 +51,7 @@ import org.mozilla.focus.searchsuggestions.ui.SearchSuggestionsFragment
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.tips.Tip
+ import org.mozilla.focus.tips.TipManager
+-import org.mozilla.focus.utils.AppConstants
+-import org.mozilla.focus.utils.Features
+-import org.mozilla.focus.utils.OneShotOnPreDrawListener
+-import org.mozilla.focus.utils.Settings
+-import org.mozilla.focus.utils.StatusBarUtils
+-import org.mozilla.focus.utils.SupportUtils
+-import org.mozilla.focus.utils.UrlUtils
+-import org.mozilla.focus.utils.ViewUtils
++import org.mozilla.focus.utils.*
+ import org.mozilla.focus.viewmodel.MainViewModel
+ import org.mozilla.focus.whatsnew.WhatsNew
+ import java.util.Objects
+@@ -146,7 +140,10 @@ class UrlInputFragment :
+     private var job = Job()
+     override val coroutineContext: CoroutineContext
+         get() = job + Dispatchers.Main
+-    private val autoCompleteProvider: DomainAutoCompleteProvider = DomainAutoCompleteProvider()
++    private val shippedDomainsProvider = ShippedDomainsProvider()
++    private val customDomainsProvider = CustomDomainsProvider()
++    private var useShipped = false
++    private var useCustom = false
+     private var displayedPopupMenu: HomeMenu? = null
+ 
+     @Volatile
+@@ -201,10 +198,10 @@ class UrlInputFragment :
+ 
+         activity?.let {
+             val settings = Settings.getInstance(it.applicationContext)
+-            val useCustomDomains = settings.shouldAutocompleteFromCustomDomainList()
+-            val useShippedDomains = settings.shouldAutocompleteFromShippedDomainList()
+-            autoCompleteProvider.initialize(it.applicationContext, useShippedDomains,
+-                useCustomDomains)
++            useCustom = settings.shouldAutocompleteFromCustomDomainList()
++            useShipped = settings.shouldAutocompleteFromShippedDomainList()
++            shippedDomainsProvider.initialize(it.applicationContext)
++            customDomainsProvider.initialize(it.applicationContext)
+         }
+ 
+         StatusBarUtils.getStatusBarHeight(keyboardLinearLayout) {
+@@ -653,7 +650,7 @@ class UrlInputFragment :
+     }
+ 
+     private fun onCommit() {
+-        val input = urlView.autocompleteResult.formattedText.let {
++        val input = urlView.autocompleteResult!!.text.let {
+             if (it.isEmpty() || !URLUtil.isValidUrl(urlView?.text.toString())) {
+                 urlView?.text.toString()
+             } else it
+@@ -671,7 +668,7 @@ class UrlInputFragment :
+ 
+             openUrl(url, searchTerms)
+ 
+-            TelemetryWrapper.urlBarEvent(isUrl, urlView.autocompleteResult)
++            TelemetryWrapper.urlBarEvent(isUrl, urlView.autocompleteResult!!)
+         }
+     }
+ 
+@@ -772,6 +769,10 @@ class UrlInputFragment :
+         }
+     }
+ 
++    private fun onFilter(searchText: String) {
++        onFilter(searchText, null)
++    }
++
+     private fun onFilter(searchText: String, view: InlineAutocompleteEditText?) {
+         // If the UrlInputFragment has already been hidden, don't bother with filtering. Because of the text
+         // input architecture on Android it's possible for onFilter() to be called after we've already
+@@ -782,8 +783,14 @@ class UrlInputFragment :
+         }
+ 
+         view?.let {
+-            val result = autoCompleteProvider.autocomplete(searchText)
+-            view.applyAutocompleteResult(AutocompleteResult(result.text, result.source, result.size, { result.url }))
++            val result = if (useShipped) {
++                shippedDomainsProvider.getAutocompleteSuggestion(searchText)
++            } else if (useCustom) {
++                customDomainsProvider.getAutocompleteSuggestion(searchText)
++            } else {
++                null
++            }
++            view.applyAutocompleteResult(AutocompleteResult(result!!.text, result.source, result.totalItems, { result.url }))
+         }
+ 
+         searchSuggestionsViewModel.setSearchQuery(searchText)
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/CustomSearchEngineProvider.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/CustomSearchEngineProvider.kt
+index 1b9082f495d4..6636c7cf0c95 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/CustomSearchEngineProvider.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/search/CustomSearchEngineProvider.kt
+@@ -8,6 +8,7 @@ import android.content.Context
+ import kotlinx.coroutines.coroutineScope
+ import mozilla.components.browser.search.SearchEngine
+ import mozilla.components.browser.search.provider.SearchEngineProvider
++import mozilla.components.browser.search.provider.SearchEngineList
+ 
+ /**
+  * SearchEngineProvider implementation to load user entered custom search engines.
+@@ -15,7 +16,7 @@ import mozilla.components.browser.search.provider.SearchEngineProvider
+ class CustomSearchEngineProvider : SearchEngineProvider {
+     // Our version of ktlint enforces the wrong modifier order. We need to update the plugin: #2488
+     /* ktlint-disable modifier-order */
+-    override suspend fun loadSearchEngines(context: Context): List<SearchEngine> = coroutineScope {
+-        CustomSearchEngineStore.loadCustomSearchEngines(context)
++    override suspend fun loadSearchEngines(context: Context): SearchEngineList = coroutineScope {
++        SearchEngineList(CustomSearchEngineStore.loadCustomSearchEngines(context), null)
+     }
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineListPreference.kt b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineListPreference.kt
+index 90feae17722b..b5d62b7c92f8 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineListPreference.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/search/SearchEngineListPreference.kt
+@@ -66,6 +66,7 @@ abstract class SearchEngineListPreference : Preference, CoroutineScope {
+             searchEngines = context.components.searchEngineManager
+                     .load(this@SearchEngineListPreference.context)
+                     .await()
++                    .list
+                     .sortedBy { it.name }
+             refreshSearchEngineViews(this@SearchEngineListPreference.context)
+         }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
+index bfad2daad111..4e8d02ac4e8e 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
+@@ -16,6 +16,7 @@ import android.preference.PreferenceManager
+ import android.support.annotation.CheckResult
+ import android.support.annotation.VisibleForTesting
+ import kotlinx.coroutines.runBlocking
++import mozilla.components.lib.fetch.httpurlconnection.HttpURLConnectionClient
+ import mozilla.components.ui.autocomplete.InlineAutocompleteEditText
+ import org.json.JSONObject
+ import org.mozilla.focus.BuildConfig
+@@ -33,7 +34,7 @@ import org.mozilla.telemetry.config.TelemetryConfiguration
+ import org.mozilla.telemetry.event.TelemetryEvent
+ import org.mozilla.telemetry.measurement.DefaultSearchMeasurement
+ import org.mozilla.telemetry.measurement.SearchesMeasurement
+-import org.mozilla.telemetry.net.HttpURLConnectionTelemetryClient
++import org.mozilla.telemetry.net.TelemetryClient
+ import org.mozilla.telemetry.ping.TelemetryCorePingBuilder
+ import org.mozilla.telemetry.ping.TelemetryEventPingBuilder
+ import org.mozilla.telemetry.ping.TelemetryMobileMetricsPingBuilder
+@@ -264,7 +265,7 @@ object TelemetryWrapper {
+ 
+             val serializer = JSONPingSerializer()
+             val storage = FileTelemetryStorage(configuration, serializer)
+-            val client = HttpURLConnectionTelemetryClient()
++            val client = TelemetryClient(HttpURLConnectionClient())
+             val scheduler = JobSchedulerTelemetryScheduler()
+ 
+             TelemetryHolder.set(Telemetry(configuration, storage, client, scheduler)
+@@ -403,9 +404,9 @@ object TelemetryWrapper {
+ 
+     private fun browseEvent(autocompleteResult: InlineAutocompleteEditText.AutocompleteResult) {
+         val event = TelemetryEvent.create(Category.ACTION, Method.TYPE_URL, Object.SEARCH_BAR)
+-                .extra(Extra.AUTOCOMPLETE, (!autocompleteResult.isEmpty).toString())
++                .extra(Extra.AUTOCOMPLETE, (!autocompleteResult.text.isEmpty()).toString())
+ 
+-        if (!autocompleteResult.isEmpty) {
++        if (!autocompleteResult.text.isEmpty()) {
+             event.extra(Extra.TOTAL, autocompleteResult.totalItems.toString())
+             event.extra(Extra.SOURCE, autocompleteResult.source)
+         }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/web/GeckoWebViewProvider.kt b/focus-android/app/src/main/java/org/mozilla/focus/web/GeckoWebViewProvider.kt
+index 753907d4fb49..8a696885832d 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/web/GeckoWebViewProvider.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/web/GeckoWebViewProvider.kt
+@@ -42,6 +42,7 @@ import org.mozilla.focus.utils.Settings
+ import org.mozilla.focus.utils.UrlUtils
+ import org.mozilla.focus.webview.SystemWebView
+ import org.mozilla.geckoview.AllowOrDeny
++import org.mozilla.geckoview.ContentBlocking
+ import org.mozilla.geckoview.GeckoResult
+ import org.mozilla.geckoview.GeckoRuntime
+ import org.mozilla.geckoview.GeckoRuntimeSettings
+@@ -88,8 +89,16 @@ class GeckoWebViewProvider : IWebViewProvider {
+         if (geckoRuntime == null) {
+             val runtimeSettingsBuilder = GeckoRuntimeSettings.Builder()
+             runtimeSettingsBuilder.useContentProcessHint(true)
+-            runtimeSettingsBuilder.blockMalware(Settings.getInstance(context).shouldUseSafeBrowsing())
+-            runtimeSettingsBuilder.blockPhishing(Settings.getInstance(context).shouldUseSafeBrowsing())
++            runtimeSettingsBuilder.contentBlocking(ContentBlocking.Settings.Builder()
++                    .categories(ContentBlocking.SB_MALWARE)
++                    .categories(ContentBlocking.SB_PHISHING)
++                    .build())
++            val contentBlockingBuilder = ContentBlocking.Settings.Builder()
++            if (Settings.getInstance(context).shouldUseSafeBrowsing()) {
++                contentBlockingBuilder.categories(ContentBlocking.SB_MALWARE)
++                        .categories(ContentBlocking.SB_PHISHING)
++            }
++            runtimeSettingsBuilder.contentBlocking(contentBlockingBuilder.build())
+             runtimeSettingsBuilder.crashHandler(CrashHandlerService::class.java)
+ 
+             geckoRuntime =
+@@ -153,19 +162,18 @@ class GeckoWebViewProvider : IWebViewProvider {
+             geckoSession.contentDelegate = createContentDelegate()
+             geckoSession.progressDelegate = createProgressDelegate()
+             geckoSession.navigationDelegate = createNavigationDelegate()
+-            geckoSession.trackingProtectionDelegate = createTrackingProtectionDelegate()
++            geckoSession.contentBlockingDelegate = createTrackingProtectionDelegate()
+             geckoSession.promptDelegate = createPromptDelegate()
+             finder = geckoSession.finder
+             finder.displayFlags = GeckoSession.FINDER_DISPLAY_HIGHLIGHT_ALL
+         }
+ 
+         private fun createGeckoSession(): GeckoSession {
+-            val settings = GeckoSessionSettings()
+-            settings.setBoolean(GeckoSessionSettings.USE_MULTIPROCESS, true)
+-            settings.setBoolean(GeckoSessionSettings.USE_PRIVATE_MODE, true)
+-            settings.setBoolean(GeckoSessionSettings.SUSPEND_MEDIA_WHEN_INACTIVE, true)
+-
+-            return GeckoSession(settings)
++            val builder = GeckoSessionSettings.Builder()
++            builder.useMultiprocess(true)
++            builder.usePrivateMode(true)
++            builder.suspendMediaWhenInactive(true)
++            return GeckoSession(builder.build())
+         }
+ 
+         override fun setCallback(callback: IWebView.Callback?) {
+@@ -220,24 +228,22 @@ class GeckoWebViewProvider : IWebViewProvider {
+         }
+ 
+         override fun setBlockingEnabled(enabled: Boolean) {
+-            geckoSession.settings.setBoolean(GeckoSessionSettings.USE_TRACKING_PROTECTION, enabled)
++            geckoSession.settings.useTrackingProtection = enabled
+             if (enabled) {
+                 updateBlocking()
+                 applyAppSettings()
+             } else {
+                 geckoRuntime!!.settings.javaScriptEnabled = true
+                 geckoRuntime!!.settings.webFontsEnabled = true
+-                geckoRuntime!!.settings.cookieBehavior = GeckoRuntimeSettings.COOKIE_ACCEPT_ALL
++                geckoRuntime!!.settings.contentBlocking.cookieBehavior = ContentBlocking.COOKIE_ACCEPT_ALL
+             }
+             callback?.onBlockingStateChanged(enabled)
+         }
+ 
+         override fun setRequestDesktop(shouldRequestDesktop: Boolean) {
+-            geckoSession.settings.setInt(
+-                GeckoSessionSettings.USER_AGENT_MODE,
+-                if (shouldRequestDesktop) GeckoSessionSettings.USER_AGENT_MODE_DESKTOP
+-                else GeckoSessionSettings.USER_AGENT_MODE_MOBILE
+-            )
++            geckoSession.settings.userAgentMode =
++                    if (shouldRequestDesktop) GeckoSessionSettings.USER_AGENT_MODE_DESKTOP
++                    else GeckoSessionSettings.USER_AGENT_MODE_MOBILE
+             callback?.onRequestDesktopStateChanged(shouldRequestDesktop)
+         }
+ 
+@@ -266,8 +272,13 @@ class GeckoWebViewProvider : IWebViewProvider {
+                 context.getString(R.string.pref_key_safe_browsing) -> {
+                     val shouldUseSafeBrowsing =
+                         Settings.getInstance(context).shouldUseSafeBrowsing()
+-                    geckoRuntime!!.settings.blockMalware = shouldUseSafeBrowsing
+-                    geckoRuntime!!.settings.blockPhishing = shouldUseSafeBrowsing
++                    var cats = geckoRuntime!!.settings.contentBlocking.categories
++                    if (shouldUseSafeBrowsing) {
++                        cats = cats or ContentBlocking.SB_MALWARE or ContentBlocking.SB_PHISHING
++                    } else {
++                        cats = cats and ContentBlocking.SB_MALWARE.inv() and ContentBlocking.SB_PHISHING.inv()
++                    }
++                    geckoRuntime!!.settings.contentBlocking.categories = cats
+                 }
+                 else -> return
+             }
+@@ -284,48 +295,48 @@ class GeckoWebViewProvider : IWebViewProvider {
+         }
+ 
+         private fun updateCookieSettings() {
+-            geckoRuntime!!.settings.cookieBehavior =
++            geckoRuntime!!.settings.contentBlocking.cookieBehavior =
+                     when (Settings.getInstance(context).shouldBlockCookiesValue()) {
+                         context.getString(
+                             R.string.preference_privacy_should_block_cookies_yes_option
+                         ) ->
+-                            GeckoRuntimeSettings.COOKIE_ACCEPT_NONE
++                            ContentBlocking.COOKIE_ACCEPT_NONE
+                         context.getString(
+                             R.string.preference_privacy_should_block_cookies_third_party_tracker_cookies_option
+                         ) ->
+-                            GeckoRuntimeSettings.COOKIE_ACCEPT_NON_TRACKERS
++                            ContentBlocking.COOKIE_ACCEPT_NON_TRACKERS
+                         context.getString(
+                             R.string.preference_privacy_should_block_cookies_third_party_only_option
+                         ) ->
+-                            GeckoRuntimeSettings.COOKIE_ACCEPT_FIRST_PARTY
+-                        else -> GeckoRuntimeSettings.COOKIE_ACCEPT_ALL
++                            ContentBlocking.COOKIE_ACCEPT_FIRST_PARTY
++                        else -> ContentBlocking.COOKIE_ACCEPT_ALL
+                     }
+         }
+ 
+         private fun updateBlocking() {
+             val settings = Settings.getInstance(context)
+ 
+-            var categories = 0
++            var categories = geckoRuntime!!.settings.contentBlocking.categories
+             if (settings.shouldBlockSocialTrackers()) {
+-                categories += GeckoSession.TrackingProtectionDelegate.CATEGORY_SOCIAL
++                categories = categories or ContentBlocking.AT_SOCIAL
+             }
+             if (settings.shouldBlockAdTrackers()) {
+-                categories += GeckoSession.TrackingProtectionDelegate.CATEGORY_AD
++                categories = categories or ContentBlocking.AT_AD
+             }
+             if (settings.shouldBlockAnalyticTrackers()) {
+-                categories += GeckoSession.TrackingProtectionDelegate.CATEGORY_ANALYTIC
++                categories = categories or ContentBlocking.AT_ANALYTIC
+             }
+             if (settings.shouldBlockOtherTrackers()) {
+-                categories += GeckoSession.TrackingProtectionDelegate.CATEGORY_CONTENT
++                categories = categories or ContentBlocking.AT_CONTENT
+             }
+ 
+-            geckoRuntime!!.settings.trackingProtectionCategories = categories
++            geckoRuntime!!.settings.contentBlocking.categories = categories
+         }
+ 
+         @Suppress("ComplexMethod", "ReturnCount")
+         private fun createContentDelegate(): GeckoSession.ContentDelegate {
+             return object : GeckoSession.ContentDelegate {
+-                override fun onTitleChange(session: GeckoSession, title: String) {
++                override fun onTitleChange(session: GeckoSession, title: String?) {
+                     webViewTitle = title
+                     callback?.onTitleChanged(title)
+                 }
+@@ -407,7 +418,7 @@ class GeckoWebViewProvider : IWebViewProvider {
+         @Suppress("ComplexMethod")
+         private fun createProgressDelegate(): GeckoSession.ProgressDelegate {
+             return object : GeckoSession.ProgressDelegate {
+-                override fun onProgressChange(session: GeckoSession?, progress: Int) {
++                override fun onProgressChange(session: GeckoSession, progress: Int) {
+                     if (progress == PROGRESS_100) {
+                         if (UrlUtils.isLocalizedContent(url)) {
+                             // When the url is a localized content, then the page is secure
+@@ -495,7 +506,7 @@ class GeckoWebViewProvider : IWebViewProvider {
+                 }
+ 
+                 override fun onLoadError(
+-                    session: GeckoSession?,
++                    session: GeckoSession,
+                     uri: String?,
+                     webRequestError: WebRequestError
+                 ): GeckoResult<String> {
+@@ -516,7 +527,7 @@ class GeckoWebViewProvider : IWebViewProvider {
+                     throw IllegalStateException()
+                 }
+ 
+-                override fun onLocationChange(session: GeckoSession, url: String) {
++                override fun onLocationChange(session: GeckoSession, url: String?) {
+                     var desiredUrl = url
+                     // Save internal data: urls we should override to present focus:about, focus:rights
+                     if (isLoadingInternalUrl) {
+@@ -536,7 +547,7 @@ class GeckoWebViewProvider : IWebViewProvider {
+                         desiredUrl = LocalizedContent.URL_RIGHTS
+                     }
+ 
+-                    currentUrl = desiredUrl
++                    currentUrl = desiredUrl!!
+                     callback?.onURLChanged(desiredUrl)
+                 }
+ 
+@@ -550,9 +561,11 @@ class GeckoWebViewProvider : IWebViewProvider {
+             }
+         }
+ 
+-        private fun createTrackingProtectionDelegate(): GeckoSession.TrackingProtectionDelegate {
+-            return GeckoSession.TrackingProtectionDelegate { _, _, _ ->
+-                callback?.countBlockedTracker()
++        private fun createTrackingProtectionDelegate(): ContentBlocking.Delegate {
++            return object : ContentBlocking.Delegate {
++                override fun onContentBlocked(session: GeckoSession, event: ContentBlocking.BlockEvent) {
++                    callback?.countBlockedTracker()
++                }
+             }
+         }
+ 
+diff --git a/focus-android/build.gradle b/focus-android/build.gradle
+index 127c14b71f3f..07747be8294a 100644
+--- a/focus-android/build.gradle
++++ b/focus-android/build.gradle
+@@ -6,10 +6,10 @@ buildscript {
+     ext.espresso_version = '3.0.1'
+     ext.kotlin_version = '1.3.0'
+     ext.coroutines_version = '1.0.1'
+-    ext.geckoview_revision = '01f0896a142d0f6e19cae9e1075439c0e05f5bba'
+-    ext.geckoview_version = '65.0.20190125143011' // GV 65 Rel Branch 1.20.2019
++    ext.geckoview_revision = '9f56254cb36b05beeb9d7ecc233496eefb857e13'
++    ext.geckoview_version = '68.0.20190401094905' // GV 65 Rel Branch 1.20.2019
+     ext.spotbugs_version = '3.1.4'
+-    ext.mozilla_components_version = '0.32.1'
++    ext.mozilla_components_version = '0.49.0'
+ 
+     repositories {
+         google()
+diff --git a/focus-android/gradle/wrapper/gradle-wrapper.properties b/focus-android/gradle/wrapper/gradle-wrapper.properties
+index 16d28051c9c4..35589cb6638f 100644
+--- a/focus-android/gradle/wrapper/gradle-wrapper.properties
++++ b/focus-android/gradle/wrapper/gradle-wrapper.properties
+@@ -1,5 +1,6 @@
++#Mon Apr 08 20:29:53 CDT 2019
+ distributionBase=GRADLE_USER_HOME
+ distributionPath=wrapper/dists
+-distributionUrl=https\://services.gradle.org/distributions/gradle-4.7-bin.zip
+ zipStoreBase=GRADLE_USER_HOME
+ zipStorePath=wrapper/dists
++distributionUrl=https\://services.gradle.org/distributions/gradle-4.7-all.zip

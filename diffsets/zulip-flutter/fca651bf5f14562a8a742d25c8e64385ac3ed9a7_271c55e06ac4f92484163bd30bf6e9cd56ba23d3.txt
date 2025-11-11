@@ -1,0 +1,189 @@
+diff --git a/lib/widgets/message_list.dart b/lib/widgets/message_list.dart
+index c204b3fa2b..90a0762d34 100644
+--- a/lib/widgets/message_list.dart
++++ b/lib/widgets/message_list.dart
+@@ -580,11 +580,20 @@ class _MessageListState extends State<MessageList> with PerAccountStoreAwareStat
+   }
+ 
+   Widget _buildListView(BuildContext context) {
+-    final numItems = model!.items.length;
+     const centerSliverKey = ValueKey('center sliver');
+     final zulipLocalizations = ZulipLocalizations.of(context);
+ 
+-    Widget sliver = SliverStickyHeaderList(
++    // The list has two slivers: a top sliver growing upward,
++    // and a bottom sliver growing downward.
++    // Each sliver has some of the items from `model!.items`.
++    const maxBottomItems = 1;
++    final totalItems = model!.items.length;
++    final bottomItems = totalItems <= maxBottomItems ? totalItems : maxBottomItems;
++    final topItems = totalItems - bottomItems;
++
++    // The top sliver has its child 0 as the item just before the
++    // sliver boundary, child 1 as the item before that, and so on.
++    final topSliver = SliverStickyHeaderList(
+       headerPlacement: HeaderPlacement.scrollingStart,
+       delegate: SliverChildBuilderDelegate(
+         // To preserve state across rebuilds for individual [MessageItem]
+@@ -606,20 +615,59 @@ class _MessageListState extends State<MessageList> with PerAccountStoreAwareStat
+           final messageId = (key as ValueKey<int>).value;
+           final itemIndex = model!.findItemWithMessageId(messageId);
+           if (itemIndex == -1) return null;
+-          final childIndex = numItems - 1 - (itemIndex - 3);
++          final childIndex = totalItems - 1 - (itemIndex + bottomItems);
++          if (childIndex < 0) return null;
+           return childIndex;
+         },
+-        childCount: numItems + 3,
++        childCount: topItems,
++        (context, childIndex) {
++          final itemIndex = totalItems - 1 - (childIndex + bottomItems);
++          final data = model!.items[itemIndex];
++          final item = _buildItem(zulipLocalizations, data);
++          return item;
++        }));
++
++    // The bottom sliver has its child 0 as the item just after the
++    // sliver boundary (just after child 0 of the top sliver),
++    // its child 1 as the next item after that, and so on.
++    Widget bottomSliver = SliverStickyHeaderList(
++      key: centerSliverKey,
++      headerPlacement: HeaderPlacement.scrollingStart,
++      delegate: SliverChildBuilderDelegate(
++        // To preserve state across rebuilds for individual [MessageItem]
++        // widgets as the size of [MessageListView.items] changes we need
++        // to match old widgets by their key to their new position in
++        // the list.
++        //
++        // The keys are of type [ValueKey] with a value of [Message.id]
++        // and here we use a O(log n) binary search method. This could
++        // be improved but for now it only triggers for materialized
++        // widgets. As a simple test, flinging through All Messages in
++        // CZO on a Pixel 5, this only runs about 10 times per rebuild
++        // and the timing for each call is <100 microseconds.
++        //
++        // Non-message items (e.g., start and end markers) that do not
++        // have state that needs to be preserved have not been given keys
++        // and will not trigger this callback.
++        findChildIndexCallback: (Key key) {
++          final messageId = (key as ValueKey<int>).value;
++          final itemIndex = model!.findItemWithMessageId(messageId);
++          if (itemIndex == -1) return null;
++          final childIndex = itemIndex - topItems;
++          if (childIndex < 0) return null;
++          return childIndex;
++        },
++        childCount: bottomItems + 3,
+         (context, childIndex) {
+           // To reinforce that the end of the feed has been reached:
+           //   https://chat.zulip.org/#narrow/stream/243-mobile-team/topic/flutter.3A.20Mark-as-read/near/1680603
+-          if (childIndex == 0) return const SizedBox(height: 36);
++          if (childIndex == bottomItems + 2) return const SizedBox(height: 36);
+ 
+-          if (childIndex == 1) return MarkAsReadWidget(narrow: widget.narrow);
++          if (childIndex == bottomItems + 1) return MarkAsReadWidget(narrow: widget.narrow);
+ 
+-          if (childIndex == 2) return TypingStatusWidget(narrow: widget.narrow);
++          if (childIndex == bottomItems) return TypingStatusWidget(narrow: widget.narrow);
+ 
+-          final itemIndex = numItems - 1 - (childIndex - 3);
++          final itemIndex = topItems + childIndex;
+           final data = model!.items[itemIndex];
+           return _buildItem(zulipLocalizations, data);
+         }));
+@@ -627,7 +675,7 @@ class _MessageListState extends State<MessageList> with PerAccountStoreAwareStat
+     if (!ComposeBox.hasComposeBox(widget.narrow)) {
+       // TODO(#311) If we have a bottom nav, it will pad the bottom inset,
+       //   and this can be removed; also remove mention in MessageList dartdoc
+-      sliver = SliverSafeArea(sliver: sliver);
++      bottomSliver = SliverSafeArea(key: bottomSliver.key, sliver: bottomSliver);
+     }
+ 
+     return MessageListScrollView(
+@@ -643,17 +691,13 @@ class _MessageListState extends State<MessageList> with PerAccountStoreAwareStat
+       },
+ 
+       controller: scrollController,
+-      semanticChildCount: numItems, // TODO(#537): what's the right value for this?
++      semanticChildCount: totalItems, // TODO(#537): what's the right value for this?
+       center: centerSliverKey,
+       paintOrder: SliverPaintOrder.firstIsTop,
+ 
+       slivers: [
+-        sliver,
+-
+-        // This is a trivial placeholder that occupies no space.  Its purpose is
+-        // to have the key that's passed to [ScrollView.center], and so to cause
+-        // the above [SliverStickyHeaderList] to run from bottom to top.
+-        const SliverToBoxAdapter(key: centerSliverKey),
++        topSliver,
++        bottomSliver,
+       ]);
+   }
+ 
+diff --git a/test/widgets/message_list_test.dart b/test/widgets/message_list_test.dart
+index bf93c1f078..047a036cb5 100644
+--- a/test/widgets/message_list_test.dart
++++ b/test/widgets/message_list_test.dart
+@@ -453,6 +453,31 @@ void main() {
+     });
+   });
+ 
++  group('scroll position', () {
++    // The scrolling behavior is tested in more detail in the tests of
++    // [MessageListScrollView], in scrolling_test.dart .
++
++    testWidgets('sticks to end upon new message', (tester) async {
++      await setupMessageListPage(tester,
++        messages: List.generate(10, (_) => eg.streamMessage(content: '<p>a</p>')));
++      final controller = findMessageListScrollController(tester)!;
++
++      // Starts at end, and with room to scroll up.
++      check(controller.position)
++        ..extentAfter.equals(0)
++        ..extentBefore.isGreaterThan(0);
++      final oldPosition = controller.position.pixels;
++
++      // On new message, position remains at end…
++      await store.addMessage(eg.streamMessage(content: '<p>a</p><p>b</p>'));
++      await tester.pump();
++      check(controller.position)
++        ..extentAfter.equals(0)
++        // … even though that means a bigger number now.
++        ..pixels.isGreaterThan(oldPosition);
++    });
++  });
++
+   group('ScrollToBottomButton interactions', () {
+     bool isButtonVisible(WidgetTester tester) {
+       return tester.any(find.descendant(
+@@ -1490,8 +1515,15 @@ void main() {
+       // as the number of items changes in MessageList. See
+       // `findChildIndexCallback` passed into [SliverStickyHeaderList]
+       // at [_MessageListState._buildListView].
++
++      // TODO(#82): Cut paddingMessage.  It's there to paper over a glitch:
++      //   the _UnreadMarker animation *does* get interrupted in the case where
++      //   the message gets pushed from one sliver to the other.  See:
++      //     https://github.com/zulip/zulip-flutter/pull/1436#issuecomment-2756738779
++      //   That case will no longer exist when #82 is complete.
+       final message = eg.streamMessage(flags: []);
+-      await setupMessageListPage(tester, messages: [message]);
++      final paddingMessage = eg.streamMessage();
++      await setupMessageListPage(tester, messages: [message, paddingMessage]);
+       check(getAnimation(tester, message.id))
+         ..value.equals(1.0)
+         ..status.equals(AnimationStatus.dismissed);
+@@ -1515,10 +1547,11 @@ void main() {
+         ..status.equals(AnimationStatus.forward);
+ 
+       // introduce new message
++      check(find.byType(MessageItem)).findsExactly(2);
+       final newMessage = eg.streamMessage(flags:[MessageFlag.read]);
+       await store.addMessage(newMessage);
+       await tester.pump(); // process handleEvent
+-      check(find.byType(MessageItem).evaluate()).length.equals(2);
++      check(find.byType(MessageItem)).findsExactly(3);
+       check(getAnimation(tester, message.id))
+         ..value.isGreaterThan(0.0)
+         ..value.isLessThan(1.0)

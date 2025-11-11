@@ -1,0 +1,232 @@
+diff --git a/SignalMessaging/Views/ImageEditor/ImageEditorCropViewController.swift b/SignalMessaging/Views/ImageEditor/ImageEditorCropViewController.swift
+index b379ae892e9..3f420ac348a 100644
+--- a/SignalMessaging/Views/ImageEditor/ImageEditorCropViewController.swift
++++ b/SignalMessaging/Views/ImageEditor/ImageEditorCropViewController.swift
+@@ -284,11 +284,13 @@ class ImageEditorCropViewController: OWSViewController {
+ 
+         let pinchGestureRecognizer = ImageEditorPinchGestureRecognizer(target: self, action: #selector(handlePinchGesture(_:)))
+         pinchGestureRecognizer.referenceView = self.clipView
++        pinchGestureRecognizer.delegate = self
+         view.addGestureRecognizer(pinchGestureRecognizer)
+ 
+         let panGestureRecognizer = ImageEditorPanGestureRecognizer(target: self, action: #selector(handlePanGesture(_:)))
+         panGestureRecognizer.maximumNumberOfTouches = 1
+         panGestureRecognizer.referenceView = self.clipView
++        panGestureRecognizer.delegate = self
+         view.addGestureRecognizer(panGestureRecognizer)
+     }
+ 
+@@ -349,7 +351,7 @@ class ImageEditorCropViewController: OWSViewController {
+             updateTransform(ImageEditorTransform(outputSizePixels: gestureStartTransform.outputSizePixels,
+                                              unitTranslation: newUnitTranslation,
+                                              rotationRadians: newRotationRadians,
+-                                             scaling: newScaling).normalize())
++                                             scaling: newScaling).normalize(srcImageSizePixels: model.srcImageSizePixels))
+         default:
+             break
+         }
+@@ -521,7 +523,7 @@ class ImageEditorCropViewController: OWSViewController {
+         updateTransform(ImageEditorTransform(outputSizePixels: croppedOutputSizePixels,
+                                               unitTranslation: unitTranslation,
+                                               rotationRadians: transform.rotationRadians,
+-                                              scaling: scaling).normalize())
++                                              scaling: scaling).normalize(srcImageSizePixels: model.srcImageSizePixels))
+     }
+ 
+     private func handleNormalPanGesture(_ gestureRecognizer: ImageEditorPanGestureRecognizer) {
+@@ -545,7 +547,7 @@ class ImageEditorCropViewController: OWSViewController {
+         updateTransform(ImageEditorTransform(outputSizePixels: gestureStartTransform.outputSizePixels,
+                                          unitTranslation: newUnitTranslation,
+                                          rotationRadians: gestureStartTransform.rotationRadians,
+-                                         scaling: gestureStartTransform.scaling).normalize())
++                                         scaling: gestureStartTransform.scaling).normalize(srcImageSizePixels: model.srcImageSizePixels))
+     }
+ 
+     private func cropRegion(forGestureRecognizer gestureRecognizer: ImageEditorPanGestureRecognizer) -> CropRegion? {
+@@ -622,7 +624,7 @@ class ImageEditorCropViewController: OWSViewController {
+         updateTransform(ImageEditorTransform(outputSizePixels: outputSizePixels,
+                                          unitTranslation: unitTranslation,
+                                          rotationRadians: rotationRadians,
+-                                         scaling: scaling).normalize())
++                                         scaling: scaling).normalize(srcImageSizePixels: model.srcImageSizePixels))
+     }
+ 
+     @objc public func zoom2xButtonPressed() {
+@@ -633,10 +635,24 @@ class ImageEditorCropViewController: OWSViewController {
+         updateTransform(ImageEditorTransform(outputSizePixels: outputSizePixels,
+                                          unitTranslation: unitTranslation,
+                                          rotationRadians: rotationRadians,
+-                                         scaling: scaling).normalize())
++                                         scaling: scaling).normalize(srcImageSizePixels: model.srcImageSizePixels))
+     }
+ 
+     @objc public func resetButtonPressed() {
+         updateTransform(ImageEditorTransform.defaultTransform(srcImageSizePixels: model.srcImageSizePixels))
+     }
+ }
++
++// MARK: -
++
++extension ImageEditorCropViewController: UIGestureRecognizerDelegate {
++
++    @objc public func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
++        // Until the GR recognizes, it should only see touches that start within the content.
++        guard gestureRecognizer.state == .possible else {
++            return true
++        }
++        let location = touch.location(in: clipView)
++        return clipView.bounds.contains(location)
++    }
++}
+diff --git a/SignalMessaging/Views/ImageEditor/ImageEditorModel.swift b/SignalMessaging/Views/ImageEditor/ImageEditorModel.swift
+index c544d26ba11..29b54540070 100644
+--- a/SignalMessaging/Views/ImageEditor/ImageEditorModel.swift
++++ b/SignalMessaging/Views/ImageEditor/ImageEditorModel.swift
+@@ -78,7 +78,7 @@ public class ImageEditorTransform: NSObject {
+         return ImageEditorTransform(outputSizePixels: srcImageSizePixels,
+                                     unitTranslation: .zero,
+                                     rotationRadians: 0.0,
+-                                    scaling: 1.0).normalize()
++                                    scaling: 1.0).normalize(srcImageSizePixels: srcImageSizePixels)
+     }
+ 
+     public func affineTransform(viewSize: CGSize) -> CGAffineTransform {
+@@ -92,16 +92,91 @@ public class ImageEditorTransform: NSObject {
+         return transform
+     }
+ 
+-    public func normalize() -> ImageEditorTransform {
+-        // TODO: Normalize translation.
+-//        public let unitTranslation: CGPoint
+-
+-        // We need to ensure that 
++    public func normalize(srcImageSizePixels: CGSize) -> ImageEditorTransform {
++        // Normalize scaling.
++        // The "src/background" image is rendered at a size that will fill
++        // the canvas bounds if scaling = 1.0 and translation = .zero.
++        // Therefore, any scaling >= 1.0 is valid.
+         let minScaling: CGFloat = 1.0
+         let scaling = max(minScaling, self.scaling)
+ 
+         // We don't need to normalize rotation.
+ 
++        // Normalize translation.
++        //
++        // This is decidedly non-trivial because of the way that
++        // scaling, rotation and translation combine.  We need to
++        // guarantee that the image _always_ fills the canvas
++        // bounds.  So want to clamp the translation such that the
++        // image can be moved _exactly_ to the edge of the canvas
++        // and no further in a way that reflects the current
++        // crop, scaling and rotation.
++
++        // Normalize translation, Step 1:
++        //
++        // We project the viewport onto the canvas to determine
++        // its bounding box.
++        let viewBounds = CGRect(origin: .zero, size: self.outputSizePixels)
++        // This "naive" transform represents the proposed transform
++        // with no translation.
++        let naiveTransform = ImageEditorTransform(outputSizePixels: outputSizePixels,
++                                                  unitTranslation: .zero,
++                                                  rotationRadians: rotationRadians,
++                                                  scaling: scaling)
++        let naiveAffineTransform = naiveTransform.affineTransform(viewSize: viewBounds.size)
++        var naiveViewportMinCanvas = CGPoint.zero
++        var naiveViewportMaxCanvas = CGPoint.zero
++        // Find the "naive" bounding box of the viewport on the canvas
++        // by projects its corners from view coordinates to canvas
++        // coordinates.
++        //
++        // Due to symmetry, it should be sufficient to project 2 corners
++        // but we do all four corners for safety.
++        for viewCorner in [
++            viewBounds.topLeft,
++            viewBounds.topRight,
++            viewBounds.bottomLeft,
++            viewBounds.bottomRight
++            ] {
++                let naiveViewCornerInCanvas = viewCorner.minus(viewBounds.center).applyingInverse(naiveAffineTransform).plus(viewBounds.center)
++                naiveViewportMinCanvas = naiveViewportMinCanvas.min(naiveViewCornerInCanvas)
++                naiveViewportMaxCanvas = naiveViewportMaxCanvas.max(naiveViewCornerInCanvas)
++        }
++        let naiveViewportSizeCanvas: CGPoint = naiveViewportMaxCanvas.minus(naiveViewportMinCanvas)
++
++        // Normalize translation, Step 2:
++        //
++        // Now determine the "naive" image frame on the canvas.
++        let naiveImageFrameCanvas = ImageEditorCanvasView.imageFrame(forViewSize: viewBounds.size, imageSize: srcImageSizePixels, transform: naiveTransform)
++        let naiveImageSizeCanvas = CGPoint(x: naiveImageFrameCanvas.width, y: naiveImageFrameCanvas.height)
++
++        // Normalize translation, Step 3:
++        //
++        // The min/max translation can now by computed by diffing
++        // the size of the bounding box of the naive viewport and
++        // the size of the image on canvas.
++        let maxTranslationCanvas = naiveImageSizeCanvas.minus(naiveViewportSizeCanvas).times(0.5).max(.zero)
++
++        // Normalize translation, Step 4:
++        //
++        // Clamp the proposed translation to the "max translation"
++        // from the last step.
++        //
++        // This is subtle.  We want to clamp in canvas coordinates
++        // since the translation is specified in "unit canvas"
++        // coordinates.  However, because the translation is
++        // applied in SRT order (scale-rotate-transform), it
++        // effectively operates in view coordinates since it is
++        // applied last.  So we project it from view coordinates
++        // to canvas coordinates, clamp it, then project it back
++        // into unit view coordinates.
++        let translationInView = self.unitTranslation.fromUnitCoordinates(viewBounds: viewBounds)
++        let translationInCanvas = translationInView.applyingInverse(naiveAffineTransform)
++        // Clamp the translation to +/- maxTranslationCanvasUnit.
++        let clampedTranslationInCanvas = translationInCanvas.min(maxTranslationCanvas).max(maxTranslationCanvas.inverse())
++        let clampedTranslationInView = clampedTranslationInCanvas.applying(naiveAffineTransform)
++        let unitTranslation = clampedTranslationInView.toUnitCoordinates(viewBounds: viewBounds, shouldClamp: false)
++
+         return ImageEditorTransform(outputSizePixels: outputSizePixels,
+                                     unitTranslation: unitTranslation,
+                                     rotationRadians: rotationRadians,
+diff --git a/SignalMessaging/categories/UIView+OWS.swift b/SignalMessaging/categories/UIView+OWS.swift
+index 3a7fa6ca9c6..47f6bbfbb3d 100644
+--- a/SignalMessaging/categories/UIView+OWS.swift
++++ b/SignalMessaging/categories/UIView+OWS.swift
+@@ -170,6 +170,22 @@ public extension CGPoint {
+         return CGPointSubtract(self, value)
+     }
+ 
++    public func times(_ value: CGFloat) -> CGPoint {
++        return CGPoint(x: x * value, y: y * value)
++    }
++
++    public func min(_ value: CGPoint) -> CGPoint {
++        // We use "Swift" to disambiguate the global function min() from this method.
++        return CGPoint(x: Swift.min(x, value.x),
++                       y: Swift.min(y, value.y))
++    }
++
++    public func max(_ value: CGPoint) -> CGPoint {
++        // We use "Swift" to disambiguate the global function max() from this method.
++        return CGPoint(x: Swift.max(x, value.x),
++                       y: Swift.max(y, value.y))
++    }
++
+     public static let unit: CGPoint = CGPoint(x: 1.0, y: 1.0)
+ 
+     public static let unitMidpoint: CGPoint = CGPoint(x: 0.5, y: 0.5)
+@@ -188,6 +204,14 @@ public extension CGRect {
+         return origin
+     }
+ 
++    public var topRight: CGPoint {
++        return CGPoint(x: maxX, y: 0)
++    }
++
++    public var bottomLeft: CGPoint {
++        return CGPoint(x: 0, y: maxY)
++    }
++
+     public var bottomRight: CGPoint {
+         return CGPoint(x: maxX, y: maxY)
+     }

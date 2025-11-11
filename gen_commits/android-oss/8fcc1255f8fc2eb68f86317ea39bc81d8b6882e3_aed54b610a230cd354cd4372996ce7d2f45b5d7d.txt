@@ -1,0 +1,920 @@
+diff --git a/app/src/main/java/com/kickstarter/services/KSApolloClientV2.kt b/app/src/main/java/com/kickstarter/services/KSApolloClientV2.kt
+index db5e707e55..f9ae36d613 100644
+--- a/app/src/main/java/com/kickstarter/services/KSApolloClientV2.kt
++++ b/app/src/main/java/com/kickstarter/services/KSApolloClientV2.kt
+@@ -44,6 +44,7 @@ import com.apollographql.apollo.ApolloCall
+ import com.apollographql.apollo.ApolloClient
+ import com.apollographql.apollo.api.Response
+ import com.apollographql.apollo.exception.ApolloException
++import com.google.android.gms.common.util.Base64Utils
+ import com.google.gson.Gson
+ import com.kickstarter.libs.utils.extensions.isNotNull
+ import com.kickstarter.models.Backing
+@@ -93,6 +94,7 @@ import type.CurrencyCode
+ import type.NonDeprecatedFlaggingKind
+ import type.PaymentTypes
+ import type.StripeIntentContextTypes
++import java.nio.charset.Charset
+ 
+ interface ApolloClientTypeV2 {
+     fun getProject(project: Project): Observable<Project>
+@@ -1570,7 +1572,7 @@ class KSApolloClientV2(val service: ApolloClient, val gson: Gson) : ApolloClient
+ 
+             this.service.mutate(
+                 CompleteOnSessionCheckoutMutation.builder()
+-                    .checkoutId(checkoutId)
++                    .checkoutId(Base64Utils.encodeUrlSafe(("Checkout-$checkoutId").toByteArray(Charset.defaultCharset())))
+                     .paymentIntentClientSecret(paymentIntentClientSecret)
+                     .paymentSourceId(paymentSourceId)
+                     .build()
+diff --git a/app/src/main/java/com/kickstarter/ui/activities/ProjectPageActivity.kt b/app/src/main/java/com/kickstarter/ui/activities/ProjectPageActivity.kt
+index 3ae0bc563e..2aa051f7bd 100644
+--- a/app/src/main/java/com/kickstarter/ui/activities/ProjectPageActivity.kt
++++ b/app/src/main/java/com/kickstarter/ui/activities/ProjectPageActivity.kt
+@@ -83,6 +83,7 @@ import com.kickstarter.ui.fragments.RewardsFragment
+ import com.kickstarter.viewmodels.projectpage.AddOnsViewModel
+ import com.kickstarter.viewmodels.projectpage.CheckoutFlowViewModel
+ import com.kickstarter.viewmodels.projectpage.ConfirmDetailsViewModel
++import com.kickstarter.viewmodels.projectpage.LatePledgeCheckoutViewModel
+ import com.kickstarter.viewmodels.projectpage.PagerTabConfig
+ import com.kickstarter.viewmodels.projectpage.ProjectPageViewModel
+ import com.kickstarter.viewmodels.projectpage.RewardsSelectionViewModel
+@@ -111,6 +112,9 @@ class ProjectPageActivity :
+     private lateinit var confirmDetailsViewModelFactory: ConfirmDetailsViewModel.Factory
+     private val confirmDetailsViewModel: ConfirmDetailsViewModel by viewModels { confirmDetailsViewModelFactory }
+ 
++    private lateinit var latePledgeCheckoutViewModelFactory: LatePledgeCheckoutViewModel.Factory
++    private val latePledgeCheckoutViewModel: LatePledgeCheckoutViewModel by viewModels { latePledgeCheckoutViewModelFactory }
++
+     private lateinit var addOnsViewModelFactory: AddOnsViewModel.Factory
+     private val addOnsViewModel: AddOnsViewModel by viewModels { addOnsViewModelFactory }
+ 
+@@ -151,6 +155,7 @@ class ProjectPageActivity :
+             checkoutViewModelFactory = CheckoutFlowViewModel.Factory(env)
+             confirmDetailsViewModelFactory = ConfirmDetailsViewModel.Factory(env)
+             addOnsViewModelFactory = AddOnsViewModel.Factory(env)
++            latePledgeCheckoutViewModelFactory = LatePledgeCheckoutViewModel.Factory(env)
+             env
+         }
+ 
+@@ -512,8 +517,14 @@ class ProjectPageActivity :
+                         if (checkoutPayment.id != 0L) checkoutFlowViewModel.onConfirmDetailsContinueClicked {
+                             startLoginToutActivity()
+                         }
++                        latePledgeCheckoutViewModel.provideCheckoutId(checkoutPayment.id)
+                     }
+ 
++                    val latePledgeCheckoutUIState by latePledgeCheckoutViewModel.latePledgeCheckoutUIState.collectAsStateWithLifecycle()
++
++                    val userStoredCards = latePledgeCheckoutUIState.storeCards
++                    val userEmail = latePledgeCheckoutUIState.userEmail
++
+                     val pagerState = rememberPagerState(initialPage = 0, pageCount = { 4 })
+ 
+                     this@ProjectPageActivity.onBackPressedDispatcher.addCallback {
+@@ -594,9 +605,16 @@ class ProjectPageActivity :
+                                 }
+                             }
+                         },
++                        storedCards = userStoredCards,
++                        userEmail = userEmail,
+                         onBonusSupportMinusClicked = { confirmDetailsViewModel.decrementBonusSupport() },
+                         onBonusSupportPlusClicked = { confirmDetailsViewModel.incrementBonusSupport() },
+-                        selectedAddOnsMap = selectedAddOnsMap
++                        selectedAddOnsMap = selectedAddOnsMap,
++                        onPledgeCtaClicked = { selectedCard ->
++                            latePledgeCheckoutViewModel.onPledgeButtonClicked(selectedCard = selectedCard, project = projectData.project(), totalAmount = totalAmount)
++                        },
++                        onAddPaymentMethodClicked = {
++                        }
+                     )
+                 }
+             }
+diff --git a/app/src/main/java/com/kickstarter/ui/activities/compose/projectpage/CheckoutScreen.kt b/app/src/main/java/com/kickstarter/ui/activities/compose/projectpage/CheckoutScreen.kt
+index 5ce5ffd08e..f2524adca8 100644
+--- a/app/src/main/java/com/kickstarter/ui/activities/compose/projectpage/CheckoutScreen.kt
++++ b/app/src/main/java/com/kickstarter/ui/activities/compose/projectpage/CheckoutScreen.kt
+@@ -81,7 +81,6 @@ import java.util.Locale
+ fun CheckoutScreenPreview() {
+     KSTheme {
+         CheckoutScreen(
+-            isCTAButtonEnabled = true,
+             rewardsList = (1..6).map {
+                 Pair("Cool Item $it", "$20")
+             },
+@@ -109,6 +108,7 @@ fun CheckoutScreenPreview() {
+                 .build(),
+             email = "example@example.com",
+             pledgeReason = PledgeReason.PLEDGE,
++            rewardsHaveShippables = true,
+             onPledgeCtaClicked = { },
+             newPaymentMethodClicked = { }
+         )
+@@ -117,8 +117,7 @@ fun CheckoutScreenPreview() {
+ 
+ @Composable
+ fun CheckoutScreen(
+-    storedCards: List<StoredCard>? = null,
+-    isCTAButtonEnabled: Boolean,
++    storedCards: List<StoredCard> = listOf(),
+     environment: Environment,
+     selectedReward: Reward? = null,
+     project: Project,
+@@ -129,11 +128,21 @@ fun CheckoutScreen(
+     pledgeReason: PledgeReason,
+     totalAmount: Double,
+     currentShippingRule: ShippingRule,
+-    totalAmountConverted: Double = 0.0,
+     totalBonusSupport: Double = 0.0,
+-    onPledgeCtaClicked: () -> Unit,
++    rewardsHaveShippables: Boolean,
++    onPledgeCtaClicked: (selectedCard: StoredCard?) -> Unit,
+     newPaymentMethodClicked: () -> Unit
+ ) {
++    var (selectedOption, onOptionSelected) = remember {
++        mutableStateOf(
++            storedCards.firstOrNull {
++                project.acceptedCardType(
++                    it.type()
++                )
++            }
++        )
++    }
++
+     Scaffold(
+         backgroundColor = colors.backgroundAccentGraySubtle,
+         modifier = Modifier
+@@ -154,21 +163,32 @@ fun CheckoutScreen(
+                     Column(
+                         modifier = Modifier
+                             .background(colors.kds_white)
+-                            .padding(bottom = dimensions.paddingMediumLarge, start = dimensions.paddingMediumLarge, end = dimensions.paddingMediumLarge, top = dimensions.paddingMediumLarge)
++                            .padding(
++                                bottom = dimensions.paddingMediumLarge,
++                                start = dimensions.paddingMediumLarge,
++                                end = dimensions.paddingMediumLarge,
++                                top = dimensions.paddingMediumLarge
++                            )
+                     ) {
+ 
+                         KSPrimaryGreenButton(
+                             modifier = Modifier
+                                 .padding(bottom = dimensions.paddingMediumSmall)
+                                 .fillMaxWidth(),
+-                            onClickAction = onPledgeCtaClicked,
+-                            isEnabled = !storedCards.isNullOrEmpty() && isCTAButtonEnabled, // feel free to remove one of these, just wanted to give the option of passing in the value or setting it here based on the information we have
+-                            text = if (pledgeReason == PledgeReason.PLEDGE) stringResource(id = R.string.Pledge) else stringResource(id = R.string.Confirm)
++                            onClickAction = { onPledgeCtaClicked(selectedOption) },
++                            isEnabled = project.acceptedCardType(selectedOption?.type()) || selectedOption?.isFromPaymentSheet() ?: false,
++                            text = if (pledgeReason == PledgeReason.PLEDGE) stringResource(id = R.string.Pledge) else stringResource(
++                                id = R.string.Confirm
++                            )
+                         )
+ 
+                         val formattedEmailDisclaimerString = ksString?.let {
+                             email?.let { email ->
+-                                ksString.format(stringResource(id = R.string.Your_payment_method_will_be_charged_immediately), "user_email", email)
++                                ksString.format(
++                                    stringResource(id = R.string.Your_payment_method_will_be_charged_immediately),
++                                    "user_email",
++                                    email
++                                )
+                             }
+                         }
+ 
+@@ -201,28 +221,45 @@ fun CheckoutScreen(
+             ).toString()
+         } ?: ""
+ 
+-        val totalAmountConvertedString = if (totalAmountConverted.equals(0.0)) "" else
+-            environment.ksCurrency()?.format(
+-                totalAmountConverted,
++        val totalAmountConvertedString = environment.ksCurrency()?.formatWithUserPreference(
++            totalAmount,
++            project,
++            RoundingMode.UP,
++            2
++        ) ?: ""
++
++        val shippingAmountString = environment.ksCurrency()?.let {
++            RewardViewUtils.styleCurrency(
++                shippingAmount,
+                 project,
+-                true,
+-                RoundingMode.HALF_UP,
+-                true
+-            ) ?: ""
++                it
++            ).toString()
++        } ?: ""
+ 
+-        val aboutTotalString = if (totalAmountConvertedString.isEmpty()) "" else environment.ksString()?.format(
+-            stringResource(id = R.string.About_reward_amount),
+-            "reward_amount",
+-            totalAmountConvertedString
+-        ) ?: "About $totalAmountConvertedString"
++        val initialBonusSupportString = environment.ksCurrency()?.let {
++            RewardViewUtils.styleCurrency(
++                0.0,
++                project,
++                it
++            ).toString()
++        } ?: ""
+ 
+-        val shippingLocation = currentShippingRule.location()?.displayableName() ?: ""
++        val totalBonusSupportString = environment.ksCurrency()?.let {
++            RewardViewUtils.styleCurrency(
++                totalBonusSupport,
++                project,
++                it
++            ).toString()
++        } ?: ""
++
++        val aboutTotalString =
++            if (totalAmountConvertedString.isEmpty()) "" else environment.ksString()?.format(
++                stringResource(id = R.string.About_reward_amount),
++                "reward_amount",
++                totalAmountConvertedString
++            ) ?: "About $totalAmountConvertedString"
+ 
+-        val shippingLocationString = environment.ksString()?.format(
+-            stringResource(id = R.string.Shipping_to_country),
+-            "country",
+-            shippingLocation
+-        ) ?: "Shipping: $shippingLocation"
++        val shippingLocation = currentShippingRule.location()?.displayableName() ?: ""
+ 
+         val deliveryDateString = if (selectedReward?.estimatedDeliveryOn().isNotNull()) {
+             stringResource(id = R.string.Estimated_delivery) + " " + DateTimeUtils.estimatedDeliveryOn(
+@@ -240,157 +277,175 @@ fun CheckoutScreen(
+         ) {
+ 
+             Text(
+-                modifier = Modifier.padding(start = dimensions.paddingMediumLarge, top = dimensions.paddingMediumLarge),
++                modifier = Modifier.padding(
++                    start = dimensions.paddingMediumLarge,
++                    top = dimensions.paddingMediumLarge
++                ),
+                 text = stringResource(id = R.string.Checkout),
+                 style = typography.title3Bold,
+                 color = colors.kds_black,
+             )
+             Spacer(modifier = Modifier.height(dimensions.paddingMediumSmall))
+ 
+-            if (!storedCards.isNullOrEmpty()) {
+-                var (selectedOption, onOptionSelected) = remember { mutableStateOf(storedCards.firstOrNull { project.acceptedCardType(it.type()) }) }
+-                storedCards.forEach {
+-                    val isAvailable = project.acceptedCardType(it.type()) || it.isFromPaymentSheet()
+-                    Card(
+-                        backgroundColor = colors.kds_white,
+-                        modifier = Modifier
+-                            .padding(start = dimensions.paddingMedium, end = dimensions.paddingMedium)
+-                            .fillMaxWidth()
+-                            .selectableGroup()
+-                            .selectable(
+-                                enabled = isAvailable,
+-                                selected = it == selectedOption,
+-                                onClick = {
+-                                    onOptionSelected(it)
+-                                }
+-                            )
+-                    ) {
+-                        Column {
+-                            Row(
+-                                verticalAlignment = Alignment.CenterVertically,
+-                                modifier = Modifier
+-                                    .padding(
+-                                        top = dimensions.paddingSmall,
+-                                        bottom = dimensions.paddingSmall
+-                                    )
+-                            ) {
+-
+-                                KSRadioButton(
+-                                    selected = it == selectedOption, onClick = { onOptionSelected(it) }, enabled = isAvailable
+-                                )
+-
+-                                KSCardElement(card = it, environment.ksString(), isAvailable)
+-                            }
+-
+-                            if (!isAvailable) {
+-                                Text(
+-                                    modifier = Modifier.padding(start = dimensions.paddingDoubleLarge, end = dimensions.paddingMediumLarge, bottom = dimensions.paddingSmall),
+-                                    style = typography.caption1Medium,
+-                                    color = colors.kds_alert,
+-                                    text = stringResource(id = R.string.This_project_has_a_set_currency_that_cant_process_this_option)
+-                                )
+-                            }
+-                        }
+-                    }
+-                    Spacer(modifier = Modifier.height(dimensions.paddingXSmall))
+-                }
+-
++            storedCards.forEach {
++                val isAvailable = project.acceptedCardType(it.type()) || it.isFromPaymentSheet()
+                 Card(
+                     backgroundColor = colors.kds_white,
+                     modifier = Modifier
+                         .padding(start = dimensions.paddingMedium, end = dimensions.paddingMedium)
+-                        .clickable { newPaymentMethodClicked.invoke() }
+                         .fillMaxWidth()
+-                ) {
+-                    Row(horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = dimensions.paddingMedium, bottom = dimensions.paddingMedium)) {
+-                        Icon(
+-                            painter = painterResource(id = R.drawable.ic_add_rounded),
+-                            contentDescription = "",
+-                            tint = colors.textAccentGreen,
+-                            modifier = Modifier.background(color = colors.kds_create_700.copy(alpha = 0.2f), CircleShape)
+-                        )
+-
+-                        Text(
+-                            modifier = Modifier.padding(start = dimensions.paddingSmall),
+-                            color = colors.textAccentGreen,
+-                            style = typography.subheadlineMedium,
+-                            text = stringResource(id = R.string.New_payment_method)
++                        .selectableGroup()
++                        .selectable(
++                            enabled = isAvailable,
++                            selected = it == selectedOption,
++                            onClick = {
++                                onOptionSelected(it)
++                            }
+                         )
+-                    }
+-                }
+-
+-                Spacer(modifier = Modifier.height(dimensions.paddingLarge))
+-
+-                Card(
+-                    modifier = Modifier.padding(start = dimensions.paddingMedium, end = dimensions.paddingMedium),
+-                    shape = RoundedCornerShape(
+-                        bottomStart = dimensions.radiusMediumLarge,
+-                        bottomEnd = dimensions.radiusMediumLarge,
+-                        topStart = dimensions.radiusMediumLarge,
+-                        topEnd = dimensions.radiusMediumLarge
+-                    ),
+-                    backgroundColor = colors.kds_support_200,
+                 ) {
+-                    Row(modifier = Modifier.padding(dimensions.paddingSmall)) {
+-                        Icon(
++                    Column {
++                        Row(
++                            verticalAlignment = Alignment.CenterVertically,
+                             modifier = Modifier
+-                                .padding(start = dimensions.paddingMediumSmall, end = dimensions.paddingLarge)
+-                                .align(Alignment.CenterVertically),
+-                            painter = painterResource(id = R.drawable.ic_not_a_store),
+-                            contentDescription = null,
+-                            tint = colors.textAccentGreen
+-                        )
++                                .padding(
++                                    top = dimensions.paddingSmall,
++                                    bottom = dimensions.paddingSmall
++                                )
++                        ) {
++
++                            KSRadioButton(
++                                selected = it == selectedOption,
++                                onClick = { onOptionSelected(it) },
++                                enabled = isAvailable
++                            )
+ 
+-                        Column {
++                            KSCardElement(card = it, environment.ksString(), isAvailable)
++                        }
+ 
++                        if (!isAvailable) {
+                             Text(
+-                                modifier = Modifier.padding(bottom = dimensions.paddingXSmall, top = dimensions.paddingXSmall),
+-                                text = stringResource(id = R.string.Kickstarter_is_not_a_store), style = typography.body2Medium, color = colors.kds_support_400
+-                            )
+-                            TextWithClickableAccountabilityLink(
+-                                padding = dimensions.paddingXSmall,
+-                                html = stringResource(id = R.string.Its_a_way_to_bring_creative_projects_to_life_Learn_more_about_accountability),
++                                modifier = Modifier.padding(
++                                    start = dimensions.paddingDoubleLarge,
++                                    end = dimensions.paddingMediumLarge,
++                                    bottom = dimensions.paddingSmall
++                                ),
++                                style = typography.caption1Medium,
++                                color = colors.kds_alert,
++                                text = stringResource(id = R.string.This_project_has_a_set_currency_that_cant_process_this_option)
+                             )
+                         }
+                     }
+                 }
++                Spacer(modifier = Modifier.height(dimensions.paddingXSmall))
++            }
++
++            Card(
++                backgroundColor = colors.kds_white,
++                modifier = Modifier
++                    .padding(start = dimensions.paddingMedium, end = dimensions.paddingMedium)
++                    .clickable { newPaymentMethodClicked.invoke() }
++                    .fillMaxWidth()
++            ) {
++                Row(
++                    horizontalArrangement = Arrangement.Center,
++                    verticalAlignment = Alignment.CenterVertically,
++                    modifier = Modifier.padding(
++                        top = dimensions.paddingMedium,
++                        bottom = dimensions.paddingMedium
++                    )
++                ) {
++                    Icon(
++                        painter = painterResource(id = R.drawable.ic_add_rounded),
++                        contentDescription = "",
++                        tint = colors.textAccentGreen,
++                        modifier = Modifier.background(
++                            color = colors.kds_create_700.copy(alpha = 0.2f),
++                            CircleShape
++                        )
++                    )
+ 
+-                Spacer(modifier = Modifier.height(dimensions.paddingMediumSmall))
+-
+-                if (rewardsList.isNotEmpty()) {
+-
+-                    ItemizedRewardListContainer(
+-                        ksString = ksString,
+-                        rewardsList = rewardsList,
+-                        shippingAmount = shippingAmount,
+-                        initialShippingLocation = shippingLocationString,
+-                        totalAmount = totalAmountString,
+-                        totalAmountCurrencyConverted = aboutTotalString,
+-                        initialBonusSupport = "",
+-                        totalBonusSupport = if (totalBonusSupport > 0.0) {
+-                            environment.ksCurrency()?.let { ksCurrency ->
+-                                RewardViewUtils.styleCurrency(
+-                                    totalBonusSupport,
+-                                    project,
+-                                    ksCurrency
+-                                ).toString()
+-                            } ?: ""
+-                        } else "",
+-                        deliveryDateString = deliveryDateString
++                    Text(
++                        modifier = Modifier.padding(start = dimensions.paddingSmall),
++                        color = colors.textAccentGreen,
++                        style = typography.subheadlineMedium,
++                        text = stringResource(id = R.string.New_payment_method)
+                     )
+-                } else {
+-                    ItemizedRewardListContainer(
+-                        totalAmount = totalAmountString,
+-                        totalAmountCurrencyConverted = aboutTotalString,
+-                        rewardsList = (1..1).map {
+-                            Pair(stringResource(id = R.string.Pledge_without_a_reward), totalAmountString)
+-                        },
+-                        initialBonusSupport = "",
+-                        totalBonusSupport = "",
+-                        shippingAmount = shippingAmount
++                }
++            }
++
++            Spacer(modifier = Modifier.height(dimensions.paddingLarge))
++
++            Card(
++                modifier = Modifier.padding(
++                    start = dimensions.paddingMedium,
++                    end = dimensions.paddingMedium
++                ),
++                shape = RoundedCornerShape(
++                    bottomStart = dimensions.radiusMediumLarge,
++                    bottomEnd = dimensions.radiusMediumLarge,
++                    topStart = dimensions.radiusMediumLarge,
++                    topEnd = dimensions.radiusMediumLarge
++                ),
++                backgroundColor = colors.kds_support_200,
++            ) {
++                Row(modifier = Modifier.padding(dimensions.paddingSmall)) {
++                    Icon(
++                        modifier = Modifier
++                            .padding(
++                                start = dimensions.paddingMediumSmall,
++                                end = dimensions.paddingLarge
++                            )
++                            .align(Alignment.CenterVertically),
++                        painter = painterResource(id = R.drawable.ic_not_a_store),
++                        contentDescription = null,
++                        tint = colors.textAccentGreen
+                     )
++
++                    Column {
++
++                        Text(
++                            modifier = Modifier.padding(
++                                bottom = dimensions.paddingXSmall,
++                                top = dimensions.paddingXSmall
++                            ),
++                            text = stringResource(id = R.string.Kickstarter_is_not_a_store),
++                            style = typography.body2Medium,
++                            color = colors.kds_support_400
++                        )
++                        TextWithClickableAccountabilityLink(
++                            padding = dimensions.paddingXSmall,
++                            html = stringResource(id = R.string.Its_a_way_to_bring_creative_projects_to_life_Learn_more_about_accountability),
++                        )
++                    }
+                 }
+             }
++
++            Spacer(modifier = Modifier.height(dimensions.paddingMediumSmall))
++
++            if (rewardsList.isNotEmpty()) {
++
++                ItemizedRewardListContainer(
++                    ksString = ksString,
++                    rewardsList = rewardsList,
++                    shippingAmount = shippingAmount,
++                    shippingAmountString = shippingAmountString,
++                    initialShippingLocation = shippingLocation,
++                    totalAmount = totalAmountString,
++                    totalAmountCurrencyConverted = totalAmountConvertedString,
++                    initialBonusSupport = initialBonusSupportString,
++                    totalBonusSupport = totalBonusSupportString,
++                    deliveryDateString = deliveryDateString,
++                    rewardsHaveShippables = rewardsHaveShippables
++                )
++            } else {
++                ItemizedRewardListContainer(
++                    totalAmount = totalAmountString,
++                    totalAmountCurrencyConverted = totalAmountConvertedString,
++                    initialBonusSupport = initialBonusSupportString,
++                    totalBonusSupport = totalBonusSupportString,
++                    shippingAmount = shippingAmount,
++                )
++            }
+         }
+     }
+ }
+@@ -626,7 +681,10 @@ fun KSCardElement(card: StoredCard, ksString: KSString?, isAvailable: Boolean) {
+                 Text(
+                     maxLines = 1,
+                     overflow = TextOverflow.Ellipsis,
+-                    modifier = Modifier.padding(top = dimensions.paddingXSmall, end = dimensions.paddingMediumLarge),
++                    modifier = Modifier.padding(
++                        top = dimensions.paddingXSmall,
++                        end = dimensions.paddingMediumLarge
++                    ),
+                     style = typography.caption2Medium,
+                     color = if (isAvailable) colors.kds_support_700 else colors.kds_support_400,
+                     text = expirationString
+diff --git a/app/src/main/java/com/kickstarter/ui/activities/compose/projectpage/ConfirmPledgeDetailsScreen.kt b/app/src/main/java/com/kickstarter/ui/activities/compose/projectpage/ConfirmPledgeDetailsScreen.kt
+index 9ec46a4e02..f4a3d9a43e 100644
+--- a/app/src/main/java/com/kickstarter/ui/activities/compose/projectpage/ConfirmPledgeDetailsScreen.kt
++++ b/app/src/main/java/com/kickstarter/ui/activities/compose/projectpage/ConfirmPledgeDetailsScreen.kt
+@@ -372,7 +372,7 @@ fun ConfirmPledgeDetailsScreen(
+                 )
+             }
+ 
+-            if (rewardsList.isNotEmpty() && shippingLocation.isNotEmpty()) {
++            if (rewardsList.isNotEmpty() && shippingLocation.isNotEmpty() && rewardsHaveShippables) {
+                 item {
+                     Column(
+                         modifier = Modifier.padding(
+@@ -486,7 +486,8 @@ fun ConfirmPledgeDetailsScreen(
+                         totalAmountCurrencyConverted = totalAmountConvertedString,
+                         initialBonusSupport = initialBonusSupportString,
+                         totalBonusSupport = totalBonusSupportString,
+-                        deliveryDateString = deliveryDateString
++                        deliveryDateString = deliveryDateString,
++                        rewardsHaveShippables = rewardsHaveShippables
+                     )
+                 }
+             }
+@@ -575,8 +576,8 @@ fun ItemizedRewardListContainer(
+     totalAmountCurrencyConverted: String = "",
+     initialBonusSupport: String,
+     totalBonusSupport: String,
+-    deliveryDateString: String = ""
+-
++    deliveryDateString: String = "",
++    rewardsHaveShippables: Boolean = false
+ ) {
+     Column(
+         modifier = Modifier
+@@ -633,7 +634,7 @@ fun ItemizedRewardListContainer(
+             KSDividerLineGrey()
+         }
+ 
+-        if (shippingAmount > 0 && initialShippingLocation.isNotEmpty()) {
++        if (shippingAmount > 0 && initialShippingLocation.isNotEmpty() && rewardsHaveShippables) {
+             Spacer(modifier = Modifier.height(dimensions.paddingMedium))
+ 
+             Row {
+diff --git a/app/src/main/java/com/kickstarter/ui/activities/compose/projectpage/ProjectPledgeButtonAndFragmentContainer.kt b/app/src/main/java/com/kickstarter/ui/activities/compose/projectpage/ProjectPledgeButtonAndFragmentContainer.kt
+index b0539be6db..5cefd35a83 100644
+--- a/app/src/main/java/com/kickstarter/ui/activities/compose/projectpage/ProjectPledgeButtonAndFragmentContainer.kt
++++ b/app/src/main/java/com/kickstarter/ui/activities/compose/projectpage/ProjectPledgeButtonAndFragmentContainer.kt
+@@ -40,11 +40,13 @@ import com.kickstarter.libs.utils.extensions.isNullOrZero
+ import com.kickstarter.models.Project
+ import com.kickstarter.models.Reward
+ import com.kickstarter.models.ShippingRule
++import com.kickstarter.models.StoredCard
+ import com.kickstarter.ui.compose.designsystem.KSAlertDialog
+ import com.kickstarter.ui.compose.designsystem.KSPrimaryGreenButton
+ import com.kickstarter.ui.compose.designsystem.KSTheme
+ import com.kickstarter.ui.compose.designsystem.KSTheme.colors
+ import com.kickstarter.ui.compose.designsystem.KSTheme.dimensions
++import com.kickstarter.ui.data.PledgeReason
+ import com.kickstarter.ui.toolbars.compose.TopToolBar
+ import kotlinx.coroutines.launch
+ 
+@@ -104,7 +106,11 @@ private fun ProjectPledgeButtonAndContainerPreview() {
+             onConfirmDetailsContinueClicked = {},
+             selectedRewardAndAddOnList = listOf(),
+             onBonusSupportMinusClicked = {},
+-            onBonusSupportPlusClicked = {}
++            onBonusSupportPlusClicked = {},
++            storedCards = listOf(),
++            userEmail = "test@test.test",
++            onPledgeCtaClicked = {},
++            onAddPaymentMethodClicked = {}
+         )
+     }
+ }
+@@ -142,7 +148,11 @@ fun ProjectPledgeButtonAndFragmentContainer(
+     shippingAmount: Double = 0.0,
+     selectedRewardAndAddOnList: List<Reward>,
+     onBonusSupportPlusClicked: () -> Unit,
+-    onBonusSupportMinusClicked: () -> Unit
++    onBonusSupportMinusClicked: () -> Unit,
++    storedCards: List<StoredCard>,
++    userEmail: String,
++    onPledgeCtaClicked: (selectedCard: StoredCard?) -> Unit,
++    onAddPaymentMethodClicked: () -> Unit
+ ) {
+     Column {
+         Surface(
+@@ -295,7 +305,23 @@ fun ProjectPledgeButtonAndFragmentContainer(
+                                 }
+ 
+                                 3 -> {
+-                                    // Pledge page
++                                    CheckoutScreen(
++                                        storedCards = storedCards,
++                                        environment = environment ?: Environment.builder().build(),
++                                        ksString = environment?.ksString(),
++                                        project = project,
++                                        email = userEmail,
++                                        selectedReward = selectedReward,
++                                        rewardsList = getRewardListAndPrices(selectedRewardAndAddOnList, environment, project),
++                                        pledgeReason = PledgeReason.PLEDGE,
++                                        shippingAmount = shippingAmount,
++                                        totalAmount = totalAmount,
++                                        totalBonusSupport = totalBonusSupportAmount,
++                                        currentShippingRule = currentShippingRule,
++                                        rewardsHaveShippables = selectedRewardAndAddOnList.any { RewardUtils.isShippable(it) },
++                                        onPledgeCtaClicked = onPledgeCtaClicked,
++                                        newPaymentMethodClicked = onAddPaymentMethodClicked
++                                    )
+                                 }
+                             }
+                         }
+diff --git a/app/src/main/java/com/kickstarter/viewmodels/projectpage/ConfirmDetailsViewModel.kt b/app/src/main/java/com/kickstarter/viewmodels/projectpage/ConfirmDetailsViewModel.kt
+index 45a5812860..e8c09c7302 100644
+--- a/app/src/main/java/com/kickstarter/viewmodels/projectpage/ConfirmDetailsViewModel.kt
++++ b/app/src/main/java/com/kickstarter/viewmodels/projectpage/ConfirmDetailsViewModel.kt
+@@ -97,14 +97,7 @@ class ConfirmDetailsViewModel(val environment: Environment) : ViewModel() {
+             pledgeReason = pledgeDataAndPledgeReason(projectData, reward).second
+         }
+ 
+-        if (::selectedShippingRule.isInitialized) {
+-            shippingAmount = getShippingAmount(
+-                rule = selectedShippingRule,
+-                reason = pledgeReason,
+-                bShippingAmount = null,
+-                rewards = rewardAndAddOns
+-            )
+-        }
++        updateShippingAmount()
+ 
+         totalAmount = calculateTotal()
+ 
+@@ -129,14 +122,7 @@ class ConfirmDetailsViewModel(val environment: Environment) : ViewModel() {
+ 
+         rewardAndAddOns = rewardsAndAddOns
+ 
+-        if (::selectedShippingRule.isInitialized) {
+-            shippingAmount = getShippingAmount(
+-                rule = selectedShippingRule,
+-                reason = pledgeReason,
+-                bShippingAmount = null,
+-                rewards = rewardAndAddOns
+-            )
+-        }
++        updateShippingAmount()
+ 
+         totalAmount = calculateTotal()
+ 
+@@ -149,10 +135,26 @@ class ConfirmDetailsViewModel(val environment: Environment) : ViewModel() {
+         var total = 0.0
+         total += getRewardsTotalAmount(rewardAndAddOns)
+         total += initialBonusSupport + addedBonusSupport
+-        total += if (RewardUtils.isNoReward(userSelectedReward)) 0.0 else shippingAmount
++        if (::userSelectedReward.isInitialized) {
++            total +=
++                if (RewardUtils.isNoReward(userSelectedReward)) 0.0
++                else if (RewardUtils.isShippable(userSelectedReward)) shippingAmount
++                else 0.0
++        }
+         return total
+     }
+ 
++    private fun updateShippingAmount() {
++        if (::selectedShippingRule.isInitialized) {
++            shippingAmount = getShippingAmount(
++                rule = selectedShippingRule,
++                reason = pledgeReason,
++                bShippingAmount = null,
++                rewards = rewardAndAddOns
++            )
++        } else shippingAmount = 0.0
++    }
++
+     /**
+      *  Calculate the shipping amount in case of shippable reward and reward + AddOns
+      */
+@@ -277,12 +279,8 @@ class ConfirmDetailsViewModel(val environment: Environment) : ViewModel() {
+ 
+     fun provideCurrentShippingRule(shippingRule: ShippingRule) {
+         selectedShippingRule = shippingRule
+-        shippingAmount = getShippingAmount(
+-            rule = selectedShippingRule,
+-            reason = pledgeReason,
+-            bShippingAmount = null,
+-            rewards = rewardAndAddOns
+-        )
++        updateShippingAmount()
++        totalAmount = calculateTotal()
+ 
+         viewModelScope.launch {
+             emitCurrentState()
+diff --git a/app/src/main/java/com/kickstarter/viewmodels/projectpage/LatePledgeCheckoutViewModel.kt b/app/src/main/java/com/kickstarter/viewmodels/projectpage/LatePledgeCheckoutViewModel.kt
+new file mode 100644
+index 0000000000..61cd36ab3d
+--- /dev/null
++++ b/app/src/main/java/com/kickstarter/viewmodels/projectpage/LatePledgeCheckoutViewModel.kt
+@@ -0,0 +1,162 @@
++package com.kickstarter.viewmodels.projectpage
++
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.ViewModelProvider
++import androidx.lifecycle.viewModelScope
++import com.kickstarter.libs.Environment
++import com.kickstarter.libs.utils.extensions.isNotNull
++import com.kickstarter.models.CreatePaymentIntentInput
++import com.kickstarter.models.Project
++import com.kickstarter.models.StoredCard
++import com.stripe.android.Stripe
++import com.stripe.android.confirmPaymentIntent
++import com.stripe.android.model.ConfirmPaymentIntentParams
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.SharingStarted
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.catch
++import kotlinx.coroutines.flow.collect
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.stateIn
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.rx2.asFlow
++
++data class LatePledgeCheckoutUIState(
++    val storeCards: List<StoredCard> = listOf(),
++    val userEmail: String = ""
++)
++
++class LatePledgeCheckoutViewModel(val environment: Environment) : ViewModel() {
++
++    private val apolloClient = requireNotNull(environment.apolloClientV2())
++
++    private var storedCards: List<StoredCard> = listOf()
++    private var userEmail: String = ""
++    private var checkoutId: String? = null
++
++    private var stripe: Stripe = requireNotNull(environment.stripe())
++
++    private var mutableLatePledgeCheckoutUIState = MutableStateFlow(LatePledgeCheckoutUIState())
++    val latePledgeCheckoutUIState: StateFlow<LatePledgeCheckoutUIState>
++        get() = mutableLatePledgeCheckoutUIState
++            .asStateFlow()
++            .stateIn(
++                scope = viewModelScope,
++                started = SharingStarted.WhileSubscribed(),
++                initialValue = LatePledgeCheckoutUIState()
++            )
++
++    init {
++        viewModelScope.launch {
++            environment.currentUserV2()?.observable()?.asFlow()?.map {
++                if (it.isPresent()) {
++                    apolloClient.userPrivacy().asFlow().map { userPrivacy ->
++                        userEmail = userPrivacy.email
++                        mutableLatePledgeCheckoutUIState.emit(
++                            LatePledgeCheckoutUIState(
++                                storeCards = storedCards,
++                                userEmail = userEmail,
++                            )
++                        )
++                    }.catch {
++                        // Some error
++                    }.collect()
++
++                    apolloClient.getStoredCards().asFlow().map { cards ->
++                        storedCards = cards
++                        mutableLatePledgeCheckoutUIState.emit(
++                            LatePledgeCheckoutUIState(
++                                storeCards = storedCards,
++                                userEmail = userEmail,
++                            )
++                        )
++                    }.catch {
++                        // Some error
++                    }.collect()
++                }
++            }?.catch {
++                // Some error
++            }?.collect()
++        }
++    }
++
++    fun provideCheckoutId(checkoutId: Long) {
++        this.checkoutId = checkoutId.toString()
++    }
++
++    fun onPledgeButtonClicked(selectedCard: StoredCard?, project: Project, totalAmount: Double) {
++        viewModelScope.launch {
++            apolloClient.createPaymentIntent(
++                CreatePaymentIntentInput(
++                    project = project,
++                    amount = totalAmount.toString()
++                )
++            ).asFlow().map { clientSecret ->
++                selectedCard?.let {
++                    checkoutId?.let {
++                        validateCheckout(clientSecret = clientSecret, selectedCard = selectedCard)
++                    } ?: run {
++                        // Some error
++                    }
++                } ?: run {
++                    // Some error
++                }
++            }.catch {
++                // Some error
++            }.collect()
++        }
++    }
++
++    private suspend fun validateCheckout(clientSecret: String, selectedCard: StoredCard) {
++        apolloClient.validateCheckout(
++            checkoutId = checkoutId ?: "",
++            paymentIntentClientSecret = clientSecret,
++            paymentSourceId = selectedCard.stripeCardId() ?: ""
++        ).asFlow().map { validation ->
++            if (validation.isValid) {
++                // Validation success, proceed with stripe
++                stripeConfirmPaymentIntent(clientSecret = clientSecret, selectedCard = selectedCard)
++            } else {
++                // User validation.messages for displaying an error
++            }
++        }.catch {
++            // Some error
++        }.collect()
++    }
++
++    private suspend fun stripeConfirmPaymentIntent(clientSecret: String, selectedCard: StoredCard) {
++        val intentParams = ConfirmPaymentIntentParams.createWithPaymentMethodId(
++            clientSecret = clientSecret,
++            paymentMethodId = selectedCard.stripeCardId() ?: ""
++        )
++        val withSDK =
++            intentParams.withShouldUseStripeSdk(shouldUseStripeSdk = true)
++        val paymentIntent = stripe.confirmPaymentIntent(withSDK)
++        if (paymentIntent.lastPaymentError.isNotNull()) {
++            // Display error with lastPaymentError.message
++        } else {
++            // Success, move on
++            completeOnSessionCheckout(clientSecret = clientSecret, selectedCard = selectedCard)
++        }
++    }
++
++    private suspend fun completeOnSessionCheckout(clientSecret: String, selectedCard: StoredCard) {
++        apolloClient.completeOnSessionCheckout(
++            checkoutId = checkoutId ?: "",
++            paymentIntentClientSecret = clientSecret,
++            paymentSourceId = selectedCard.id() ?: ""
++        ).asFlow().map {
++            // Full flow success, show thanks page
++        }.catch {
++            // Some error
++        }.collect()
++    }
++
++    class Factory(private val environment: Environment) :
++        ViewModelProvider.Factory {
++        override fun <T : ViewModel> create(modelClass: Class<T>): T {
++            return LatePledgeCheckoutViewModel(environment) as T
++        }
++    }
++}

@@ -1,0 +1,1047 @@
+diff --git a/focus-android/app/build.gradle b/focus-android/app/build.gradle
+index a4b5b6b45729..c533d028c6f7 100644
+--- a/focus-android/app/build.gradle
++++ b/focus-android/app/build.gradle
+@@ -18,7 +18,7 @@ android {
+         // in order to run UI tests against other build variants than debug in automation.
+         testBuildType project.property("testBuildType")
+     }
+-    
++
+     defaultConfig {
+         applicationId "org.mozilla"
+         minSdkVersion 21
+@@ -219,6 +219,7 @@ dependencies {
+     implementation "org.mozilla.components:feature-search:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:feature-tabs:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:feature-toolbar:${AndroidComponents.VERSION}"
++    implementation "org.mozilla.components:feature-top-sites:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:lib-crash:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:lib-state:${AndroidComponents.VERSION}"
+     implementation "org.mozilla.components:service-glean:${AndroidComponents.VERSION}"
+@@ -251,6 +252,7 @@ dependencies {
+     testRuntimeOnly "org.junit.vintage:junit-vintage-engine:5.3.1"
+     testImplementation Dependencies.testing_robolectric
+     testImplementation Dependencies.testing_mockito
++    testImplementation Dependencies.testing_coroutines
+     testImplementation Dependencies.androidx_arch_core_testing
+     testImplementation "org.mozilla.components:support-test:${AndroidComponents.VERSION}"
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/Components.kt b/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
+index 76540540f278..96c1029dcbff 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
+@@ -32,6 +32,8 @@ import mozilla.components.feature.session.SettingsUseCases
+ import mozilla.components.feature.session.TrackingProtectionUseCases
+ import mozilla.components.feature.tabs.CustomTabsUseCases
+ import mozilla.components.feature.tabs.TabsUseCases
++import mozilla.components.feature.top.sites.PinnedSiteStorage
++import mozilla.components.feature.top.sites.TopSitesUseCases
+ import mozilla.components.feature.webcompat.WebCompatFeature
+ import mozilla.components.feature.webcompat.reporter.WebCompatReporterFeature
+ import mozilla.components.lib.crash.CrashReporter
+@@ -59,6 +61,7 @@ import org.mozilla.focus.state.AppStore
+ import org.mozilla.focus.state.Screen
+ import org.mozilla.focus.telemetry.GleanMetricsService
+ import org.mozilla.focus.telemetry.TelemetryMiddleware
++import org.mozilla.focus.topsites.DefaultTopSitesStorage
+ import org.mozilla.focus.utils.Settings
+ import java.util.Locale
+ 
+@@ -73,7 +76,8 @@ class Components(
+     val appStore: AppStore by lazy {
+         AppStore(
+             AppState(
+-                screen = determineInitialScreen(context)
++                screen = determineInitialScreen(context),
++                topSites = emptyList()
+             )
+         )
+     }
+@@ -169,6 +173,10 @@ class Components(
+     val searchTelemetry: InContentTelemetry by lazy { InContentTelemetry() }
+ 
+     val icons by lazy { BrowserIcons(context, client) }
++
++    val topSitesStorage by lazy { DefaultTopSitesStorage(PinnedSiteStorage(context)) }
++
++    val topSitesUseCases: TopSitesUseCases by lazy { TopSitesUseCases(topSitesStorage) }
+ }
+ 
+ private fun determineInitialScreen(context: Context): Screen {
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/browser/integration/BrowserMenuController.kt b/focus-android/app/src/main/java/org/mozilla/focus/browser/integration/BrowserMenuController.kt
+index 84834b1619e9..db00bd10d9f4 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/browser/integration/BrowserMenuController.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/browser/integration/BrowserMenuController.kt
+@@ -1,9 +1,18 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
+ package org.mozilla.focus.browser.integration
+ 
++import androidx.annotation.VisibleForTesting
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import mozilla.components.browser.state.selector.findTabOrCustomTabOrSelectedTab
++import mozilla.components.browser.state.state.SessionState
++import mozilla.components.browser.state.store.BrowserStore
+ import mozilla.components.feature.session.SessionUseCases
++import mozilla.components.feature.top.sites.TopSitesUseCases
+ import org.mozilla.focus.menu.ToolbarMenu
+ import org.mozilla.focus.state.AppAction
+ import org.mozilla.focus.state.AppStore
+@@ -13,6 +22,8 @@ import org.mozilla.focus.state.Screen
+ class BrowserMenuController(
+     private val sessionUseCases: SessionUseCases,
+     private val appStore: AppStore,
++    private val store: BrowserStore,
++    private val topSitesUseCases: TopSitesUseCases,
+     private val currentTabId: String,
+     private val shareCallback: () -> Unit,
+     private val requestDesktopCallback: (isChecked: Boolean) -> Unit,
+@@ -21,7 +32,14 @@ class BrowserMenuController(
+     private val openInCallback: () -> Unit,
+     private val openInBrowser: () -> Unit
+ ) {
++    @VisibleForTesting
++    private val currentTab: SessionState?
++        get() = store.state.findTabOrCustomTabOrSelectedTab(currentTabId)
++
++    @VisibleForTesting
++    internal var ioScope: CoroutineScope = CoroutineScope(Dispatchers.IO)
+ 
++    @Suppress("ComplexMethod")
+     fun handleMenuInteraction(item: ToolbarMenu.Item) {
+         when (item) {
+             is ToolbarMenu.Item.Back -> sessionUseCases.goBack(currentTabId)
+@@ -30,6 +48,26 @@ class BrowserMenuController(
+             is ToolbarMenu.Item.Stop -> sessionUseCases.stopLoading(currentTabId)
+             is ToolbarMenu.Item.Share -> shareCallback()
+             is ToolbarMenu.Item.FindInPage -> showFindInPageCallback()
++            is ToolbarMenu.Item.AddToShortcuts -> {
++                ioScope.launch {
++                    currentTab?.let { state ->
++                        topSitesUseCases.addPinnedSites(
++                            title = state.content.title,
++                            url = state.content.url
++                        )
++                    }
++                }
++            }
++            is ToolbarMenu.Item.RemoveFromShortcuts -> {
++                ioScope.launch {
++                    currentTab?.let { state ->
++                        appStore.state.topSites.find { it.url == state.content.url }
++                            ?.let { topSite ->
++                                topSitesUseCases.removeTopSites(topSite)
++                            }
++                    }
++                }
++            }
+             is ToolbarMenu.Item.RequestDesktop -> requestDesktopCallback(item.isChecked)
+             is ToolbarMenu.Item.AddToHomeScreen -> addToHomeScreenCallback()
+             is ToolbarMenu.Item.OpenInBrowser -> openInBrowser()
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
+index 4d8470a12fbe..a0e9a3e98131 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
+@@ -277,6 +277,8 @@ class BrowserFragment :
+         val controller = BrowserMenuController(
+             requireComponents.sessionUseCases,
+             requireComponents.appStore,
++            requireComponents.store,
++            requireComponents.topSitesUseCases,
+             tabId,
+             ::shareCurrentUrl,
+             ::setShouldRequestDesktop,
+@@ -289,6 +291,7 @@ class BrowserFragment :
+         if (tab.ifCustomTab()?.config == null) {
+             val browserMenu = DefaultBrowserMenu(
+                 context = requireContext(),
++                appStore = requireComponents.appStore,
+                 store = requireComponents.store,
+                 onItemTapped = { controller.handleMenuInteraction(it) }
+             )
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt
+index a40d8307d7af..7f7a29c824e6 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/fragment/UrlInputFragment.kt
+@@ -19,16 +19,19 @@ import android.view.View
+ import android.view.ViewGroup
+ import android.widget.FrameLayout
+ import android.widget.TextView
++import androidx.compose.ui.platform.ComposeView
++import androidx.compose.ui.res.stringResource
+ import androidx.lifecycle.Observer
+ import androidx.lifecycle.ViewModelProvider
++import androidx.lifecycle.lifecycleScope
+ import androidx.preference.PreferenceManager
+-import kotlinx.android.synthetic.main.firstrun_page.*
+-import kotlinx.android.synthetic.main.firstrun_page.view.*
+ import kotlinx.android.synthetic.main.fragment_urlinput2.*
+ import kotlinx.android.synthetic.main.fragment_urlinput2.view.*
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Dispatchers.IO
+ import kotlinx.coroutines.Job
++import kotlinx.coroutines.launch
+ import mozilla.components.browser.domains.autocomplete.CustomDomainsProvider
+ import mozilla.components.browser.domains.autocomplete.ShippedDomainsProvider
+ import mozilla.components.browser.state.action.ContentAction
+@@ -36,12 +39,16 @@ import mozilla.components.browser.state.selector.findTab
+ import mozilla.components.browser.state.state.SessionState
+ import mozilla.components.browser.state.state.TabSessionState
+ import mozilla.components.browser.state.state.selectedOrDefaultSearchEngine
++import mozilla.components.feature.top.sites.TopSitesConfig
++import mozilla.components.feature.top.sites.TopSitesFeature
++import mozilla.components.lib.state.ext.observeAsComposableState
+ import mozilla.components.support.base.feature.ViewBoundFeatureWrapper
+ import mozilla.components.support.ktx.android.view.hideKeyboard
+ import mozilla.components.support.utils.ThreadUtils
+ import org.mozilla.focus.R
+ import org.mozilla.focus.ext.isSearch
+ import org.mozilla.focus.ext.requireComponents
++import org.mozilla.focus.home.HomeScreen
+ import org.mozilla.focus.input.InputToolbarIntegration
+ import org.mozilla.focus.menu.home.HomeMenu
+ import org.mozilla.focus.searchsuggestions.SearchSuggestionsViewModel
+@@ -51,6 +58,8 @@ import org.mozilla.focus.state.Screen
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.tips.Tip
+ import org.mozilla.focus.tips.TipManager
++import org.mozilla.focus.topsites.DefaultTopSitesView
++import org.mozilla.focus.topsites.TopSiteMenuItem
+ import org.mozilla.focus.utils.AppConstants
+ import org.mozilla.focus.utils.Features
+ import org.mozilla.focus.utils.OneShotOnPreDrawListener
+@@ -151,6 +160,7 @@ class UrlInputFragment :
+     private var isInitialized = false
+ 
+     private val toolbarIntegration = ViewBoundFeatureWrapper<InputToolbarIntegration>()
++    private val topSitesFeature = ViewBoundFeatureWrapper<TopSitesFeature>()
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+@@ -289,8 +299,40 @@ class UrlInputFragment :
+         inflater: LayoutInflater,
+         container: ViewGroup?,
+         savedInstanceState: Bundle?
+-    ): View? = inflater.inflate(R.layout.fragment_urlinput2, container, false)
++    ): View? {
++        val view = inflater.inflate(R.layout.fragment_urlinput2, container, false)
++
++        val topSites = view.findViewById<ComposeView>(R.id.topSites)
++        topSites.setContent {
++            val topSitesState = requireComponents.appStore.observeAsComposableState { state -> state.topSites }
++
++            HomeScreen(
++                topSites = topSitesState.value!!,
++                topSitesMenuItems = listOfNotNull(
++                    TopSiteMenuItem(
++                        title = stringResource(R.string.remove_top_site),
++                        onClick = { topSite ->
++                            viewLifecycleOwner.lifecycleScope.launch(IO) {
++                                requireComponents.topSitesUseCases.removeTopSites(topSite)
++                            }
++                        }
++                    )
++                ),
++                onTopSiteClick = { topSite ->
++                    requireComponents.tabsUseCases.addTab(
++                        url = topSite.url,
++                        source = SessionState.Source.Internal.HomeScreen,
++                        selectTab = true,
++                        private = true
++                    )
++                }
++            )
++        }
++
++        return view
++    }
+ 
++    @Suppress("LongMethod")
+     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+         toolbarIntegration.set(
+             InputToolbarIntegration(
+@@ -303,6 +345,21 @@ class UrlInputFragment :
+             view = browserToolbar
+         )
+ 
++        topSitesFeature.set(
++            feature = TopSitesFeature(
++                view = DefaultTopSitesView(requireComponents.appStore),
++                storage = requireComponents.topSitesStorage,
++                config = {
++                    TopSitesConfig(
++                        totalSites = 4,
++                        frecencyConfig = null
++                    )
++                }
++            ),
++            owner = this,
++            view = view
++        )
++
+         dismissView.setOnClickListener(this)
+ 
+         if (urlInputContainerView != null) {
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/home/HomeScreen.kt b/focus-android/app/src/main/java/org/mozilla/focus/home/HomeScreen.kt
+new file mode 100644
+index 000000000000..75577716e9c6
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/home/HomeScreen.kt
+@@ -0,0 +1,42 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.home
++
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.height
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
++import mozilla.components.feature.top.sites.TopSite
++import org.mozilla.focus.topsites.TopSiteMenuItem
++import org.mozilla.focus.topsites.TopSites
++
++/**
++ * The home screen.
++ *
++ * @param topSites List of [TopSite] to display.
++ * @param topSitesMenuItems List of [TopSiteMenuItem] to display in a top site dropdown menu.
++ * @param onTopSiteClick Invoked when the user clicks on a top site.
++ */
++@Composable
++fun HomeScreen(
++    topSites: List<TopSite>,
++    topSitesMenuItems: List<TopSiteMenuItem>,
++    onTopSiteClick: (TopSite) -> Unit = {}
++) {
++    Column(horizontalAlignment = Alignment.CenterHorizontally) {
++        if (topSites.isNotEmpty()) {
++            Spacer(modifier = Modifier.height(24.dp))
++
++            TopSites(
++                topSites = topSites,
++                menuItems = topSitesMenuItems,
++                onTopSiteClick = onTopSiteClick
++            )
++        }
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/menu/ToolbarMenu.kt b/focus-android/app/src/main/java/org/mozilla/focus/menu/ToolbarMenu.kt
+index 276491371445..9c78ecc3f059 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/menu/ToolbarMenu.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/menu/ToolbarMenu.kt
+@@ -14,6 +14,8 @@ interface ToolbarMenu {
+         object Back : Item()
+         object Forward : Item()
+         object Share : Item()
++        object AddToShortcuts : Item()
++        object RemoveFromShortcuts : Item()
+         object FindInPage : Item()
+         object AddToHomeScreen : Item()
+         object OpenInBrowser : Item()
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/menu/browser/DefaultBrowserMenu.kt b/focus-android/app/src/main/java/org/mozilla/focus/menu/browser/DefaultBrowserMenu.kt
+index c62660969b61..ad8aff58bb0d 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/menu/browser/DefaultBrowserMenu.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/menu/browser/DefaultBrowserMenu.kt
+@@ -1,6 +1,7 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
+ package org.mozilla.focus.menu.browser
+ 
+ import android.content.Context
+@@ -16,13 +17,16 @@ import mozilla.components.browser.state.store.BrowserStore
+ import mozilla.components.feature.webcompat.reporter.WebCompatReporterFeature
+ import org.mozilla.focus.R
+ import org.mozilla.focus.menu.ToolbarMenu
++import org.mozilla.focus.state.AppStore
+ import org.mozilla.focus.theme.resolveAttribute
++import org.mozilla.focus.topsites.DefaultTopSitesStorage.Companion.TOP_SITES_MAX_LIMIT
+ 
+ /**
+  * The overflow menu shown in the BrowserFragment containing page actions like "Refresh", "Share" etc.
+  */
+ class DefaultBrowserMenu(
+     private val context: Context,
++    private val appStore: AppStore,
+     private val store: BrowserStore,
+     private val onItemTapped: (ToolbarMenu.Item) -> Unit = {}
+ ) : ToolbarMenu {
+@@ -94,7 +98,26 @@ class DefaultBrowserMenu(
+         BrowserMenuItemToolbar(listOf(back, forward, refresh, share))
+     }
+ 
+-    val mvpMenuItems by lazy {
++    private val mvpMenuItems by lazy {
++        val url = selectedSession?.content?.url
++        val topSites = appStore.state.topSites
++        val hasTopSite = topSites.find { it.url == url } != null
++        val canAddTopSite = url != null && !hasTopSite && topSites.size < TOP_SITES_MAX_LIMIT
++
++        val addToShortcuts = BrowserMenuImageText(
++            label = context.getString(R.string.menu_add_to_shortcuts),
++            imageResource = R.drawable.mozac_ic_pin
++        ) {
++            onItemTapped.invoke(ToolbarMenu.Item.AddToShortcuts)
++        }
++
++        val removeFromShortcuts = BrowserMenuImageText(
++            label = context.getString(R.string.menu_remove_from_shortcuts),
++            imageResource = R.drawable.mozac_ic_pin_remove
++        ) {
++            onItemTapped.invoke(ToolbarMenu.Item.RemoveFromShortcuts)
++        }
++
+         val findInPage = BrowserMenuImageText(
+             label = context.getString(R.string.find_in_page),
+             imageResource = R.drawable.ic_search
+@@ -139,9 +162,13 @@ class DefaultBrowserMenu(
+         ) {
+             onItemTapped.invoke(ToolbarMenu.Item.Settings)
+         }
++
+         listOfNotNull(
+             menuToolbar,
+             BrowserMenuDivider(),
++            if (canAddTopSite) addToShortcuts else null,
++            if (hasTopSite) removeFromShortcuts else null,
++            if (canAddTopSite || hasTopSite) BrowserMenuDivider() else null,
+             findInPage,
+             desktopMode,
+             reportSiteIssuePlaceholder,
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/state/AppAction.kt b/focus-android/app/src/main/java/org/mozilla/focus/state/AppAction.kt
+index 2018bea96b72..e40746eee6ae 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/state/AppAction.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/state/AppAction.kt
+@@ -4,6 +4,7 @@
+ 
+ package org.mozilla.focus.state
+ 
++import mozilla.components.feature.top.sites.TopSite
+ import mozilla.components.lib.state.Action
+ 
+ /**
+@@ -74,4 +75,9 @@ sealed class AppAction : Action {
+      * Opens the tab with the given [tabId] and actively switches to the browser screen if needed.
+      */
+     data class OpenTab(val tabId: String) : AppAction()
++
++    /**
++     * The list of [TopSite] has changed.
++     */
++    data class TopSitesChange(val topSites: List<TopSite>) : AppAction()
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/state/AppReducer.kt b/focus-android/app/src/main/java/org/mozilla/focus/state/AppReducer.kt
+index d1e5fa3eb906..cf099af95b68 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/state/AppReducer.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/state/AppReducer.kt
+@@ -6,11 +6,13 @@
+ 
+ package org.mozilla.focus.state
+ 
++import mozilla.components.feature.top.sites.TopSite
+ import mozilla.components.lib.state.Reducer
+ 
+ /**
+  * Reducer creating a new [AppState] for dispatched [AppAction]s.
+  */
++@Suppress("ComplexMethod")
+ object AppReducer : Reducer<AppState, AppAction> {
+     override fun invoke(state: AppState, action: AppAction): AppState {
+         return when (action) {
+@@ -27,6 +29,7 @@ object AppReducer : Reducer<AppState, AppAction> {
+             is AppAction.OpenSettings -> openSettings(state, action)
+             is AppAction.NavigateUp -> navigateUp(state, action)
+             is AppAction.OpenTab -> openTab(state, action)
++            is AppAction.TopSitesChange -> topSitesChanged(state, action)
+         }
+     }
+ }
+@@ -147,6 +150,13 @@ private fun openTab(state: AppState, action: AppAction.OpenTab): AppState {
+     )
+ }
+ 
++/**
++ * The list of [TopSite] has changed.
++ */
++private fun topSitesChanged(state: AppState, action: AppAction.TopSitesChange): AppState {
++    return state.copy(topSites = action.topSites)
++}
++
+ @Suppress("ComplexMethod")
+ private fun navigateUp(state: AppState, action: AppAction.NavigateUp): AppState {
+     if (state.screen !is Screen.Settings) {
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/state/AppState.kt b/focus-android/app/src/main/java/org/mozilla/focus/state/AppState.kt
+index 7e3059e6df80..bdb228797bf0 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/state/AppState.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/state/AppState.kt
+@@ -4,6 +4,7 @@
+ 
+ package org.mozilla.focus.state
+ 
++import mozilla.components.feature.top.sites.TopSite
+ import mozilla.components.lib.state.State
+ import java.util.UUID
+ 
+@@ -11,9 +12,11 @@ import java.util.UUID
+  * Global state of the application.
+  *
+  * @property screen The currently displayed screen.
++ * @property topSites The list of [TopSite] to display on the Home screen.
+  */
+ data class AppState(
+-    val screen: Screen
++    val screen: Screen,
++    val topSites: List<TopSite> = emptyList()
+ ) : State
+ 
+ /**
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/topsites/DefaultTopSitesStorage.kt b/focus-android/app/src/main/java/org/mozilla/focus/topsites/DefaultTopSitesStorage.kt
+new file mode 100644
+index 000000000000..179253a14a4c
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/topsites/DefaultTopSitesStorage.kt
+@@ -0,0 +1,62 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.topsites
++
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import mozilla.components.concept.storage.FrecencyThresholdOption
++import mozilla.components.feature.top.sites.PinnedSiteStorage
++import mozilla.components.feature.top.sites.TopSite
++import mozilla.components.feature.top.sites.TopSitesStorage
++import mozilla.components.support.base.observer.Observable
++import mozilla.components.support.base.observer.ObserverRegistry
++import kotlin.coroutines.CoroutineContext
++
++/**
++ * Default implementation of [TopSitesStorage].
++ *
++ * @param pinnedSitesStorage An instance of [PinnedSiteStorage], used for storing pinned sites.
++ */
++class DefaultTopSitesStorage(
++    private val pinnedSitesStorage: PinnedSiteStorage,
++    coroutineContext: CoroutineContext = Dispatchers.IO
++) : TopSitesStorage, Observable<TopSitesStorage.Observer> by ObserverRegistry() {
++
++    private var scope = CoroutineScope(coroutineContext)
++
++    override fun addTopSite(title: String, url: String, isDefault: Boolean) {
++        scope.launch {
++            pinnedSitesStorage.addPinnedSite(title, url, isDefault)
++
++            notifyObservers { onStorageUpdated() }
++        }
++    }
++
++    override fun removeTopSite(topSite: TopSite) {
++        scope.launch {
++            pinnedSitesStorage.removePinnedSite(topSite)
++
++            notifyObservers { onStorageUpdated() }
++        }
++    }
++
++    override fun updateTopSite(topSite: TopSite, title: String, url: String) {
++        scope.launch {
++            pinnedSitesStorage.updatePinnedSite(topSite, title, url)
++
++            notifyObservers { onStorageUpdated() }
++        }
++    }
++
++    override suspend fun getTopSites(
++        totalSites: Int,
++        frecencyConfig: FrecencyThresholdOption?
++    ): List<TopSite> = pinnedSitesStorage.getPinnedSites().take(totalSites)
++
++    companion object {
++        const val TOP_SITES_MAX_LIMIT = 4
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/topsites/DefaultTopSitesView.kt b/focus-android/app/src/main/java/org/mozilla/focus/topsites/DefaultTopSitesView.kt
+new file mode 100644
+index 000000000000..155bae66904c
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/topsites/DefaultTopSitesView.kt
+@@ -0,0 +1,22 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.topsites
++
++import mozilla.components.feature.top.sites.TopSite
++import mozilla.components.feature.top.sites.view.TopSitesView
++import org.mozilla.focus.state.AppAction
++import org.mozilla.focus.state.AppStore
++
++/**
++ * The default implementation of [TopSitesView] for displaying the top site UI.
++ *
++ * @property store [AppStore] instance for dispatching the top sites changes.
++ */
++class DefaultTopSitesView(private val store: AppStore) : TopSitesView {
++
++    override fun displayTopSites(topSites: List<TopSite>) {
++        store.dispatch(AppAction.TopSitesChange(topSites))
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/topsites/TopSiteMenuItem.kt b/focus-android/app/src/main/java/org/mozilla/focus/topsites/TopSiteMenuItem.kt
+new file mode 100644
+index 000000000000..93ea861fbe4a
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/topsites/TopSiteMenuItem.kt
+@@ -0,0 +1,18 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.topsites
++
++import mozilla.components.feature.top.sites.TopSite
++
++/**
++ * A menu item in the top site dropdown menu.
++ *
++ * @property title The menu item title.
++ * @property onClick Invoked when the user clicks on the menu item.
++ */
++data class TopSiteMenuItem(
++    val title: String,
++    val onClick: (TopSite) -> Unit
++)
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/topsites/TopSites.kt b/focus-android/app/src/main/java/org/mozilla/focus/topsites/TopSites.kt
+new file mode 100644
+index 000000000000..e8c7b35275fe
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/topsites/TopSites.kt
+@@ -0,0 +1,161 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.topsites
++
++import androidx.compose.foundation.ExperimentalFoundationApi
++import androidx.compose.foundation.background
++import androidx.compose.foundation.combinedClickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.Card
++import androidx.compose.material.DropdownMenu
++import androidx.compose.material.DropdownMenuItem
++import androidx.compose.material.Surface
++import androidx.compose.material.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import mozilla.components.feature.top.sites.TopSite
++import mozilla.components.support.ktx.kotlin.getRepresentativeCharacter
++import mozilla.components.ui.colors.PhotonColors
++
++/**
++ * A list of top sites.
++ *
++ * @param topSites List of [TopSite] to display.
++ * @param menuItems List of [TopSiteMenuItem] to display in a top site dropdown menu.
++ * @param onTopSiteClick Invoked when the user clicks on a top site.
++ */
++@Composable
++fun TopSites(
++    topSites: List<TopSite>,
++    menuItems: List<TopSiteMenuItem>,
++    onTopSiteClick: (TopSite) -> Unit = {}
++) {
++    Row(
++        modifier = Modifier
++            .padding(horizontal = 10.dp)
++            .size(width = 324.dp, height = 84.dp),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(28.dp)
++    ) {
++        topSites.forEach { topSite ->
++            TopSiteItem(
++                topSite = topSite,
++                menuItems = menuItems,
++                onTopSiteClick = onTopSiteClick
++            )
++        }
++    }
++}
++
++/**
++ * A top site item.
++ *
++ * @param topSite The [TopSite] to display.
++ * @param menuItems List of [TopSiteMenuItem] to display in a top site dropdown menu.
++ * @param onTopSiteClick Invoked when the user clicks on a top site.
++ */
++@OptIn(ExperimentalFoundationApi::class)
++@Composable
++private fun TopSiteItem(
++    topSite: TopSite,
++    menuItems: List<TopSiteMenuItem>,
++    onTopSiteClick: (TopSite) -> Unit = {}
++) {
++    var menuExpanded by remember { mutableStateOf(false) }
++
++    Box {
++        Column(
++            modifier = Modifier
++                .combinedClickable(
++                    onClick = { onTopSiteClick(topSite) },
++                    onLongClick = { menuExpanded = true }
++                )
++                .size(width = 60.dp, height = 84.dp),
++            horizontalAlignment = Alignment.CenterHorizontally
++        ) {
++            TopSiteFaviconCard(topSite = topSite)
++
++            Text(
++                text = topSite.title ?: topSite.url,
++                modifier = Modifier.padding(top = 8.dp),
++                color = PhotonColors.LightGrey05,
++                fontSize = 12.sp,
++                overflow = TextOverflow.Ellipsis,
++                maxLines = 1
++            )
++        }
++
++        DropdownMenu(
++            expanded = menuExpanded,
++            onDismissRequest = { menuExpanded = false },
++            modifier = Modifier.background(color = PhotonColors.Ink30)
++        ) {
++            for (item in menuItems) {
++                DropdownMenuItem(
++                    onClick = {
++                        menuExpanded = false
++                        item.onClick(topSite)
++                    }
++                ) {
++                    Text(
++                        text = item.title,
++                        color = Color.White
++                    )
++                }
++            }
++        }
++    }
++}
++
++/**
++ * The top site favicon card.
++ *
++ * @param topSite The [TopSite] to display.
++ */
++@Composable
++private fun TopSiteFaviconCard(topSite: TopSite) {
++    Card(
++        modifier = Modifier.size(60.dp),
++        shape = RoundedCornerShape(8.dp),
++        backgroundColor = PhotonColors.Ink30
++    ) {
++        Column(
++            verticalArrangement = Arrangement.Center,
++            horizontalAlignment = Alignment.CenterHorizontally
++        ) {
++            Surface(
++                modifier = Modifier.size(36.dp),
++                shape = RoundedCornerShape(4.dp),
++                color = PhotonColors.Ink60
++            ) {
++                Column(
++                    verticalArrangement = Arrangement.Center,
++                    horizontalAlignment = Alignment.CenterHorizontally
++                ) {
++                    Text(
++                        text = topSite.url.getRepresentativeCharacter(),
++                        color = PhotonColors.LightGrey05,
++                        fontSize = 20.sp
++                    )
++                }
++            }
++        }
++    }
++}
+diff --git a/focus-android/app/src/main/res/layout/fragment_urlinput2.xml b/focus-android/app/src/main/res/layout/fragment_urlinput2.xml
+index 6d7539f6892f..67d5e06b5e9f 100644
+--- a/focus-android/app/src/main/res/layout/fragment_urlinput2.xml
++++ b/focus-android/app/src/main/res/layout/fragment_urlinput2.xml
+@@ -19,6 +19,11 @@
+         android:weightSum="1"
+         app:animate="true">
+ 
++        <androidx.compose.ui.platform.ComposeView
++            android:id="@+id/topSites"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"/>
++
+         <ImageView
+             android:layout_width="wrap_content"
+             android:layout_height="wrap_content"
+diff --git a/focus-android/app/src/main/res/values/ids.xml b/focus-android/app/src/main/res/values/ids.xml
+index 3ace77105401..485dee349b31 100644
+--- a/focus-android/app/src/main/res/values/ids.xml
++++ b/focus-android/app/src/main/res/values/ids.xml
+@@ -3,6 +3,8 @@
+    - License, v. 2.0. If a copy of the MPL was not distributed with this
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+ <resources>
++    <item name="add_to_shortcuts" type="id" />
++    <item name="remove_from_shortcuts" type="id" />
+     <item name="share" type="id" />
+     <item name="settings" type="id" />
+     <item name="open_default" type="id" />
+diff --git a/focus-android/app/src/main/res/values/strings.xml b/focus-android/app/src/main/res/values/strings.xml
+index 54ce4e2bd668..c5dab288d1c1 100644
+--- a/focus-android/app/src/main/res/values/strings.xml
++++ b/focus-android/app/src/main/res/values/strings.xml
+@@ -50,6 +50,11 @@
+     <!-- Menu item: Add the current page as a shortcut to the device's home screen (launcher). -->
+     <string name="menu_add_to_home_screen">Add to Home screen</string>
+ 
++    <!-- Menu item: Add the current site as a shortcut on the Home screen -->
++    <string name="menu_add_to_shortcuts">Add to Shortcuts</string>
++    <!-- Menu item: Remove the current site as a shortcut from the Home screen -->
++    <string name="menu_remove_from_shortcuts">Remove from Shortcuts</string>
++
+     <!-- Menu item: Shows information about features and changes that are new to this version -->
+     <string name="menu_whats_new">What’s New</string>
+     <string name="menu_settings">Settings</string>
+@@ -770,4 +775,8 @@ The new line here must be kept as the second half of the string is clickable for
+ 
+     <!-- Content description (not visible, for screen readers etc.): Navigate back button description -->
+     <string name="go_back">Go back</string>
++
++    <!-- Top Sites -->
++    <!-- Text for the menu button to remove a top site -->
++    <string name="remove_top_site">Remove</string>
+ </resources>
+diff --git a/focus-android/app/src/test/java/org/mozilla/focus/menu/BrowserMenuControllerTest.kt b/focus-android/app/src/test/java/org/mozilla/focus/menu/BrowserMenuControllerTest.kt
+index ec77b767b183..c1d19bf3bf42 100644
+--- a/focus-android/app/src/test/java/org/mozilla/focus/menu/BrowserMenuControllerTest.kt
++++ b/focus-android/app/src/test/java/org/mozilla/focus/menu/BrowserMenuControllerTest.kt
+@@ -1,12 +1,14 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
+ package org.mozilla.focus.menu
+ 
+ import mozilla.components.browser.state.state.BrowserState
+ import mozilla.components.browser.state.state.createTab
+ import mozilla.components.browser.state.store.BrowserStore
+ import mozilla.components.feature.session.SessionUseCases
++import mozilla.components.feature.top.sites.TopSitesUseCases
+ import org.junit.Before
+ import org.junit.Test
+ import org.junit.runner.RunWith
+@@ -29,6 +31,9 @@ class BrowserMenuControllerTest {
+     @Mock
+     private lateinit var appStore: AppStore
+ 
++    @Mock
++    private lateinit var topSitesUseCases: TopSitesUseCases
++
+     private val currentTabId: String = "1"
+     private val selectedTab = createTab("https://www.mozilla.org", id = "1")
+     private val shareCallback: () -> Unit = {}
+@@ -63,6 +68,8 @@ class BrowserMenuControllerTest {
+         browserMenuController = BrowserMenuController(
+             sessionUseCases,
+             appStore,
++            store,
++            topSitesUseCases,
+             currentTabId,
+             shareCallback,
+             requestDesktopCallback,
+diff --git a/focus-android/app/src/test/java/org/mozilla/focus/topsites/DefaultTopSitesStorageTest.kt b/focus-android/app/src/test/java/org/mozilla/focus/topsites/DefaultTopSitesStorageTest.kt
+new file mode 100644
+index 000000000000..b22ff367ba30
+--- /dev/null
++++ b/focus-android/app/src/test/java/org/mozilla/focus/topsites/DefaultTopSitesStorageTest.kt
+@@ -0,0 +1,135 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.topsites
++
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.test.runBlockingTest
++import mozilla.components.feature.top.sites.PinnedSiteStorage
++import mozilla.components.feature.top.sites.TopSite
++import mozilla.components.support.test.mock
++import mozilla.components.support.test.whenever
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.mockito.Mockito.verify
++import org.robolectric.RobolectricTestRunner
++
++@ExperimentalCoroutinesApi
++@RunWith(RobolectricTestRunner::class)
++class DefaultTopSitesStorageTest {
++
++    private val pinnedSitesStorage: PinnedSiteStorage = mock()
++
++    @Test
++    fun `WHEN a top site is added THEN the pinned sites storage is called`() = runBlockingTest {
++        val defaultTopSitesStorage = DefaultTopSitesStorage(
++            pinnedSitesStorage,
++            coroutineContext
++        )
++
++        defaultTopSitesStorage.addTopSite("Mozilla", "https://mozilla.com", isDefault = false)
++
++        verify(pinnedSitesStorage).addPinnedSite(
++            "Mozilla",
++            "https://mozilla.com",
++            isDefault = false
++        )
++    }
++
++    @Test
++    fun `WHEN a top site is removed THEN the pinned sites storage is called`() = runBlockingTest {
++        val defaultTopSitesStorage = DefaultTopSitesStorage(
++            pinnedSitesStorage,
++            coroutineContext
++        )
++
++        val pinnedSite = TopSite(
++            id = 2,
++            title = "Firefox",
++            url = "https://firefox.com",
++            createdAt = 2,
++            type = TopSite.Type.PINNED
++        )
++
++        defaultTopSitesStorage.removeTopSite(pinnedSite)
++
++        verify(pinnedSitesStorage).removePinnedSite(pinnedSite)
++    }
++
++    @Test
++    fun `WHEN a top site is updated THEN the pinned sites storage is called`() = runBlockingTest {
++        val defaultTopSitesStorage = DefaultTopSitesStorage(
++            pinnedSitesStorage,
++            coroutineContext
++        )
++
++        val pinnedSite = TopSite(
++            id = 2,
++            title = "Wikipedia",
++            url = "https://wikipedia.com",
++            createdAt = 2,
++            type = TopSite.Type.PINNED
++        )
++        defaultTopSitesStorage.updateTopSite(
++            pinnedSite,
++            "Wiki",
++            "https://en.wikipedia.org/wiki/Wiki"
++        )
++
++        verify(pinnedSitesStorage).updatePinnedSite(
++            pinnedSite,
++            "Wiki",
++            "https://en.wikipedia.org/wiki/Wiki"
++        )
++    }
++
++    @Test
++    fun `WHEN getTopSites is called THEN the appropriate top sites are returned`() = runBlockingTest {
++        val defaultTopSitesStorage = DefaultTopSitesStorage(
++            pinnedSitesStorage,
++            coroutineContext
++        )
++
++        val pinnedSite1 = TopSite(
++            id = 2,
++            title = "Wikipedia",
++            url = "https://wikipedia.com",
++            createdAt = 2,
++            type = TopSite.Type.PINNED
++        )
++        val pinnedSite2 = TopSite(
++            id = 3,
++            title = "Example",
++            url = "https://example.com",
++            createdAt = 3,
++            type = TopSite.Type.PINNED
++        )
++
++        whenever(pinnedSitesStorage.getPinnedSites()).thenReturn(
++            listOf(
++                pinnedSite1,
++                pinnedSite2
++            )
++        )
++
++        var topSites = defaultTopSitesStorage.getTopSites(0, frecencyConfig = null)
++        assertTrue(topSites.isEmpty())
++
++        topSites = defaultTopSitesStorage.getTopSites(1, frecencyConfig = null)
++        assertEquals(1, topSites.size)
++        assertEquals(pinnedSite1, topSites[0])
++
++        topSites = defaultTopSitesStorage.getTopSites(2, frecencyConfig = null)
++        assertEquals(2, topSites.size)
++        assertEquals(pinnedSite1, topSites[0])
++        assertEquals(pinnedSite2, topSites[1])
++
++        topSites = defaultTopSitesStorage.getTopSites(5, frecencyConfig = null)
++        assertEquals(2, topSites.size)
++        assertEquals(pinnedSite1, topSites[0])
++        assertEquals(pinnedSite2, topSites[1])
++    }
++}
+diff --git a/focus-android/buildSrc/src/main/java/Dependencies.kt b/focus-android/buildSrc/src/main/java/Dependencies.kt
+index 25ca651d2683..e7cd90c64afa 100644
+--- a/focus-android/buildSrc/src/main/java/Dependencies.kt
++++ b/focus-android/buildSrc/src/main/java/Dependencies.kt
+@@ -37,6 +37,7 @@ object Versions {
+     object Test {
+         const val robolectric = "4.6.1"
+         const val mockito = "3.11.0"
++        const val coroutines = "1.5.0"
+     }
+ }
+ 
+@@ -69,4 +70,5 @@ object Dependencies {
+ 
+     const val testing_robolectric = "org.robolectric:robolectric:${Versions.Test.robolectric}"
+     const val testing_mockito = "org.mockito:mockito-core:${Versions.Test.mockito}"
++    const val testing_coroutines = "org.jetbrains.kotlinx:kotlinx-coroutines-test:${Versions.Test.coroutines}"
+ }

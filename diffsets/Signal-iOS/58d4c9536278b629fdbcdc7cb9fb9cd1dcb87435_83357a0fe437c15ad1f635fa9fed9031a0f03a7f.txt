@@ -1,0 +1,191 @@
+diff --git a/Signal/src/ViewControllers/DebugUI/DebugUIMisc.m b/Signal/src/ViewControllers/DebugUI/DebugUIMisc.m
+index ec66c4a93ff..69edb9314db 100644
+--- a/Signal/src/ViewControllers/DebugUI/DebugUIMisc.m
++++ b/Signal/src/ViewControllers/DebugUI/DebugUIMisc.m
+@@ -6,6 +6,7 @@
+ #import "Environment.h"
+ #import "OWSCountryMetadata.h"
+ #import "OWSTableViewController.h"
++#import "RegistrationViewController.h"
+ #import "Signal-Swift.h"
+ #import "ThreadUtil.h"
+ #import <AFNetworking/AFNetworking.h>
+@@ -21,6 +22,12 @@
+ 
+ NS_ASSUME_NONNULL_BEGIN
+ 
++@interface TSAccountManager (Debug)
++
++- (void)resetForRegistration;
++
++@end
++
+ @implementation DebugUIMisc
+ 
+ #pragma mark - Logging
+@@ -61,6 +68,41 @@ - (nullable OWSTableSection *)sectionForThread:(nullable TSThread *)thread
+                                      actionBlock:^{
+                                          [DebugUIMisc clearHasDismissedOffers];
+                                      }]];
++
++    [items addObject:[OWSTableItem
++                         itemWithTitle:@"Re-register"
++                           actionBlock:^{
++
++                               [OWSAlerts
++                                   showConfirmationAlertWithTitle:@"Re-register?"
++                                                          message:@"If you proceed, you will not lose any of your "
++                                                                  @"current messages, but your account will be "
++                                                                  @"deactivated until you complete re-registration."
++                                                     proceedTitle:@"Proceed"
++                                                    proceedAction:^(UIAlertAction *_Nonnull action) {
++                                                        DDLogError(@"Re-registering.");
++
++                                                        [[TSAccountManager sharedInstance] resetForRegistration];
++                                                        OWSSyncPushTokensJob *syncPushTokensJob = [
++                                                            [OWSSyncPushTokensJob alloc]
++                                                            initWithPushManager:[PushManager sharedManager]
++                                                                 accountManager:[Environment getCurrent].accountManager
++                                                                    preferences:[Environment getCurrent].preferences];
++                                                        syncPushTokensJob.uploadOnlyIfStale = NO;
++                                                        __unused id promise = [syncPushTokensJob run];
++
++                                                        RegistrationViewController *viewController =
++                                                            [RegistrationViewController new];
++                                                        OWSNavigationController *navigationController =
++                                                            [[OWSNavigationController alloc]
++                                                                initWithRootViewController:viewController];
++                                                        navigationController.navigationBarHidden = YES;
++                                                        [UIApplication sharedApplication]
++                                                            .delegate.window.rootViewController
++                                                            = navigationController;
++                                                    }];
++                           }]];
++
+     return [OWSTableSection sectionWithTitle:self.name items:items];
+ }
+ 
+diff --git a/Signal/src/ViewControllers/SafetyNumberConfirmationAlert.swift b/Signal/src/ViewControllers/SafetyNumberConfirmationAlert.swift
+index e50c6eeed3e..044f02b66d1 100644
+--- a/Signal/src/ViewControllers/SafetyNumberConfirmationAlert.swift
++++ b/Signal/src/ViewControllers/SafetyNumberConfirmationAlert.swift
+@@ -74,7 +74,7 @@ class SafetyNumberConfirmationAlert: NSObject {
+         }
+         actionSheetController.addAction(showSafetyNumberAction)
+ 
+-        actionSheetController.addAction(OWSAlerts.cancelAction())
++        actionSheetController.addAction(OWSAlerts.cancelAction)
+ 
+         UIApplication.shared.frontmostViewController?.present(actionSheetController, animated: true)
+         return true
+diff --git a/Signal/src/views/OWSAlerts.swift b/Signal/src/views/OWSAlerts.swift
+index df4d1fcaa39..1b46de1768a 100644
+--- a/Signal/src/views/OWSAlerts.swift
++++ b/Signal/src/views/OWSAlerts.swift
+@@ -33,14 +33,26 @@ import Foundation
+     public class func showAlert(withTitle title: String, message: String? = nil, buttonTitle: String? = nil) {
+         assert(title.characters.count > 0)
+ 
+-        let actionTitle = (buttonTitle != nil ? buttonTitle : NSLocalizedString("OK", comment: ""))
++        let actionTitle = buttonTitle ?? NSLocalizedString("OK", comment: "")
+ 
+         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+         alert.addAction(UIAlertAction(title: actionTitle, style: .default, handler: nil))
+         UIApplication.shared.frontmostViewController?.present(alert, animated: true, completion: nil)
+     }
+ 
+-    public class func cancelAction() -> UIAlertAction {
++    public class func showConfirmationAlert(withTitle title: String, message: String? = nil, proceedTitle: String? = nil, proceedAction: @escaping (UIAlertAction) -> Void) {
++        assert(title.characters.count > 0)
++
++        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
++        alert.addAction(self.cancelAction)
++
++        let actionTitle = proceedTitle ?? NSLocalizedString("OK", comment: "")
++        alert.addAction(UIAlertAction(title: actionTitle, style: .default, handler: proceedAction))
++
++        UIApplication.shared.frontmostViewController?.present(alert, animated: true, completion: nil)
++    }
++
++    public class var cancelAction: UIAlertAction {
+         let action = UIAlertAction(title: CommonStrings.cancelButton, style: .cancel) { _ in
+             Logger.debug("Cancel item")
+             // Do nothing.
+diff --git a/SignalServiceKit/src/Account/TSAccountManager.m b/SignalServiceKit/src/Account/TSAccountManager.m
+index dc5b61604c7..2d03aebcc07 100644
+--- a/SignalServiceKit/src/Account/TSAccountManager.m
++++ b/SignalServiceKit/src/Account/TSAccountManager.m
+@@ -12,6 +12,7 @@
+ #import "TSNetworkManager.h"
+ #import "TSPreKeyManager.h"
+ #import "TSSocketManager.h"
++#import "TSStorageManager+SessionStore.h"
+ #import "TSStorageManager+keyingMaterial.h"
+ 
+ NS_ASSUME_NONNULL_BEGIN
+@@ -76,6 +77,18 @@ - (void)setPhoneNumberAwaitingVerification:(NSString *_Nullable)phoneNumberAwait
+                                                            userInfo:nil];
+ }
+ 
++- (void)resetForRegistration
++{
++    @synchronized(self)
++    {
++        _isRegistered = NO;
++        _cachedLocalNumber = nil;
++        _phoneNumberAwaitingVerification = nil;
++        [self removeStoredLocalNumber];
++    }
++    [[TSStorageManager sharedManager] resetSessionStore];
++}
++
+ + (BOOL)isRegistered
+ {
+     return [[self sharedInstance] isRegistered];
+@@ -137,6 +150,15 @@ - (nullable NSString *)localNumber
+     return self.cachedLocalNumber;
+ }
+ 
++- (void)removeStoredLocalNumber
++{
++    @synchronized(self)
++    {
++        [self.dbConnection removeObjectForKey:TSAccountManager_RegisteredNumberKey
++                                 inCollection:TSStorageUserAccountCollection];
++    }
++}
++
+ - (nullable NSString *)storedLocalNumber
+ {
+     @synchronized (self) {
+diff --git a/SignalServiceKit/src/Storage/AxolotlStore/TSStorageManager+SessionStore.h b/SignalServiceKit/src/Storage/AxolotlStore/TSStorageManager+SessionStore.h
+index 741146204f1..5dff6712bad 100644
+--- a/SignalServiceKit/src/Storage/AxolotlStore/TSStorageManager+SessionStore.h
++++ b/SignalServiceKit/src/Storage/AxolotlStore/TSStorageManager+SessionStore.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma mark - debug
+ 
++- (void)resetSessionStore;
+ - (void)printAllSessions;
+ 
+ @end
+diff --git a/SignalServiceKit/src/Storage/AxolotlStore/TSStorageManager+SessionStore.m b/SignalServiceKit/src/Storage/AxolotlStore/TSStorageManager+SessionStore.m
+index 466a3a70c1d..062ca2e64b3 100644
+--- a/SignalServiceKit/src/Storage/AxolotlStore/TSStorageManager+SessionStore.m
++++ b/SignalServiceKit/src/Storage/AxolotlStore/TSStorageManager+SessionStore.m
+@@ -189,6 +189,14 @@ - (void)archiveAllSessionsForContact:(NSString *)contactIdentifier
+ 
+ #pragma mark - debug
+ 
++- (void)resetSessionStore
++{
++    DDLogWarn(@"%@ resetting session store", self.tag);
++    [self.sessionDBConnection readWriteWithBlock:^(YapDatabaseReadWriteTransaction *_Nonnull transaction) {
++        [transaction removeAllObjectsInCollection:TSStorageManagerSessionStoreCollection];
++    }];
++}
++
+ - (void)printAllSessions
+ {
+     AssertIsOnSessionStoreQueue();

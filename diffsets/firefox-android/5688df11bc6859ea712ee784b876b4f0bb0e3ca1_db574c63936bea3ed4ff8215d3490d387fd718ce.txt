@@ -1,0 +1,188 @@
+diff --git a/android-components/components/feature/recentlyclosed/build.gradle b/android-components/components/feature/recentlyclosed/build.gradle
+index 3468de340c90..95b37e6bffed 100644
+--- a/android-components/components/feature/recentlyclosed/build.gradle
++++ b/android-components/components/feature/recentlyclosed/build.gradle
+@@ -71,6 +71,11 @@ dependencies {
+     testImplementation Dependencies.testing_robolectric
+     testImplementation Dependencies.kotlin_coroutines
+     testImplementation Dependencies.testing_coroutines
++
++    androidTestImplementation project(':support-test-fakes')
++
++    androidTestImplementation Dependencies.androidx_test_core
++    androidTestImplementation Dependencies.androidx_test_runner
+ }
+ 
+ apply from: '../../../publish.gradle'
+diff --git a/android-components/components/feature/recentlyclosed/src/androidTest/java/mozilla/components/feature/recentlyclosed/RecentlyClosedTabsStorageOnDeviceTest.kt b/android-components/components/feature/recentlyclosed/src/androidTest/java/mozilla/components/feature/recentlyclosed/RecentlyClosedTabsStorageOnDeviceTest.kt
+new file mode 100644
+index 000000000000..b8ab6b76bb3b
+--- /dev/null
++++ b/android-components/components/feature/recentlyclosed/src/androidTest/java/mozilla/components/feature/recentlyclosed/RecentlyClosedTabsStorageOnDeviceTest.kt
+@@ -0,0 +1,103 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package mozilla.components.feature.recentlyclosed
++
++import androidx.test.core.app.ApplicationProvider
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.MainScope
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import mozilla.components.browser.state.state.recover.RecoverableTab
++import mozilla.components.browser.state.state.recover.TabState
++import mozilla.components.concept.base.crash.Breadcrumb
++import mozilla.components.concept.base.crash.CrashReporting
++import mozilla.components.concept.engine.EngineSessionState
++import mozilla.components.concept.engine.EngineSessionStateStorage
++import mozilla.components.support.test.fakes.engine.FakeEngine
++import mozilla.components.support.test.fakes.engine.FakeEngineSessionState
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class RecentlyClosedTabsStorageOnDeviceTest {
++    private val engineState = FakeEngineSessionState("testId")
++    private val storage = RecentlyClosedTabsStorage(
++        context = ApplicationProvider.getApplicationContext(),
++        engine = FakeEngine(),
++        crashReporting = FakeCrashReporting(),
++        engineStateStorage = FakeEngineSessionStateStorage()
++    )
++
++    @Test
++    fun testRowTooBigExceptionCaughtAndStorageCleared() = runBlocking {
++        val closedTab1 = RecoverableTab(
++            engineSessionState = engineState,
++            state = TabState(
++                id = "test",
++                title = "Pocket",
++                url = "test",
++                lastAccess = System.currentTimeMillis()
++            )
++        )
++        val closedTab2 = closedTab1.copy(
++            state = closedTab1.state.copy(
++                url = "test".repeat(1_000_000), // much more than 2MB of data. Just to be sure.
++            )
++        )
++
++        // First check what happens if too large tabs are persisted and then asked for
++        storage.addTabsToCollectionWithMax(listOf(closedTab1, closedTab2), 2)
++        assertFalse((storage.engineStateStorage() as FakeEngineSessionStateStorage).data.isEmpty())
++        val corruptedTabsResult = storage.getTabs().first()
++        assertTrue(corruptedTabsResult.isEmpty())
++        assertTrue((storage.engineStateStorage() as FakeEngineSessionStateStorage).data.isEmpty())
++
++        // Then check that new data is persisted and queried successfully
++        val closedTab3 = RecoverableTab(
++            engineSessionState = engineState,
++            state = TabState(
++                id = "test2",
++                title = "Pocket2",
++                url = "test2",
++                lastAccess = System.currentTimeMillis()
++            )
++        )
++        storage.addTabState(closedTab3)
++        val recentlyClosedTabsResult = storage.getTabs().first()
++        assertEquals(listOf(closedTab3.state), recentlyClosedTabsResult)
++        assertEquals(1, (storage.engineStateStorage() as FakeEngineSessionStateStorage).data.size)
++    }
++}
++
++private class FakeCrashReporting : CrashReporting {
++    override fun submitCaughtException(throwable: Throwable): Job {
++        return MainScope().launch {}
++    }
++
++    override fun recordCrashBreadcrumb(breadcrumb: Breadcrumb) {}
++}
++
++private class FakeEngineSessionStateStorage : EngineSessionStateStorage {
++    val data: MutableMap<String, EngineSessionState?> = mutableMapOf()
++
++    override suspend fun write(uuid: String, state: EngineSessionState): Boolean {
++        data[uuid] = state
++        return true
++    }
++
++    override suspend fun read(uuid: String): EngineSessionState? {
++        return data[uuid]
++    }
++
++    override suspend fun delete(uuid: String) {
++        data.remove(uuid)
++    }
++
++    override suspend fun deleteAll() {
++        data.clear()
++    }
++}
+diff --git a/android-components/components/feature/recentlyclosed/src/main/java/mozilla/components/feature/recentlyclosed/RecentlyClosedTabsStorage.kt b/android-components/components/feature/recentlyclosed/src/main/java/mozilla/components/feature/recentlyclosed/RecentlyClosedTabsStorage.kt
+index 48b39cb489c8..2b22b8e0c8bc 100644
+--- a/android-components/components/feature/recentlyclosed/src/main/java/mozilla/components/feature/recentlyclosed/RecentlyClosedTabsStorage.kt
++++ b/android-components/components/feature/recentlyclosed/src/main/java/mozilla/components/feature/recentlyclosed/RecentlyClosedTabsStorage.kt
+@@ -7,8 +7,8 @@ package mozilla.components.feature.recentlyclosed
+ import android.content.Context
+ import androidx.annotation.VisibleForTesting
+ import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.catch
+ import kotlinx.coroutines.flow.first
+-import kotlinx.coroutines.flow.flowOf
+ import kotlinx.coroutines.flow.map
+ import mozilla.components.browser.session.storage.FileEngineSessionStateStorage
+ import mozilla.components.browser.state.state.TabSessionState
+@@ -26,7 +26,7 @@ import mozilla.components.support.base.log.logger.Logger
+  * Instances of this class are submitted via [CrashReporting]. This wrapping helps easily identify
+  * exceptions related to [RecentlyClosedTabsStorage].
+  */
+-private class RecentlyClosedTabsStorageException(e: Exception) : Exception(e)
++private class RecentlyClosedTabsStorageException(e: Throwable) : Throwable(e)
+ 
+ /**
+  * A storage implementation that saves snapshots of recently closed tabs / sessions.
+@@ -48,14 +48,19 @@ class RecentlyClosedTabsStorage(
+      */
+     @Suppress("TooGenericExceptionCaught")
+     override suspend fun getTabs(): Flow<List<TabState>> {
+-        return try {
+-            database.value.recentlyClosedTabDao().getTabs().map { list ->
++        return database.value.recentlyClosedTabDao().getTabs()
++            .catch { exception ->
++                crashReporting.submitCaughtException(RecentlyClosedTabsStorageException(exception))
++                // If the database is "corrupted" then we clean the database and also the file storage
++                // to allow for a fresh set of recently closed tabs later.
++                removeAllTabs()
++                // Inform all observers of this data that recent tabs are cleared
++                // to prevent users from trying to restore nonexistent recently closed tabs.
++                emit(emptyList())
++            }
++            .map { list ->
+                 list.map { it.asTabState() }
+             }
+-        } catch (e: Exception) {
+-            crashReporting.submitCaughtException(RecentlyClosedTabsStorageException(e))
+-            flowOf()
+-        }
+     }
+ 
+     /**
+diff --git a/android-components/docs/changelog.md b/android-components/docs/changelog.md
+index 8183639bfc5a..4fad628b333f 100644
+--- a/android-components/docs/changelog.md
++++ b/android-components/docs/changelog.md
+@@ -11,6 +11,9 @@ permalink: /changelog/
+ * [Gecko](https://github.com/mozilla-mobile/android-components/blob/main/buildSrc/src/main/java/Gecko.kt)
+ * [Configuration](https://github.com/mozilla-mobile/android-components/blob/main/.config.yml)
+ 
++* **feature-recentlyclosed**
++  * 🚒 Bug fixed [issue #12310](https://github.com/mozilla-mobile/android-components/issues/12310) - Catch all database exceptions thrown when querying recently closed tabs and clean the storage for corrupted data.
++
+ * **feature-media**
+   *  App should not be locked in landscape when a tab or custom tab loads while in pip mode. [#12298] (https://github.com/mozilla-mobile/android-components/issues/12298)
+ 

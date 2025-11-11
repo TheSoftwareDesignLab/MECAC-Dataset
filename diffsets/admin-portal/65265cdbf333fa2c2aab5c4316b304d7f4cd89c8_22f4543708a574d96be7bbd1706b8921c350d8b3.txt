@@ -1,0 +1,175 @@
+diff --git a/lib/data/repositories/invoice_repository.dart b/lib/data/repositories/invoice_repository.dart
+index a05b8a97a62..6bd01aad4f8 100644
+--- a/lib/data/repositories/invoice_repository.dart
++++ b/lib/data/repositories/invoice_repository.dart
+@@ -60,23 +60,42 @@ class InvoiceRepository {
+   }
+ 
+   Future<InvoiceEntity> saveData(
+-      Credentials credentials, InvoiceEntity invoice) async {
++    Credentials credentials,
++    InvoiceEntity invoice, {
++    bool isSent = false,
++    bool isPaid = false,
++  }) async {
+     invoice = invoice.rebuild((b) => b..documents.clear());
+     final data = serializers.serializeWith(InvoiceEntity.serializer, invoice);
+     dynamic response;
++    String url;
+ 
+     if (invoice.isNew) {
+-      response = await webClient.post(
+-          credentials.url + '/invoices?include=activities.history',
+-          credentials.token,
+-          data: json.encode(data));
++      url = credentials.url + '/invoices?include=activities.history';
++
++      response =
++          await webClient.post(url, credentials.token, data: json.encode(data));
+     } else {
+-      final url =
++      url =
+           '${credentials.url}/invoices/${invoice.id}?include=activities.history';
+       response =
+           await webClient.put(url, credentials.token, data: json.encode(data));
+     }
+ 
++    if (isSent) {
++      url += '&public=true';
++    } else if (isPaid) {
++      url += '&paid=true';
++    }
++
++    if (invoice.isNew) {
++      response =
++          await webClient.post(url, credentials.token, data: json.encode(data));
++    } else {
++      response =
++          await webClient.put(url, credentials.token, data: json.encode(data));
++    }
++
+     final InvoiceItemResponse invoiceResponse =
+         serializers.deserializeWith(InvoiceItemResponse.serializer, response);
+ 
+diff --git a/lib/redux/invoice/invoice_actions.dart b/lib/redux/invoice/invoice_actions.dart
+index 7e2636c784c..c2ef5910e37 100644
+--- a/lib/redux/invoice/invoice_actions.dart
++++ b/lib/redux/invoice/invoice_actions.dart
+@@ -188,12 +188,12 @@ class SaveInvoiceRequest implements StartSaving {
+   SaveInvoiceRequest({
+     this.completer,
+     this.invoice,
+-    this.skipRefresh = false,
++    this.action,
+   });
+ 
+   final Completer completer;
+   final InvoiceEntity invoice;
+-  final bool skipRefresh;
++  final EntityAction action;
+ }
+ 
+ class SaveInvoiceSuccess implements StopSaving, PersistUI {
+@@ -504,9 +504,8 @@ class UpdateInvoiceTab implements PersistUI {
+   final int tabIndex;
+ }
+ 
+-void handleInvoiceAction(
+-    BuildContext context, List<BaseEntity> invoices, EntityAction action,
+-    {VoidCallback callback}) async {
++void handleInvoiceAction(BuildContext context, List<BaseEntity> invoices,
++    EntityAction action) async {
+   if (invoices.isEmpty) {
+     return;
+   }
+@@ -536,8 +535,7 @@ void handleInvoiceAction(
+               context,
+               invoiceIds.length == 1
+                   ? localization.markedInvoiceAsSent
+-                  : localization.markedInvoicesAsSent,
+-              callback: callback),
++                  : localization.markedInvoicesAsSent),
+           invoiceIds));
+       break;
+     case EntityAction.reverse:
+@@ -564,8 +562,7 @@ void handleInvoiceAction(
+               context,
+               invoiceIds.length == 1
+                   ? localization.markedInvoiceAsPaid
+-                  : localization.markedInvoicesAsPaid,
+-              callback: callback),
++                  : localization.markedInvoicesAsPaid),
+           invoiceIds));
+       break;
+     case EntityAction.emailInvoice:
+diff --git a/lib/redux/invoice/invoice_middleware.dart b/lib/redux/invoice/invoice_middleware.dart
+index c40364ef53d..dac30cd821e 100644
+--- a/lib/redux/invoice/invoice_middleware.dart
++++ b/lib/redux/invoice/invoice_middleware.dart
+@@ -403,16 +403,19 @@ Middleware<AppState> _saveInvoice(InvoiceRepository repository) {
+           .replace(action.invoice.lineItems.where((item) => !item.isEmpty)));
+ 
+     repository
+-        .saveData(store.state.credentials, updatedInvoice)
++        .saveData(
++      store.state.credentials,
++      updatedInvoice,
++      isSent: action.action == EntityAction.markSent,
++      isPaid: action.action == EntityAction.markPaid,
++    )
+         .then((InvoiceEntity invoice) {
+       if (action.invoice.isNew) {
+         store.dispatch(AddInvoiceSuccess(invoice));
+       } else {
+         store.dispatch(SaveInvoiceSuccess(invoice));
+       }
+-      if (!action.skipRefresh) {
+-        store.dispatch(RefreshData());
+-      }
++      store.dispatch(RefreshData());
+       action.completer.complete(invoice);
+     }).catchError((Object error) {
+       print(error);
+diff --git a/lib/ui/invoice/edit/invoice_edit_vm.dart b/lib/ui/invoice/edit/invoice_edit_vm.dart
+index c23aa9983b6..892d3381dc2 100644
+--- a/lib/ui/invoice/edit/invoice_edit_vm.dart
++++ b/lib/ui/invoice/edit/invoice_edit_vm.dart
+@@ -29,7 +29,7 @@ class InvoiceEditScreen extends StatelessWidget {
+       builder: (context, viewModel) {
+         return InvoiceEdit(
+           viewModel: viewModel,
+-          key: ValueKey(viewModel.invoice.id),
++          key: ValueKey(viewModel.invoice.updatedAt),
+         );
+       },
+     );
+@@ -135,10 +135,7 @@ class InvoiceEditVM extends AbstractInvoiceEditVM {
+           store.dispatch(SaveInvoiceRequest(
+             completer: completer,
+             invoice: invoice,
+-            skipRefresh: [
+-              EntityAction.markSent,
+-              EntityAction.markPaid,
+-            ].contains(action),
++            action: action,
+           ));
+           return completer.future.then((savedInvoice) {
+             showToast(invoice.isNew
+@@ -162,14 +159,9 @@ class InvoiceEditVM extends AbstractInvoiceEditVM {
+                     force: true);
+               }
+ 
+-              if (action != null) {
+-                handleInvoiceAction(context, [savedInvoice], action,
+-                    callback: () {
+-                  editEntity(
+-                      context: navigatorKey.currentContext,
+-                      entity: state.invoiceState.get(savedInvoice.id),
+-                      force: true);
+-                });
++              if ([EntityAction.emailInvoice, EntityAction.viewPdf]
++                  .contains(action)) {
++                handleEntityAction(savedInvoice, action);
+               }
+             }
+           }).catchError((Object error) {

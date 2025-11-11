@@ -1,0 +1,1228 @@
+diff --git a/AnkiDroid/src/main/AndroidManifest.xml b/AnkiDroid/src/main/AndroidManifest.xml
+index c04c52b3d178..671c6791c63a 100644
+--- a/AnkiDroid/src/main/AndroidManifest.xml
++++ b/AnkiDroid/src/main/AndroidManifest.xml
+@@ -595,12 +595,17 @@
+          -->
+         <activity
+             android:name="com.ichi2.anki.instantnoteeditor.InstantNoteEditorActivity"
+-            android:exported="false"
++            android:exported="true"
+             android:label="@string/instant_card"
+             android:launchMode="singleInstance"
+             android:excludeFromRecents="true"
+             android:taskAffinity=""
+             android:theme="@style/Theme.AppCompat.Transparent.NoActionBar" >
++            <intent-filter>
++                <action android:name="android.intent.action.SEND" />
++                <category android:name="android.intent.category.DEFAULT" />
++                <data android:mimeType="text/plain" />
++            </intent-filter>
+         </activity>
+ 
+ 
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/NoteEditor.kt b/AnkiDroid/src/main/java/com/ichi2/anki/NoteEditor.kt
+index e2b84e7a5008..274fbfb2df5f 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/NoteEditor.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/NoteEditor.kt
+@@ -517,7 +517,7 @@ class NoteEditor : AnkiActivity(), DeckSelectionListener, SubtitleListener, Tags
+             }
+             CALLER_STUDYOPTIONS, CALLER_DECKPICKER, CALLER_REVIEWER_ADD, CALLER_CARDBROWSER_ADD, CALLER_NOTEEDITOR ->
+                 addNote = true
+-            CALLER_NOTEEDITOR_INTENT_ADD -> {
++            CALLER_NOTEEDITOR_INTENT_ADD, INSTANT_NOTE_EDITOR -> {
+                 fetchIntentInformation(intent)
+                 if (sourceText == null) {
+                     finish()
+@@ -2458,6 +2458,7 @@ class NoteEditor : AnkiActivity(), DeckSelectionListener, SubtitleListener, Tags
+         const val RESULT_UPDATED_IO_NOTE = 11
+         const val CALLER_IMG_OCCLUSION = 12
+         const val CALLER_ADD_IMAGE = 13
++        const val INSTANT_NOTE_EDITOR = 14
+ 
+         // preferences keys
+         const val PREF_NOTE_EDITOR_SCROLL_TOOLBAR = "noteEditorScrollToolbar"
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/instantnoteeditor/InstantEditorViewModel.kt b/AnkiDroid/src/main/java/com/ichi2/anki/instantnoteeditor/InstantEditorViewModel.kt
+new file mode 100644
+index 000000000000..8a790af81692
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/instantnoteeditor/InstantEditorViewModel.kt
+@@ -0,0 +1,174 @@
++/*
++ * Copyright (c) 2024 Ashish Yadav <mailtoashish693@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation; either version 3 of the License, or (at your option) any later
++ * version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++ * FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
++ * details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package com.ichi2.anki.instantnoteeditor
++
++import android.content.Context
++import androidx.annotation.VisibleForTesting
++import androidx.lifecycle.LiveData
++import androidx.lifecycle.MutableLiveData
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import com.ichi2.anki.CollectionManager.withCol
++import com.ichi2.anki.NoteFieldsCheckResult
++import com.ichi2.anki.OnErrorListener
++import com.ichi2.anki.R
++import com.ichi2.anki.checkNoteFieldsResponse
++import com.ichi2.anki.instantnoteeditor.InstantNoteEditorActivity.DialogType
++import com.ichi2.anki.utils.ext.getAllClozeTextFields
++import com.ichi2.libanki.DeckId
++import com.ichi2.libanki.Decks
++import com.ichi2.libanki.Note
++import com.ichi2.libanki.NotetypeJson
++import com.ichi2.libanki.undoableOp
++import kotlinx.coroutines.flow.MutableSharedFlow
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.launch
++import timber.log.Timber
++
++/**
++ * ViewModel for managing instant note editing functionality.
++ * This ViewModel provides methods for handling note editing operations and
++ * managing the state related to instant note editing.
++ */
++class InstantEditorViewModel : ViewModel(), OnErrorListener {
++    override val onError = MutableSharedFlow<String>()
++
++    /** Errors or Warnings related to the edit fields that might occur when trying to save note */
++    val instantEditorError = MutableSharedFlow<String?>()
++
++    /**
++     * Gets the current editor note.
++     */
++    @VisibleForTesting
++    lateinit var editorNote: Note
++
++    private val _currentlySelectedNotetype = MutableLiveData<NotetypeJson>()
++
++    /**
++     * Representing the currently selected note type.
++     *
++     * @see NotetypeJson
++     */
++    val currentlySelectedNotetype: LiveData<NotetypeJson> get() = _currentlySelectedNotetype
++
++    var deckId: DeckId? = null
++
++    private val _dialogType = MutableStateFlow<DialogType?>(null)
++
++    /** Representing the type of dialog to be displayed.
++     * @see DialogType*/
++    val dialogType: StateFlow<DialogType?> get() = _dialogType
++
++    init {
++        viewModelScope.launch {
++            // setup the deck Id
++            withCol { config.get<Long?>(Decks.CURRENT_DECK) ?: 1L }.let { did ->
++                deckId = did
++            }
++
++            // setup the note type
++            // TODO: Use did here
++            val noteType = withCol { notetypes.all().firstOrNull { it.isCloze } }
++            if (noteType == null) {
++                _dialogType.emit(DialogType.NO_CLOZE_NOTE_TYPES_DIALOG)
++                return@launch
++            }
++
++            @Suppress("RedundantRequireNotNullCall") // postValue lint requires this
++            val clozeNoteType = requireNotNull(noteType)
++            Timber.d("Changing to cloze type note")
++            _currentlySelectedNotetype.postValue(clozeNoteType)
++            Timber.i("Using note type '%d", clozeNoteType.id)
++            editorNote = withCol { Note.fromNotetypeId(clozeNoteType.id) }
++
++            _dialogType.emit(DialogType.SHOW_EDITOR_DIALOG)
++        }
++    }
++
++    /** Update the deck id when changed from deck spinner **/
++    fun setDeckId(deckId: DeckId) {
++        this.deckId = deckId
++    }
++
++    /**
++     * Checks the note fields and calls [saveNote] if all fields are valid.
++     * If [skipClozeCheck] is set to true, the cloze field check is skipped.
++     *
++     * @param context The context used to retrieve localized error messages.
++     * @param skipClozeCheck Indicates whether to skip the cloze field check.
++     * @return A [SaveNoteResult] indicating the outcome of the operation.
++     */
++    suspend fun checkAndSaveNote(
++        context: Context,
++        skipClozeCheck: Boolean = false
++    ): SaveNoteResult {
++        if (skipClozeCheck) {
++            return saveNote()
++        }
++
++        val note = editorNote
++        val result = checkNoteFieldsResponse(note)
++        if (result is NoteFieldsCheckResult.Failure) {
++            val errorMessage = result.getLocalizedMessage(context)
++            return SaveNoteResult.Warning(errorMessage)
++        }
++        Timber.d("Note fields check successful, saving note")
++        instantEditorError.emit(null)
++        return saveNote()
++    }
++
++    /** Adds the note to the collection.
++     * @return If the operation is successful, returns [SaveNoteResult.Success],
++     * otherwise returns [SaveNoteResult.Failure].
++     */
++    private suspend fun saveNote(): SaveNoteResult {
++        return try {
++            editorNote.notetype.put("did", deckId)
++
++            val note = editorNote
++            val deckId = deckId ?: return SaveNoteResult.Failure()
++
++            Timber.d("Note and deck id not null, adding note")
++            undoableOp { addNote(note, deckId) }
++
++            SaveNoteResult.Success
++        } catch (e: Exception) {
++            Timber.w(e, "Error saving note")
++            SaveNoteResult.Failure()
++        }
++    }
++
++    fun getClozeFields(): List<String> {
++        return editorNote.notetype.getAllClozeTextFields()
++    }
++}
++
++/**
++ * Represents the result of saving a note operation.
++ */
++sealed class SaveNoteResult {
++    data object Success : SaveNoteResult()
++
++    data class Failure(val message: String? = null) : SaveNoteResult() {
++        fun getErrorMessage(context: Context) =
++            message ?: context.getString(R.string.something_wrong)
++    }
++
++    data class Warning(val message: String?) : SaveNoteResult()
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/instantnoteeditor/InstantNoteEditorActivity.kt b/AnkiDroid/src/main/java/com/ichi2/anki/instantnoteeditor/InstantNoteEditorActivity.kt
+index b89a8e60d326..39ad77f5036b 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/instantnoteeditor/InstantNoteEditorActivity.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/instantnoteeditor/InstantNoteEditorActivity.kt
+@@ -17,17 +17,72 @@
+ 
+ package com.ichi2.anki.instantnoteeditor
+ 
++import android.app.Activity
++import android.content.Context
++import android.content.Intent
+ import android.os.Bundle
++import android.text.Editable
++import android.text.TextWatcher
++import android.view.ActionMode
++import android.view.LayoutInflater
++import android.view.View
++import android.view.inputmethod.InputMethodManager
++import android.widget.EditText
++import android.widget.LinearLayout
+ import androidx.activity.enableEdgeToEdge
++import androidx.activity.viewModels
++import androidx.appcompat.app.AlertDialog
++import androidx.appcompat.app.AppCompatActivity
++import androidx.lifecycle.flowWithLifecycle
++import androidx.lifecycle.lifecycleScope
++import com.google.android.material.button.MaterialButton
++import com.google.android.material.materialswitch.MaterialSwitch
++import com.google.android.material.textfield.TextInputEditText
++import com.google.android.material.textfield.TextInputLayout
+ import com.ichi2.anki.AnkiActivity
++import com.ichi2.anki.CollectionManager.TR
++import com.ichi2.anki.CustomActionModeCallback
++import com.ichi2.anki.DeckSpinnerSelection
++import com.ichi2.anki.NoteEditor
+ import com.ichi2.anki.R
++import com.ichi2.anki.dialogs.DeckSelectionDialog
++import com.ichi2.anki.launchCatchingTask
++import com.ichi2.anki.servicelayer.NoteService
++import com.ichi2.anki.showThemedToast
++import com.ichi2.anki.withProgress
++import com.ichi2.libanki.NotetypeJson
+ import com.ichi2.themes.setTransparentBackground
++import com.ichi2.ui.FixedTextView
++import com.ichi2.utils.jsonObjectIterable
++import com.ichi2.utils.message
++import com.ichi2.utils.negativeButton
++import com.ichi2.utils.positiveButton
++import com.ichi2.utils.show
++import com.ichi2.utils.title
++import kotlinx.coroutines.flow.launchIn
++import kotlinx.coroutines.flow.onEach
++import kotlinx.coroutines.launch
++import timber.log.Timber
++import kotlin.math.max
+ 
+ /**
+  * Single instance Activity for instantly editing and adding cloze card/s without actually opening the app,
+  * uses a custom dialog layout and a transparent activity theme to achieve the functionality.
+  **/
+-class InstantNoteEditorActivity : AnkiActivity() {
++class InstantNoteEditorActivity : AnkiActivity(), DeckSelectionDialog.DeckSelectionListener {
++    private val viewModel: InstantEditorViewModel by viewModels()
++
++    private var deckSpinnerSelection: DeckSpinnerSelection? = null
++
++    private var dialogView: View? = null
++
++    private var sharedIntentText: IntentSharedText? = null
++
++    private lateinit var singleTapSwitch: MaterialSwitch
++    private var editFieldsLayout: LinearLayout? = null
++    private lateinit var clozeEditTextField: TextInputEditText
++    private lateinit var warningTextField: FixedTextView
++    private lateinit var instantAlertDialog: AlertDialog
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         if (showedActivityFailedScreen(savedInstanceState)) {
+@@ -39,7 +94,425 @@ class InstantNoteEditorActivity : AnkiActivity() {
+         }
+         setTransparentBackground()
+         enableEdgeToEdge()
++
+         setContentView(R.layout.activity_instant_note_editor)
+-        onDestroy()
++
++        if (Intent.ACTION_SEND == intent.action && intent.type != null && "text/plain" == intent.type) {
++            handleSharedText(intent)
++        }
++
++        setupErrorListeners()
++        prepareEditorDialog()
++    }
++
++    private fun prepareEditorDialog() = lifecycleScope.launch {
++        Timber.d("Checking for cloze note type")
++
++        viewModel.dialogType.collect { dialogType ->
++            dialogType?.let { dialog ->
++                when (dialog) {
++                    DialogType.NO_CLOZE_NOTE_TYPES_DIALOG -> {
++                        Timber.d("Showing no cloze note type dialog")
++                        noClozeNoteTypesFoundDialog()
++                    }
++
++                    DialogType.SHOW_EDITOR_DIALOG -> {
++                        Timber.d("Showing editor dialog")
++                        showEditorDialog()
++                    }
++                }
++            }
++        }
++    }
++
++    /** Setup the deck spinner and custom editor dialog layout **/
++    private fun showEditorDialog() {
++        showDialog()
++        deckSpinnerSelection = DeckSpinnerSelection(
++            dialogView!!.context as AppCompatActivity,
++            dialogView!!.findViewById(R.id.note_deck_spinner),
++            showAllDecks = false,
++            alwaysShowDefault = true,
++            showFilteredDecks = false
++        ).apply {
++            initializeNoteEditorDeckSpinner(getColUnsafe)
++            launchCatchingTask {
++                viewModel.deckId?.let { selectDeckById(it, true) }
++            }
++        }
++    }
++
++    /** Handles the shared text received through an Intent. **/
++    private fun handleSharedText(receivedIntent: Intent) {
++        val sharedText = receivedIntent.getStringExtra(Intent.EXTRA_TEXT) ?: return
++        sharedIntentText = IntentSharedText(sharedText)
++    }
++
++    private fun openNoteEditor() {
++        val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
++        val noteEditorIntent = Intent(this, NoteEditor::class.java).apply {
++            putExtra(NoteEditor.EXTRA_CALLER, NoteEditor.INSTANT_NOTE_EDITOR)
++            putExtra(Intent.EXTRA_TEXT, sharedText)
++        }
++        startActivity(noteEditorIntent)
++        finish()
++    }
++
++    fun showDialog() {
++        Timber.d("Showing Instant Note Editor dialog")
++        val dialogView = layoutInflater.inflate(R.layout.instant_editor_dialog, null).also { dv ->
++            dialogView = dv
++        }
++        editFieldsLayout = dialogView.findViewById(R.id.editor_fields_layout)
++        singleTapSwitch = dialogView.findViewById(R.id.switch_single_tap_cloze)
++        dialogView.findViewById<MaterialButton>(R.id.open_note_editor)?.setOnClickListener {
++            openNoteEditor()
++        }
++        warningTextField = dialogView.findViewById(R.id.warning_text)
++        dialogView.findViewById<MaterialButton>(R.id.increment_cloze_button)?.setOnClickListener {
++            currentClozeNumber++
++            Timber.d("Incrementing cloze number: $currentClozeNumber")
++        }
++
++        val editFields = createEditFields(this, viewModel.currentlySelectedNotetype.value)
++
++        Timber.d("Adding edit text fields to the dialog")
++        for (editField in editFields) {
++            editFieldsLayout?.addView(editField)
++        }
++
++        instantAlertDialog = AlertDialog.Builder(this).show {
++            setView(dialogView)
++            val spinner = dialogView.findViewById<LinearLayout>(R.id.spinner_layout)
++            spinner.setOnClickListener {
++                launchCatchingTask { deckSpinnerSelection!!.displayDeckSelectionDialog() }
++            }
++            dialogView.findViewById<MaterialButton>(R.id.action_save_note)?.setOnClickListener {
++                Timber.d("Save note button pressed")
++                checkAndSave()
++            }
++            setOnDismissListener {
++                finish()
++            }
++        }
++    }
++
++    private fun createEditFields(
++        context: Context,
++        notetypeJson: NotetypeJson?
++    ): List<View> {
++        val editLines: MutableList<View> = mutableListOf()
++
++        val clozeFields = viewModel.getClozeFields()
++        var clozeFieldsSet = false
++
++        for (i in notetypeJson?.flds!!.jsonObjectIterable()) {
++            // Inflate the existing layout
++            val inflater = LayoutInflater.from(context)
++            val existingLayout = inflater.inflate(R.layout.instant_editor_field_layout, null)
++
++            val textInputLayout =
++                existingLayout.findViewById<TextInputLayout>(R.id.edit_text_layout)
++            val textInputEditText =
++                existingLayout.findViewById<TextInputEditText>(R.id.edit_field_text)
++
++            val name = i.getString("name")
++            textInputLayout.hint = name
++
++            Timber.d("Populating the cloze edit text fields")
++            // Anki allows multiple cloze fields, we pick the first field
++            if (clozeFields.contains(name) && !clozeFieldsSet) {
++                setupClozeFields(textInputEditText)
++                clozeFieldsSet = true
++            }
++
++            editLines.add(existingLayout)
++        }
++        return editLines
++    }
++
++    /** Sets the copied text to the cloze field and enable the single tap gesture for that field**/
++    private fun setupClozeFields(textBox: TextInputEditText) {
++        clozeEditTextField = textBox
++        textBox.setText(sharedIntentText?.sharedTextString)
++        val gestureHelper = EditTextGestureHelper(
++            textBox,
++            EditTextGestureState(singleTapSwitch.isChecked)
++        )
++
++        enableErrorMessage()
++
++        setActionModeCallback(textBox)
++
++        singleTapSwitch.setOnCheckedChangeListener { _, check ->
++            gestureHelper.toggleGestureState()
++            if (check) {
++                hideKeyboard()
++            }
++        }
++    }
++
++    private fun hideKeyboard() {
++        val inputMethodManager =
++            this.getSystemService(Activity.INPUT_METHOD_SERVICE) as InputMethodManager
++        inputMethodManager.hideSoftInputFromWindow(clozeEditTextField.windowToken, 0)
++    }
++
++    /** Set the error message to null when the text is changed in the TextInputEditText **/
++    private fun enableErrorMessage() {
++        clozeEditTextField.addTextChangedListener(object : TextWatcher {
++            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {
++                // No action needed
++            }
++
++            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
++                lifecycleScope.launch {
++                    viewModel.instantEditorError.emit(null)
++                }
++            }
++
++            override fun afterTextChanged(s: Editable?) {
++                // No action needed
++            }
++        })
++    }
++
++    /**
++     * Checks if the fields are not empty and contain cloze deletions,
++     * retrieves the field content, and saves the note
++     */
++    private fun checkAndSave() {
++        getFieldValues()
++
++        lifecycleScope.launch {
++            val result = withProgress(resources.getString(R.string.saving_facts)) {
++                viewModel.checkAndSaveNote(this@InstantNoteEditorActivity)
++            }
++            handleSaveNoteResult(result)
++        }
++    }
++
++    private fun handleSaveNoteResult(result: SaveNoteResult) {
++        when (result) {
++            is SaveNoteResult.Failure -> {
++                Timber.d("Failed to save note")
++                savingErrorDialog(result.getErrorMessage(this))
++            }
++
++            SaveNoteResult.Success -> {
++                currentClozeNumber = 0
++                // Don't show snackbar to avoid blocking parent app
++                showThemedToast(this@InstantNoteEditorActivity, TR.addingAdded(), true)
++                instantAlertDialog.dismiss()
++            }
++
++            is SaveNoteResult.Warning -> {
++                Timber.d("Showing warning to the user")
++                lifecycleScope.launch { viewModel.instantEditorError.emit(result.message) }
++            }
++        }
++    }
++
++    override fun onDestroy() {
++        super.onDestroy()
++        currentClozeNumber = 0
++    }
++
++    /** Gets the field content from the editor **/
++    private fun getFieldValues() {
++        val editTextValues = mutableListOf<String>()
++
++        editFieldsLayout?.let { layout ->
++            for (i in 0 until layout.childCount) {
++                val childView = layout.getChildAt(i)
++
++                if (childView is TextInputLayout) {
++                    val text = extractTextFromInputField(childView)
++                    Timber.d("String values in field are $text")
++                    editTextValues.add(text)
++
++                    updateFields(i, childView.findViewById(R.id.edit_field_text))
++                }
++            }
++        }
++    }
++
++    private fun extractTextFromInputField(textInputLayout: TextInputLayout): String {
++        val textInputEditText =
++            textInputLayout.findViewById<TextInputEditText>(R.id.edit_field_text)
++        return textInputEditText?.text?.toString() ?: ""
++    }
++
++    private fun updateFields(index: Int, field: TextInputEditText?) {
++        val fieldContent = field!!.text?.toString() ?: ""
++        val correctedFieldContent = NoteService.convertToHtmlNewline(
++            fieldContent,
++            false
++        )
++
++        val note = viewModel.editorNote
++        if (note.values()[index] != correctedFieldContent) {
++            note.values()[index] = correctedFieldContent
++        }
++    }
++
++    /** Show a dialog when there is no cloze note type is found, allowing user either to cancel or to open
++     * AnkiDroid Note Editor **/
++    private fun noClozeNoteTypesFoundDialog() {
++        AlertDialog.Builder(this).show {
++            title(R.string.cloze_note_required)
++            message(R.string.cloze_not_found_message)
++            positiveButton(R.string.open) {
++                openNoteEditor()
++            }
++            negativeButton(R.string.dialog_cancel) {
++                finish()
++            }
++        }
++    }
++
++    private fun setupErrorListeners() {
++        viewModel.onError.flowWithLifecycle(lifecycle).onEach { errorMessage ->
++            AlertDialog.Builder(this).setTitle(R.string.vague_error).setMessage(errorMessage)
++                .show()
++        }.launchIn(lifecycleScope)
++
++        viewModel.instantEditorError.onEach { errorMessage ->
++            when (errorMessage) {
++                null -> {
++                    warningTextField.visibility = View.INVISIBLE
++                }
++
++                TR.addingYouHaveAClozeDeletionNote() -> {
++                    noClozeDialog(errorMessage)
++                }
++
++                else -> {
++                    warningTextField.visibility = View.VISIBLE
++                    warningTextField.text = errorMessage
++                }
++            }
++        }.launchIn(lifecycleScope)
++    }
++
++    /** In case saving the note fails we, want to allow user to cancel and try again, or exist the activity **/
++    private fun savingErrorDialog(message: String) {
++        AlertDialog.Builder(this).show {
++            message(text = message)
++            positiveButton(R.string.dialog_cancel) {
++                instantAlertDialog.dismiss()
++            }
++            negativeButton(R.string.try_again)
++        }
++    }
++
++    /** Warns the user for no cloze in the cloze field, and provide the choice to proceed or
++     * to abort save and go back to the editor  **/
++    private fun noClozeDialog(errorMessage: String) {
++        AlertDialog.Builder(this).show {
++            message(text = errorMessage)
++            positiveButton(text = TR.actionsSave()) {
++                lifecycleScope.launch {
++                    val result = withProgress(resources.getString(R.string.saving_facts)) {
++                        viewModel.checkAndSaveNote(this@InstantNoteEditorActivity, true)
++                    }
++                    handleSaveNoteResult(result)
++                }
++            }
++            negativeButton(R.string.dialog_cancel)
++        }
++    }
++
++    override fun onDeckSelected(deck: DeckSelectionDialog.SelectableDeck?) {
++        if (deck == null) {
++            return
++        }
++        viewModel.setDeckId(deck.deckId)
++        // this is called because DeckSpinnerSelection.onDeckAdded doesn't update the list
++        deckSpinnerSelection!!.initializeNoteEditorDeckSpinner(getColUnsafe)
++        launchCatchingTask {
++            viewModel.deckId?.let { deckSpinnerSelection!!.selectDeckById(it, false) }
++        }
++    }
++
++    private fun setActionModeCallback(textBox: TextInputEditText) {
++        val clozeMenuId = View.generateViewId()
++        textBox.customSelectionActionModeCallback = getActionModeCallback(textBox, clozeMenuId)
++        textBox.customInsertionActionModeCallback = getActionModeCallback(textBox, clozeMenuId)
++        getActionModeCallback(textBox, clozeMenuId)
++    }
++
++    private fun getActionModeCallback(
++        textBox: TextInputEditText,
++        clozeMenuId: Int
++    ): ActionMode.Callback {
++        return CustomActionModeCallback(
++            // we always have cloze type notes here
++            isClozeType = true,
++            getString(R.string.multimedia_editor_popup_cloze),
++            clozeMenuId,
++            onActionItemSelected = { mode, item ->
++                val itemId = item.itemId
++                if (itemId == clozeMenuId) {
++                    val selectedText = textBox.text?.substring(
++                        textBox.selectionStart,
++                        textBox.selectionEnd
++                    ) ?: ""
++                    convertSelectedTextToCloze(
++                        textBox,
++                        selectedText,
++                        max(currentClozeNumber, 1)
++                    )
++
++                    mode.finish()
++                    true
++                } else {
++                    false
++                }
++            }
++        )
++    }
++
++    private fun convertSelectedTextToCloze(
++        textBox: EditText,
++        word: String,
++        incrementNumber: Int
++    ) {
++        val text = textBox.text.toString()
++        val selectionStart = textBox.selectionStart
++
++        val start = text.indexOf(word, selectionStart - word.length)
++        val end = start + word.length
++
++        if (start != -1 && end != -1) {
++            val newText =
++                text.substring(0, start) + "{{c$incrementNumber::$word}}" + text.substring(end)
++
++            textBox.setText(newText)
++            textBox.setSelection(start + "{{c$incrementNumber::".length)
++        }
++    }
++
++    /**
++     * Enum class that represent the dialog that can be shown when the InstantEditor is initialized
++     * **/
++    enum class DialogType {
++        /** Indicates that no cloze note types were found. **/
++        NO_CLOZE_NOTE_TYPES_DIALOG,
++
++        /** Indicates that the editor dialog should be shown. **/
++        SHOW_EDITOR_DIALOG
++    }
++
++    companion object {
++        /** Allows to keep track of the current cloze number, reset to 0 when activity is destroyed **/
++        var currentClozeNumber: Int = 0
+     }
+ }
++
++/**
++ * Encapsulates the shared text data received through Intent
++ **/
++data class IntentSharedText(
++    val sharedTextString: String
++)
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/instantnoteeditor/TextSurroundHelper.kt b/AnkiDroid/src/main/java/com/ichi2/anki/instantnoteeditor/TextSurroundHelper.kt
+new file mode 100644
+index 000000000000..1f0e853d7de1
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/instantnoteeditor/TextSurroundHelper.kt
+@@ -0,0 +1,149 @@
++/*
++ * Copyright (c) 2024 Ashish Yadav <mailtoashish693@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation; either version 3 of the License, or (at your option) any later
++ * version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++ * FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
++ * details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package com.ichi2.anki.instantnoteeditor
++
++import android.view.GestureDetector
++import android.view.MotionEvent
++import android.widget.EditText
++import kotlin.math.max
++
++/**
++ * Represents the state of EditText gesture  recognition
++ *
++ * This data class holds states of gesture recognition for an EditText,
++ * allowing for clear and concise representation of its state.
++ */
++data class EditTextGestureState(val isEnabled: Boolean)
++
++/**
++ * Helper class to handle gesture recognition for EditText
++ *
++ * Facilitates the management of gesture recognition functionality
++ * for an EditText component. It allows enabling or disabling gesture detection
++ * based on the provided state, and provides methods for toggling the gesture state.
++ */
++class EditTextGestureHelper(private val editText: EditText, initialState: EditTextGestureState) {
++    private var currentState: EditTextGestureState = initialState
++
++    init {
++        applyState(currentState)
++    }
++
++    private fun applyState(state: EditTextGestureState) {
++        if (state.isEnabled) {
++            enableGesture()
++        } else {
++            disableGesture()
++        }
++    }
++
++    private fun setupGestureDetection() {
++        val gestureDetector =
++            GestureDetector(
++                editText.context,
++                object : GestureDetector.SimpleOnGestureListener() {
++                    override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
++                        handleSingleTap(e)
++                        return super.onSingleTapConfirmed(e)
++                    }
++                }
++            )
++
++        editText.setOnTouchListener { _, event ->
++            gestureDetector.onTouchEvent(event)
++            editText.onTouchEvent(event)
++            true
++        }
++
++        editText.apply {
++            showSoftInputOnFocus = false
++            isFocusable = false
++            isCursorVisible = false
++            isFocusableInTouchMode = true
++        }
++    }
++
++    private fun handleSingleTap(event: MotionEvent) {
++        singleTap(editText, event)
++    }
++
++    /**
++     * Handles a single tap event on the EditText.
++     * This method is responsible for detecting the tapped word, surrounding it with cloze brackets,
++     * and updating the EditText with the modified text.
++     *
++     * @param editText The EditText where the tap event occurred.
++     * @param event The MotionEvent representing the tap event.
++     */
++    private fun singleTap(editText: EditText, event: MotionEvent) {
++        val layout = editText.layout
++        val x = event.x.toInt()
++        val y = event.y.toInt()
++
++        val line = layout.getLineForVertical(y)
++        val offset = layout.getOffsetForHorizontal(line, x.toFloat())
++
++        val text = editText.text.toString()
++        val start = findWordStart(text, offset)
++        val end = findWordEnd(text, offset)
++
++        val selectedWord = text.substring(start, end)
++        InstantNoteEditorActivity.currentClozeNumber = max(InstantNoteEditorActivity.currentClozeNumber, 1)
++        val newText = buildString {
++            append(text.substring(0, start))
++            append("{{c${InstantNoteEditorActivity.currentClozeNumber}::$selectedWord}}")
++            append(text.substring(end))
++        }
++        editText.setText(newText)
++    }
++
++    private fun findWordStart(text: String, offset: Int): Int {
++        var start = offset
++        while (start > 0 && !text[start - 1].isWhitespace()) {
++            start--
++        }
++        return start
++    }
++
++    private fun findWordEnd(text: String, offset: Int): Int {
++        var end = offset
++        while (end < text.length && !text[end].isWhitespace()) {
++            end++
++        }
++        return end
++    }
++
++    private fun enableGesture() {
++        setupGestureDetection()
++    }
++
++    private fun disableGesture() {
++        editText.apply {
++            setOnTouchListener(null)
++            isFocusable = true
++            isFocusableInTouchMode = true
++            showSoftInputOnFocus = true
++            isCursorVisible = true
++        }
++    }
++
++    fun toggleGestureState() {
++        currentState = EditTextGestureState(!currentState.isEnabled)
++        applyState(currentState)
++    }
++}
+diff --git a/AnkiDroid/src/main/res/drawable/ic_round_open_in_new.xml b/AnkiDroid/src/main/res/drawable/ic_round_open_in_new.xml
+new file mode 100644
+index 000000000000..88a65a8ade78
+--- /dev/null
++++ b/AnkiDroid/src/main/res/drawable/ic_round_open_in_new.xml
+@@ -0,0 +1,22 @@
++<!--
++  ~ Copyright (c) 2024 Ashish Yadav <mailtoashish693@gmail.com>
++  ~
++  ~ This program is free software; you can redistribute it and/or modify it under
++  ~ the terms of the GNU General Public License as published by the Free Software
++  ~ Foundation; either version 3 of the License, or (at your option) any later
++  ~ version.
++  ~
++  ~ This program is distributed in the hope that it will be useful, but WITHOUT ANY
++  ~ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++  ~ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
++  ~ details.
++  ~
++  ~ You should have received a copy of the GNU General Public License along with
++  ~ this program.  If not, see <http://www.gnu.org/licenses/>.
++  -->
++
++<vector xmlns:android="http://schemas.android.com/apk/res/android" android:autoMirrored="true" android:height="24dp" android:tint="#000000" android:viewportHeight="24" android:viewportWidth="24" android:width="24dp">
++      
++    <path android:fillColor="@android:color/white" android:pathData="M18,19H6c-0.55,0 -1,-0.45 -1,-1V6c0,-0.55 0.45,-1 1,-1h5c0.55,0 1,-0.45 1,-1s-0.45,-1 -1,-1H5c-1.11,0 -2,0.9 -2,2v14c0,1.1 0.9,2 2,2h14c1.1,0 2,-0.9 2,-2v-6c0,-0.55 -0.45,-1 -1,-1s-1,0.45 -1,1v5c0,0.55 -0.45,1 -1,1zM14,4c0,0.55 0.45,1 1,1h2.59l-9.13,9.13c-0.39,0.39 -0.39,1.02 0,1.41 0.39,0.39 1.02,0.39 1.41,0L19,6.41V9c0,0.55 0.45,1 1,1s1,-0.45 1,-1V4c0,-0.55 -0.45,-1 -1,-1h-5c-0.55,0 -1,0.45 -1,1z"/>
++    
++</vector>
+diff --git a/AnkiDroid/src/main/res/layout/instant_editor_dialog.xml b/AnkiDroid/src/main/res/layout/instant_editor_dialog.xml
+new file mode 100644
+index 000000000000..9d461c66e8b2
+--- /dev/null
++++ b/AnkiDroid/src/main/res/layout/instant_editor_dialog.xml
+@@ -0,0 +1,135 @@
++<?xml version="1.0" encoding="utf-8"?><!--
++  ~ Copyright (c) 2024 Ashish Yadav <mailtoashish693@gmail.com>
++  ~
++  ~ This program is free software; you can redistribute it and/or modify it under
++  ~ the terms of the GNU General Public License as published by the Free Software
++  ~ Foundation; either version 3 of the License, or (at your option) any later
++  ~ version.
++  ~
++  ~ This program is distributed in the hope that it will be useful, but WITHOUT ANY
++  ~ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++  ~ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
++  ~ details.
++  ~
++  ~ You should have received a copy of the GNU General Public License along with
++  ~ this program.  If not, see <http://www.gnu.org/licenses/>.
++  -->
++
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:orientation="vertical">
++
++    <LinearLayout
++        android:gravity="center"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginHorizontal="20dp"
++        android:orientation="horizontal"
++        android:paddingVertical="10dp">
++
++        <LinearLayout
++            android:layout_weight="1"
++            android:id="@+id/spinner_layout"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginVertical="2dp"
++            android:orientation="horizontal">
++
++            <com.ichi2.ui.FixedTextView
++                android:id="@+id/CardEditorDeckText"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:layout_gravity="center"
++                android:clickable="false"
++                android:gravity="start|center_vertical"
++                android:text="@string/CardEditorNoteDeck"
++                android:textStyle="bold" />
++
++            <Spinner
++                android:id="@+id/note_deck_spinner"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:layout_weight="1"
++                app:popupTheme="@style/ActionBar.Popup" />
++
++        </LinearLayout>
++
++        <com.google.android.material.button.MaterialButton
++            android:id="@+id/open_note_editor"
++            style="@style/Widget.Material3.Button.IconButton.Filled.Tonal"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            app:icon="@drawable/ic_round_open_in_new" />
++
++        <com.google.android.material.button.MaterialButton
++            android:id="@+id/increment_cloze_button"
++            style="@style/Widget.Material3.Button.IconButton.Filled.Tonal"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            app:icon="@drawable/ic_cloze_new_card" />
++
++    </LinearLayout>
++
++    <com.google.android.material.divider.MaterialDivider
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content" />
++
++    <ScrollView
++        android:layout_width="match_parent"
++        android:layout_height="0dp"
++        android:layout_weight="1">
++
++        <LinearLayout
++            android:id="@+id/editor_fields_layout"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginHorizontal="20dp"
++            android:layout_marginVertical="4dp"
++            android:orientation="vertical" />
++
++    </ScrollView>
++
++    <LinearLayout
++
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:orientation="vertical"
++        android:layout_marginHorizontal="20dp">
++
++        <com.ichi2.ui.FixedTextView
++            android:id="@+id/warning_text"
++            android:layout_marginTop="6dp"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_gravity="center"
++            android:drawablePadding="6dp"
++            android:drawableStart="@drawable/ic_warning"
++            android:drawableTint="@color/badge_error"
++            android:gravity="start|center"
++            android:visibility="invisible" />
++
++        <com.google.android.material.materialswitch.MaterialSwitch
++            android:id="@+id/switch_single_tap_cloze"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:checked="true"
++            android:text="@string/tap_to_cloze" />
++
++    </LinearLayout>
++
++    <LinearLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginHorizontal="20dp"
++        android:layout_marginVertical="8dp"
++        android:orientation="vertical">
++        <com.google.android.material.button.MaterialButton
++            android:id="@+id/action_save_note"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:text="@string/menu_add" />
++    </LinearLayout>
++
++</LinearLayout>
+\ No newline at end of file
+diff --git a/AnkiDroid/src/main/res/layout/instant_editor_field_layout.xml b/AnkiDroid/src/main/res/layout/instant_editor_field_layout.xml
+new file mode 100644
+index 000000000000..c860f9b785b9
+--- /dev/null
++++ b/AnkiDroid/src/main/res/layout/instant_editor_field_layout.xml
+@@ -0,0 +1,36 @@
++<?xml version="1.0" encoding="utf-8"?><!--
++  ~ Copyright (c) 2024 Ashish Yadav <mailtoashish693@gmail.com>
++  ~
++  ~ This program is free software; you can redistribute it and/or modify it under
++  ~ the terms of the GNU General Public License as published by the Free Software
++  ~ Foundation; either version 3 of the License, or (at your option) any later
++  ~ version.
++  ~
++  ~ This program is distributed in the hope that it will be useful, but WITHOUT ANY
++  ~ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++  ~ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
++  ~ details.
++  ~
++  ~ You should have received a copy of the GNU General Public License along with
++  ~ this program.  If not, see <http://www.gnu.org/licenses/>.
++  -->
++
++<com.google.android.material.textfield.TextInputLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:paddingVertical="4dp"
++    android:id="@+id/edit_text_layout"
++    style="?attr/textInputFilledStyle"
++    android:layout_weight="1"
++    android:gravity="center">
++        <com.google.android.material.textfield.TextInputEditText
++            android:id="@+id/edit_field_text"
++            android:textSize="18sp"
++            android:scrollbars="vertical"
++            android:scrollbarStyle="insideOverlay"
++            android:overScrollMode="ifContentScrolls"
++            android:lineSpacingExtra="12sp"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content" />
++    </com.google.android.material.textfield.TextInputLayout>
+\ No newline at end of file
+diff --git a/AnkiDroid/src/main/res/values/03-dialogs.xml b/AnkiDroid/src/main/res/values/03-dialogs.xml
+index 9f36df404b36..1878f2b30b0b 100644
+--- a/AnkiDroid/src/main/res/values/03-dialogs.xml
++++ b/AnkiDroid/src/main/res/values/03-dialogs.xml
+@@ -271,4 +271,10 @@ also changes the interval of the card"
+     <string name="set_due_date_range_start" comment="'Set Due Date' may change the due date of a card to a random number of days in the future. This labels the 'minimum' value of this range (inclusive)">From</string>
+     <string name="set_due_date_range_end" comment="'Set Due Date' may change the due date of a card to a random number of days in the future. This labels the 'maximum' value of this range (inclusive)">To</string>
+ 
++    <!-- Instant Note Editor -->
++    <string name="cloze_note_required">Cloze Type Note Required</string>
++    <string name="cloze_not_found_message">No Cloze type note found, open the Note Editor or try again after adding a Cloze type note.</string>
++    <string name="open">Open</string>
++    <string name="tap_to_cloze">Single tap text to cloze</string>
++
+ </resources>
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/instanteditor/InstantEditorViewModelTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/instanteditor/InstantEditorViewModelTest.kt
+new file mode 100644
+index 000000000000..3c438741b5a0
+--- /dev/null
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/instanteditor/InstantEditorViewModelTest.kt
+@@ -0,0 +1,110 @@
++/*
++ * Copyright (c) 2024 Ashish Yadav <mailtoashish693@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation; either version 3 of the License, or (at your option) any later
++ * version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++ * FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
++ * details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package com.ichi2.anki.instanteditor
++
++import androidx.test.ext.junit.runners.AndroidJUnit4
++import com.ichi2.anki.CollectionManager
++import com.ichi2.anki.RobolectricTest
++import com.ichi2.anki.instantnoteeditor.InstantEditorViewModel
++import com.ichi2.anki.instantnoteeditor.InstantNoteEditorActivity
++import com.ichi2.anki.instantnoteeditor.SaveNoteResult
++import com.ichi2.libanki.removeNotetype
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++
++@RunWith(AndroidJUnit4::class)
++class InstantEditorViewModelTest : RobolectricTest() {
++
++    @Test
++    fun testSetUpNoteType_with_Cloze_NoteType() = runViewModelTest {
++        assertEquals(InstantNoteEditorActivity.DialogType.SHOW_EDITOR_DIALOG, dialogType.value)
++    }
++
++    @Test
++    fun testSetUpNoteType_with_NoCloze_NoteType() = runViewModelTest {
++        val noteTypes = col.notetypes.all().filter { it.isCloze }
++
++        for (note in noteTypes) {
++            col.backend.removeNotetype(note.id)
++        }
++
++        waitForAsyncTasksToComplete()
++
++        // Reinitialize the viewModel
++        runViewModelTest({ InstantEditorViewModel() }) {
++            assertEquals(
++                InstantNoteEditorActivity.DialogType.NO_CLOZE_NOTE_TYPES_DIALOG,
++                dialogType.value
++            )
++        }
++    }
++
++    @Test
++    fun testSavingNoteWithNoCloze() = runViewModelTest {
++        editorNote.setField(0, "Hello")
++        val result = checkAndSaveNote(targetContext)
++
++        assertEquals(CollectionManager.TR.addingYouHaveAClozeDeletionNote(), saveNoteResult(result))
++    }
++
++    @Test
++    fun testSavingNoteWithEmptyFields() = runViewModelTest {
++        editorNote.setField(0, "{{c1::Hello}}")
++
++        val result = checkAndSaveNote(targetContext)
++
++        assertEquals("Success", saveNoteResult(result))
++    }
++
++    @Test
++    fun testSavingNoteWithClozeFields() = runViewModelTest {
++        val result = checkAndSaveNote(targetContext)
++
++        assertEquals(CollectionManager.TR.addingTheFirstFieldIsEmpty(), saveNoteResult(result))
++    }
++
++    @Test
++    fun testCheckAndSaveNote_NullEditorNote_ReturnsFailure() = runViewModelTest {
++        val result = checkAndSaveNote(targetContext)
++
++        assertTrue(result is SaveNoteResult.Warning)
++    }
++
++    private fun runViewModelTest(
++        initViewModel: () -> InstantEditorViewModel = { InstantEditorViewModel() },
++        testBody: suspend InstantEditorViewModel.() -> Unit
++    ) = runTest {
++        val viewModel = initViewModel()
++        testBody(viewModel)
++    }
++
++    private fun saveNoteResult(result: SaveNoteResult): String? {
++        return when (result) {
++            is SaveNoteResult.Failure -> result.message
++
++            SaveNoteResult.Success -> {
++                // It doesn't return a string in case of success hence we mimic that that the check was successful
++                "Success"
++            }
++
++            is SaveNoteResult.Warning -> result.message
++        }
++    }
++}

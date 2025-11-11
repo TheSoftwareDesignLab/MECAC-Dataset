@@ -1,0 +1,181 @@
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationCollectionView.m b/Signal/src/ViewControllers/ConversationView/ConversationCollectionView.m
+index 41cfbc0dfe9..109feeba424 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationCollectionView.m
++++ b/Signal/src/ViewControllers/ConversationView/ConversationCollectionView.m
+@@ -139,15 +139,12 @@ - (void)cvc_performBatchUpdates:(CVCPerformBatchUpdatesBlock)batchUpdates
+     @try {
+         void (^updateBlock)(void) = ^{
+             ConversationViewLayout *layout = cvc.layout;
+-            layout.isApplyingUpdate = YES;
+             [layout willPerformBatchUpdatesWithScrollContinuityToken:scrollContinuityToken];
+             [cvc.collectionView
+                 performBatchUpdates:^{ batchUpdates(); }
+                 completion:^(BOOL finished) {
+                     [layout didCompleteBatchUpdates];
+ 
+-                    layout.isApplyingUpdate = NO;
+-
+                     completion(finished);
+                 }];
+             [layout didPerformBatchUpdatesWithScrollContinuityToken:scrollContinuityToken];
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationViewController+CVC.swift b/Signal/src/ViewControllers/ConversationView/ConversationViewController+CVC.swift
+index 64b8cc1d094..a629617ff18 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationViewController+CVC.swift
++++ b/Signal/src/ViewControllers/ConversationView/ConversationViewController+CVC.swift
+@@ -65,7 +65,7 @@ extension ConversationViewController {
+ 
+     @objc
+     public var isLayoutApplyingUpdate: Bool {
+-        layout.isApplyingUpdate
++        layout.isPerformBatchUpdatesOrReloadDataBeingAppliedOrSettling
+     }
+ 
+     @objc
+@@ -628,8 +628,21 @@ extension ConversationViewController: CVLoadCoordinatorDelegate {
+             }
+         }
+ 
++        // We have two scroll continuity mechanisms.
++        // One is the targetContentOffset(forProposedContentOffset:) method in CVC+Scroll.swift.
++        // To work correctly, it often needs a valid "last known distance from bottom" value. We didn't always have one. This method ensures that a valid value is always prepared before we land the load.
++
++        // We have two scroll continuity mechanisms:
++        //
++        // * The first is in the targetContentOffset(forProposedContentOffset:) method in CVC+Scroll.swift.
++        //   This handles scroll continuity in most cases.
++        // * The second is in ConversationViewLayout.willPerformBatchUpdates().
++        //   We manipulate the content offset using
++        //   UICollectionViewLayoutInvalidationContext.contentOffsetAdjustment.
++        //   We (currently) only apply the second mechanism when landing "adjacent"
++        //   loads during a scroll gesture or animation. 
+         var scrollContinuityToken: CVScrollContinuityToken?
+-        if isLoadAdjacent, hasScrollingAnimation {
++        if isLoadAdjacent && (hasScrollingAnimation || isUserScrolling) {
+             scrollContinuityToken = updateToken.scrollContinuityToken
+         }
+ 
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationViewController+Misc.swift b/Signal/src/ViewControllers/ConversationView/ConversationViewController+Misc.swift
+index 212061233ae..bd306fcd2ed 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationViewController+Misc.swift
++++ b/Signal/src/ViewControllers/ConversationView/ConversationViewController+Misc.swift
+@@ -479,7 +479,7 @@ extension ConversationViewController {
+     private func readTimerDidFire() {
+         AssertIsOnMainThread()
+ 
+-        if layout.isUpdating {
++        if layout.isPerformBatchUpdatesOrReloadDataBeingApplied {
+             return
+         }
+         markVisibleMessagesAsRead()
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationViewController+UIScrollView.swift b/Signal/src/ViewControllers/ConversationView/ConversationViewController+UIScrollView.swift
+index 8e79484815f..1fc54491147 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationViewController+UIScrollView.swift
++++ b/Signal/src/ViewControllers/ConversationView/ConversationViewController+UIScrollView.swift
+@@ -245,6 +245,17 @@ extension ConversationViewController: UIScrollViewDelegate {
+     public func scrollViewShouldScrollToTop(_ scrollView: UIScrollView) -> Bool {
+         AssertIsOnMainThread()
+ 
++        // If the user taps on the status bar, the UIScrollView tries to perform
++        // a "scroll to top" animation that swings _past_ the top of the scroll
++        // view content, then bounces back to settle at zero.  This is likely
++        // to trigger a "load older" load which can land before the animation
++        // settles.  If so, the animation will overwrite the contentOffset,
++        // breaking scroll continuity and probably triggering another "load older"
++        // load.  So there's also a risk of a load loop.
++        //
++        // To avoid this, we use a simple animation to "scroll to top" unless
++        // we know its safe to use the default animation, e.g. when there's no
++        // older content to load.
+         if canLoadOlderItems {
+             let newContentOffset = CGPoint(x: 0, y: 0)
+             collectionView.setContentOffset(newContentOffset, animated: true)
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationViewLayout.swift b/Signal/src/ViewControllers/ConversationView/ConversationViewLayout.swift
+index 43c8547e2f3..30d9c0149c7 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationViewLayout.swift
++++ b/Signal/src/ViewControllers/ConversationView/ConversationViewLayout.swift
+@@ -400,20 +400,32 @@ public class ConversationViewLayout: UICollectionViewLayout {
+         return true
+     }
+ 
+-    // MARK: - performBatchUpdates()
++    // MARK: - performBatchUpdates() & reloadData()
+ 
++    // Flag set before reloadData() and cleared after it _completes_.
++    private var isReloadingData = false
++
++    // Flag set before performBatchUpdates() and cleared after it _returns_.
++    private var isPerformingBatchUpdates = false
++
++    // Returns true during performBatchUpdates() or reloadData().
++    // Unlike isPerformBatchUpdatesOrReloadDataBeingAppliedOrSettling, this
++    // returns true after performBatchUpdates() returns, before
++    // its completion is called.
+     @objc
+-    public var isUpdating: Bool {
++    public var isPerformBatchUpdatesOrReloadDataBeingApplied: Bool {
+         isPerformingBatchUpdates || isReloadingData
+     }
+ 
+-    // Flag set before performBatchUpdates() and cleared in its completion.
+-    @objc
+-    public var isApplyingUpdate = false
++    private let updateCompletionCounter = AtomicUInt(0)
+ 
+-    // Flag set before performBatchUpdates() and cleared after it returns.
++    // Returns true during performBatchUpdates() or reloadData().
++    // Unlike isPerformBatchUpdatesOrReloadDataBeingApplied, this
++    // returns true until the completion of performBatchUpdates().
+     @objc
+-    public private(set) var isPerformingBatchUpdates = false
++    public var isPerformBatchUpdatesOrReloadDataBeingAppliedOrSettling: Bool {
++        updateCompletionCounter.get() > 0
++    }
+ 
+     @objc
+     public func willPerformBatchUpdates(scrollContinuityToken: CVScrollContinuityToken?) {
+@@ -421,6 +433,7 @@ public class ConversationViewLayout: UICollectionViewLayout {
+         owsAssertDebug(currentLayoutInfo != nil)
+ 
+         isPerformingBatchUpdates = true
++        updateCompletionCounter.increment()
+ 
+         // When landing some CVC loads, we maintain scroll continuity by setting a
+         // `contentOffsetAdjustment` on the UICollectionViewLayoutInvalidationContext
+@@ -488,15 +501,16 @@ public class ConversationViewLayout: UICollectionViewLayout {
+     @objc
+     public func didCompleteBatchUpdates() {
+         AssertIsOnMainThread()
+-    }
+ 
+-    private var isReloadingData = false
++        updateCompletionCounter.decrementOrZero()
++    }
+ 
+     @objc
+     public func willReloadData() {
+         AssertIsOnMainThread()
+ 
+         isReloadingData = true
++        updateCompletionCounter.increment()
+     }
+ 
+     @objc
+@@ -504,6 +518,7 @@ public class ConversationViewLayout: UICollectionViewLayout {
+         AssertIsOnMainThread()
+ 
+         isReloadingData = false
++        updateCompletionCounter.decrementOrZero()
+     }
+ 
+     public func buildScrollContinuityToken() -> CVScrollContinuityToken {
+@@ -582,7 +597,9 @@ public class ConversationViewLayout: UICollectionViewLayout {
+             return proposedContentOffset
+         }
+ 
+-        if isUpdating {
++        // While applying reloadData() and performBatchUpdates(), allow CVC
++        // to maintain scroll continuity.
++        if isPerformBatchUpdatesOrReloadDataBeingApplied {
+             let targetContentOffset = delegate.targetContentOffset(forProposedContentOffset: proposedContentOffset)
+             return targetContentOffset
+         } else {

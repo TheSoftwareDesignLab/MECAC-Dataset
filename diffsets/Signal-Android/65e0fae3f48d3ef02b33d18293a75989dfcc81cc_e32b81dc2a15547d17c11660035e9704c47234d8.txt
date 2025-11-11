@@ -1,0 +1,647 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/ScrollToPositionDelegate.kt b/app/src/main/java/org/thoughtcrime/securesms/components/ScrollToPositionDelegate.kt
+index c1886d5def5..8ab75294f7b 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/ScrollToPositionDelegate.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/ScrollToPositionDelegate.kt
+@@ -52,9 +52,36 @@ class ScrollToPositionDelegate private constructor(
+         recyclerView.doAfterNextLayout {
+           handleScrollPositionRequest(position, recyclerView)
+         }
++
++        if (!(recyclerView.isLayoutRequested || recyclerView.isInLayout)) {
++          recyclerView.requestLayout()
++        }
+       })
+   }
+ 
++  /**
++   * Entry point for requesting a specific scroll position.
++   */
++  fun requestScrollPosition(position: Int, smooth: Boolean = true) {
++    scrollPositionRequested.onNext(ScrollToPositionRequest(position, smooth))
++  }
++
++  /**
++   * Reset the scroll position to 0
++   */
++  fun resetScrollPosition() {
++    requestScrollPosition(0, true)
++  }
++
++  /**
++   * This should be called every time a list is submitted to the RecyclerView's adapter.
++   */
++  fun notifyListCommitted() {
++    listCommitted.onNext(Unit)
++  }
++
++  fun isListCommitted(): Boolean = listCommitted.value != null
++
+   private fun handleScrollPositionRequest(
+     request: ScrollToPositionRequest,
+     recyclerView: RecyclerView
+@@ -87,28 +114,6 @@ class ScrollToPositionDelegate private constructor(
+     }
+   }
+ 
+-  /**
+-   * Entry point for requesting a specific scroll position.
+-   */
+-  fun requestScrollPosition(position: Int, smooth: Boolean = true) {
+-    scrollPositionRequested.onNext(ScrollToPositionRequest(position, smooth))
+-  }
+-
+-  /**
+-   * Reset the scroll position to 0
+-   */
+-  fun resetScrollPosition() {
+-    requestScrollPosition(0, true)
+-    recyclerView.requestLayout()
+-  }
+-
+-  /**
+-   * This should be called every time a list is submitted to the RecyclerView's adapter.
+-   */
+-  fun notifyListCommitted() {
+-    listCommitted.onNext(Unit)
+-  }
+-
+   private data class ScrollToPositionRequest(
+     val position: Int,
+     val smooth: Boolean
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationAdapter.java b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationAdapter.java
+index bf6bb0ccd3c..c73ca5afbd2 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationAdapter.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationAdapter.java
+@@ -402,6 +402,39 @@ public void onBindHeaderViewHolder(StickyHeaderViewHolder viewHolder, int positi
+     }
+   }
+ 
++  /**
++   * Checks a range around the given position for nulls.
++   *
++   * @param position The position we wish to jump to.
++   * @return true if we seem like we've paged in the right data, false if not so.
++   */
++  public boolean canJumpToPosition(int position) {
++    position = isTypingViewEnabled() ? position - 1 : position;
++    if (position < 0) {
++      return false;
++    }
++
++    if (position > super.getItemCount()) {
++      Log.d(TAG, "Could not access corrected position " + position + " as it is out of bounds.");
++      return false;
++    }
++
++    int start = Math.max(position - 10, 0);
++    int end = Math.min(position + 5, super.getItemCount());
++
++    for (int i = start; i < end; i++) {
++      if (super.getItem(i) == null) {
++        if (pagingController != null) {
++          pagingController.onDataNeededAroundIndex(position);
++        }
++
++        return false;
++      }
++    }
++
++    return true;
++  }
++
+   public void setPagingController(@Nullable PagingController pagingController) {
+     this.pagingController = pagingController;
+   }
+@@ -431,7 +464,7 @@ boolean hasNoConversationMessages() {
+    * an adjusted message position based on adapter state.
+    */
+   @MainThread
+-  int getAdapterPositionForMessagePosition(int messagePosition) {
++  public int getAdapterPositionForMessagePosition(int messagePosition) {
+     return isTypingViewEnabled() ? messagePosition + 1 : messagePosition;
+   }
+ 
+@@ -580,7 +613,7 @@ private void updateSelected() {
+    * Provided a pool, this will initialize it with view counts that make sense.
+    */
+   @MainThread
+-  static void initializePool(@NonNull RecyclerView.RecycledViewPool pool) {
++  public static void initializePool(@NonNull RecyclerView.RecycledViewPool pool) {
+     pool.setMaxRecycledViews(MESSAGE_TYPE_INCOMING_TEXT, 25);
+     pool.setMaxRecycledViews(MESSAGE_TYPE_INCOMING_MULTIMEDIA, 15);
+     pool.setMaxRecycledViews(MESSAGE_TYPE_OUTGOING_TEXT, 25);
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationData.kt b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationData.kt
+index 4555a4f0a3e..4a56d2b5f90 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationData.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationData.kt
+@@ -22,6 +22,15 @@ data class ConversationData(
+     return lastSeenPosition > 0
+   }
+ 
++  fun getStartPosition(): Int {
++    return when {
++      shouldJumpToMessage() -> jumpToPosition
++      messageRequestData.isMessageRequestAccepted && shouldScrollToLastSeen() -> lastSeenPosition
++      messageRequestData.isMessageRequestAccepted -> lastScrolledPosition
++      else -> threadSize
++    }
++  }
++
+   data class MessageRequestData @JvmOverloads constructor(
+     val isMessageRequestAccepted: Boolean,
+     val isHidden: Boolean,
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationFragment.java b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationFragment.java
+index 06fd8874968..6389b3cd306 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationFragment.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/ConversationFragment.java
+@@ -115,6 +115,7 @@
+ import org.thoughtcrime.securesms.conversation.ui.edit.EditMessageHistoryDialog;
+ import org.thoughtcrime.securesms.conversation.ui.error.EnableCallNotificationSettingsDialog;
+ import org.thoughtcrime.securesms.conversation.v2.AddToContactsContract;
++import org.thoughtcrime.securesms.conversation.v2.BubbleLayoutTransitionListener;
+ import org.thoughtcrime.securesms.database.DatabaseObserver;
+ import org.thoughtcrime.securesms.database.MessageTable;
+ import org.thoughtcrime.securesms.database.SignalDatabase;
+@@ -258,8 +259,6 @@ public class ConversationFragment extends LoggingFragment implements Multiselect
+   private OnScrollListener            conversationScrollListener;
+   private int                         lastSeenScrollOffset;
+   private Stopwatch                   startupStopwatch;
+-  private LayoutTransition            layoutTransition;
+-  private TransitionListener          transitionListener;
+   private View                        reactionsShade;
+   private SignalBottomActionBar       bottomActionBar;
+   private OpenableGiftItemDecoration  openableGiftItemDecoration;
+@@ -309,8 +308,8 @@ public View onCreateView(@NonNull LayoutInflater inflater, ViewGroup container,
+     list           = view.findViewById(android.R.id.list);
+     composeDivider = view.findViewById(R.id.compose_divider);
+ 
+-    layoutTransition   = new LayoutTransition();
+-    transitionListener = new TransitionListener(list);
++    BubbleLayoutTransitionListener bubbleLayoutTransitionListener = new BubbleLayoutTransitionListener(list);
++    getViewLifecycleOwner().getLifecycle().addObserver(bubbleLayoutTransitionListener);
+ 
+     scrollToBottomButton  = view.findViewById(R.id.scroll_to_bottom);
+     scrollToMentionButton = view.findViewById(R.id.scroll_to_mention);
+@@ -514,7 +513,6 @@ public void onStart() {
+     super.onStart();
+     initializeTypingObserver();
+     SignalProxyUtil.startListeningToWebsocket();
+-    layoutTransition.getAnimator(LayoutTransition.CHANGE_DISAPPEARING).addListener(transitionListener);
+   }
+ 
+   @Override
+@@ -538,7 +536,6 @@ public void onPause() {
+   public void onStop() {
+     super.onStop();
+     ApplicationDependencies.getTypingStatusRepository().getTypists(threadId).removeObservers(getViewLifecycleOwner());
+-    layoutTransition.getAnimator(LayoutTransition.CHANGE_DISAPPEARING).removeListener(transitionListener);
+   }
+ 
+   @Override
+@@ -2396,34 +2393,4 @@ public void run() {
+       }, 400);
+     }
+   }
+-
+-  private static final class TransitionListener implements Animator.AnimatorListener {
+-
+-    private final ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
+-
+-    TransitionListener(RecyclerView recyclerView) {
+-      animator.addUpdateListener(unused -> recyclerView.invalidate());
+-      animator.setDuration(100L);
+-    }
+-
+-    @Override
+-    public void onAnimationStart(Animator animation) {
+-      animator.start();
+-    }
+-
+-    @Override
+-    public void onAnimationEnd(Animator animation) {
+-      animator.end();
+-    }
+-
+-    @Override
+-    public void onAnimationCancel(Animator animation) {
+-      // Do Nothing
+-    }
+-
+-    @Override
+-    public void onAnimationRepeat(Animator animation) {
+-      // Do Nothing
+-    }
+-  }
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/BubbleLayoutTransitionListener.kt b/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/BubbleLayoutTransitionListener.kt
+new file mode 100644
+index 00000000000..59d19b9eb28
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/BubbleLayoutTransitionListener.kt
+@@ -0,0 +1,47 @@
++package org.thoughtcrime.securesms.conversation.v2
++
++import android.animation.Animator
++import android.animation.LayoutTransition
++import android.animation.ValueAnimator
++import androidx.lifecycle.DefaultLifecycleObserver
++import androidx.lifecycle.LifecycleOwner
++import androidx.recyclerview.widget.RecyclerView
++
++class BubbleLayoutTransitionListener(
++  recyclerView: RecyclerView
++) : DefaultLifecycleObserver {
++
++  private val layoutTransition = LayoutTransition()
++  private val transitionListener = TransitionListener(recyclerView)
++
++  override fun onStart(owner: LifecycleOwner) {
++    super.onStart(owner)
++    layoutTransition.getAnimator(LayoutTransition.CHANGE_DISAPPEARING).addListener(transitionListener)
++  }
++
++  override fun onStop(owner: LifecycleOwner) {
++    super.onStop(owner)
++    layoutTransition.getAnimator(LayoutTransition.CHANGE_DISAPPEARING).removeListener(transitionListener)
++  }
++
++  private class TransitionListener(recyclerView: RecyclerView) : Animator.AnimatorListener {
++    private val animator = ValueAnimator.ofFloat(0f, 1f)
++
++    init {
++      animator.addUpdateListener { recyclerView.invalidate() }
++      animator.duration = 100L
++    }
++
++    override fun onAnimationStart(animation: Animator) {
++      animator.start()
++    }
++
++    override fun onAnimationEnd(animation: Animator) {
++      animator.end()
++    }
++
++    override fun onAnimationCancel(animation: Animator) = Unit
++
++    override fun onAnimationRepeat(animation: Animator) = Unit
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/ConversationFragment.kt b/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/ConversationFragment.kt
+index b50a66f2e7c..a5c4653e59e 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/ConversationFragment.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/ConversationFragment.kt
+@@ -32,6 +32,7 @@ import org.thoughtcrime.securesms.MainActivity
+ import org.thoughtcrime.securesms.R
+ import org.thoughtcrime.securesms.badges.gifts.viewgift.received.ViewReceivedGiftBottomSheet
+ import org.thoughtcrime.securesms.badges.gifts.viewgift.sent.ViewSentGiftBottomSheet
++import org.thoughtcrime.securesms.components.ScrollToPositionDelegate
+ import org.thoughtcrime.securesms.components.ViewBinderDelegate
+ import org.thoughtcrime.securesms.components.recyclerview.SmoothScrollingLinearLayoutManager
+ import org.thoughtcrime.securesms.components.voice.VoiceNoteMediaControllerOwner
+@@ -48,6 +49,7 @@ import org.thoughtcrime.securesms.conversation.ConversationOptionsMenu
+ import org.thoughtcrime.securesms.conversation.MarkReadHelper
+ import org.thoughtcrime.securesms.conversation.colors.Colorizer
+ import org.thoughtcrime.securesms.conversation.colors.RecyclerViewColorizer
++import org.thoughtcrime.securesms.conversation.mutiselect.ConversationItemAnimator
+ import org.thoughtcrime.securesms.conversation.mutiselect.MultiselectItemDecoration
+ import org.thoughtcrime.securesms.conversation.mutiselect.MultiselectPart
+ import org.thoughtcrime.securesms.conversation.v2.groups.ConversationGroupCallViewModel
+@@ -56,6 +58,7 @@ import org.thoughtcrime.securesms.database.model.InMemoryMessageRecord
+ import org.thoughtcrime.securesms.database.model.MessageRecord
+ import org.thoughtcrime.securesms.database.model.MmsMessageRecord
+ import org.thoughtcrime.securesms.databinding.V2ConversationFragmentBinding
++import org.thoughtcrime.securesms.dependencies.ApplicationDependencies
+ import org.thoughtcrime.securesms.giph.mp4.GiphyMp4ItemDecoration
+ import org.thoughtcrime.securesms.giph.mp4.GiphyMp4PlaybackController
+ import org.thoughtcrime.securesms.giph.mp4.GiphyMp4PlaybackPolicy
+@@ -89,6 +92,7 @@ import org.thoughtcrime.securesms.util.ContextUtil
+ import org.thoughtcrime.securesms.util.DrawableUtil
+ import org.thoughtcrime.securesms.util.FullscreenHelper
+ import org.thoughtcrime.securesms.util.WindowUtil
++import org.thoughtcrime.securesms.util.doAfterNextLayout
+ import org.thoughtcrime.securesms.util.fragments.requireListener
+ import org.thoughtcrime.securesms.util.hasGiftBadge
+ import org.thoughtcrime.securesms.util.visible
+@@ -145,8 +149,12 @@ class ConversationFragment : LoggingFragment(R.layout.v2_conversation_fragment)
+     FullscreenHelper(requireActivity()).showSystemUI()
+ 
+     layoutManager = SmoothScrollingLinearLayoutManager(requireContext(), true)
++    binding.conversationItemRecycler.setHasFixedSize(false)
+     binding.conversationItemRecycler.layoutManager = layoutManager
+ 
++    val layoutTransitionListener = BubbleLayoutTransitionListener(binding.conversationItemRecycler)
++    viewLifecycleOwner.lifecycle.addObserver(layoutTransitionListener)
++
+     val recyclerViewColorizer = RecyclerViewColorizer(binding.conversationItemRecycler)
+     recyclerViewColorizer.setChatColors(args.chatColors)
+ 
+@@ -174,6 +182,10 @@ class ConversationFragment : LoggingFragment(R.layout.v2_conversation_fragment)
+         presentConversationTitle(it)
+       })
+ 
++    disposables += viewModel.markReadRequests
++      .observeOn(AndroidSchedulers.mainThread())
++      .subscribeBy(onNext = markReadHelper::onViewsRevealed)
++
+     EventBus.getDefault().registerForLifecycle(groupCallViewModel, viewLifecycleOwner)
+     presentGroupCallJoinButton()
+   }
+@@ -184,6 +196,15 @@ class ConversationFragment : LoggingFragment(R.layout.v2_conversation_fragment)
+     WindowUtil.setLightNavigationBarFromTheme(requireActivity())
+     WindowUtil.setLightStatusBarFromTheme(requireActivity())
+     groupCallViewModel.peekGroupCall()
++
++    if (!args.conversationScreenType.isInBubble) {
++      ApplicationDependencies.getMessageNotifier().setVisibleThread(ConversationId.forConversation(args.threadId))
++    }
++  }
++
++  override fun onPause() {
++    super.onPause()
++    ApplicationDependencies.getMessageNotifier().clearVisibleThread()
+   }
+ 
+   private fun registerForResults() {
+@@ -204,23 +225,50 @@ class ConversationFragment : LoggingFragment(R.layout.v2_conversation_fragment)
+       colorizer
+     )
+ 
++    val scrollToPositionDelegate = ScrollToPositionDelegate(
++      binding.conversationItemRecycler,
++      adapter::canJumpToPosition,
++      adapter::getAdapterPositionForMessagePosition
++    )
++
++    binding.conversationItemRecycler.itemAnimator = ConversationItemAnimator(
++      isInMultiSelectMode = adapter.selectedItems::isNotEmpty,
++      shouldPlayMessageAnimations = {
++        scrollToPositionDelegate.isListCommitted() && binding.conversationItemRecycler.scrollState == RecyclerView.SCROLL_STATE_IDLE
++      },
++      isParentFilled = {
++        binding.conversationItemRecycler.canScrollVertically(1) || binding.conversationItemRecycler.canScrollVertically(-1)
++      }
++    )
++
++    ConversationAdapter.initializePool(binding.conversationItemRecycler.recycledViewPool)
+     adapter.setPagingController(viewModel.pagingController)
++    adapter.registerAdapterDataObserver(DataObserver(scrollToPositionDelegate))
+     viewLifecycleOwner.lifecycle.addObserver(LastSeenPositionUpdater(adapter, layoutManager, viewModel))
+     binding.conversationItemRecycler.adapter = adapter
+     giphyMp4ProjectionRecycler = initializeGiphyMp4()
+ 
+-    binding.conversationItemRecycler.addItemDecoration(
+-      MultiselectItemDecoration(
+-        requireContext()
+-      ) { viewModel.wallpaperSnapshot }
+-    )
++    val multiselectItemDecoration = MultiselectItemDecoration(
++      requireContext()
++    ) { viewModel.wallpaperSnapshot }
++
++    binding.conversationItemRecycler.addItemDecoration(multiselectItemDecoration)
++    viewLifecycleOwner.lifecycle.addObserver(multiselectItemDecoration)
++
++    disposables += viewModel.conversationThreadState.subscribeBy {
++      scrollToPositionDelegate.requestScrollPosition(it.meta.getStartPosition(), false)
++    }
+ 
+     disposables += viewModel
+       .conversationThreadState
+-      .flatMap { it.items.data }
++      .flatMapObservable { it.items.data }
+       .observeOn(AndroidSchedulers.mainThread())
+       .subscribeBy(onNext = {
+-        adapter.submitList(it)
++        adapter.submitList(it) {
++          binding.conversationItemRecycler.doAfterNextLayout {
++            scrollToPositionDelegate.notifyListCommitted()
++          }
++        }
+       })
+ 
+     disposables += viewModel
+@@ -231,6 +279,13 @@ class ConversationFragment : LoggingFragment(R.layout.v2_conversation_fragment)
+         adapter.notifyItemRangeChanged(0, adapter.itemCount)
+       })
+ 
++    binding.conversationItemRecycler.addOnScrollListener(object : RecyclerView.OnScrollListener() {
++      override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
++        val timestamp = MarkReadHelper.getLatestTimestamp(adapter, layoutManager)
++        timestamp.ifPresent(viewModel::requestMarkRead)
++      }
++    })
++
+     presentActionBarMenu()
+   }
+ 
+@@ -353,6 +408,18 @@ class ConversationFragment : LoggingFragment(R.layout.v2_conversation_fragment)
+     return callback
+   }
+ 
++  private inner class DataObserver(
++    private val scrollToPositionDelegate: ScrollToPositionDelegate
++  ) : RecyclerView.AdapterDataObserver() {
++    override fun onItemRangeInserted(positionStart: Int, itemCount: Int) {
++      Log.d(TAG, "onItemRangeInserted $positionStart $itemCount")
++      if (positionStart == 0 && itemCount == 1 && !binding.conversationItemRecycler.canScrollVertically(1)) {
++        Log.d(TAG, "Requesting scroll to bottom.")
++        scrollToPositionDelegate.resetScrollPosition()
++      }
++    }
++  }
++
+   private inner class ConversationItemClickListener : ConversationAdapter.ItemClickListener {
+     override fun onQuoteClicked(messageRecord: MmsMessageRecord?) {
+       // TODO [alex] - ("Not yet implemented")
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/ConversationRepository.kt b/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/ConversationRepository.kt
+index 92543b0b60a..1d0297eafc4 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/ConversationRepository.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/ConversationRepository.kt
+@@ -11,10 +11,8 @@ import org.signal.paging.PagingConfig
+ import org.thoughtcrime.securesms.conversation.ConversationDataSource
+ import org.thoughtcrime.securesms.conversation.colors.GroupAuthorNameColorHelper
+ import org.thoughtcrime.securesms.conversation.colors.NameColor
+-import org.thoughtcrime.securesms.database.DatabaseObserver
+ import org.thoughtcrime.securesms.database.SignalDatabase
+ import org.thoughtcrime.securesms.database.SignalDatabase.Companion.threads
+-import org.thoughtcrime.securesms.dependencies.ApplicationDependencies
+ import org.thoughtcrime.securesms.recipients.Recipient
+ import org.thoughtcrime.securesms.recipients.RecipientId
+ import kotlin.math.max
+@@ -50,16 +48,10 @@ class ConversationRepository(context: Context) {
+    * Loads the details necessary to display the conversation thread.
+    */
+   fun getConversationThreadState(threadId: Long, requestedStartPosition: Int): Single<ConversationThreadState> {
+-    return Single.create { emitter ->
+-      val recipient = SignalDatabase.threads.getRecipientForThreadId(threadId)!!
++    return Single.fromCallable {
++      val recipient = threads.getRecipientForThreadId(threadId)!!
+       val metadata = oldConversationRepository.getConversationData(threadId, recipient, requestedStartPosition)
+       val messageRequestData = metadata.messageRequestData
+-      val startPosition = when {
+-        metadata.shouldJumpToMessage() -> metadata.jumpToPosition
+-        messageRequestData.isMessageRequestAccepted && metadata.shouldScrollToLastSeen() -> metadata.lastSeenPosition
+-        messageRequestData.isMessageRequestAccepted -> metadata.lastScrolledPosition
+-        else -> metadata.threadSize
+-      }
+       val dataSource = ConversationDataSource(
+         applicationContext,
+         threadId,
+@@ -69,36 +61,13 @@ class ConversationRepository(context: Context) {
+       )
+       val config = PagingConfig.Builder().setPageSize(25)
+         .setBufferPages(2)
+-        .setStartIndex(max(startPosition, 0))
++        .setStartIndex(max(metadata.getStartPosition(), 0))
+         .build()
+ 
+-      val threadState = ConversationThreadState(
++      ConversationThreadState(
+         items = PagedData.createForObservable(dataSource, config),
+         meta = metadata
+       )
+-
+-      val controller = threadState.items.controller
+-      val messageUpdateObserver = DatabaseObserver.MessageObserver {
+-        controller.onDataItemChanged(it)
+-      }
+-      val messageInsertObserver = DatabaseObserver.MessageObserver {
+-        controller.onDataItemInserted(it, 0)
+-      }
+-      val conversationObserver = DatabaseObserver.Observer {
+-        controller.onDataInvalidated()
+-      }
+-
+-      ApplicationDependencies.getDatabaseObserver().registerMessageUpdateObserver(messageUpdateObserver)
+-      ApplicationDependencies.getDatabaseObserver().registerMessageInsertObserver(threadId, messageInsertObserver)
+-      ApplicationDependencies.getDatabaseObserver().registerConversationObserver(threadId, conversationObserver)
+-
+-      emitter.setCancellable {
+-        ApplicationDependencies.getDatabaseObserver().unregisterObserver(messageUpdateObserver)
+-        ApplicationDependencies.getDatabaseObserver().unregisterObserver(messageInsertObserver)
+-        ApplicationDependencies.getDatabaseObserver().unregisterObserver(conversationObserver)
+-      }
+-
+-      emitter.onSuccess(threadState)
+     }
+   }
+ 
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/ConversationViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/ConversationViewModel.kt
+index e95ad615b01..1c803123bce 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/ConversationViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/ConversationViewModel.kt
+@@ -2,18 +2,23 @@ package org.thoughtcrime.securesms.conversation.v2
+ 
+ import androidx.lifecycle.ViewModel
+ import androidx.lifecycle.ViewModelProvider
++import io.reactivex.rxjava3.core.Flowable
+ import io.reactivex.rxjava3.core.Observable
++import io.reactivex.rxjava3.core.Single
+ import io.reactivex.rxjava3.disposables.CompositeDisposable
+ import io.reactivex.rxjava3.kotlin.plusAssign
+ import io.reactivex.rxjava3.kotlin.subscribeBy
++import io.reactivex.rxjava3.processors.PublishProcessor
+ import io.reactivex.rxjava3.subjects.BehaviorSubject
+ import io.reactivex.rxjava3.subjects.Subject
+ import org.signal.paging.ProxyPagingController
+ import org.thoughtcrime.securesms.conversation.ConversationIntents.Args
+ import org.thoughtcrime.securesms.conversation.colors.GroupAuthorNameColorHelper
+ import org.thoughtcrime.securesms.conversation.colors.NameColor
++import org.thoughtcrime.securesms.database.DatabaseObserver
+ import org.thoughtcrime.securesms.database.model.MessageId
+ import org.thoughtcrime.securesms.database.model.MessageRecord
++import org.thoughtcrime.securesms.dependencies.ApplicationDependencies
+ import org.thoughtcrime.securesms.recipients.Recipient
+ import org.thoughtcrime.securesms.recipients.RecipientId
+ import org.thoughtcrime.securesms.util.hasGiftBadge
+@@ -35,7 +40,12 @@ class ConversationViewModel(
+   val recipient: Observable<Recipient> = _recipient
+ 
+   private val _conversationThreadState: Subject<ConversationThreadState> = BehaviorSubject.create()
+-  val conversationThreadState: Observable<ConversationThreadState> = _conversationThreadState
++  val conversationThreadState: Single<ConversationThreadState> = _conversationThreadState.firstOrError()
++
++  private val _markReadProcessor: PublishProcessor<Long> = PublishProcessor.create()
++  val markReadRequests: Flowable<Long> = _markReadProcessor
++    .onBackpressureBuffer()
++    .distinct()
+ 
+   val pagingController = ProxyPagingController<MessageId>()
+ 
+@@ -56,6 +66,31 @@ class ConversationViewModel(
+         pagingController.set(it.items.controller)
+         _conversationThreadState.onNext(it)
+       })
++
++    disposables += _conversationThreadState.firstOrError().flatMapObservable { threadState ->
++      Observable.create<Unit> { emitter ->
++        val controller = threadState.items.controller
++        val messageUpdateObserver = DatabaseObserver.MessageObserver {
++          controller.onDataItemChanged(it)
++        }
++        val messageInsertObserver = DatabaseObserver.MessageObserver {
++          controller.onDataItemInserted(it, 0)
++        }
++        val conversationObserver = DatabaseObserver.Observer {
++          controller.onDataInvalidated()
++        }
++
++        ApplicationDependencies.getDatabaseObserver().registerMessageUpdateObserver(messageUpdateObserver)
++        ApplicationDependencies.getDatabaseObserver().registerMessageInsertObserver(threadId, messageInsertObserver)
++        ApplicationDependencies.getDatabaseObserver().registerConversationObserver(threadId, conversationObserver)
++
++        emitter.setCancellable {
++          ApplicationDependencies.getDatabaseObserver().unregisterObserver(messageUpdateObserver)
++          ApplicationDependencies.getDatabaseObserver().unregisterObserver(messageInsertObserver)
++          ApplicationDependencies.getDatabaseObserver().unregisterObserver(conversationObserver)
++        }
++      }
++    }.subscribe()
+   }
+ 
+   override fun onCleared() {
+@@ -75,6 +110,9 @@ class ConversationViewModel(
+     }
+   }
+ 
++  fun requestMarkRead(timestamp: Long) {
++  }
++
+   class Factory(
+     private val args: Args,
+     private val repository: ConversationRepository
+diff --git a/app/src/main/res/layout/v2_conversation_fragment.xml b/app/src/main/res/layout/v2_conversation_fragment.xml
+index b33e5139d21..d553f786935 100644
+--- a/app/src/main/res/layout/v2_conversation_fragment.xml
++++ b/app/src/main/res/layout/v2_conversation_fragment.xml
+@@ -37,9 +37,14 @@
+     <org.thoughtcrime.securesms.conversation.mutiselect.MultiselectRecyclerView
+         android:id="@+id/conversation_item_recycler"
+         android:layout_width="match_parent"
+-        android:layout_height="0dp"
+-        app:layout_constraintBottom_toTopOf="@+id/conversation_bottom_panel_barrier"
++        android:layout_height="0dip"
++        android:clipChildren="false"
++        android:clipToPadding="false"
++        android:overScrollMode="ifContentScrolls"
++        android:scrollbars="vertical"
++        android:splitMotionEvents="false"
+         app:layout_constraintTop_toTopOf="parent"
++        app:layout_constraintBottom_toTopOf="@id/conversation_bottom_panel_barrier"
+         tools:itemCount="20"
+         tools:listitem="@layout/conversation_item_sent_text_only" />
+ 
+@@ -94,10 +99,10 @@
+ 
+     <androidx.constraintlayout.widget.Barrier
+         android:id="@+id/conversation_bottom_panel_barrier"
+-        app:barrierDirection="top"
+-        app:constraint_referenced_ids="conversation_input_panel"
+         android:layout_width="wrap_content"
+-        android:layout_height="wrap_content" />
++        android:layout_height="wrap_content"
++        app:barrierDirection="top"
++        app:constraint_referenced_ids="conversation_input_panel" />
+ 
+     <include
+         android:id="@+id/conversation_input_panel"

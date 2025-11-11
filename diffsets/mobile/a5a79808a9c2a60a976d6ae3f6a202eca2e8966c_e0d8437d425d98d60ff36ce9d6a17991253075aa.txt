@@ -1,0 +1,414 @@
+diff --git a/lib/src/app_initialization.dart b/lib/src/app_initialization.dart
+index 3f61b84bfe..fa586c5f07 100644
+--- a/lib/src/app_initialization.dart
++++ b/lib/src/app_initialization.dart
+@@ -42,7 +42,9 @@ Future<AppInitializationData> appInitialization(
+   final deviceInfo = await DeviceInfoPlugin().deviceInfo;
+   final prefs = await SharedPreferences.getInstance();
+   final soundTheme = GeneralPreferences.fetchFromStorage(prefs).soundTheme;
+-  final soundPool = await ref.watch(soundPoolProvider(soundTheme).future);
++  final masterVolume = GeneralPreferences.fetchFromStorage(prefs).volume;
++  final soundPool =
++      await ref.watch(soundPoolProvider(soundTheme, masterVolume).future);
+ 
+   final dbPath = p.join(await getDatabasesPath(), kLichessDatabaseName);
+ 
+diff --git a/lib/src/model/common/service/sound_service.dart b/lib/src/model/common/service/sound_service.dart
+index 6c48be6d3f..c2df23605a 100644
+--- a/lib/src/model/common/service/sound_service.dart
++++ b/lib/src/model/common/service/sound_service.dart
+@@ -29,15 +29,14 @@ SoundService soundService(SoundServiceRef ref) {
+   // anything. See: lib/src/app.dart
+   final deps = ref.read(appInitializationProvider).requireValue;
+   final (pool, sounds) = deps.soundPool;
+-  final masterVolume =
+-      ref.watch(generalPreferencesProvider.select((value) => value.volume));
+-  return SoundService(pool, sounds, masterVolume, ref);
++  return SoundService(pool, sounds, ref);
+ }
+ 
+ @Riverpod(keepAlive: true)
+ Future<(Soundpool, SoundMap)> soundPool(
+   SoundPoolRef ref,
+   SoundTheme theme,
++  double masterVolume,
+ ) async {
+   final pool = Soundpool.fromOptions(
+     options: const SoundpoolOptions(
+@@ -49,16 +48,20 @@ Future<(Soundpool, SoundMap)> soundPool(
+   );
+ 
+   ref.onDispose(pool.release);
+-  final sounds = await loadSounds(pool, theme);
++  final sounds = await loadSounds(pool, theme, masterVolume);
+ 
+   return (pool, sounds);
+ }
+ 
+ final extension = defaultTargetPlatform == TargetPlatform.iOS ? 'aifc' : 'mp3';
+ 
+-Future<SoundMap> loadSounds(Soundpool pool, SoundTheme soundTheme) async {
++Future<SoundMap> loadSounds(
++  Soundpool pool,
++  SoundTheme soundTheme,
++  double masterVolume,
++) async {
+   await pool.release();
+-  return IMap({
++  final sounds = IMap({
+     for (final sound in Sound.values)
+       sound: await rootBundle
+           .load('assets/sounds/${soundTheme.name}/${sound.name}.$extension')
+@@ -73,14 +76,22 @@ Future<SoundMap> loadSounds(Soundpool pool, SoundTheme soundTheme) async {
+           )
+           .then((soundData) => pool.load(soundData)),
+   });
++
++  for (final sound in Sound.values) {
++    final soundId = sounds[sound];
++    if (soundId != null) {
++      await pool.setVolume(soundId: soundId, volume: masterVolume);
++    }
++  }
++
++  return sounds;
+ }
+ 
+ class SoundService {
+-  SoundService(this._pool, this._sounds, this.masterVolume, this._ref);
++  SoundService(this._pool, this._sounds, this._ref);
+ 
+   final Soundpool _pool;
+   SoundMap _sounds;
+-  final double masterVolume;
+   final SoundServiceRef _ref;
+ 
+   (int, Sound)? _currentStream;
+@@ -102,23 +113,27 @@ class SoundService {
+     return null;
+   }
+ 
+-  Future<void> setVolume() async {
+-    for (final sound in Sound.values) {
+-      final soundId = _sounds[sound];
+-      if (soundId != null) {
+-        await _pool.setVolume(soundId: soundId, volume: masterVolume);
+-      }
+-    }
+-  }
+-
+   Future<void> stopCurrent() async {
+     if (_currentStream != null) return _pool.stop(_currentStream!.$1);
+   }
+ 
+-  Future<void> changeTheme(SoundTheme theme, {bool playSound = false}) async {
+-    _sounds = await loadSounds(_pool, theme);
++  Future<void> changeTheme(
++    SoundTheme theme,
++    double masterVolume, {
++    bool playSound = false,
++  }) async {
++    _sounds = await loadSounds(_pool, theme, masterVolume);
+     if (playSound) {
+       play(Sound.move);
+     }
+   }
++
++  Future<void> setVolume(double masterVolume) async {
++    for (final sound in Sound.values) {
++      final soundId = _sounds[sound];
++      if (soundId != null) {
++        await _pool.setVolume(soundId: soundId, volume: masterVolume);
++      }
++    }
++  }
+ }
+diff --git a/lib/src/view/settings/settings_screen.dart b/lib/src/view/settings/settings_screen.dart
+index d3db684acf..bfaa560774 100644
+--- a/lib/src/view/settings/settings_screen.dart
++++ b/lib/src/view/settings/settings_screen.dart
+@@ -15,6 +15,7 @@ import 'package:lichess_mobile/src/utils/l10n_context.dart';
+ import 'package:lichess_mobile/src/utils/navigation.dart';
+ import 'package:lichess_mobile/src/utils/package_info.dart';
+ import 'package:lichess_mobile/src/view/account/profile_screen.dart';
++import 'package:lichess_mobile/src/view/settings/volume_screen.dart';
+ import 'package:lichess_mobile/src/widgets/adaptive_action_sheet.dart';
+ import 'package:lichess_mobile/src/widgets/adaptive_choice_picker.dart';
+ import 'package:lichess_mobile/src/widgets/feedback.dart';
+@@ -217,6 +218,7 @@ class _Body extends ConsumerWidget {
+                         .setSoundTheme(value ?? SoundTheme.standard);
+                     ref.read(soundServiceProvider).changeTheme(
+                           value ?? SoundTheme.standard,
++                          volume,
+                           playSound: true,
+                         );
+                   },
+@@ -232,38 +234,36 @@ class _Body extends ConsumerWidget {
+           ),
+           SettingsListTile(
+             icon: const Icon(Icons.volume_up),
++            // TODO: translate
+             settingsLabel: const Text('Volume'),
+             settingsValue: volumeLabel(volume),
+             onTap: () {
+-              showDialog<void>(
+-                context: context,
+-                builder: (context) {
+-                  return _SettingsSliderDialog(
+-                    title: 'Volume',
+-                    value: volume,
+-                    values: const [
+-                      0.0,
+-                      0.1,
+-                      0.2,
+-                      0.3,
+-                      0.4,
+-                      0.5,
+-                      0.6,
+-                      0.7,
+-                      0.8,
+-                      0.9,
+-                      1.0,
+-                    ],
+-                    onChangeEnd: (double value) async {
+-                      await ref
+-                          .read(generalPreferencesProvider.notifier)
+-                          .setVolume(value);
+-                      await ref.read(soundServiceProvider).setVolume();
+-                    },
+-                    labelBuilder: volumeLabel,
+-                  );
+-                },
+-              );
++              if (Theme.of(context).platform == TargetPlatform.iOS) {
++                pushPlatformRoute(
++                  context,
++                  title: 'Volume',
++                  builder: (context) => const VolumeScreen(),
++                );
++              } else {
++                showDialog<void>(
++                  context: context,
++                  builder: (context) {
++                    return _SettingsSliderDialog(
++                      title: 'Volume',
++                      value: volume,
++                      values: kMasterVolumeValues,
++                      onChangeEnd: (double value) {
++                        ref
++                            .read(generalPreferencesProvider.notifier)
++                            .setVolume(value);
++
++                        ref.read(soundServiceProvider).setVolume(value);
++                      },
++                      labelBuilder: volumeLabel,
++                    );
++                  },
++                );
++              }
+             },
+           ),
+           if (Theme.of(context).platform == TargetPlatform.android)
+diff --git a/lib/src/view/settings/sound_settings_screen.dart b/lib/src/view/settings/sound_settings_screen.dart
+index 15a8a09aa2..29c68015f1 100644
+--- a/lib/src/view/settings/sound_settings_screen.dart
++++ b/lib/src/view/settings/sound_settings_screen.dart
+@@ -46,12 +46,17 @@ class _Body extends ConsumerWidget {
+       ),
+     );
+ 
++    final volume = ref.watch(
++      generalPreferencesProvider.select((state) => state.volume),
++    );
++
+     void onChanged(SoundTheme? value) {
+       ref
+           .read(generalPreferencesProvider.notifier)
+           .setSoundTheme(value ?? SoundTheme.standard);
+       ref.read(soundServiceProvider).changeTheme(
+             value ?? SoundTheme.standard,
++            volume,
+             playSound: true,
+           );
+     }
+diff --git a/lib/src/view/settings/volume_screen.dart b/lib/src/view/settings/volume_screen.dart
+new file mode 100644
+index 0000000000..d984d8e134
+--- /dev/null
++++ b/lib/src/view/settings/volume_screen.dart
+@@ -0,0 +1,80 @@
++import 'package:flutter/cupertino.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_riverpod/flutter_riverpod.dart';
++import 'package:lichess_mobile/src/model/common/service/sound_service.dart';
++import 'package:lichess_mobile/src/model/settings/general_preferences.dart';
++import 'package:lichess_mobile/src/widgets/list.dart';
++import 'package:lichess_mobile/src/widgets/platform.dart';
++import 'package:lichess_mobile/src/widgets/settings.dart';
++
++const kMasterVolumeValues = [
++  0.0,
++  0.1,
++  0.2,
++  0.3,
++  0.4,
++  0.5,
++  0.6,
++  0.7,
++  0.8,
++  0.9,
++  1.0,
++];
++
++class VolumeScreen extends StatelessWidget {
++  const VolumeScreen({super.key});
++
++  @override
++  Widget build(BuildContext context) {
++    return PlatformWidget(
++      androidBuilder: _androidBuilder,
++      iosBuilder: _iosBuilder,
++    );
++  }
++
++  Widget _androidBuilder(BuildContext context) {
++    return Scaffold(
++      appBar: AppBar(title: const Text('Volume')),
++      body: _Body(),
++    );
++  }
++
++  Widget _iosBuilder(BuildContext context) {
++    return CupertinoPageScaffold(
++      navigationBar: const CupertinoNavigationBar(),
++      child: _Body(),
++    );
++  }
++}
++
++class _Body extends ConsumerWidget {
++  @override
++  Widget build(BuildContext context, WidgetRef ref) {
++    final volume = ref.watch(
++      generalPreferencesProvider.select((state) => state.volume),
++    );
++
++    return SafeArea(
++      child: ListView(
++        children: [
++          ListSection(
++            children: [
++              SliderSettingsTile(
++                value: volume,
++                values: kMasterVolumeValues,
++                onChangeEnd: (value) {
++                  ref
++                      .read(generalPreferencesProvider.notifier)
++                      .setVolume(value);
++
++                  ref.read(soundServiceProvider).setVolume(value);
++                },
++                labelBuilder: (value) => '${(value * 100).round()}%',
++              ),
++            ],
++          ),
++        ],
++      ),
++    );
++  }
++}
+diff --git a/lib/src/widgets/settings.dart b/lib/src/widgets/settings.dart
+index 55be552df7..dce5eabe50 100644
+--- a/lib/src/widgets/settings.dart
++++ b/lib/src/widgets/settings.dart
+@@ -97,6 +97,59 @@ class SwitchSettingTile extends StatelessWidget {
+   }
+ }
+ 
++class SliderSettingsTile extends StatefulWidget {
++  const SliderSettingsTile({
++    this.title,
++    required this.value,
++    required this.values,
++    required this.onChangeEnd,
++    this.labelBuilder,
++  });
++
++  final Text? title;
++  final double value;
++  final List<double> values;
++  final void Function(double value) onChangeEnd;
++  final String Function(double)? labelBuilder;
++
++  @override
++  State<SliderSettingsTile> createState() => _SliderSettingsTileState();
++}
++
++class _SliderSettingsTileState extends State<SliderSettingsTile> {
++  late int _index = widget.values.indexOf(widget.value);
++
++  @override
++  Widget build(BuildContext context) {
++    final slider = Slider.adaptive(
++      value: _index.toDouble(),
++      min: 0,
++      max: widget.values.length.toDouble() - 1,
++      divisions: widget.values.length - 1,
++      label: widget.labelBuilder?.call(widget.values[_index]) ??
++          widget.values[_index].toString(),
++      onChanged: (value) {
++        final newIndex = value.toInt();
++        setState(() {
++          _index = newIndex;
++        });
++      },
++      onChangeEnd: (value) {
++        widget.onChangeEnd(widget.values[_index]);
++      },
++    );
++
++    return PlatformListTile(
++      title:
++          widget.title != null ? _SettingsTitle(title: widget.title!) : slider,
++      subtitle: widget.title != null ? slider : null,
++      trailing: widget.labelBuilder != null
++          ? Text(widget.labelBuilder!.call(widget.values[_index]))
++          : null,
++    );
++  }
++}
++
+ class SettingsSectionTitle extends StatelessWidget {
+   const SettingsSectionTitle(this.title, {super.key});
+ 
+diff --git a/test/model/common/service/fake_sound_service.dart b/test/model/common/service/fake_sound_service.dart
+index f7e616aefa..7df57decef 100644
+--- a/test/model/common/service/fake_sound_service.dart
++++ b/test/model/common/service/fake_sound_service.dart
+@@ -2,20 +2,21 @@ import 'package:lichess_mobile/src/model/common/service/sound_service.dart';
+ import 'package:lichess_mobile/src/model/settings/sound_theme.dart';
+ 
+ class FakeSoundService implements SoundService {
+-  @override
+-  final double masterVolume = 0;
+-
+   @override
+   Future<int?> play(Sound sound) async {
+     return null;
+   }
+ 
+   @override
+-  Future<void> setVolume() async {}
++  Future<void> setVolume(double volume) async {}
+ 
+   @override
+   Future<void> stopCurrent() async {}
+ 
+   @override
+-  Future<void> changeTheme(SoundTheme theme, {bool playSound = false}) async {}
++  Future<void> changeTheme(
++    SoundTheme theme,
++    double volume, {
++    bool playSound = false,
++  }) async {}
+ }

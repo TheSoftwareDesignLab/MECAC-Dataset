@@ -1,0 +1,2531 @@
+diff --git a/android/app/build.gradle b/android/app/build.gradle
+index c5a80bceaa..4a8045bb35 100644
+--- a/android/app/build.gradle
++++ b/android/app/build.gradle
+@@ -42,6 +42,14 @@ android {
+         disable 'InvalidPackage'
+     }
+ 
++    compileOptions {
++        coreLibraryDesugaringEnabled true
++
++        sourceCompatibility JavaVersion.VERSION_17
++        targetCompatibility JavaVersion.VERSION_17
++    }
++
++
+     namespace "com.cakewallet.cake_wallet"
+ 
+     defaultConfig {
+@@ -91,6 +99,7 @@ dependencies {
+     testImplementation 'junit:junit:4.12'
+     androidTestImplementation 'androidx.test:runner:1.3.0'
+     androidTestImplementation 'androidx.test.espresso:espresso-core:3.3.0'
++    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
+ }
+ configurations {
+     implementation.exclude module:'proto-google-common-protos'
+diff --git a/android/app/src/main/AndroidManifestBase.xml b/android/app/src/main/AndroidManifestBase.xml
+index 4f15370c38..280a45b3c9 100644
+--- a/android/app/src/main/AndroidManifestBase.xml
++++ b/android/app/src/main/AndroidManifestBase.xml
+@@ -24,6 +24,10 @@
+     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+ 
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
++    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+ 
+     <application
+         android:name=".Application"
+@@ -35,6 +39,10 @@
+         android:versionName="__versionName__"
+         android:requestLegacyExternalStorage="true"
+         android:extractNativeLibs="true">
++        <service 
++            android:name="androidx.work.impl.foreground.SystemForegroundService"
++            android:foregroundServiceType="dataSync"
++            android:exported="false" />
+         <activity
+             android:name=".MainActivity"
+             android:launchMode="singleInstance"
+diff --git a/cw_monero/lib/monero_wallet.dart b/cw_monero/lib/monero_wallet.dart
+index dc346a22c3..69c894908e 100644
+--- a/cw_monero/lib/monero_wallet.dart
++++ b/cw_monero/lib/monero_wallet.dart
+@@ -256,8 +256,9 @@ abstract class MoneroWalletBase extends WalletBase<MoneroBalance,
+   Future<void> stopSync() async {
+     if (isBackgroundSyncRunning) {
+       printV("Stopping background sync");
+-      await save();
++      monero.Wallet_store(wptr!);
+       monero.Wallet_stopBackgroundSync(wptr!, '');
++      monero_wallet.store();
+       isBackgroundSyncRunning = false;
+     }
+     await save();
+@@ -268,9 +269,9 @@ abstract class MoneroWalletBase extends WalletBase<MoneroBalance,
+   Future<void> stopBackgroundSync(String password) async {
+     if (isBackgroundSyncRunning) {
+       printV("Stopping background sync");
+-      await save();
++      monero.Wallet_store(wptr!);
+       monero.Wallet_stopBackgroundSync(wptr!, password);
+-      await save();
++      monero.Wallet_store(wptr!);
+       isBackgroundSyncRunning = false;
+     }
+   }
+diff --git a/cw_shared_external/android/build.gradle b/cw_shared_external/android/build.gradle
+index 8d2b1b13d6..360f518ffa 100644
+--- a/cw_shared_external/android/build.gradle
++++ b/cw_shared_external/android/build.gradle
+@@ -9,7 +9,7 @@ buildscript {
+     }
+ 
+     dependencies {
+-        classpath 'com.android.tools.build:gradle:7.3.0'
++        classpath 'com.android.tools.build:gradle:8.7.1'
+         classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+     }
+ }
+diff --git a/lib/core/background_sync.dart b/lib/core/background_sync.dart
+index 0098b62b68..12eb81f995 100644
+--- a/lib/core/background_sync.dart
++++ b/lib/core/background_sync.dart
+@@ -1,26 +1,101 @@
+ import 'dart:async';
+-import 'dart:math';
++import 'dart:io';
+ 
+ import 'package:cake_wallet/core/key_service.dart';
+ import 'package:cake_wallet/core/wallet_loading_service.dart';
+ import 'package:cake_wallet/di.dart';
++import 'package:cake_wallet/entities/preferences_key.dart';
+ import 'package:cake_wallet/store/settings_store.dart';
++import 'package:cake_wallet/utils/feature_flag.dart';
+ import 'package:cake_wallet/view_model/wallet_list/wallet_list_item.dart';
+ import 'package:cake_wallet/view_model/wallet_list/wallet_list_view_model.dart';
+ import 'package:cw_core/sync_status.dart';
++import 'package:cw_core/transaction_direction.dart';
+ import 'package:cw_core/utils/print_verbose.dart';
+ import 'package:cw_core/wallet_type.dart';
+-import 'package:flutter/foundation.dart';
+-import 'package:http/http.dart' as http;
++import 'package:flutter_local_notifications/flutter_local_notifications.dart';
++import 'package:shared_preferences/shared_preferences.dart';
+ 
+ class BackgroundSync {
++  final FlutterLocalNotificationsPlugin _notificationsPlugin = FlutterLocalNotificationsPlugin();
++  bool _isInitialized = false;
++
++  Future<void> _initializeNotifications() async {
++    if (_isInitialized) return;
++
++    const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
++    
++    const iosSettings = DarwinInitializationSettings(
++      requestAlertPermission: true,
++      requestBadgePermission: true,
++      requestSoundPermission: true,
++    );
++
++    const initializationSettings = InitializationSettings(
++      android: androidSettings,
++      iOS: iosSettings,
++    );
++
++    await _notificationsPlugin.initialize(initializationSettings);
++    _isInitialized = true;
++  }
++
++  Future<bool> requestPermissions() async {
++    if (Platform.isIOS || Platform.isMacOS) {
++      return await _notificationsPlugin
++          .resolvePlatformSpecificImplementation<IOSFlutterLocalNotificationsPlugin>()
++          ?.requestPermissions(
++            alert: true,
++            badge: true,
++            sound: true,
++          ) ?? false;
++    } else if (Platform.isAndroid) {
++      return await _notificationsPlugin
++          .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
++          ?.areNotificationsEnabled() ?? false;
++    }
++    return false;
++  }
++
++  Future<void> showNotification(String title, String content) async {
++    await _initializeNotifications();
++    final hasPermission = await requestPermissions();
++    
++    if (!hasPermission) {
++      printV('Notification permissions not granted');
++      return;
++    }
++
++    const androidDetails = AndroidNotificationDetails(
++      'transactions',
++      'Transactions',
++      channelDescription: 'Channel for notifications about transactions',
++      importance: Importance.defaultImportance,
++      priority: Priority.defaultPriority,
++    );
++
++    const iosDetails = DarwinNotificationDetails();
++
++    const notificationDetails = NotificationDetails(
++      android: androidDetails,
++      iOS: iosDetails,
++    );
++
++    await _notificationsPlugin.show(
++      DateTime.now().millisecondsSinceEpoch.hashCode,
++      title,
++      content,
++      notificationDetails,
++    );
++  }
++
+   Future<void> sync() async {
+     printV("Background sync started");
+-    await _syncMonero();
++    await _syncWallets();
+     printV("Background sync completed");
+   }
+ 
+-  Future<void> _syncMonero() async {
++  Future<void> _syncWallets() async {
+     final walletLoadingService = getIt.get<WalletLoadingService>();
+     final walletListViewModel = getIt.get<WalletListViewModel>();
+     final settingsStore = getIt.get<SettingsStore>();
+@@ -28,10 +103,10 @@ class BackgroundSync {
+ 
+     final List<WalletListItem> moneroWallets = walletListViewModel.wallets
+         .where((element) => !element.isHardware)
+-        .where((element) => [WalletType.monero].contains(element.type))
++        .where((element) => ![WalletType.haven, WalletType.decred].contains(element.type))
+         .toList();
+     for (int i = 0; i < moneroWallets.length; i++) {
+-      final wallet = await walletLoadingService.load(moneroWallets[i].type, moneroWallets[i].name);
++      final wallet = await walletLoadingService.load(moneroWallets[i].type, moneroWallets[i].name, isBackground: true);
+       int syncedTicks = 0;
+       final keyService = getIt.get<KeyService>();
+       
+@@ -75,7 +150,7 @@ class BackgroundSync {
+         } else {
+           syncedTicks = 0;
+         }
+-        if (kDebugMode) {
++        if (FeatureFlag.hasDevOptions) {
+           if (syncStatus is SyncingSyncStatus) {
+             final blocksLeft = syncStatus.blocksLeft;
+             printV("$blocksLeft Blocks Left");
+@@ -100,6 +175,27 @@ class BackgroundSync {
+           }
+         }
+       }
++      final txs = wallet.transactionHistory;
++      final sortedTxs = txs.transactions.values.toList()..sort((a, b) => a.date.compareTo(b.date));
++      final sharedPreferences = await SharedPreferences.getInstance();
++      for (final tx in sortedTxs) {
++        final lastTriggerString = sharedPreferences.getString(PreferencesKey.backgroundSyncLastTrigger(wallet.name));
++        final lastTriggerDate = lastTriggerString != null 
++            ? DateTime.parse(lastTriggerString) 
++            : DateTime.now();
++        final keys = sharedPreferences.getKeys();
++        if (tx.date.isBefore(lastTriggerDate)) {
++          printV("w: ${wallet.name}, tx: ${tx.date} is before $lastTriggerDate (lastTriggerString: $lastTriggerString) (k: ${keys.length})");
++          continue;
++        }
++        await sharedPreferences.setString(PreferencesKey.backgroundSyncLastTrigger(wallet.name), tx.date.add(Duration(minutes: 1)).toIso8601String());
++        final action = tx.direction == TransactionDirection.incoming ? "Received" : "Sent";
++        if (sharedPreferences.getBool(PreferencesKey.backgroundSyncNotificationsEnabled) ?? false) {
++          await showNotification("$action ${wallet.currency.fullName} in ${wallet.name}", "${tx.amountFormatted()}");
++        }
++        printV("${wallet.currency.fullName} in ${wallet.name}: TX: ${tx.date} ${tx.amount} ${tx.direction}");
++      }
++      wallet.id;
+       await wallet.stopBackgroundSync(await keyService.getWalletPassword(walletName: wallet.name));
+       await wallet.close(shouldCleanup: true);
+     }
+diff --git a/lib/core/wallet_loading_service.dart b/lib/core/wallet_loading_service.dart
+index f1996bae89..49f3668089 100644
+--- a/lib/core/wallet_loading_service.dart
++++ b/lib/core/wallet_loading_service.dart
+@@ -52,8 +52,11 @@ class WalletLoadingService {
+     }
+   }
+ 
+-  Future<WalletBase> load(WalletType type, String name, {String? password}) async {
++  Future<WalletBase> load(WalletType type, String name, {String? password, bool isBackground = false}) async {
+     try {
++      if (!isBackground) {
++        await sharedPreferences.setString(PreferencesKey.backgroundSyncLastTrigger(name), DateTime.now().toIso8601String());
++      }
+       final walletService = walletServiceFactory.call(type);
+       final walletPassword = password ?? (await keyService.getWalletPassword(walletName: name));
+       final wallet = await walletService.openWallet(name, walletPassword);
+diff --git a/lib/di.dart b/lib/di.dart
+index 87092a7ebd..05f2c3f77e 100644
+--- a/lib/di.dart
++++ b/lib/di.dart
+@@ -33,11 +33,13 @@ import 'package:cake_wallet/exchange/provider/trocador_exchange_provider.dart';
+ import 'package:cake_wallet/haven/cw_haven.dart';
+ import 'package:cake_wallet/src/screens/dev/monero_background_sync.dart';
+ import 'package:cake_wallet/src/screens/dev/moneroc_call_profiler.dart';
++import 'package:cake_wallet/src/screens/dev/shared_preferences_page.dart';
+ import 'package:cake_wallet/src/screens/settings/background_sync_page.dart';
+ import 'package:cake_wallet/src/screens/wallet_connect/services/bottom_sheet_service.dart';
+ import 'package:cake_wallet/src/screens/wallet_connect/services/key_service/wallet_connect_key_service.dart';
+ import 'package:cake_wallet/src/screens/wallet_connect/services/walletkit_service.dart';
+ import 'package:cake_wallet/view_model/dev/monero_background_sync.dart';
++import 'package:cake_wallet/view_model/dev/shared_preferences.dart';
+ import 'package:cake_wallet/view_model/link_view_model.dart';
+ import 'package:cake_wallet/tron/tron.dart';
+ import 'package:cake_wallet/src/screens/transaction_details/rbf_details_page.dart';
+@@ -266,6 +268,8 @@ import 'buy/kryptonim/kryptonim.dart';
+ import 'buy/meld/meld_buy_provider.dart';
+ import 'src/screens/buy/buy_sell_page.dart';
+ import 'cake_pay/cake_pay_payment_credantials.dart';
++import 'package:cake_wallet/view_model/dev/background_sync_logs_view_model.dart';
++import 'package:cake_wallet/src/screens/dev/background_sync_logs_page.dart';
+ 
+ final getIt = GetIt.instance;
+ 
+@@ -883,9 +887,8 @@ Future<void> setup({
+           nanoAccountCreationViewModel:
+               getIt.get<NanoAccountEditOrCreateViewModel>(param1: account)));
+ 
+-  getIt.registerFactory(() {
+-    return DisplaySettingsViewModel(getIt.get<SettingsStore>());
+-  });
++  getIt.registerFactory(() =>
++      DisplaySettingsViewModel(getIt.get<SettingsStore>()));
+ 
+   getIt.registerFactory(() =>
+       SilentPaymentsSettingsViewModel(getIt.get<SettingsStore>(), getIt.get<AppStore>().wallet!));
+@@ -893,22 +896,20 @@ Future<void> setup({
+   getIt.registerFactory(
+       () => MwebSettingsViewModel(getIt.get<SettingsStore>(), getIt.get<AppStore>().wallet!));
+ 
+-  getIt.registerFactory(() {
+-    return PrivacySettingsViewModel(getIt.get<SettingsStore>(), getIt.get<AppStore>().wallet!);
+-  });
++  getIt.registerFactory(() =>
++      PrivacySettingsViewModel(getIt.get<SettingsStore>(), getIt.get<AppStore>().wallet!));
+ 
+   getIt.registerFactory(() => TrocadorExchangeProvider());
+ 
+   getIt.registerFactory(() => TrocadorProvidersViewModel(
+       getIt.get<SettingsStore>(), getIt.get<TrocadorExchangeProvider>()));
+ 
+-  getIt.registerFactory(() {
+-    return OtherSettingsViewModel(getIt.get<SettingsStore>(), getIt.get<AppStore>().wallet!,
+-        getIt.get<SendViewModel>());});
++  getIt.registerFactory(() =>
++      OtherSettingsViewModel(getIt.get<SettingsStore>(), getIt.get<AppStore>().wallet!,
++          getIt.get<SendViewModel>()));
+ 
+-  getIt.registerFactory(() {
+-    return SecuritySettingsViewModel(getIt.get<SettingsStore>());
+-  });
++  getIt.registerFactory(() =>
++      SecuritySettingsViewModel(getIt.get<SettingsStore>()));
+ 
+   getIt.registerFactory(() => WalletSeedViewModel(getIt.get<AppStore>().wallet!));
+ 
+@@ -916,6 +917,8 @@ Future<void> setup({
+ 
+   getIt.registerFactory(() => DevMoneroBackgroundSync(getIt.get<AppStore>().wallet!));
+ 
++  getIt.registerFactory(() => DevSharedPreferences());
++
+   getIt.registerFactoryParam<WalletSeedPage, bool, void>((bool isWalletCreated, _) =>
+       WalletSeedPage(getIt.get<WalletSeedViewModel>(), isNewWalletCreated: isWalletCreated));
+ 
+@@ -1456,6 +1459,14 @@ Future<void> setup({
+   getIt.registerFactory(() => SeedVerificationPage(getIt.get<WalletSeedViewModel>()));
+ 
+   getIt.registerFactory(() => DevMoneroBackgroundSyncPage(getIt.get<DevMoneroBackgroundSync>()));
++
+   getIt.registerFactory(() => DevMoneroCallProfilerPage());
++
++  getIt.registerFactory(() => DevSharedPreferencesPage(getIt.get<DevSharedPreferences>()));
++  
++  getIt.registerFactory(() => BackgroundSyncLogsViewModel());
++  
++  getIt.registerFactory(() => DevBackgroundSyncLogsPage(getIt.get<BackgroundSyncLogsViewModel>()));
++  
+   _isSetupFinished = true;
+ }
+diff --git a/lib/entities/preferences_key.dart b/lib/entities/preferences_key.dart
+index 9e889ff46d..59989ba14a 100644
+--- a/lib/entities/preferences_key.dart
++++ b/lib/entities/preferences_key.dart
+@@ -105,4 +105,6 @@ class PreferencesKey {
+   static const walletConnectPairingTopicsList = 'wallet_connect_pairing_topics_list';
+   static String walletConnectPairingTopicsListForWallet(String publicKey) =>
+       '${PreferencesKey.walletConnectPairingTopicsList}_${publicKey}';
++  static String backgroundSyncLastTrigger(String walletId) => 'background_sync_last_trigger_${walletId}';
++  static const backgroundSyncNotificationsEnabled = 'background_sync_notifications_enabled';
+ }
+diff --git a/lib/router.dart b/lib/router.dart
+index 7fea601f80..dfd1631227 100644
+--- a/lib/router.dart
++++ b/lib/router.dart
+@@ -36,6 +36,8 @@ import 'package:cake_wallet/src/screens/dashboard/pages/transactions_page.dart';
+ import 'package:cake_wallet/src/screens/dashboard/sign_page.dart';
+ import 'package:cake_wallet/src/screens/dev/monero_background_sync.dart';
+ import 'package:cake_wallet/src/screens/dev/moneroc_call_profiler.dart';
++import 'package:cake_wallet/src/screens/dev/shared_preferences_page.dart';
++import 'package:cake_wallet/src/screens/dev/background_sync_logs_page.dart';
+ import 'package:cake_wallet/src/screens/disclaimer/disclaimer_page.dart';
+ import 'package:cake_wallet/src/screens/exchange/exchange_page.dart';
+ import 'package:cake_wallet/src/screens/exchange/exchange_template_page.dart';
+@@ -836,6 +838,15 @@ Route<dynamic> createRoute(RouteSettings settings) {
+       return MaterialPageRoute<void>(
+         builder: (_) => getIt.get<DevMoneroBackgroundSyncPage>(),
+       );
++    case Routes.devSharedPreferences:
++      return MaterialPageRoute<void>(
++        builder: (_) => getIt.get<DevSharedPreferencesPage>(),
++      );
++
++    case Routes.devBackgroundSyncLogs:
++      return MaterialPageRoute<void>(
++        builder: (_) => getIt.get<DevBackgroundSyncLogsPage>(),
++      );
+ 
+     case Routes.devMoneroCallProfiler:
+       return MaterialPageRoute<void>(
+diff --git a/lib/routes.dart b/lib/routes.dart
+index f7f3e2f6f4..a9a637c758 100644
+--- a/lib/routes.dart
++++ b/lib/routes.dart
+@@ -111,8 +111,12 @@ class Routes {
+   static const importNFTPage = '/import_nft_page';
+   static const torPage = '/tor_page';
+   static const backgroundSync = '/background_sync';
++
+   static const devMoneroBackgroundSync = '/dev/monero_background_sync';
+   static const devMoneroCallProfiler = '/dev/monero_call_profiler';
++  static const devSharedPreferences = '/dev/shared_preferences';
++  static const devBackgroundSyncLogs = '/dev/background_sync_logs';
++
+   static const signPage = '/sign_page';
+   static const connectDevices = '/device/connect';
+   static const urqrAnimatedPage = '/urqr/animated_page';
+diff --git a/lib/src/screens/dev/background_sync_logs_page.dart b/lib/src/screens/dev/background_sync_logs_page.dart
+new file mode 100644
+index 0000000000..b269083f25
+--- /dev/null
++++ b/lib/src/screens/dev/background_sync_logs_page.dart
+@@ -0,0 +1,314 @@
++import 'package:cake_wallet/src/screens/base_page.dart';
++import 'package:cake_wallet/view_model/dev/background_sync_logs_view_model.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter/services.dart';
++import 'package:flutter_mobx/flutter_mobx.dart';
++import 'package:intl/intl.dart';
++
++class DevBackgroundSyncLogsPage extends BasePage {
++  final BackgroundSyncLogsViewModel viewModel;
++
++  DevBackgroundSyncLogsPage(this.viewModel) {
++    viewModel.loadLogs();
++  }
++
++  @override
++  String? get title => "[dev] background sync logs";
++
++  @override
++  Widget? trailing(BuildContext context) {
++    return IconButton(
++      icon: Icon(Icons.refresh),
++      onPressed: () => viewModel.loadLogs(),
++    );
++  }
++
++  @override
++  Widget body(BuildContext context) {
++    return Observer(
++      builder: (_) {
++        if (viewModel.isLoading) {
++          return Center(child: CircularProgressIndicator());
++        }
++
++        if (viewModel.error != null) {
++          return Center(child: Text("Error: ${viewModel.error}"));
++        }
++
++        if (viewModel.logData == null) {
++          return Center(
++            child: Column(
++              mainAxisAlignment: MainAxisAlignment.center,
++              children: [
++                Text("No logs loaded"),
++                SizedBox(height: 16),
++                ElevatedButton(
++                  onPressed: () => viewModel.loadLogs(),
++                  child: Text("Load Logs"),
++                ),
++              ],
++            ),
++          );
++        }
++
++        return DefaultTabController(
++          length: 2,
++          child: Column(
++            children: [
++              TabBar(
++                tabs: [
++                  Tab(text: "Logs (${viewModel.logs.length})"),
++                  Tab(text: "Sessions (${viewModel.sessions.length})"),
++                ],
++              ),
++              Expanded(
++                child: TabBarView(
++                  children: [
++                    _buildLogsTab(context),
++                    _buildSessionsTab(context),
++                  ],
++                ),
++              ),
++              _buildActionButtons(context),
++            ],
++          ),
++        );
++      },
++    );
++  }
++
++  Widget _buildLogsTab(BuildContext context) {
++    final logs = viewModel.logs;
++    if (logs.isEmpty) {
++      return Center(child: Text("No logs available"));
++    }
++
++    final dateFormat = DateFormat('yyyy-MM-dd HH:mm:ss.SSS');
++    
++    return ListView.builder(
++      itemCount: logs.length,
++      itemBuilder: (context, index) {
++        final log = logs[index];
++        return ListTile(
++          title: Text(
++            log.message,
++            style: TextStyle(
++              fontSize: 14,
++              fontFamily: 'Monospace',
++            ),
++          ),
++          subtitle: Text(
++            '${dateFormat.format(log.timestamp)} | ${log.level}' +
++                (log.sessionId != null ? ' | Session: ${log.sessionId}' : ''),
++            style: TextStyle(
++              fontSize: 12,
++              color: _getLevelColor(log.level),
++            ),
++          ),
++          dense: true,
++          onTap: () {
++            Clipboard.setData(ClipboardData(text: log.message));
++            ScaffoldMessenger.of(context).showSnackBar(
++              SnackBar(content: Text('Log message copied to clipboard')),
++            );
++          },
++          onLongPress: () {
++            Clipboard.setData(ClipboardData(
++                text: '${dateFormat.format(log.timestamp)} [${log.level}] ${log.message}'));
++            ScaffoldMessenger.of(context).showSnackBar(
++              SnackBar(content: Text('Full log entry copied to clipboard')),
++            );
++          },
++          tileColor: index % 2 == 0 ? Colors.transparent : Colors.black.withOpacity(0.03),
++        );
++      },
++    );
++  }
++
++  Widget _buildSessionsTab(BuildContext context) {
++    final sessions = viewModel.sessions;
++    if (sessions.isEmpty) {
++      return Center(child: Text("No sessions available"));
++    }
++
++    final dateFormat = DateFormat('yyyy-MM-dd HH:mm:ss');
++    
++    return ListView.builder(
++      itemCount: sessions.length,
++      itemBuilder: (context, index) {
++        final session = sessions[index];
++        final isActive = session.endTime == null;
++        
++        return ExpansionTile(
++          title: Text(
++            session.name,
++            style: TextStyle(
++              fontWeight: FontWeight.bold,
++              color: isActive ? Colors.green : null,
++            ),
++          ),
++          subtitle: Text(
++            'ID: ${session.id} | Started: ${dateFormat.format(session.startTime)}',
++            style: TextStyle(fontSize: 12),
++          ),
++          children: [
++            Padding(
++              padding: const EdgeInsets.all(16.0),
++              child: Column(
++                crossAxisAlignment: CrossAxisAlignment.start,
++                children: [
++                  Text('Start: ${session.startTime.toString()}'),
++                  if (session.endTime != null)
++                    Text('End: ${session.endTime.toString()}'),
++                  if (session.duration != null)
++                    Text('Duration: ${_formatDuration(session.duration!)}'),
++                  SizedBox(height: 8),
++                  _buildSessionLogs(context, session.id),
++                ],
++              ),
++            ),
++          ],
++        );
++      },
++    );
++  }
++
++  Widget _buildSessionLogs(BuildContext context, int sessionId) {
++    final sessionLogs = viewModel.logs
++        .where((log) => log.sessionId == sessionId)
++        .toList();
++    
++    if (sessionLogs.isEmpty) {
++      return Text('No logs for this session');
++    }
++    
++    return Column(
++      crossAxisAlignment: CrossAxisAlignment.start,
++      children: [
++        Text('Session Logs (${sessionLogs.length}):',
++            style: TextStyle(fontWeight: FontWeight.bold)),
++        SizedBox(height: 8),
++        Container(
++          height: 200,
++          decoration: BoxDecoration(
++            color: Colors.black.withOpacity(0.05),
++            borderRadius: BorderRadius.circular(4),
++          ),
++          child: ListView.builder(
++            itemCount: sessionLogs.length,
++            itemBuilder: (context, index) {
++              final log = sessionLogs[index];
++              return Padding(
++                padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
++                child: Text(
++                  '[${log.level}] ${log.message}',
++                  style: TextStyle(
++                    fontSize: 12,
++                    fontFamily: 'Monospace',
++                    color: _getLevelColor(log.level),
++                  ),
++                ),
++              );
++            },
++          ),
++        ),
++      ],
++    );
++  }
++
++  Widget _buildActionButtons(BuildContext context) {
++    return Padding(
++      padding: const EdgeInsets.all(16.0),
++      child: Row(
++        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
++        children: [
++          ElevatedButton.icon(
++            icon: Icon(Icons.refresh),
++            label: Text('Refresh'),
++            onPressed: () => viewModel.loadLogs(),
++          ),
++          ElevatedButton.icon(
++            icon: Icon(Icons.copy),
++            label: Text('Copy All'),
++            onPressed: () => _copyAllLogs(context),
++          ),
++          ElevatedButton.icon(
++            icon: Icon(Icons.delete),
++            label: Text('Clear'),
++            onPressed: () => _confirmClearLogs(context),
++            style: ElevatedButton.styleFrom(
++              backgroundColor: Colors.red,
++              foregroundColor: Colors.white,
++            ),
++          ),
++        ],
++      ),
++    );
++  }
++
++  void _copyAllLogs(BuildContext context) {
++    if (viewModel.logData == null) return;
++    
++    final buffer = StringBuffer();
++    final dateFormat = DateFormat('yyyy-MM-dd HH:mm:ss.SSS');
++    
++    for (final log in viewModel.logs) {
++      buffer.writeln('${dateFormat.format(log.timestamp)} [${log.level}] ${log.message}');
++    }
++    
++    Clipboard.setData(ClipboardData(text: buffer.toString()));
++    ScaffoldMessenger.of(context).showSnackBar(
++      SnackBar(content: Text('All logs copied to clipboard')),
++    );
++  }
++
++  void _confirmClearLogs(BuildContext context) {
++    showDialog(
++      context: context,
++      builder: (BuildContext context) {
++        return AlertDialog(
++          title: Text('Clear Logs'),
++          content: Text('Are you sure you want to clear the logs display?'),
++          actions: <Widget>[
++            TextButton(
++              child: Text('Cancel'),
++              onPressed: () => Navigator.of(context).pop(),
++            ),
++            TextButton(
++              child: Text('Clear'),
++              style: TextButton.styleFrom(foregroundColor: Colors.red),
++              onPressed: () {
++                viewModel.clearLogs();
++                Navigator.of(context).pop();
++              },
++            ),
++          ],
++        );
++      },
++    );
++  }
++
++  Color _getLevelColor(String level) {
++    switch (level.toLowerCase()) {
++      case 'error':
++        return Colors.red;
++      case 'warning':
++        return Colors.orange;
++      case 'info':
++        return Colors.blue;
++      case 'debug':
++        return Colors.green;
++      case 'trace':
++        return Colors.purple;
++      default:
++        return Colors.grey;
++    }
++  }
++
++  String _formatDuration(Duration duration) {
++    String twoDigits(int n) => n.toString().padLeft(2, '0');
++    String twoDigitMinutes = twoDigits(duration.inMinutes.remainder(60));
++    String twoDigitSeconds = twoDigits(duration.inSeconds.remainder(60));
++    return '${twoDigits(duration.inHours)}:$twoDigitMinutes:$twoDigitSeconds';
++  }
++} 
+\ No newline at end of file
+diff --git a/lib/src/screens/dev/shared_preferences_page.dart b/lib/src/screens/dev/shared_preferences_page.dart
+new file mode 100644
+index 0000000000..cb21aaa786
+--- /dev/null
++++ b/lib/src/screens/dev/shared_preferences_page.dart
+@@ -0,0 +1,404 @@
++import 'package:cake_wallet/src/screens/base_page.dart';
++import 'package:cake_wallet/view_model/dev/shared_preferences.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter/services.dart';
++import 'package:flutter_mobx/flutter_mobx.dart';
++
++class DevSharedPreferencesPage extends BasePage {
++  final DevSharedPreferences viewModel;
++
++  DevSharedPreferencesPage(this.viewModel);
++
++  @override
++  String? get title => "[dev] shared preferences";
++
++  @override
++  Widget? trailing(BuildContext context) {
++    return IconButton(
++      icon: Icon(Icons.add),
++      onPressed: () => _showCreateDialog(context),
++    );
++  }
++
++  @override
++  Widget body(BuildContext context) {
++    return Observer(
++      builder: (_) {
++        if (viewModel.sharedPreferences == null) {
++          return Center(child: Text("No shared preferences found"));
++        }
++        final keys = viewModel.keys;
++        Map<String, dynamic> values = {};
++        for (final key in keys) {
++          values[key] = viewModel.get(key);
++        }
++        Map<String, PreferenceType> types = {};
++        for (final key in keys) {
++          types[key] = viewModel.getPreferenceType(key);
++        }
++        return ListView.builder(
++          itemCount: keys.length,
++          itemBuilder: (context, index) {
++            final key = keys[index];
++            final type = types[key]!;
++            return ListTile(
++              onTap: () {
++                Clipboard.setData(ClipboardData(text: key + ": " + values[key].toString()));
++              },
++              onLongPress: () {
++                _showEditDialog(context, key, type, values[key]);
++              },
++              title: switch (type) {
++                PreferenceType.bool => Text(key, style: TextStyle(color: Colors.blue)),
++                PreferenceType.int => Text(key, style: TextStyle(color: Colors.green)),
++                PreferenceType.double => Text(key, style: TextStyle(color: Colors.yellow)),
++                PreferenceType.listString => Text(key, style: TextStyle(color: Colors.purple)),
++                PreferenceType.string => Text(key),
++                PreferenceType.unknown => Text(key),
++              },
++              subtitle: switch (type) {
++                PreferenceType.bool => Text("bool: ${values[key]}"),
++                PreferenceType.int => Text("int: ${values[key]}"),
++                PreferenceType.double => Text("double: ${values[key]}"),
++                PreferenceType.listString => values[key].isEmpty as bool ? Text("listString: []") : Text("listString:\n- ${values[key].join("\n- ")}"),
++                PreferenceType.string => Text("string: ${values[key]}"),
++                PreferenceType.unknown => Text("UNKNOWN(${values[key].runtimeType}): ${values[key]}"),
++              },
++            );
++          },
++        );
++      },
++    );
++  }
++
++  void _showEditDialog(BuildContext context, String key, PreferenceType type, dynamic currentValue) {
++    dynamic newValue = currentValue;
++    bool isListString = type == PreferenceType.listString;
++    List<String> listItems = isListString ? List<String>.from(currentValue as Iterable<dynamic>) : [];
++    TextEditingController textController = TextEditingController(
++        text: isListString ? '' : currentValue?.toString() ?? '');
++
++    showDialog(
++      context: context,
++      builder: (BuildContext context) {
++        return StatefulBuilder(
++          builder: (context, setState) {
++            return AlertDialog(
++              title: Text('Edit $key'),
++              content: SizedBox(
++                width: double.maxFinite,
++                height: double.maxFinite,
++                child: SingleChildScrollView(
++                  child: _buildDialogContent(
++                    type, 
++                    newValue, 
++                    listItems, 
++                    textController, 
++                    (value) => setState(() => newValue = value),
++                    (items) => setState(() => listItems = items),
++                  ),
++                ),
++              ),
++              actions: <Widget>[
++                TextButton(
++                  child: Text('Delete'),
++                  style: TextButton.styleFrom(foregroundColor: Colors.red),
++                  onPressed: () {
++                    _showDeleteConfirmation(context, key);
++                  },
++                ),
++                TextButton(
++                  child: Text('Cancel'),
++                  onPressed: () => Navigator.of(context).pop(),
++                ),
++                TextButton(
++                  child: Text('Save'),
++                  onPressed: () async {
++                    if (_validateAndUpdateValue(
++                      context, 
++                      type, 
++                      textController, 
++                      listItems, 
++                      (value) => newValue = value
++                    )) {
++                      await viewModel.set(key, type, newValue);
++                      Navigator.of(context).pop();
++                    }
++                  },
++                ),
++              ],
++            );
++          },
++        );
++      },
++    );
++  }
++
++  void _showDeleteConfirmation(BuildContext context, String key) {
++    showDialog(
++      context: context,
++      builder: (BuildContext context) {
++        return AlertDialog(
++          title: Text('Delete Preference'),
++          content: Text('Are you sure you want to delete "$key"?'),
++          actions: <Widget>[
++            TextButton(
++              child: Text('Cancel'),
++              onPressed: () => Navigator.of(context).pop(),
++            ),
++            TextButton(
++              child: Text('Delete'),
++              style: TextButton.styleFrom(foregroundColor: Colors.red),
++              onPressed: () {
++                viewModel.delete(key);
++                Navigator.of(context).pop();
++                Navigator.of(context).pop();
++              },
++            ),
++          ],
++        );
++      },
++    );
++  }
++
++  Widget _buildDialogContent(
++    PreferenceType type,
++    dynamic value,
++    List<String> listItems,
++    TextEditingController textController,
++    Function(dynamic) onValueChanged,
++    Function(List<String>) onListChanged,
++  ) {
++    return switch (type) {
++      PreferenceType.bool => _buildBoolEditor(value as bool, onValueChanged),
++      PreferenceType.int => _buildNumberEditor(textController, 'Integer value', true),
++      PreferenceType.double => _buildNumberEditor(textController, 'Double value', false),
++      PreferenceType.string => _buildTextEditor(textController),
++      PreferenceType.listString => _buildListEditor(listItems, textController, onListChanged),
++      PreferenceType.unknown => Text('Cannot edit unknown type'),
++    };
++  }
++
++  Widget _buildBoolEditor(bool value, Function(bool) onChanged) {
++    return CheckboxListTile(
++      title: Text('Value'),
++      value: value,
++      onChanged: (newValue) {
++        if (newValue != null) onChanged(newValue);
++      },
++    );
++  }
++
++  Widget _buildTextEditor(TextEditingController controller) {
++    return Column(
++      mainAxisSize: MainAxisSize.min,
++      children: [
++        TextField(
++          controller: controller,
++          decoration: InputDecoration(labelText: 'String value'),
++          maxLines: null,
++        ),
++      ],
++    );
++  }
++
++  Widget _buildNumberEditor(TextEditingController controller, String label, bool isInteger) {
++    return Column(
++      mainAxisSize: MainAxisSize.min,
++      children: [
++        TextField(
++          controller: controller,
++          decoration: InputDecoration(labelText: label),
++          keyboardType: isInteger 
++              ? TextInputType.number 
++              : TextInputType.numberWithOptions(decimal: true),
++          inputFormatters: isInteger
++              ? [FilteringTextInputFormatter.digitsOnly]
++              : [FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*$'))],
++        ),
++      ],
++    );
++  }
++
++  Widget _buildListEditor(
++    List<String> items, 
++    TextEditingController controller,
++    Function(List<String>) onListChanged,
++  ) {
++    return Column(
++      mainAxisSize: MainAxisSize.min,
++      children: [
++        SizedBox(
++          height: 200,
++          child: ReorderableListView(
++            shrinkWrap: true,
++            children: [
++              for (int i = 0; i < items.length; i++)
++                ListTile(
++                  key: Key('$i'),
++                  title: Text(items[i]),
++                  trailing: IconButton(
++                    icon: Icon(Icons.delete),
++                    onPressed: () {
++                      final newList = List<String>.from(items);
++                      newList.removeAt(i);
++                      onListChanged(newList);
++                    },
++                  ),
++                )
++            ],
++            onReorder: (int oldIndex, int newIndex) {
++              final newList = List<String>.from(items);
++              if (oldIndex < newIndex) {
++                newIndex -= 1;
++              }
++              final item = newList.removeAt(oldIndex);
++              newList.insert(newIndex, item);
++              onListChanged(newList);
++            },
++          ),
++        ),
++        Row(
++          children: [
++            Expanded(
++              child: TextField(
++                controller: controller,
++                decoration: InputDecoration(labelText: 'New item'),
++              ),
++            ),
++            IconButton(
++              icon: Icon(Icons.add),
++              onPressed: () {
++                if (controller.text.isNotEmpty) {
++                  final newList = List<String>.from(items);
++                  newList.add(controller.text);
++                  onListChanged(newList);
++                  controller.clear();
++                }
++              },
++            ),
++          ],
++        ),
++      ],
++    );
++  }
++
++  bool _validateAndUpdateValue(
++    BuildContext context,
++    PreferenceType type,
++    TextEditingController controller,
++    List<String> listItems,
++    Function(dynamic) setNewValue,
++  ) {
++    switch (type) {
++      case PreferenceType.int:
++        if (controller.text.isNotEmpty) {
++          try {
++            setNewValue(int.parse(controller.text));
++          } catch (e) {
++            _showErrorMessage(context, 'Invalid integer value');
++            return false;
++          }
++        }
++        break;
++      case PreferenceType.double:
++        if (controller.text.isNotEmpty) {
++          try {
++            setNewValue(double.parse(controller.text));
++          } catch (e) {
++            _showErrorMessage(context, 'Invalid double value');
++            return false;
++          }
++        }
++        break;
++      case PreferenceType.string:
++        setNewValue(controller.text);
++        break;
++      case PreferenceType.listString:
++        setNewValue(listItems);
++        break;
++      default:
++        break;
++    }
++    return true;
++  }
++
++  void _showErrorMessage(BuildContext context, String message) {
++    ScaffoldMessenger.of(context).showSnackBar(
++      SnackBar(content: Text(message)),
++    );
++  }
++
++  void _showCreateDialog(BuildContext context) {
++    PreferenceType selectedType = PreferenceType.string;
++    TextEditingController keyController = TextEditingController();
++
++    showDialog(
++      context: context,
++      builder: (BuildContext context) {
++        return StatefulBuilder(
++          builder: (context, setState) {
++            return AlertDialog(
++              title: Text('Create Preference'),
++              content: SingleChildScrollView(
++                child: Column(
++                  mainAxisSize: MainAxisSize.min,
++                  children: [
++                    TextField(
++                      controller: keyController,
++                      decoration: InputDecoration(labelText: 'Preference Key'),
++                    ),
++                    SizedBox(height: 16),
++                    DropdownButtonFormField<PreferenceType>(
++                      value: selectedType,
++                      decoration: InputDecoration(labelText: 'Type'),
++                      items: [
++                        DropdownMenuItem(value: PreferenceType.string, child: Text('String')),
++                        DropdownMenuItem(value: PreferenceType.bool, child: Text('Boolean')),
++                        DropdownMenuItem(value: PreferenceType.int, child: Text('Integer')),
++                        DropdownMenuItem(value: PreferenceType.double, child: Text('Double')),
++                        DropdownMenuItem(value: PreferenceType.listString, child: Text('List of Strings')),
++                      ],
++                      onChanged: (value) {
++                        if (value != null) {
++                          setState(() {
++                            selectedType = value;
++                          });
++                        }
++                      },
++                    ),
++                  ],
++                ),
++              ),
++              actions: <Widget>[
++                TextButton(
++                  child: Text('Cancel'),
++                  onPressed: () => Navigator.of(context).pop(),
++                ),
++                TextButton(
++                  child: Text('Create'),
++                  onPressed: () {
++                    if (keyController.text.isEmpty) {
++                      _showErrorMessage(context, 'Key cannot be empty');
++                      return;
++                    }
++
++                    viewModel.set(keyController.text, selectedType, switch (selectedType) {
++                      PreferenceType.bool => false,
++                      PreferenceType.int => 0,
++                      PreferenceType.double => 0.0,
++                      PreferenceType.string => '',
++                      PreferenceType.listString => [],
++                      PreferenceType.unknown => null,
++                    });
++                    Navigator.of(context).pop();
++                  },
++                ),
++              ],
++            );
++          },
++        );
++      },
++    );
++  }
++}
+diff --git a/lib/src/screens/settings/background_sync_page.dart b/lib/src/screens/settings/background_sync_page.dart
+index f9589297d4..91cab896bd 100644
+--- a/lib/src/screens/settings/background_sync_page.dart
++++ b/lib/src/screens/settings/background_sync_page.dart
+@@ -12,6 +12,7 @@ import 'package:cake_wallet/view_model/dashboard/dashboard_view_model.dart';
+ import 'package:cake_wallet/view_model/settings/sync_mode.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_mobx/flutter_mobx.dart';
++import 'package:permission_handler/permission_handler.dart';
+ 
+ class BackgroundSyncPage extends BasePage {
+   BackgroundSyncPage(this.dashboardViewModel);
+@@ -28,30 +29,30 @@ class BackgroundSyncPage extends BasePage {
+       child: Column(
+         mainAxisSize: MainAxisSize.min,
+         children: [
+-          if (dashboardViewModel.hasBatteryOptimization)
+-            Observer(builder: (context) {
+-              return SettingsSwitcherCell(
+-                title: S.current.unrestricted_background_service,
+-                value: !dashboardViewModel.batteryOptimizationEnabled,
+-                onValueChange: (_, bool value) {
+-                  dashboardViewModel.disableBatteryOptimization();
+-                },
+-              );
+-            }),
+           Observer(builder: (context) {
+             return SettingsSwitcherCell(
+               title: S.current.background_sync,
+               value: dashboardViewModel.backgroundSyncEnabled,
+-              onValueChange: (dashboardViewModel.batteryOptimizationEnabled && dashboardViewModel.hasBatteryOptimization) ? (_, bool value) {
+-                unawaited(showPopUp(context: context, builder: (context) => AlertWithOneAction(
+-                  alertTitle: S.current.background_sync,
+-                  alertContent: S.current.unrestricted_background_service_notice,
+-                  buttonText: S.current.ok,
+-                  buttonAction: () => Navigator.of(context).pop(),
+-                )));
+-              } : (_, bool value) {
++              onValueChange: (_, bool value) async {
+                 if (value) {
+-                  dashboardViewModel.enableBackgroundSync();
++                  if (dashboardViewModel.batteryOptimizationEnabled) {
++                    await showPopUp(context: context, builder: (context) => AlertWithOneAction(
++                      alertTitle: S.current.background_sync,
++                      alertContent: S.current.unrestricted_background_service_notice,
++                      buttonText: S.current.ok,
++                      buttonAction: () => Navigator.of(context).pop(),
++                    ));
++                    await dashboardViewModel.disableBatteryOptimization();
++                    for (var i = 0; i < 4 * 60; i++) {
++                      await Future.delayed(Duration(milliseconds: 250));
++                      if (!dashboardViewModel.batteryOptimizationEnabled) {
++                        await dashboardViewModel.enableBackgroundSync();
++                        return;
++                      }
++                    }
++                  } else {
++                    dashboardViewModel.enableBackgroundSync();
++                  }
+                 } else {
+                   dashboardViewModel.disableBackgroundSync();
+                 }
+@@ -68,22 +69,58 @@ class BackgroundSyncPage extends BasePage {
+                   dashboardViewModel.setSyncMode(syncMode);
+                 });
+           }),
+-          
+-          // Observer(builder: (context) {
+-          //   return SettingsSwitcherCell(
+-          //     title: S.current.background_sync_on_battery,
+-          //     value: dashboardViewModel.backgroundSyncOnBattery,
+-          //     onValueChange: (_, bool value) =>
+-          //         dashboardViewModel.setBackgroundSyncOnBattery(value),
+-          //   );
+-          // }),
+-          // Observer(builder: (context) {
+-          //   return SettingsSwitcherCell(
+-          //     title: S.current.background_sync_on_data,
+-          //     value: dashboardViewModel.backgroundSyncOnData,
+-          //     onValueChange: (_, bool value) => dashboardViewModel.setBackgroundSyncOnData(value),
+-          //   );
+-          // }),
++          if (dashboardViewModel.hasBgsyncNetworkConstraints)
++            Observer(builder: (context) {
++              return SettingsSwitcherCell(
++                title: S.current.background_sync_on_unmetered_network,
++                value: dashboardViewModel.backgroundSyncNetworkUnmetered,
++                onValueChange: (_, bool value) => dashboardViewModel.setBackgroundSyncNetworkUnmetered(value),
++              );
++            }),
++          if (dashboardViewModel.hasBgsyncBatteryNotLowConstraints)
++            Observer(builder: (context) {
++              return SettingsSwitcherCell(
++                title: S.current.background_sync_on_battery_low,
++                value: !dashboardViewModel.backgroundSyncBatteryNotLow,
++                onValueChange: (_, bool value) => dashboardViewModel.setBackgroundSyncBatteryNotLow(!value),
++              );
++            }),
++          if (dashboardViewModel.hasBgsyncChargingConstraints)
++            Observer(builder: (context) {
++              return SettingsSwitcherCell(
++                title: S.current.background_sync_on_charging,
++                value: dashboardViewModel.backgroundSyncCharging,
++                onValueChange: (_, bool value) => dashboardViewModel.setBackgroundSyncCharging(value),
++              );
++            }),
++          if (dashboardViewModel.hasBgsyncDeviceIdleConstraints)
++            Observer(builder: (context) {
++              return SettingsSwitcherCell(
++                title: S.current.background_sync_on_device_idle,
++                value: dashboardViewModel.backgroundSyncDeviceIdle,
++                onValueChange: (_, bool value) => dashboardViewModel.setBackgroundSyncDeviceIdle(value),
++              );
++            }),
++          Observer(builder: (context) {
++            return SettingsSwitcherCell(
++              title: S.current.new_transactions_notifications,
++              value: dashboardViewModel.backgroundSyncNotificationsEnabled,
++              onValueChange: (_, bool value) { 
++                try {
++                  dashboardViewModel.setBackgroundSyncNotificationsEnabled(value);
++                } catch (e) {
++                  showPopUp(context: context, builder: (context) => AlertWithOneAction(
++                    alertTitle: S.current.error,
++                    alertContent: S.current.notification_permission_denied,
++                    buttonText: S.current.ok,
++                    buttonAction: () {
++                      Navigator.of(context).pop();
++                    },
++                  ));
++                }
++              },
++            );
++          }),
+         ],
+       ),
+     );
+diff --git a/lib/src/screens/settings/connection_sync_page.dart b/lib/src/screens/settings/connection_sync_page.dart
+index 739e01c55c..098f80644c 100644
+--- a/lib/src/screens/settings/connection_sync_page.dart
++++ b/lib/src/screens/settings/connection_sync_page.dart
+@@ -49,7 +49,7 @@ class ConnectionSyncPage extends BasePage {
+             title: S.current.manage_nodes,
+             handler: (context) => Navigator.of(context).pushNamed(Routes.manageNodes),
+           ),
+-          if (dashboardViewModel.hasBackgroundSync && Platform.isAndroid && FeatureFlag.isBackgroundSyncEnabled) ...[
++          if (Platform.isAndroid && FeatureFlag.isBackgroundSyncEnabled) ...[
+             SettingsCellWithArrow(
+               title: S.current.background_sync,
+               handler: (context) => Navigator.of(context).pushNamed(Routes.backgroundSync),
+diff --git a/lib/src/screens/settings/other_settings_page.dart b/lib/src/screens/settings/other_settings_page.dart
+index f841e29982..730699286b 100644
+--- a/lib/src/screens/settings/other_settings_page.dart
++++ b/lib/src/screens/settings/other_settings_page.dart
+@@ -6,12 +6,10 @@ import 'package:cake_wallet/src/screens/base_page.dart';
+ import 'package:cake_wallet/src/screens/settings/widgets/setting_priority_picker_cell.dart';
+ import 'package:cake_wallet/src/screens/settings/widgets/settings_cell_with_arrow.dart';
+ import 'package:cake_wallet/src/screens/settings/widgets/settings_picker_cell.dart';
+-import 'package:cake_wallet/src/screens/settings/widgets/settings_switcher_cell.dart';
+ import 'package:cake_wallet/src/screens/settings/widgets/settings_version_cell.dart';
+ import 'package:cake_wallet/utils/feature_flag.dart';
+ import 'package:cake_wallet/view_model/settings/other_settings_view_model.dart';
+ import 'package:cw_core/wallet_type.dart';
+-import 'package:flutter/foundation.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_mobx/flutter_mobx.dart';
+ 
+@@ -77,6 +75,18 @@ class OtherSettingsPage extends BasePage {
+                   handler: (BuildContext context) =>
+                       Navigator.of(context).pushNamed(Routes.devMoneroCallProfiler),
+                 ),
++              if (FeatureFlag.hasDevOptions)
++                SettingsCellWithArrow(
++                  title: '[dev] shared preferences',
++                  handler: (BuildContext context) =>
++                      Navigator.of(context).pushNamed(Routes.devSharedPreferences),
++                ),
++              if (FeatureFlag.hasDevOptions)
++                SettingsCellWithArrow(
++                  title: '[dev] background sync logs',
++                  handler: (BuildContext context) =>
++                      Navigator.of(context).pushNamed(Routes.devBackgroundSyncLogs),
++                ),
+               Spacer(),
+               SettingsVersionCell(
+                   title: S.of(context).version(_otherSettingsViewModel.currentVersion)),
+diff --git a/lib/view_model/dashboard/dashboard_view_model.dart b/lib/view_model/dashboard/dashboard_view_model.dart
+index f5e89a023b..e5f0217831 100644
+--- a/lib/view_model/dashboard/dashboard_view_model.dart
++++ b/lib/view_model/dashboard/dashboard_view_model.dart
+@@ -51,6 +51,7 @@ import 'package:flutter/services.dart';
+ import 'package:flutter_daemon/flutter_daemon.dart';
+ import 'package:http/http.dart' as http;
+ import 'package:mobx/mobx.dart';
++import 'package:permission_handler/permission_handler.dart';
+ import 'package:shared_preferences/shared_preferences.dart';
+ 
+ import '../../themes/theme_base.dart';
+@@ -180,7 +181,7 @@ abstract class DashboardViewModelBase with Store {
+     isShowThirdYatIntroduction = false;
+     unawaited(isBackgroundSyncEnabled());
+     unawaited(isBatteryOptimizationEnabled());
+-
++    unawaited(_loadConstraints());
+     final _wallet = wallet;
+ 
+     if (_wallet.type == WalletType.monero) {
+@@ -536,6 +537,88 @@ abstract class DashboardViewModelBase with Store {
+     return resp;
+   }
+ 
++  @observable
++  late bool backgroundSyncNotificationsEnabled = sharedPreferences.getBool(PreferencesKey.backgroundSyncNotificationsEnabled) ?? false;
++
++  @action
++  Future<void> setBackgroundSyncNotificationsEnabled(bool value) async {
++    if (!value) {
++      backgroundSyncNotificationsEnabled = false;
++      sharedPreferences.setBool(PreferencesKey.backgroundSyncNotificationsEnabled, false);
++      return;
++    }
++    PermissionStatus permissionStatus = await Permission.notification.status;
++    if (permissionStatus != PermissionStatus.granted) {
++      final resp = await Permission.notification.request();
++      if (resp == PermissionStatus.denied) {
++        throw Exception("Notification permission denied");
++      }
++    }
++    backgroundSyncNotificationsEnabled = value;
++    await sharedPreferences.setBool(PreferencesKey.backgroundSyncNotificationsEnabled, value);
++  }
++
++
++  bool get hasBgsyncNetworkConstraints => Platform.isAndroid;
++  bool get hasBgsyncBatteryNotLowConstraints => Platform.isAndroid;
++  bool get hasBgsyncChargingConstraints => Platform.isAndroid;
++  bool get hasBgsyncDeviceIdleConstraints => Platform.isAndroid;
++
++  @observable
++  bool backgroundSyncNetworkUnmetered = false;
++
++  @observable
++  bool backgroundSyncBatteryNotLow = false;
++
++  @observable
++  bool backgroundSyncCharging = false;
++
++  @observable
++  bool backgroundSyncDeviceIdle = false;
++  
++  Future<void> _loadConstraints() async {
++    backgroundSyncNetworkUnmetered = await FlutterDaemon().getNetworkType();
++    backgroundSyncBatteryNotLow = await FlutterDaemon().getBatteryNotLow();
++    backgroundSyncCharging = await FlutterDaemon().getRequiresCharging();
++    backgroundSyncDeviceIdle = await FlutterDaemon().getDeviceIdle();
++  }
++
++  @action
++  Future<void> setBackgroundSyncNetworkUnmetered(bool value) async {
++    backgroundSyncNetworkUnmetered = value;
++    await FlutterDaemon().setNetworkType(value);
++    if (await isBackgroundSyncEnabled()) {
++      await enableBackgroundSync();
++    }
++  }
++
++  @action
++  Future<void> setBackgroundSyncBatteryNotLow(bool value) async {
++    backgroundSyncBatteryNotLow = value;
++    await FlutterDaemon().setBatteryNotLow(value);
++    if (await isBackgroundSyncEnabled()) {
++      await enableBackgroundSync();
++    }
++  }
++
++  @action
++  Future<void> setBackgroundSyncCharging(bool value) async {
++    backgroundSyncCharging = value;
++    await FlutterDaemon().setRequiresCharging(value);
++    if (await isBackgroundSyncEnabled()) {
++      await enableBackgroundSync();
++    }
++  }
++
++  @action
++  Future<void> setBackgroundSyncDeviceIdle(bool value) async {
++    backgroundSyncDeviceIdle = value;
++    await FlutterDaemon().setDeviceIdle(value);
++    if (await isBackgroundSyncEnabled()) {
++      await enableBackgroundSync();
++    }
++  }
++  
+   bool get hasBatteryOptimization => Platform.isAndroid;
+ 
+   @observable
+diff --git a/lib/view_model/dev/background_sync_logs_view_model.dart b/lib/view_model/dev/background_sync_logs_view_model.dart
+new file mode 100644
+index 0000000000..a448dadb55
+--- /dev/null
++++ b/lib/view_model/dev/background_sync_logs_view_model.dart
+@@ -0,0 +1,44 @@
++import 'package:flutter_daemon/flutter_daemon.dart';
++import 'package:mobx/mobx.dart';
++
++part 'background_sync_logs_view_model.g.dart';
++class BackgroundSyncLogsViewModel = BackgroundSyncLogsViewModelBase with _$BackgroundSyncLogsViewModel;
++
++abstract class BackgroundSyncLogsViewModelBase with Store {
++  final FlutterDaemon _daemon = FlutterDaemon();
++
++  @observable
++  LogData? logData;
++
++  @observable
++  bool isLoading = false;
++
++  @observable
++  String? error;
++
++  @computed
++  List<LogEntry> get logs => logData?.logs ?? [];
++
++  @computed
++  List<LogSession> get sessions => logData?.sessions ?? [];
++
++  @action
++  Future<void> loadLogs() async {
++    isLoading = true;
++    error = null;
++    
++    try {
++      logData = await _daemon.getLogs();
++    } catch (e) {
++      error = e.toString();
++    } finally {
++      isLoading = false;
++    }
++  }
++
++  @action
++  Future<void> clearLogs() async {
++    await _daemon.clearLogs();
++    await loadLogs();
++  }
++} 
+\ No newline at end of file
+diff --git a/lib/view_model/dev/shared_preferences.dart b/lib/view_model/dev/shared_preferences.dart
+new file mode 100644
+index 0000000000..4c6be7d152
+--- /dev/null
++++ b/lib/view_model/dev/shared_preferences.dart
+@@ -0,0 +1,92 @@
++import 'package:mobx/mobx.dart';
++import 'package:shared_preferences/shared_preferences.dart';
++
++part 'shared_preferences.g.dart';
++
++class DevSharedPreferences = DevSharedPreferencesBase with _$DevSharedPreferences;
++
++enum PreferenceType {
++  unknown,
++  string,
++  int,
++  double,
++  bool,
++  listString
++}
++
++abstract class DevSharedPreferencesBase with Store {
++  DevSharedPreferencesBase() {
++    SharedPreferences.getInstance().then((value) {
++      sharedPreferences = value;
++    });
++  }
++
++  @observable
++  SharedPreferences? sharedPreferences;
++
++  @computed
++  List<String> get keys => (sharedPreferences?.getKeys().toList()?..sort()) ?? [];
++
++  @action
++  Future<void> delete(String key) async {
++    if (sharedPreferences == null) {
++      return;
++    }
++    await sharedPreferences!.remove(key);
++  }
++
++  dynamic get(String key) {
++    if (sharedPreferences == null) {
++      return null;
++    }
++    return sharedPreferences!.get(key);
++  }
++
++  Future<void> set(String key, PreferenceType type, dynamic value) async {
++    if (sharedPreferences == null) {
++      return;
++    }
++    switch (type) {
++      case PreferenceType.string:
++        await sharedPreferences!.setString(key, value as String);
++        break;
++      case PreferenceType.bool:
++        await sharedPreferences!.setBool(key, value as bool);
++        break;
++      case PreferenceType.int:
++        await sharedPreferences!.setInt(key, value as int);
++        break;
++      case PreferenceType.double:
++        await sharedPreferences!.setDouble(key, value as double);
++        break;
++      case PreferenceType.listString:
++        await sharedPreferences!.setStringList(key, List<String>.from(value as Iterable<dynamic>));
++        break;
++      default:
++        throw Exception("Unknown preference type: $type");
++    }
++  }
++
++  PreferenceType getPreferenceType(String key) {
++    if (sharedPreferences == null) {
++      return PreferenceType.unknown;
++    }
++    final value = sharedPreferences!.get(key);
++    if (value is String) {
++      return PreferenceType.string;
++    }
++    if (value is bool) {
++      return PreferenceType.bool;
++    }
++    if (value is int) {
++      return PreferenceType.int;
++    }
++    if (value is double) {
++      return PreferenceType.double;
++    }
++    if (value is List<String>) {
++      return PreferenceType.listString;
++    }
++    return PreferenceType.unknown;
++  }
++}
+diff --git a/lib/view_model/send/send_view_model.dart b/lib/view_model/send/send_view_model.dart
+index 2244c9be36..b16edabd23 100644
+--- a/lib/view_model/send/send_view_model.dart
++++ b/lib/view_model/send/send_view_model.dart
+@@ -14,6 +14,7 @@ import 'package:cake_wallet/entities/evm_transaction_error_fees_handler.dart';
+ import 'package:cake_wallet/entities/fiat_currency.dart';
+ import 'package:cake_wallet/entities/parsed_address.dart';
+ import 'package:cake_wallet/entities/template.dart';
++import 'package:cake_wallet/entities/preferences_key.dart';
+ import 'package:cake_wallet/entities/transaction_description.dart';
+ import 'package:cake_wallet/entities/wallet_contact.dart';
+ import 'package:cake_wallet/ethereum/ethereum.dart';
+@@ -52,6 +53,7 @@ import 'package:cw_core/wallet_type.dart';
+ import 'package:flutter/material.dart';
+ import 'package:hive/hive.dart';
+ import 'package:mobx/mobx.dart';
++import 'package:shared_preferences/shared_preferences.dart';
+ 
+ part 'send_view_model.g.dart';
+ 
+@@ -587,6 +589,8 @@ abstract class SendViewModelBase extends WalletChangeListenerViewModel with Stor
+                 transactionNote: note,
+               ));
+       }
++      final sharedPreferences = await SharedPreferences.getInstance();
++      await sharedPreferences.setString(PreferencesKey.backgroundSyncLastTrigger(wallet.name), DateTime.now().add(Duration(minutes: 1)).toIso8601String());
+ 
+       state = TransactionCommitted();
+     } catch (e) {
+diff --git a/pubspec_base.yaml b/pubspec_base.yaml
+index c3267c6da8..e43de5ca1d 100644
+--- a/pubspec_base.yaml
++++ b/pubspec_base.yaml
+@@ -93,8 +93,8 @@ dependencies:
+   eth_sig_util: ^0.0.9
+   ens_dart:
+     git:
+-      url: https://github.com/cake-tech/ens_dart.git
+-      ref: main
++      url: https://github.com/MrCyjaneK/ens_dart.git
++      ref: 9fa09b9db69b8645d5d50a844652aa570451d101
+   fluttertoast: 8.2.12
+ #  tor:
+ #    git:
+@@ -103,7 +103,10 @@ dependencies:
+   socks5_proxy: ^1.0.4
+   flutter_svg: ^2.0.9
+   polyseed: ^0.0.7
+-  nostr_tools: ^1.0.9
++  nostr_tools:
++    git:
++      url: https://github.com/MrCyjaneK/nostr_tools.git
++      ref: 089d5a2dd751429a040ba10fb24fcbae564053e5
+   ledger_flutter_plus:
+     git:
+       url: https://github.com/vespr-wallet/ledger-flutter-plus
+@@ -121,7 +124,8 @@ dependencies:
+   flutter_daemon:
+     git:
+       url: https://github.com/MrCyjaneK/flutter_daemon
+-      ref: 5c369e0e69e6f459357b9802bc694a221397298a
++      ref: 6d5270d64b5dd588fce12fd0a0c7314c37e6cff1
++  flutter_local_notifications: ^19.0.0
+ 
+ dev_dependencies:
+   flutter_test:
+diff --git a/res/values/strings_ar.arb b/res/values/strings_ar.arb
+index 27587a3313..e68f6dc3f7 100644
+--- a/res/values/strings_ar.arb
++++ b/res/values/strings_ar.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "في انتظار تأكيد الدفع",
+   "background_sync": "مزامنة الخلفية",
+   "background_sync_mode": "وضع مزامنة الخلفية",
++  "background_sync_on_battery_low": "تزامن على البطارية المنخفضة",
++  "background_sync_on_charging": "تزامن فقط عند الشحن",
++  "background_sync_on_device_idle": "تزامن فقط عند عدم استخدام الجهاز",
++  "background_sync_on_unmetered_network": "تتطلب شبكة غير مستوفاة",
+   "backup": "نسخ الاحتياطي",
+   "backup_file": "ملف النسخ الاحتياطي",
+   "backup_password": "كلمة مرور النسخ الاحتياطي",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "تسمية",
+   "new_subaddress_title": "عنوان جديد",
+   "new_template": "قالب جديد",
++  "new_transactions_notifications": "إرسال إشعارات حول المعاملات الجديدة",
+   "new_wallet": "إنشاء محفظة جديدة",
+   "newConnection": "ﺪﻳﺪﺟ ﻝﺎﺼﺗﺍ",
+   "no_cards_found": "لم يتم العثور على بطاقات",
+@@ -507,6 +512,7 @@
+   "normal": "طبيعي",
+   "note_optional": "ملاحظة (اختياري)",
+   "note_tap_to_change": "ملاحظة (انقر للتغيير)",
++  "notification_permission_denied": "تم رفض إذن الإخطار بشكل جيد ، يرجى تمكينه يدويًا في الإعدادات",
+   "nullURIError": "ﻍﺭﺎﻓ (URI) ﻢﻈﺘﻨﻤﻟﺍ ﺩﺭﺍﻮﻤﻟﺍ ﻑﺮﻌﻣ",
+   "offer_expires_in": "ينتهي العرض في:",
+   "offline": "غير متصل على الانترنت",
+diff --git a/res/values/strings_bg.arb b/res/values/strings_bg.arb
+index 90e2e1ca90..775cc8152f 100644
+--- a/res/values/strings_bg.arb
++++ b/res/values/strings_bg.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Чака се потвърждение на плащането",
+   "background_sync": "Фон Синхх",
+   "background_sync_mode": "Режим на синхронизиране на фона",
++  "background_sync_on_battery_low": "Синхронизирайте на ниска батерия",
++  "background_sync_on_charging": "Синхронизирайте само при зареждане",
++  "background_sync_on_device_idle": "Синхронизирайте само когато устройството не се използва",
++  "background_sync_on_unmetered_network": "Изисквайте незадоволена мрежа",
+   "backup": "Резервно копие",
+   "backup_file": "Резервно копие",
+   "backup_password": "Парола за възстановяване",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Име на Label",
+   "new_subaddress_title": "Нов адрес",
+   "new_template": "Нов шаблон",
++  "new_transactions_notifications": "Изпратете известия за нови транзакции",
+   "new_wallet": "Нов портфейл",
+   "newConnection": "Нова връзка",
+   "no_cards_found": "Не са намерени карти",
+@@ -507,6 +512,7 @@
+   "normal": "нормално",
+   "note_optional": "Бележка (не е задължително)",
+   "note_tap_to_change": "Бележка (натиснете за промяна)",
++  "notification_permission_denied": "Разрешението за уведомяване е отказано, моля, моля, активирайте го в настройки",
+   "nullURIError": "URI е нула",
+   "offer_expires_in": "Предложението изтича след: ",
+   "offline": "Офлайн",
+diff --git a/res/values/strings_cs.arb b/res/values/strings_cs.arb
+index 7f878075fc..7f9e0fcf72 100644
+--- a/res/values/strings_cs.arb
++++ b/res/values/strings_cs.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Čeká se na potvrzení platby",
+   "background_sync": "Synchronizace pozadí",
+   "background_sync_mode": "Režim synchronizace pozadí",
++  "background_sync_on_battery_low": "Synchronizace na nízké baterii",
++  "background_sync_on_charging": "Synchronizovat pouze při nabíjení",
++  "background_sync_on_device_idle": "Synchronizujte pouze tehdy, když se zařízení nepoužívá",
++  "background_sync_on_unmetered_network": "Vyžadovat nemetrovou síť",
+   "backup": "Záloha",
+   "backup_file": "Soubor se zálohou",
+   "backup_password": "Heslo pro zálohy",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Popisek",
+   "new_subaddress_title": "Nová adresa",
+   "new_template": "Nová šablona",
++  "new_transactions_notifications": "Zašlete oznámení o nových transakcích",
+   "new_wallet": "Nová peněženka",
+   "newConnection": "Nové připojení",
+   "no_cards_found": "Žádné karty nenalezeny",
+@@ -507,6 +512,7 @@
+   "normal": "Normální",
+   "note_optional": "Poznámka (nepovinné)",
+   "note_tap_to_change": "Poznámka (poklepáním upravit)",
++  "notification_permission_denied": "Oznámení o oznámení bylo oprávněně zamítnuto, prosím ručně jej povolte v nastavení",
+   "nullURIError": "URI je nulové",
+   "offer_expires_in": "Nabídka vyprší: ",
+   "offline": "Offline",
+diff --git a/res/values/strings_de.arb b/res/values/strings_de.arb
+index e3a725d9cf..b87ff03d37 100644
+--- a/res/values/strings_de.arb
++++ b/res/values/strings_de.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Warten auf Zahlungsbestätigung",
+   "background_sync": "Hintergrundsynchronisation",
+   "background_sync_mode": "Hintergrundsynchronisierungsmodus",
++  "background_sync_on_battery_low": "Synchronisieren Sie einen niedrigen Akku",
++  "background_sync_on_charging": "Nur beim Laden synchronisieren",
++  "background_sync_on_device_idle": "Nur dann synchronisieren, wenn das Gerät nicht verwendet wird",
++  "background_sync_on_unmetered_network": "Erfordern ein nicht modisches Netzwerk",
+   "backup": "Sicherung",
+   "backup_file": "Sicherungsdatei",
+   "backup_password": "Passwort sichern",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Bezeichnung",
+   "new_subaddress_title": "Neue Adresse",
+   "new_template": "neue Vorlage",
++  "new_transactions_notifications": "Senden Sie Benachrichtigungen über neue Transaktionen",
+   "new_wallet": "Neue Wallet",
+   "newConnection": "Neue Verbindung",
+   "no_cards_found": "Keine Karten gefunden",
+@@ -507,6 +512,7 @@
+   "normal": "Normal",
+   "note_optional": "Bemerkung (optional)",
+   "note_tap_to_change": "Bemerkung (zum Ändern tippen)",
++  "notification_permission_denied": "Die Benachrichtigungsgenehmigung wurde verweigert verweigert. Bitte ermöglichen Sie dies manuell in Einstellungen",
+   "nullURIError": "URI ist null",
+   "offer_expires_in": "Angebot läuft ab in: ",
+   "offline": "offline",
+diff --git a/res/values/strings_en.arb b/res/values/strings_en.arb
+index abd4060105..69495ba72b 100644
+--- a/res/values/strings_en.arb
++++ b/res/values/strings_en.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Awaiting Payment Confirmation",
+   "background_sync": "Background sync",
+   "background_sync_mode": "Background sync mode",
++  "background_sync_on_battery_low": "Synchronize on low battery",
++  "background_sync_on_charging": "Synchronize only when charging",
++  "background_sync_on_device_idle": "Synchronize only when device is not being used",
++  "background_sync_on_unmetered_network": "Require unmetred network",
+   "backup": "Backup",
+   "backup_file": "Backup file",
+   "backup_password": "Backup password",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Label name",
+   "new_subaddress_title": "New address",
+   "new_template": "New Template",
++  "new_transactions_notifications": "Send notifications about new transactions",
+   "new_wallet": "New Wallet",
+   "newConnection": "New Connection",
+   "no_cards_found": "No cards found",
+@@ -507,6 +512,7 @@
+   "normal": "Normal",
+   "note_optional": "Note (optional)",
+   "note_tap_to_change": "Note (tap to change)",
++  "notification_permission_denied": "Notification permission got permamently denied, please manually enable it in settings",
+   "nullURIError": "URI is null",
+   "offer_expires_in": "Offer expires in: ",
+   "offline": "Offline",
+diff --git a/res/values/strings_es.arb b/res/values/strings_es.arb
+index c175f8393d..70a8092439 100644
+--- a/res/values/strings_es.arb
++++ b/res/values/strings_es.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Esperando confirmación de pago",
+   "background_sync": "Sincronización en segundo plano",
+   "background_sync_mode": "Modo de sincronización en segundo plano",
++  "background_sync_on_battery_low": "Sincronizar con batería baja",
++  "background_sync_on_charging": "Sincronizar solo al cargar",
++  "background_sync_on_device_idle": "Sincronizar solo cuando el dispositivo no se usa",
++  "background_sync_on_unmetered_network": "Requerir una red no metida",
+   "backup": "Apoyo",
+   "backup_file": "Archivo de respaldo",
+   "backup_password": "Contraseña de respaldo",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Nombre de etiqueta",
+   "new_subaddress_title": "Nueva direccion",
+   "new_template": "Nueva plantilla",
++  "new_transactions_notifications": "Enviar notificaciones sobre nuevas transacciones",
+   "new_wallet": "Nueva billetera",
+   "newConnection": "Nueva conexión",
+   "no_cards_found": "No se encuentran cartas",
+@@ -507,6 +512,7 @@
+   "normal": "Normal",
+   "note_optional": "Nota (opcional)",
+   "note_tap_to_change": "Nota (toque para cambiar)",
++  "notification_permission_denied": "El permiso de notificación se negó de manera permanente, por favor, habilite manualmente en la configuración",
+   "nullURIError": "URI es nula",
+   "offer_expires_in": "Oferta expira en: ",
+   "offline": "fuera de línea",
+diff --git a/res/values/strings_fr.arb b/res/values/strings_fr.arb
+index fda6781b80..01510b7a93 100644
+--- a/res/values/strings_fr.arb
++++ b/res/values/strings_fr.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "En attente de confirmation de paiement",
+   "background_sync": "Synchronisation de fond",
+   "background_sync_mode": "Mode de synchronisation en arrière-plan",
++  "background_sync_on_battery_low": "Synchroniser sur une batterie basse",
++  "background_sync_on_charging": "Synchroniser uniquement lors de la charge",
++  "background_sync_on_device_idle": "Synchroniser uniquement lorsque l'appareil n'est pas utilisé",
++  "background_sync_on_unmetered_network": "Exiger un réseau non métallique",
+   "backup": "Sauvegarde",
+   "backup_file": "Fichier de sauvegarde",
+   "backup_password": "Mot de passe de sauvegarde",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Nom",
+   "new_subaddress_title": "Nouvelle adresse",
+   "new_template": "Nouveau Modèle",
++  "new_transactions_notifications": "Envoyer des notifications sur les nouvelles transactions",
+   "new_wallet": "Nouveau Portefeuille (Wallet)",
+   "newConnection": "Nouvelle connexion",
+   "no_cards_found": "Pas de cartes trouvées",
+@@ -507,6 +512,7 @@
+   "normal": "Normal",
+   "note_optional": "Note (optionnelle)",
+   "note_tap_to_change": "Note (appuyez pour changer)",
++  "notification_permission_denied": "L'autorisation de notification a été refusée permanente, veuillez l'activer manuellement dans les paramètres",
+   "nullURIError": "L'URI est nul",
+   "offer_expires_in": "L'Offre expire dans: ",
+   "offline": "Hors ligne",
+diff --git a/res/values/strings_ha.arb b/res/values/strings_ha.arb
+index c57635f316..7629eec5f3 100644
+--- a/res/values/strings_ha.arb
++++ b/res/values/strings_ha.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Ana jiran Tabbacin Biyan Kuɗi",
+   "background_sync": "Tunawa da Setc",
+   "background_sync_mode": "Yanayin Sync",
++  "background_sync_on_battery_low": "Aiki tare a kan baturin",
++  "background_sync_on_charging": "Aiki tare kawai lokacin caji",
++  "background_sync_on_device_idle": "Aiki tare kawai lokacin da ba a amfani da na'urar",
++  "background_sync_on_unmetered_network": "Bukatar cibiyar sadarwar da ba ta dace ba",
+   "backup": "Ajiyayyen",
+   "backup_file": "Ajiyayyen fayil",
+   "backup_password": "Ajiyayyen kalmar sirri",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Lakabin suna",
+   "new_subaddress_title": "Adireshin sabuwa",
+   "new_template": "Sabon Samfura",
++  "new_transactions_notifications": "Aika sanarwa game da sababbin ma'amaloli",
+   "new_wallet": "Sabuwar Wallet",
+   "newConnection": "Sabuwar Haɗi",
+   "no_cards_found": "Babu katunan da aka samo",
+@@ -507,6 +512,7 @@
+   "normal": "Na al'ada",
+   "note_optional": "Bayani (optional)",
+   "note_tap_to_change": "Bayani (tap don canja)",
++  "notification_permission_denied": "Izinin sanarwar da aka samu an ƙaryata game da shi, don Allah a kunna shi a cikin saiti",
+   "nullURIError": "URI banza ne",
+   "offer_expires_in": "tayin zai ƙare a:",
+   "offline": "Offline",
+diff --git a/res/values/strings_hi.arb b/res/values/strings_hi.arb
+index 02e4587499..73d168d473 100644
+--- a/res/values/strings_hi.arb
++++ b/res/values/strings_hi.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "भुगतान की पुष्टि की प्रतीक्षा में",
+   "background_sync": "पृष्ठभूमि सिंक",
+   "background_sync_mode": "बैकग्राउंड सिंक मोड",
++  "background_sync_on_battery_low": "कम बैटरी पर सिंक्रनाइज़ करें",
++  "background_sync_on_charging": "चार्ज करते समय केवल सिंक्रनाइज़ करें",
++  "background_sync_on_device_idle": "केवल तब सिंक्रनाइज़ करें जब डिवाइस का उपयोग नहीं किया जा रहा है",
++  "background_sync_on_unmetered_network": "अनमेट्रेड नेटवर्क की आवश्यकता है",
+   "backup": "बैकअप",
+   "backup_file": "बैकअपफ़ाइल",
+   "backup_password": "बैकअप पासवर्ड",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "लेबल का नाम",
+   "new_subaddress_title": "नया पता",
+   "new_template": "नया टेम्पलेट",
++  "new_transactions_notifications": "नए लेनदेन के बारे में सूचनाएं भेजें",
+   "new_wallet": "नया बटुआ",
+   "newConnection": "नया कनेक्शन",
+   "no_cards_found": "कोई कार्ड नहीं मिला",
+@@ -507,6 +512,7 @@
+   "normal": "सामान्य",
+   "note_optional": "नोट (वैकल्पिक)",
+   "note_tap_to_change": "नोट (टैप टू चेंज)",
++  "notification_permission_denied": "अधिसूचना की अनुमति को पारगम्य रूप से अस्वीकार कर दिया गया, कृपया इसे मैन्युअल रूप से सेटिंग्स में सक्षम करें",
+   "nullURIError": "यूआरआई शून्य है",
+   "offer_expires_in": "में ऑफर समाप्त हो रहा है: ",
+   "offline": "ऑफ़लाइन",
+diff --git a/res/values/strings_hr.arb b/res/values/strings_hr.arb
+index 1745d834ad..75aac2682a 100644
+--- a/res/values/strings_hr.arb
++++ b/res/values/strings_hr.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Čeka se potvrda plaćanja",
+   "background_sync": "Sinkronizacija pozadine",
+   "background_sync_mode": "Sinkronizacija u pozadini",
++  "background_sync_on_battery_low": "Sinkronizirati na niskoj bateriji",
++  "background_sync_on_charging": "Sinkronizirati samo prilikom punjenja",
++  "background_sync_on_device_idle": "Sinkronizirati samo kada se uređaj ne koristi",
++  "background_sync_on_unmetered_network": "Zahtijevaju nezadovoljnu mrežu",
+   "backup": "Sigurnosna kopija",
+   "backup_file": "Sigurnosna kopija datoteke",
+   "backup_password": "Lozinka za sigurnosnu kopiju",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Oznaka",
+   "new_subaddress_title": "Nova adresa",
+   "new_template": "novi predložak",
++  "new_transactions_notifications": "Pošaljite obavijesti o novim transakcijama",
+   "new_wallet": "Novi novčanik",
+   "newConnection": "Nova veza",
+   "no_cards_found": "Nisu pronađene kartice",
+@@ -507,6 +512,7 @@
+   "normal": "Normalno",
+   "note_optional": "Poruka (nije obvezno)",
+   "note_tap_to_change": "Poruka (dodirnite za promjenu)",
++  "notification_permission_denied": "Dozvola za obavijest ostalo je odbijeno, molimo vas da ga ručno omogućite u postavkama",
+   "nullURIError": "URI je nula",
+   "offer_expires_in": "Ponuda istječe za: ",
+   "offline": "izvan mreže",
+diff --git a/res/values/strings_hy.arb b/res/values/strings_hy.arb
+index 837df61d20..09585df8a9 100644
+--- a/res/values/strings_hy.arb
++++ b/res/values/strings_hy.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Վճարման հաստատման սպասում",
+   "background_sync": "Ֆոնային համաժամեցում",
+   "background_sync_mode": "Հետին պլանի համաժամացման ռեժիմ",
++  "background_sync_on_battery_low": "Համաժամեցրեք ցածր մարտկոցի վրա",
++  "background_sync_on_charging": "Համաժամացրեք միայն լիցքավորելու ժամանակ",
++  "background_sync_on_device_idle": "Համաժամացրեք միայն այն ժամանակ, երբ սարքը չի օգտագործվում",
++  "background_sync_on_unmetered_network": "Պահանջում են չմշակված ցանց",
+   "backup": "Կրկնօրինակ",
+   "backup_file": "Կրկնօրինակի ֆայլ",
+   "backup_password": "Կրկնօրինակի գաղտնաբառ",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Պիտակի անուն",
+   "new_subaddress_title": "Նոր հասցե",
+   "new_template": "Նոր նմուշ",
++  "new_transactions_notifications": "Ուղարկեք ծանուցումներ նոր գործարքների վերաբերյալ",
+   "new_wallet": "Նոր դրամապանակ",
+   "newConnection": "Նոր կապ",
+   "no_cards_found": "Ոչ մի քարտ չի գտնվել",
+@@ -506,6 +511,7 @@
+   "normal": "Նորմալ",
+   "note_optional": "Նշում (ոչ պարտադիր)",
+   "note_tap_to_change": "Նշում (սեղմեք փոխելու համար)",
++  "notification_permission_denied": "Տեղեկացման թույլտվությունը թափանցում է, խնդրում ենք ձեռքով միացնել այն պարամետրերում",
+   "nullURIError": "URI-ն դատարկ է",
+   "offer_expires_in": "Առաջարկը վաղեմության է հասնում ",
+   "offline": "Անցանց",
+diff --git a/res/values/strings_id.arb b/res/values/strings_id.arb
+index f159a26726..a3e6abd1f7 100644
+--- a/res/values/strings_id.arb
++++ b/res/values/strings_id.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Menunggu Konfirmasi Pembayaran",
+   "background_sync": "Sinkronisasi Latar Belakang",
+   "background_sync_mode": "Mode Sinkronisasi Latar Belakang",
++  "background_sync_on_battery_low": "Sinkronisasi pada baterai rendah",
++  "background_sync_on_charging": "Menyinkronkan hanya saat pengisian",
++  "background_sync_on_device_idle": "Menyinkronkan hanya jika perangkat tidak digunakan",
++  "background_sync_on_unmetered_network": "Membutuhkan jaringan yang belum diproduksi",
+   "backup": "Cadangan",
+   "backup_file": "File cadangan",
+   "backup_password": "Kata sandi cadangan",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Nama label",
+   "new_subaddress_title": "Alamat baru",
+   "new_template": "Template Baru",
++  "new_transactions_notifications": "Kirim pemberitahuan tentang transaksi baru",
+   "new_wallet": "Dompet Baru",
+   "newConnection": "Koneksi Baru",
+   "no_cards_found": "Tidak ada kartu yang ditemukan",
+@@ -507,6 +512,7 @@
+   "normal": "Normal",
+   "note_optional": "Catatan (opsional)",
+   "note_tap_to_change": "Catatan (tap untuk mengubah)",
++  "notification_permission_denied": "Izin pemberitahuan ditolak secara permanen, mohon aktifkan secara manual dalam pengaturan",
+   "nullURIError": "URI adalah nol",
+   "offer_expires_in": "Penawaran kedaluwarsa dalam: ",
+   "offline": "Offline",
+diff --git a/res/values/strings_it.arb b/res/values/strings_it.arb
+index b05f292ee0..b558501d40 100644
+--- a/res/values/strings_it.arb
++++ b/res/values/strings_it.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "In attesa di conferma del pagamento",
+   "background_sync": "Sincronizzazione in background",
+   "background_sync_mode": "Modalità di sincronizzazione in background",
++  "background_sync_on_battery_low": "Sincronizza sulla batteria bassa",
++  "background_sync_on_charging": "Sincronizzare solo quando si carica",
++  "background_sync_on_device_idle": "Sincronizzare solo quando il dispositivo non viene utilizzato",
++  "background_sync_on_unmetered_network": "Richiedono una rete non riservata",
+   "backup": "Backup",
+   "backup_file": "Backup file",
+   "backup_password": "Backup password",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Nome etichetta",
+   "new_subaddress_title": "Nuovo indirizzo",
+   "new_template": "Nuovo modello",
++  "new_transactions_notifications": "Invia notifiche su nuove transazioni",
+   "new_wallet": "Nuovo portafoglio",
+   "newConnection": "Nuova connessione",
+   "no_cards_found": "Nessuna carta trovata",
+@@ -507,6 +512,7 @@
+   "normal": "Normale",
+   "note_optional": "Nota (opzionale)",
+   "note_tap_to_change": "Nota (clicca per cambiare)",
++  "notification_permission_denied": "L'autorizzazione alla notifica è stata negato per via per via per via per via per via per via per via per via, per favore, abilitalo manualmente",
+   "nullURIError": "L'URI è nullo",
+   "offer_expires_in": "L'offerta termina tra: ",
+   "offline": "Offline",
+diff --git a/res/values/strings_ja.arb b/res/values/strings_ja.arb
+index d6cb2c4b10..933fb706a0 100644
+--- a/res/values/strings_ja.arb
++++ b/res/values/strings_ja.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "支払い確認を待っています",
+   "background_sync": "背景同期",
+   "background_sync_mode": "バックグラウンド同期モード",
++  "background_sync_on_battery_low": "低いバッテリーで同期します",
++  "background_sync_on_charging": "充電の場合にのみ同期します",
++  "background_sync_on_device_idle": "デバイスが使用されていない場合にのみ同期します",
++  "background_sync_on_unmetered_network": "未成年のネットワークが必要です",
+   "backup": "バックアップ",
+   "backup_file": "バックアップファイル",
+   "backup_password": "バックアップパスワード",
+@@ -484,6 +488,7 @@
+   "new_subaddress_label_name": "ラベル名",
+   "new_subaddress_title": "新しいアドレス",
+   "new_template": "新しいテンプレート",
++  "new_transactions_notifications": "新しいトランザクションに関する通知を送信します",
+   "new_wallet": "新しいウォレット",
+   "newConnection": "新しい接続",
+   "no_cards_found": "カードは見つかりません",
+@@ -508,6 +513,7 @@
+   "normal": "普通",
+   "note_optional": "注（オプション）",
+   "note_tap_to_change": "注（タップして変更）",
++  "notification_permission_denied": "通知の許可はまったく拒否されました。設定で手動で有効にしてください",
+   "nullURIError": "URIがnullです",
+   "offer_expires_in": "で有効期限が切れます: ",
+   "offline": "オフライン",
+diff --git a/res/values/strings_ko.arb b/res/values/strings_ko.arb
+index d451b69a6e..582ec8f45a 100644
+--- a/res/values/strings_ko.arb
++++ b/res/values/strings_ko.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "결제 확인 대기 중",
+   "background_sync": "배경 동기화",
+   "background_sync_mode": "백그라운드 동기화 모드",
++  "background_sync_on_battery_low": "낮은 배터리에서 동기화하십시오",
++  "background_sync_on_charging": "충전 할 때만 동기화하십시오",
++  "background_sync_on_device_idle": "장치를 사용하지 않을 때만 동기화하십시오",
++  "background_sync_on_unmetered_network": "충족되지 않은 네트워크가 필요합니다",
+   "backup": "지원",
+   "backup_file": "백업 파일",
+   "backup_password": "백업 비밀번호",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "라벨 이름",
+   "new_subaddress_title": "새 주소",
+   "new_template": "새 템플릿",
++  "new_transactions_notifications": "새로운 거래에 대한 알림을 보냅니다",
+   "new_wallet": "새 월렛",
+   "newConnection": "새로운 연결",
+   "no_cards_found": "카드를 찾지 못했습니다",
+@@ -507,6 +512,7 @@
+   "normal": "정상",
+   "note_optional": "참고 (선택 사항)",
+   "note_tap_to_change": "메모 (변경하려면 탭하세요)",
++  "notification_permission_denied": "알림 허가가 부패하게 거부되었습니다. 설정에서 수동으로 활성화하십시오.",
+   "nullURIError": "URI가 null입니다.",
+   "offer_expires_in": "쿠폰 만료일: ",
+   "offline": "오프라인",
+diff --git a/res/values/strings_my.arb b/res/values/strings_my.arb
+index a49c1bb301..69eb337eee 100644
+--- a/res/values/strings_my.arb
++++ b/res/values/strings_my.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "ငွေပေးချေမှု အတည်ပြုချက်ကို စောင့်မျှော်နေပါသည်။",
+   "background_sync": "နောက်ခံထပ်တူပြုခြင်း",
+   "background_sync_mode": "နောက်ခံထပ်တူပြုခြင်း mode ကို",
++  "background_sync_on_battery_low": "အနိမ့်ဘက်ထရီအပေါ်တစ်ပြိုင်တည်းချိန်ကိုက်",
++  "background_sync_on_charging": "အားသွင်းသည့်အခါသာထပ်တူပြုခြင်း",
++  "background_sync_on_device_idle": "စက်ကိုအသုံးမပြုသည့်စက်ကိုသာတစ်ပြိုင်တည်းချိန်ကိုက်ပါ",
++  "background_sync_on_unmetered_network": "unmetred ကွန်ယက်လိုအပ်သည်",
+   "backup": "မိတ္တူ",
+   "backup_file": "အရန်ဖိုင်",
+   "backup_password": "စကားဝှက်ကို အရန်သိမ်းဆည်းပါ။",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "အညွှန်းအမည်",
+   "new_subaddress_title": "လိပ်စာအသစ်",
+   "new_template": "ပုံစံအသစ်",
++  "new_transactions_notifications": "အသစ်သောအရောင်းအဝယ်အကြောင်းသတိပေးချက်များပေးပို့ပါ",
+   "new_wallet": "ပိုက်ဆံအိတ်အသစ်",
+   "newConnection": "ချိတ်ဆက်မှုအသစ်",
+   "no_cards_found": "ကဒ်များမရှိပါ",
+@@ -507,6 +512,7 @@
+   "normal": "ပုံမှန်",
+   "note_optional": "မှတ်ချက် (ချန်လှပ်ထားနိုင်သည်)",
+   "note_tap_to_change": "မှတ်ချက် (ပြောင်းလဲရန် တို့ပါ)",
++  "notification_permission_denied": "အသိပေးချက်ခွင့်ပြုချက်ကိုအစက်အပြောက်ကိုငြင်းဆိုခဲ့သည်, ကျေးဇူးပြု. ၎င်းကိုချိန်ညှိချက်များတွင်လက်ဖြင့်ပြုလုပ်ပါ",
+   "nullURIError": "URI သည် null ဖြစ်သည်။",
+   "offer_expires_in": "ကမ်းလှမ်းချက် သက်တမ်းကုန်သည်:",
+   "offline": "အော့ဖ်လိုင်း",
+diff --git a/res/values/strings_nl.arb b/res/values/strings_nl.arb
+index bdd1f5c0c5..da508e8805 100644
+--- a/res/values/strings_nl.arb
++++ b/res/values/strings_nl.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "In afwachting van betalingsbevestiging",
+   "background_sync": "Achtergrondsynchronisatie",
+   "background_sync_mode": "Achtergrondsynchronisatiemodus",
++  "background_sync_on_battery_low": "Synchroniseren op lage batterij",
++  "background_sync_on_charging": "Synchroniseer alleen bij het opladen",
++  "background_sync_on_device_idle": "Synchroniseer alleen wanneer het apparaat niet wordt gebruikt",
++  "background_sync_on_unmetered_network": "Vereist een onvermekte netwerk",
+   "backup": "Back-up",
+   "backup_file": "Backup bestand",
+   "backup_password": "Reservewachtwoord",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Label naam",
+   "new_subaddress_title": "Nieuw adres",
+   "new_template": "Nieuwe sjabloon",
++  "new_transactions_notifications": "Stuur meldingen over nieuwe transacties",
+   "new_wallet": "Nieuwe portemonnee",
+   "newConnection": "Nieuwe verbinding",
+   "no_cards_found": "Geen kaarten gevonden",
+@@ -507,6 +512,7 @@
+   "normal": "Normaal",
+   "note_optional": "Opmerking (optioneel)",
+   "note_tap_to_change": "Opmerking (tik om te wijzigen)",
++  "notification_permission_denied": "Meldingstoestemming is permanent geweigerd, schakel het handmatig in instellingen in",
+   "nullURIError": "URI is nul",
+   "offer_expires_in": "Aanbieding verloopt over: ",
+   "offline": "Offline",
+diff --git a/res/values/strings_pl.arb b/res/values/strings_pl.arb
+index 7199b0e90d..12765881c6 100644
+--- a/res/values/strings_pl.arb
++++ b/res/values/strings_pl.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Oczekiwanie na potwierdzenie płatności",
+   "background_sync": "Synchronizacja w tle",
+   "background_sync_mode": "Tryb synchronizacji w tle",
++  "background_sync_on_battery_low": "Synchronizować na niskiej baterii",
++  "background_sync_on_charging": "Synchronizować tylko podczas ładowania",
++  "background_sync_on_device_idle": "Synchronizować tylko wtedy, gdy urządzenie nie jest używane",
++  "background_sync_on_unmetered_network": "Wymagaj niezametrowanej sieci",
+   "backup": "Kopia zapasowa",
+   "backup_file": "Plik kopii zapasowej",
+   "backup_password": "Hasło kpoii zapasowej",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Etykieta nazwy adresu",
+   "new_subaddress_title": "Nowy adres",
+   "new_template": "Nowy szablon",
++  "new_transactions_notifications": "Wyślij powiadomienia o nowych transakcjach",
+   "new_wallet": "Nowy portfel",
+   "newConnection": "Nowe połączenie",
+   "no_cards_found": "Nie znaleziono żadnych kart",
+@@ -507,6 +512,7 @@
+   "normal": "Normalna",
+   "note_optional": "Notatka (opcjonalnie)",
+   "note_tap_to_change": "Notatka (dotknij, aby zmienić)",
++  "notification_permission_denied": "Zezwolenie na powiadomienie zostało odrzucone, prosimy ręcznie włączyć go w ustawieniach",
+   "nullURIError": "URI ma wartość zerową",
+   "offer_expires_in": "Oferta wygasa za ",
+   "offline": "Offline",
+diff --git a/res/values/strings_pt.arb b/res/values/strings_pt.arb
+index d9e28005a8..c91bb04a0d 100644
+--- a/res/values/strings_pt.arb
++++ b/res/values/strings_pt.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Aguardando confirmação de pagamento",
+   "background_sync": "Sincronização de fundo",
+   "background_sync_mode": "Modo de sincronização em segundo plano",
++  "background_sync_on_battery_low": "Sincronizar com bateria baixa",
++  "background_sync_on_charging": "Sincronize apenas ao carregar",
++  "background_sync_on_device_idle": "Sincronize apenas quando o dispositivo não está sendo usado",
++  "background_sync_on_unmetered_network": "Requer rede não meta",
+   "backup": "Cópia de segurança",
+   "backup_file": "Arquivo de backup",
+   "backup_password": "Senha de backup",
+@@ -484,6 +488,7 @@
+   "new_subaddress_label_name": "Nome",
+   "new_subaddress_title": "Novo endereço",
+   "new_template": "Novo modelo",
++  "new_transactions_notifications": "Envie notificações sobre novas transações",
+   "new_wallet": "Nova carteira",
+   "newConnection": "Nova conexão",
+   "no_cards_found": "Nenhum cartão encontrado",
+@@ -508,6 +513,7 @@
+   "normal": "Normal",
+   "note_optional": "Nota (opcional)",
+   "note_tap_to_change": "Nota (toque para alterar)",
++  "notification_permission_denied": "A permissão de notificação foi negada com permamer, por favor, ativá -la manualmente em configurações",
+   "nullURIError": "URI é nulo",
+   "offer_expires_in": "A oferta expira em: ",
+   "offline": "offline",
+diff --git a/res/values/strings_ru.arb b/res/values/strings_ru.arb
+index 34c1968d18..37750c3ce4 100644
+--- a/res/values/strings_ru.arb
++++ b/res/values/strings_ru.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Ожидается подтверждения платежа",
+   "background_sync": "Фоновая синхронизация",
+   "background_sync_mode": "Режим фоновой синхронизации",
++  "background_sync_on_battery_low": "Синхронизировать на низкой батареи",
++  "background_sync_on_charging": "Синхронизировать только при зарядке",
++  "background_sync_on_device_idle": "Синхронизировать только тогда, когда устройство не используется",
++  "background_sync_on_unmetered_network": "Требуется незамеченная сеть",
+   "backup": "Резервная копия",
+   "backup_file": "Файл резервной копии",
+   "backup_password": "Пароль резервной копии",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Имя",
+   "new_subaddress_title": "Новый адрес",
+   "new_template": "Новый шаблон",
++  "new_transactions_notifications": "Отправить уведомления о новых транзакциях",
+   "new_wallet": "Новый кошелёк",
+   "newConnection": "Новое соединение",
+   "no_cards_found": "Карт не найдено",
+@@ -507,6 +512,7 @@
+   "normal": "Нормальный",
+   "note_optional": "Примечание (необязательно)",
+   "note_tap_to_change": "Примечание (нажмите для изменения)",
++  "notification_permission_denied": "Разрешение уведомления было отклонено, пожалуйста, вручную включить его в настройках",
+   "nullURIError": "URI имеет значение null",
+   "offer_expires_in": "Предложение истекает через: ",
+   "offline": "Не в сети",
+diff --git a/res/values/strings_th.arb b/res/values/strings_th.arb
+index d9bb16118f..cbc007035a 100644
+--- a/res/values/strings_th.arb
++++ b/res/values/strings_th.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "รอการยืนยันการชำระเงิน",
+   "background_sync": "การซิงค์พื้นหลัง",
+   "background_sync_mode": "โหมดซิงค์พื้นหลัง",
++  "background_sync_on_battery_low": "ซิงโครไนซ์กับแบตเตอรี่ต่ำ",
++  "background_sync_on_charging": "ซิงโครไนซ์เฉพาะเมื่อชาร์จ",
++  "background_sync_on_device_idle": "ซิงโครไนซ์เฉพาะเมื่อไม่ใช้อุปกรณ์",
++  "background_sync_on_unmetered_network": "ต้องการเครือข่ายที่ไม่ได้รับการแก้ไข",
+   "backup": "สำรองข้อมูล",
+   "backup_file": "ไฟล์สำรองข้อมูล",
+   "backup_password": "รหัสผ่านสำรองข้อมูล",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "ชื่อป้ายกำกับ",
+   "new_subaddress_title": "ที่อยู่ใหม่",
+   "new_template": "แม่แบบใหม่",
++  "new_transactions_notifications": "ส่งการแจ้งเตือนเกี่ยวกับธุรกรรมใหม่",
+   "new_wallet": "กระเป๋าใหม่",
+   "newConnection": "การเชื่อมต่อใหม่",
+   "no_cards_found": "ไม่พบการ์ด",
+@@ -507,6 +512,7 @@
+   "normal": "ปกติ",
+   "note_optional": "บันทึก (ไม่จำเป็น)",
+   "note_tap_to_change": "หมายเหตุ (กดเพื่อเปลี่ยน)",
++  "notification_permission_denied": "การอนุญาตการแจ้งเตือนได้รับการปฏิเสธอย่างอนุญาตโปรดเปิดใช้งานด้วยตนเองในการตั้งค่า",
+   "nullURIError": "URI เป็นโมฆะ",
+   "offer_expires_in": "ข้อเสนอจะหมดอายุใน: ",
+   "offline": "ออฟไลน์",
+diff --git a/res/values/strings_tl.arb b/res/values/strings_tl.arb
+index 31bf58691e..356eae8c50 100644
+--- a/res/values/strings_tl.arb
++++ b/res/values/strings_tl.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Nanghihintay ng Kumpirmasyon sa Pagbabayad",
+   "background_sync": "Pag -sync ng background",
+   "background_sync_mode": "Background sync mode",
++  "background_sync_on_battery_low": "Mag -synchronize sa mababang baterya",
++  "background_sync_on_charging": "Mag -synchronize lamang kapag singilin",
++  "background_sync_on_device_idle": "Mag -synchronize lamang kapag hindi ginagamit ang aparato",
++  "background_sync_on_unmetered_network": "Nangangailangan ng hindi natukoy na network",
+   "backup": "Backup",
+   "backup_file": "Backup na file",
+   "backup_password": "Backup na password",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Pangalan ng label",
+   "new_subaddress_title": "Bagong address",
+   "new_template": "Bagong Template",
++  "new_transactions_notifications": "Magpadala ng mga abiso tungkol sa mga bagong transaksyon",
+   "new_wallet": "Bagong Wallet",
+   "newConnection": "Bagong Koneksyon",
+   "no_cards_found": "Walang nahanap na mga card",
+@@ -507,6 +512,7 @@
+   "normal": "Normal",
+   "note_optional": "Tala (opsyonal)",
+   "note_tap_to_change": "Tala (i-tap para baguhin)",
++  "notification_permission_denied": "Ang pahintulot ng abiso ay pinahihintulutan na tumanggi, mangyaring manu -manong paganahin ito sa mga setting",
+   "nullURIError": "Ang URI ay null",
+   "offer_expires_in": "Mag-expire ang alok sa: ",
+   "offline": "Offline",
+diff --git a/res/values/strings_tr.arb b/res/values/strings_tr.arb
+index b8503af934..5265e5f4ea 100644
+--- a/res/values/strings_tr.arb
++++ b/res/values/strings_tr.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Ödemenin onaylanması bekleniyor",
+   "background_sync": "Arka plan senkronizasyonu",
+   "background_sync_mode": "Arka Plan Senkronizasyon Modu",
++  "background_sync_on_battery_low": "Düşük pille senkronize edin",
++  "background_sync_on_charging": "Yalnızca şarj ederken senkronize edin",
++  "background_sync_on_device_idle": "Yalnızca cihaz kullanılmadığında senkronize edin",
++  "background_sync_on_unmetered_network": "Karşıdamlanmamış ağ gerektirir",
+   "backup": "Yedek",
+   "backup_file": "Yedek dosyası",
+   "backup_password": "Yedek parolası",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Etiket ismi",
+   "new_subaddress_title": "Yeni adres",
+   "new_template": "Yeni Şablon",
++  "new_transactions_notifications": "Yeni işlemler hakkında bildirimler gönderin",
+   "new_wallet": "Yeni Cüzdan",
+   "newConnection": "Yeni bağlantı",
+   "no_cards_found": "Kart bulunamadı",
+@@ -507,6 +512,7 @@
+   "normal": "Normal",
+   "note_optional": "Not (isteğe bağlı)",
+   "note_tap_to_change": "Not (değiştirmek için dokunun)",
++  "notification_permission_denied": "Bildirim izni perdence reddedildi, lütfen ayarlarda manuel olarak etkinleştirin",
+   "nullURIError": "URI boş",
+   "offer_expires_in": "Teklifin bitmesine kalan: ",
+   "offline": "Çevrimdışı",
+diff --git a/res/values/strings_uk.arb b/res/values/strings_uk.arb
+index 5ff9b72f6a..99c94854bb 100644
+--- a/res/values/strings_uk.arb
++++ b/res/values/strings_uk.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Очікується підтвердження платежу",
+   "background_sync": "Фонове синхронізація",
+   "background_sync_mode": "Фоновий режим синхронізації",
++  "background_sync_on_battery_low": "Синхронізувати на низькому батареї",
++  "background_sync_on_charging": "Синхронізуватися лише при зарядці",
++  "background_sync_on_device_idle": "Синхронізувати лише тоді, коли пристрій не використовується",
++  "background_sync_on_unmetered_network": "Вимагати незадоволеної мережі",
+   "backup": "Резервна копія",
+   "backup_file": "Файл резервної копії",
+   "backup_password": "Пароль резервної копії",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "Ім'я",
+   "new_subaddress_title": "Нова адреса",
+   "new_template": "Новий шаблон",
++  "new_transactions_notifications": "Надішліть сповіщення про нові транзакції",
+   "new_wallet": "Новий гаманець",
+   "newConnection": "Нове підключення",
+   "no_cards_found": "Карт не знайдено",
+@@ -507,6 +512,7 @@
+   "normal": "нормальний",
+   "note_optional": "Примітка (необов’язково)",
+   "note_tap_to_change": "Примітка (натисніть для зміни)",
++  "notification_permission_denied": "Повідомлення дозволу отримали безперервно, будь ласка, вручну ввімкніть його в налаштуваннях",
+   "nullURIError": "URI нульовий",
+   "offer_expires_in": "Пропозиція закінчиться через: ",
+   "offline": "Офлайн",
+diff --git a/res/values/strings_ur.arb b/res/values/strings_ur.arb
+index 2e27ff85eb..152cd7d116 100644
+--- a/res/values/strings_ur.arb
++++ b/res/values/strings_ur.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "ادائیگی کی تصدیق کے منتظر",
+   "background_sync": "پس منظر کی ہم آہنگی",
+   "background_sync_mode": "پس منظر کی مطابقت پذیری کا موڈ",
++  "background_sync_on_battery_low": "کم بیٹری پر ہم وقت سازی کریں",
++  "background_sync_on_charging": "چارج کرتے وقت صرف ہم وقت سازی کریں",
++  "background_sync_on_device_idle": "صرف اس وقت مطابقت پذیر کریں جب آلہ استعمال نہ ہو",
++  "background_sync_on_unmetered_network": "بے ساختہ نیٹ ورک کی ضرورت ہے",
+   "backup": "بیک اپ",
+   "backup_file": "بیک اپ فائل",
+   "backup_password": "بیک اپ پاس ورڈ",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "لیبل کا نام",
+   "new_subaddress_title": "نیا پتہ",
+   "new_template": "نیا سانچہ",
++  "new_transactions_notifications": "نئے لین دین کے بارے میں اطلاعات بھیجیں",
+   "new_wallet": "نیا پرس",
+   "newConnection": "ﻦﺸﮑﻨﮐ ﺎﯿﻧ",
+   "no_cards_found": "کوئی کارڈ نہیں ملا",
+@@ -507,6 +512,7 @@
+   "normal": "نارمل",
+   "note_optional": "نوٹ (اختیاری)",
+   "note_tap_to_change": "نوٹ (تبدیل کرنے کے لیے تھپتھپائیں)",
++  "notification_permission_denied": "نوٹیفکیشن کی اجازت کو یقینی طور پر انکار کردیا گیا ، براہ کرم اسے دستی طور پر ترتیبات میں اہل بنائیں",
+   "nullURIError": "URI ۔ﮯﮨ ﻡﺪﻌﻟﺎﮐ",
+   "offer_expires_in": "پیشکش کی میعاد اس وقت ختم ہو جاتی ہے:",
+   "offline": "آف لائن",
+diff --git a/res/values/strings_vi.arb b/res/values/strings_vi.arb
+index 7bbe35a4af..56a9305bff 100644
+--- a/res/values/strings_vi.arb
++++ b/res/values/strings_vi.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "Đang chờ xác nhận thanh toán",
+   "background_sync": "Đồng bộ nền",
+   "background_sync_mode": "Chế độ đồng bộ nền",
++  "background_sync_on_battery_low": "Đồng bộ hóa trên pin thấp",
++  "background_sync_on_charging": "Chỉ đồng bộ hóa khi sạc",
++  "background_sync_on_device_idle": "Chỉ đồng bộ hóa khi thiết bị không được sử dụng",
++  "background_sync_on_unmetered_network": "Yêu cầu mạng không được thiết kế",
+   "backup": "Sao lưu",
+   "backup_file": "Tập tin sao lưu",
+   "backup_password": "Mật khẩu sao lưu",
+@@ -482,6 +486,7 @@
+   "new_subaddress_label_name": "Tên nhãn",
+   "new_subaddress_title": "Địa chỉ mới",
+   "new_template": "Mẫu mới",
++  "new_transactions_notifications": "Gửi thông báo về các giao dịch mới",
+   "new_wallet": "Ví mới",
+   "newConnection": "Kết nối mới",
+   "no_cards_found": "Không tìm thấy thẻ",
+@@ -505,6 +510,7 @@
+   "normal": "Bình thường",
+   "note_optional": "Ghi chú (tùy chọn)",
+   "note_tap_to_change": "Ghi chú (nhấn để thay đổi)",
++  "notification_permission_denied": "Giấy phép thông báo bị từ chối, vui lòng bật thủ công nó trong cài đặt",
+   "nullURIError": "URI là null",
+   "offer_expires_in": "Ưu đãi hết hạn trong: ",
+   "offline": "Ngoại tuyến",
+diff --git a/res/values/strings_yo.arb b/res/values/strings_yo.arb
+index 6a5ff26fdd..c17f07eb69 100644
+--- a/res/values/strings_yo.arb
++++ b/res/values/strings_yo.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "À ń dúró de ìjẹ́rìísí àránṣẹ́",
+   "background_sync": "Imuṣiṣẹ Labẹ",
+   "background_sync_mode": "Ipo amuṣiṣẹpọ abẹlẹ",
++  "background_sync_on_battery_low": "Muuṣiṣẹ lori batiri kekere",
++  "background_sync_on_charging": "Muṣiṣẹpọ nikan nigbati gbigba agbara",
++  "background_sync_on_device_idle": "Muṣiṣẹpọ nikan nigbati ẹrọ ko lo",
++  "background_sync_on_unmetered_network": "Nilo nẹtiwọki ti ko ni aabo",
+   "backup": "Ṣẹ̀dà",
+   "backup_file": "Ṣẹ̀dà akọsílẹ̀",
+   "backup_password": "Ṣẹ̀dà ọ̀rọ̀ aṣínà",
+@@ -484,6 +488,7 @@
+   "new_subaddress_label_name": "Orúkọ",
+   "new_subaddress_title": "Àdírẹ́sì títun",
+   "new_template": "Àwòṣe títun",
++  "new_transactions_notifications": "Firanṣẹ awọn iwifunni nipa awọn iṣowo tuntun",
+   "new_wallet": "Àpamọ́wọ́ títun",
+   "newConnection": "Tuntun Asopọ",
+   "no_cards_found": "Ko si awọn kaadi ti a rii",
+@@ -508,6 +513,7 @@
+   "normal": "Deede",
+   "note_optional": "Àkọsílẹ̀ (ìyàn nìyí)",
+   "note_tap_to_change": "Àkọsílẹ̀  (ẹ tẹ̀ láti pààrọ̀)",
++  "notification_permission_denied": "Igbanilaaye iwifunni ni sẹsẹ sẹsẹ, jọwọ jẹ ki o mu ṣiṣẹ ni awọn eto",
+   "nullURIError": "URI jẹ asan",
+   "offer_expires_in": "Ìrònúdábàá máa gbẹ́mìí mì ní: ",
+   "offline": "kò wà lórí ayélujára",
+diff --git a/res/values/strings_zh.arb b/res/values/strings_zh.arb
+index d75b2e3fb6..d0bbe9c08c 100644
+--- a/res/values/strings_zh.arb
++++ b/res/values/strings_zh.arb
+@@ -73,6 +73,10 @@
+   "awaiting_payment_confirmation": "等待付款确认",
+   "background_sync": "背景同步",
+   "background_sync_mode": "后台同步模式",
++  "background_sync_on_battery_low": "在低电池上同步",
++  "background_sync_on_charging": "仅在充电时同步",
++  "background_sync_on_device_idle": "仅在不使用设备时同步",
++  "background_sync_on_unmetered_network": "需要未经许可的网络",
+   "backup": "备份",
+   "backup_file": "备份文件",
+   "backup_password": "备份密码",
+@@ -483,6 +487,7 @@
+   "new_subaddress_label_name": "标签名称",
+   "new_subaddress_title": "新地址",
+   "new_template": "新模板",
++  "new_transactions_notifications": "发送有关新交易的通知",
+   "new_wallet": "新钱包",
+   "newConnection": "新连接",
+   "no_cards_found": "找不到卡",
+@@ -507,6 +512,7 @@
+   "normal": "普通的",
+   "note_optional": "注释（可选）",
+   "note_tap_to_change": "注释（轻按即可更改）",
++  "notification_permission_denied": "通知许可被e opply拒绝，请在设置中手动启用它",
+   "nullURIError": "URI 为空",
+   "offer_expires_in": "优惠有效期至 ",
+   "offline": "离线",

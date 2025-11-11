@@ -1,0 +1,662 @@
+diff --git a/SignalServiceKit/src/Contacts/Threads/TSPrivateStoryThread.m b/SignalServiceKit/src/Contacts/Threads/TSPrivateStoryThread.m
+index 9d41d1052c7..09c215725ea 100644
+--- a/SignalServiceKit/src/Contacts/Threads/TSPrivateStoryThread.m
++++ b/SignalServiceKit/src/Contacts/Threads/TSPrivateStoryThread.m
+@@ -22,11 +22,6 @@ @interface TSPrivateStoryThread ()
+ 
+ @implementation TSPrivateStoryThread
+ 
+-+ (TSFTSIndexMode)FTSIndexMode
+-{
+-    return TSFTSIndexModeNever;
+-}
+-
+ - (instancetype)initWithUniqueId:(NSString *)uniqueId
+                             name:(NSString *)name
+                    allowsReplies:(BOOL)allowsReplies
+diff --git a/SignalServiceKit/src/Storage/Database/GRDBSchemaMigrator.swift b/SignalServiceKit/src/Storage/Database/GRDBSchemaMigrator.swift
+index be3c1c775e8..546caf17462 100644
+--- a/SignalServiceKit/src/Storage/Database/GRDBSchemaMigrator.swift
++++ b/SignalServiceKit/src/Storage/Database/GRDBSchemaMigrator.swift
+@@ -256,10 +256,11 @@ public class GRDBSchemaMigrator: NSObject {
+         case dataMigration_updateStoriesDisabledInAccountRecord
+         case dataMigration_removeGroupStoryRepliesFromSearchIndex
+         case dataMigration_populateStoryContextAssociatedDataLastReadTimestamp
++        case dataMigration_indexPrivateStoryThreadNames
+     }
+ 
+     public static let grdbSchemaVersionDefault: UInt = 0
+-    public static let grdbSchemaVersionLatest: UInt = 49
++    public static let grdbSchemaVersionLatest: UInt = 50
+ 
+     // An optimization for new users, we have the first migration import the latest schema
+     // and mark any other migrations as "already run".
+@@ -2566,6 +2567,25 @@ public class GRDBSchemaMigrator: NSObject {
+             }
+         }
+ 
++        migrator.registerMigration(.dataMigration_indexPrivateStoryThreadNames) { db in
++            do {
++                let transaction = GRDBWriteTransaction(database: db)
++                defer { transaction.finalizeTransaction() }
++
++                let sql = "SELECT * FROM model_TSThread WHERE recordType IS \(SDSRecordType.privateStoryThread.rawValue)"
++                let cursor = TSThread.grdbFetchCursor(sql: sql, transaction: transaction)
++                while let thread = try cursor.next() {
++                    guard let storyThread = thread as? TSPrivateStoryThread else {
++                        continue
++                    }
++                    GRDBFullTextSearchFinder.modelWasInserted(model: storyThread, transaction: transaction)
++                }
++            } catch {
++                owsFail("Error: \(error)")
++            }
++
++        }
++
+         // MARK: - Data Migration Insertion Point
+     }
+ }
+diff --git a/SignalServiceKit/src/Storage/FullTextSearchFinder.swift b/SignalServiceKit/src/Storage/FullTextSearchFinder.swift
+index 9ce88e5f9b6..095812a1f32 100644
+--- a/SignalServiceKit/src/Storage/FullTextSearchFinder.swift
++++ b/SignalServiceKit/src/Storage/FullTextSearchFinder.swift
+@@ -602,6 +602,11 @@ class AnySearchIndexer: Dependencies {
+         return groupThread.groupModel.groupNameOrDefault
+     }
+ 
++    private static let privateStoryThreadIndexer: SearchIndexer<TSPrivateStoryThread> = SearchIndexer { (storyThread: TSPrivateStoryThread, _: SDSAnyReadTransaction) in
++        // NOTE: returns the right name for my story as well.
++        return storyThread.name
++    }
++
+     private static let groupMemberIndexer: SearchIndexer<TSGroupMember> = SearchIndexer { (groupMember: TSGroupMember, transaction: SDSAnyReadTransaction) in
+         return recipientIndexer.index(groupMember.address, transaction: transaction)
+     }
+@@ -670,6 +675,8 @@ class AnySearchIndexer: Dependencies {
+ 
+         if let groupThread = object as? TSGroupThread {
+             return self.groupThreadIndexer.index(groupThread, transaction: transaction)
++        } else if let privateStoryThread = object as? TSPrivateStoryThread {
++            return self.privateStoryThreadIndexer.index(privateStoryThread, transaction: transaction)
+         } else if let groupMember = object as? TSGroupMember {
+             return self.groupMemberIndexer.index(groupMember, transaction: transaction)
+         } else if let contactThread = object as? TSContactThread {
+diff --git a/SignalUI/Utils/FullTextSearcher.swift b/SignalUI/Utils/FullTextSearcher.swift
+index 2f3952fcd48..7d95a27d57f 100644
+--- a/SignalUI/Utils/FullTextSearcher.swift
++++ b/SignalUI/Utils/FullTextSearcher.swift
+@@ -108,6 +108,38 @@ public class ContactSearchResult: NSObject, Comparable {
+ 
+ // MARK: -
+ 
++/// Can represent either a group thread with stories, or a private story thread.
++@objc
++public class StorySearchResult: NSObject, Comparable {
++
++    public let thread: TSThread
++
++    private let sortKey: ConversationSortKey
++
++    init(thread: TSThread, sortKey: ConversationSortKey) {
++        self.thread = thread
++        self.sortKey = sortKey
++    }
++
++    // MARK: Comparable
++
++    public static func < (lhs: StorySearchResult, rhs: StorySearchResult) -> Bool {
++        return lhs.sortKey < rhs.sortKey
++    }
++
++    // MARK: Equatable
++
++    public override func isEqual(_ object: Any?) -> Bool {
++        guard let other = object as? Self else {
++            return false
++        }
++
++        return thread.uniqueId == other.thread.uniqueId
++    }
++}
++
++// MARK: -
++
+ public class HomeScreenSearchResultSet: NSObject {
+     public let searchText: String
+     public let contactThreads: [ConversationSearchResult<ConversationSortKey>]
+@@ -252,6 +284,80 @@ public class ComposeScreenSearchResultSet: NSObject {
+ 
+ // MARK: -
+ 
++@objc
++public class ConversationPickerScreenSearchResultSet: NSObject {
++
++    @objc
++    public let searchText: String
++
++    @objc
++    public let groups: [GroupSearchResult]
++
++    @objc
++    public var groupThreads: [TSGroupThread] {
++        return groups.compactMap { $0.thread.threadRecord as? TSGroupThread }
++    }
++
++    @objc
++    public let signalContacts: [ContactSearchResult]
++
++    @objc
++    public var signalAccounts: [SignalAccount] {
++        return signalContacts.map { $0.signalAccount }
++    }
++
++    /// Includes both group threads with stories, and private story threads.
++    @objc
++    public let storyResults: [StorySearchResult]
++
++    @objc
++    public var storyThreads: [TSThread] {
++        return storyResults.map(\.thread)
++    }
++
++    public init(
++        searchText: String,
++        groups: [GroupSearchResult],
++        storyThreads: [StorySearchResult],
++        signalContacts: [ContactSearchResult]
++    ) {
++        self.searchText = searchText
++        self.groups = groups
++        self.storyResults = storyThreads
++        self.signalContacts = signalContacts
++    }
++
++    @objc
++    public static let empty = ComposeScreenSearchResultSet(searchText: "", groups: [], signalContacts: [])
++
++    @objc
++    public var isEmpty: Bool {
++        return groups.isEmpty && signalContacts.isEmpty
++    }
++
++    @objc
++    public var logDescription: String {
++        var sections = [String]()
++        if !groups.isEmpty {
++            var splits = [String]()
++            for group in groups {
++                splits.append(group.thread.threadRecord.uniqueId)
++            }
++            sections.append("groups: " + splits.joined(separator: ","))
++        }
++        if !signalAccounts.isEmpty {
++            var splits = [String]()
++            for signalAccount in signalAccounts {
++                splits.append(signalAccount.addressComponentsDescription)
++            }
++            sections.append("signalAccounts: " + splits.joined(separator: ","))
++        }
++        return "[" + sections.joined(separator: ",") + "]"
++    }
++}
++
++// MARK: -
++
+ @objc
+ public class MessageSearchResult: NSObject, Comparable {
+ 
+@@ -416,6 +522,124 @@ public class FullTextSearcher: NSObject {
+         return ComposeScreenSearchResultSet(searchText: searchText, groups: groups, signalContacts: signalContacts)
+     }
+ 
++    @objc
++    public func searchForConvsersationPickerScreen(
++        searchText: String,
++        maxResults: UInt = kDefaultMaxResults,
++        transaction: SDSAnyReadTransaction
++    ) -> ConversationPickerScreenSearchResultSet {
++
++        var signalContactMap = [SignalServiceAddress: ContactSearchResult]()
++        var signalRecipentResults: [ContactSearchResult] = []
++        var groups: [GroupSearchResult] = []
++        var storyThreads: [StorySearchResult] = []
++
++        var hasReachedMaxResults: Bool {
++            guard (signalContactMap.count + signalRecipentResults.count + groups.count + storyThreads.count) < maxResults else { return true }
++            return false
++        }
++
++        finder.enumerateObjects(
++            searchText: searchText,
++            collections: [
++                SignalAccount.collection(),
++                SignalRecipient.collection(),
++                TSThread.collection()
++            ],
++            maxResults: maxResults,
++            transaction: transaction
++        ) { match, _, stop in
++
++            guard !hasReachedMaxResults else {
++                stop.pointee = true
++                return
++            }
++
++            switch match {
++            case let signalAccount as SignalAccount:
++                let searchResult = ContactSearchResult(signalAccount: signalAccount, transaction: transaction)
++                assert(signalContactMap[signalAccount.recipientAddress] == nil)
++                signalContactMap[signalAccount.recipientAddress] = searchResult
++            case let signalRecipient as SignalRecipient:
++                guard signalRecipient.devices.count > 0 else {
++                    // Ignore unregistered recipients.
++                    return
++                }
++                let signalAccount = SignalAccount.transientSignalAccount(forSignalRecipient: signalRecipient)
++                let searchResult = ContactSearchResult(signalAccount: signalAccount, transaction: transaction)
++                signalRecipentResults.append(searchResult)
++            case let groupThread as TSGroupThread:
++                let sortKey = ConversationSortKey(isContactThread: false,
++                                                  creationDate: groupThread.creationDate,
++                                                  lastInteractionRowId: groupThread.lastInteractionRowId)
++                let threadViewModel = ThreadViewModel(thread: groupThread,
++                                                      forChatList: true,
++                                                      transaction: transaction)
++                let searchResult = GroupSearchResult(thread: threadViewModel, sortKey: sortKey)
++                groups.append(searchResult)
++
++                if groupThread.isStorySendEnabled(transaction: transaction) {
++                    let searchResult = StorySearchResult(thread: groupThread, sortKey: sortKey)
++                    storyThreads.append(searchResult)
++                }
++
++            case let storyThread as TSPrivateStoryThread:
++                let sortKey = ConversationSortKey(
++                    isContactThread: false,
++                    creationDate: storyThread.creationDate,
++                    lastInteractionRowId: storyThread.lastInteractionRowId
++                )
++                let searchResult = StorySearchResult(thread: storyThread, sortKey: sortKey)
++                storyThreads.append(searchResult)
++            case is TSContactThread:
++                // not included in compose screen results
++                break
++            default:
++                owsFailDebug("Unexpected match of type \(type(of: match))")
++            }
++        }
++
++        // Fill in user matches from SignalRecipients, but only if
++        // we don't already have a SignalAccount for the same user.
++        for signalRecipentResult in signalRecipentResults {
++            if signalContactMap[signalRecipentResult.recipientAddress] == nil {
++                signalContactMap[signalRecipentResult.recipientAddress] = signalRecipentResult
++            }
++        }
++
++        if let localAddress = TSAccountManager.localAddress {
++            if matchesNoteToSelf(searchText: searchText, transaction: transaction) {
++                if signalContactMap[localAddress] == nil {
++                    let localAccount = SignalAccount(address: localAddress)
++                    let localResult = ContactSearchResult(signalAccount: localAccount, transaction: transaction)
++                    signalContactMap[localAddress] = localResult
++                }
++            }
++        } else {
++            owsFailDebug("localAddress was unexpectedly nil")
++        }
++
++        // Filter out contact results with pending message requests.
++        var signalContacts = Array(signalContactMap.values).filter { (contactResult: ContactSearchResult) in
++            !self.shouldFilterContactResult(contactResult: contactResult,
++                                            omitLocalUser: false,
++                                            transaction: transaction)
++        }
++        // Order contact results by display name.
++        signalContacts.sort()
++
++        // Order the conversation and message results in reverse chronological order.
++        // The contact results are pre-sorted by display name.
++        groups.sort(by: >)
++
++        return ConversationPickerScreenSearchResultSet(
++            searchText: searchText,
++            groups: groups,
++            storyThreads: storyThreads,
++            signalContacts: signalContacts
++        )
++    }
++
+     func shouldFilterContactResult(contactResult: ContactSearchResult,
+                                    omitLocalUser: Bool,
+                                    transaction: SDSAnyReadTransaction) -> Bool {
+diff --git a/SignalUI/ViewControllers/ConversationPicker/ConversationItem.swift b/SignalUI/ViewControllers/ConversationPicker/ConversationItem.swift
+index 820b9de07e0..5a2dcd4e349 100644
+--- a/SignalUI/ViewControllers/ConversationPicker/ConversationItem.swift
++++ b/SignalUI/ViewControllers/ConversationPicker/ConversationItem.swift
+@@ -251,6 +251,7 @@ public struct StoryConversationItem {
+     public static func allItems(
+         includeImplicitGroupThreads: Bool,
+         excludeHiddenContexts: Bool,
++        prioritizeThreadsCreatedAfter: Date? = nil,
+         transaction: SDSAnyReadTransaction
+     ) -> [StoryConversationItem] {
+         func sortTime(
+@@ -283,29 +284,46 @@ public struct StoryConversationItem {
+             .sorted { lhs, rhs in
+                 if (lhs.0 as? TSPrivateStoryThread)?.isMyStory == true { return true }
+                 if (rhs.0 as? TSPrivateStoryThread)?.isMyStory == true { return false }
++                if let priorityDateThreshold = prioritizeThreadsCreatedAfter {
++                    let lhsCreatedAfterThreshold = lhs.0.creationDate?.isAfter(priorityDateThreshold) ?? false
++                    let rhsCreatedAfterThreshold = rhs.0.creationDate?.isAfter(priorityDateThreshold) ?? false
++                    if lhsCreatedAfterThreshold != rhsCreatedAfterThreshold {
++                        return lhsCreatedAfterThreshold
++                    }
++                }
+                 return sortTime(for: lhs.1, thread: lhs.0) > sortTime(for: rhs.1, thread: rhs.0)
+             }
+             .map(\.0)
+-            .compactMap { thread -> StoryConversationItem.ItemType? in
+-                if let groupThread = thread as? TSGroupThread {
+-                    guard groupThread.isLocalUserFullMember else {
+-                        return nil
+-                    }
+-                    return .groupStory(GroupConversationItem(
+-                        groupThreadId: groupThread.uniqueId,
+-                        isBlocked: false,
+-                        disappearingMessagesConfig: nil
+-                    ))
+-                } else if let privateStoryThread = thread as? TSPrivateStoryThread {
+-                    return .privateStory(PrivateStoryConversationItem(
+-                        storyThreadId: privateStoryThread.uniqueId,
+-                        isMyStory: privateStoryThread.isMyStory
+-                    ))
+-                } else {
+-                    owsFailDebug("Unexpected story thread type \(type(of: thread))")
++            .compactMap { thread -> Self? in
++                return .from(thread: thread)
++            }
++    }
++
++    public static func from(thread: TSThread) -> Self? {
++        let backingItem: StoryConversationItem.ItemType? = {
++            if let groupThread = thread as? TSGroupThread {
++                guard groupThread.isLocalUserFullMember else {
+                     return nil
+                 }
+-            }.map { .init(backingItem: $0) }
++                return .groupStory(GroupConversationItem(
++                    groupThreadId: groupThread.uniqueId,
++                    isBlocked: false,
++                    disappearingMessagesConfig: nil
++                ))
++            } else if let privateStoryThread = thread as? TSPrivateStoryThread {
++                return .privateStory(PrivateStoryConversationItem(
++                    storyThreadId: privateStoryThread.uniqueId,
++                    isMyStory: privateStoryThread.isMyStory
++                ))
++            } else {
++                owsFailDebug("Unexpected story thread type \(type(of: thread))")
++                return nil
++            }
++        }()
++        guard let backingItem = backingItem else {
++            return nil
++        }
++        return .init(backingItem: backingItem)
+     }
+ }
+ 
+diff --git a/SignalUI/ViewControllers/ConversationPicker/ConversationPicker.swift b/SignalUI/ViewControllers/ConversationPicker/ConversationPicker.swift
+index 65a2db0246f..f5c963aa465 100644
+--- a/SignalUI/ViewControllers/ConversationPicker/ConversationPicker.swift
++++ b/SignalUI/ViewControllers/ConversationPicker/ConversationPicker.swift
+@@ -36,6 +36,8 @@ open class ConversationPickerViewController: OWSTableViewController2 {
+     private let textAttachment: TextAttachment?
+     private let maxVideoAttachmentDuration: TimeInterval?
+ 
++    private let creationDate = Date()
++
+     public let selection: ConversationPickerSelection
+ 
+     private let footerView = ApprovalFooterView()
+@@ -227,6 +229,7 @@ open class ConversationPickerViewController: OWSTableViewController2 {
+         super.applyTheme()
+ 
+         searchBar.searchFieldBackgroundColorOverride = Theme.searchFieldElevatedBackgroundColor
++        updateTableContents(shouldReload: false)
+     }
+ 
+     open override func viewSafeAreaInsetsDidChange() {
+@@ -254,16 +257,14 @@ open class ConversationPickerViewController: OWSTableViewController2 {
+         updateUIForCurrentSelection(animated: false)
+     }
+ 
+-    func buildSearchResults(searchText: String) -> Promise<ComposeScreenSearchResultSet?> {
++    func buildSearchResults(searchText: String) -> Promise<ConversationPickerScreenSearchResultSet?> {
+         guard searchText.count > 1 else {
+             return Promise.value(nil)
+         }
+ 
+         return firstly(on: .global()) {
+             Self.databaseStorage.read { transaction in
+-                self.fullTextSearcher.searchForComposeScreen(searchText: searchText,
+-                                                             omitLocalUser: false,
+-                                                             transaction: transaction)
++                self.fullTextSearcher.searchForConvsersationPickerScreen(searchText: searchText, transaction: transaction)
+             }
+         }
+     }
+@@ -380,8 +381,16 @@ open class ConversationPickerViewController: OWSTableViewController2 {
+             let storyItems = StoryConversationItem.allItems(
+                 includeImplicitGroupThreads: true,
+                 excludeHiddenContexts: true,
++                prioritizeThreadsCreatedAfter: creationDate,
+                 transaction: transaction
+             )
++            if
++                let firstSelectedStoryIndex = storyItems.firstIndex(where: { self.selection.isSelected(conversation: $0)}),
++                firstSelectedStoryIndex >= self.maxStoryConversationsToRender - 1 {
++                // If we've come in already having selected a story in the expanded section,
++                // expand right away.
++                self.isStorySectionExpanded = true
++            }
+ 
+             return ConversationCollection(contactConversations: contactItems,
+                                           recentConversations: pinnedItems + recentItems,
+@@ -391,7 +400,7 @@ open class ConversationPickerViewController: OWSTableViewController2 {
+         }
+     }
+ 
+-    fileprivate func buildConversationCollection(searchResults: ComposeScreenSearchResultSet?) -> Promise<ConversationCollection> {
++    fileprivate func buildConversationCollection(searchResults: ConversationPickerScreenSearchResultSet?) -> Promise<ConversationCollection> {
+         guard let searchResults = searchResults else {
+             return Promise.value(buildConversationCollection())
+         }
+@@ -406,12 +415,15 @@ open class ConversationPickerViewController: OWSTableViewController2 {
+                     return self.buildGroupItem(groupThread, transaction: transaction)
+                 }
+                 let contactItems = searchResults.signalAccounts.map { self.buildContactItem($0.recipientAddress, transaction: transaction) }
+-
+-                return ConversationCollection(contactConversations: contactItems,
+-                                              recentConversations: [],
+-                                              groupConversations: groupItems,
+-                                              storyConversations: [],
+-                                              isSearchResults: true)
++                let storyItems = searchResults.storyThreads.compactMap { StoryConversationItem.from(thread: $0) }
++
++                return ConversationCollection(
++                    contactConversations: contactItems,
++                    recentConversations: [],
++                    groupConversations: groupItems,
++                    storyConversations: storyItems,
++                    isSearchResults: true
++                )
+             }
+         }
+     }
+@@ -455,12 +467,14 @@ open class ConversationPickerViewController: OWSTableViewController2 {
+         do {
+             let section = OWSTableSection()
+             if
++                !conversationCollection.isSearchResults,
+                 sectionOptions.contains(.mediaPreview),
+                 let attachments = attachments,
+                 !attachments.isEmpty
+             {
+                 addMediaPreview(to: section, attachments: attachments)
+             } else if
++                !conversationCollection.isSearchResults,
+                 sectionOptions.contains(.mediaPreview),
+                 let textAttachment = textAttachment
+             {
+@@ -473,16 +487,24 @@ open class ConversationPickerViewController: OWSTableViewController2 {
+         do {
+             let section = OWSTableSection()
+             if StoryManager.areStoriesEnabled && sectionOptions.contains(.stories) && !conversationCollection.storyConversations.isEmpty {
+-                section.customHeaderView = NewStoryHeaderView(title: Strings.storiesSection, delegate: self)
+-
+-                addExpandableConversations(
+-                    to: section,
+-                    sectionIndex: .stories,
+-                    conversations: conversationCollection.storyConversations,
+-                    maxConversationsToRender: maxStoryConversationsToRender,
+-                    isExpanded: isStorySectionExpanded,
+-                    markAsExpanded: { [weak self] in self?.isStorySectionExpanded = true }
++                section.customHeaderView = NewStoryHeaderView(
++                    title: Strings.storiesSection,
++                    showsNewStoryButton: !conversationCollection.isSearchResults,
++                    delegate: self
+                 )
++
++                if conversationCollection.isSearchResults {
++                    addConversations(to: section, conversations: conversationCollection.storyConversations)
++                } else {
++                    addExpandableConversations(
++                        to: section,
++                        sectionIndex: .stories,
++                        conversations: conversationCollection.storyConversations,
++                        maxConversationsToRender: maxStoryConversationsToRender,
++                        isExpanded: isStorySectionExpanded,
++                        markAsExpanded: { [weak self] in self?.isStorySectionExpanded = true }
++                    )
++                }
+                 hasContents = true
+             }
+             contents.addSection(section)
+@@ -558,7 +580,7 @@ open class ConversationPickerViewController: OWSTableViewController2 {
+             return cell
+         },
+         actionBlock: { [weak self] in
+-            self?.didToggleSection(conversation: item)
++            self?.didToggleSelection(conversation: item)
+         }))
+     }
+ 
+@@ -716,6 +738,19 @@ open class ConversationPickerViewController: OWSTableViewController2 {
+         }
+     }
+ 
++    public func tableView(_ tableView: UITableView, willDisplay cell: UITableViewCell, forRowAt indexPath: IndexPath) {
++        guard let conversation = conversation(for: indexPath) else {
++            return
++        }
++        if selection.isSelected(conversation: conversation) {
++            cell.setSelected(true, animated: false)
++            tableView.selectRow(at: indexPath, animated: false, scrollPosition: .none)
++        } else {
++            cell.setSelected(false, animated: false)
++            tableView.deselectRow(at: indexPath, animated: false)
++        }
++    }
++
+     public override func tableView(_ tableView: UITableView, willSelectRowAt indexPath: IndexPath) -> IndexPath? {
+         guard let indexPath = super.tableView(tableView, willSelectRowAt: indexPath) else {
+             return nil
+@@ -794,13 +829,14 @@ open class ConversationPickerViewController: OWSTableViewController2 {
+         }
+     }
+ 
+-    fileprivate func didToggleSection(conversation: ConversationItem) {
++    fileprivate func didToggleSelection(conversation: ConversationItem) {
+         AssertIsOnMainThread()
+ 
+         if selection.isSelected(conversation: conversation) {
+             didDeselect(conversation: conversation)
+         } else {
+             didSelect(conversation: conversation)
++            searchBar.resignFirstResponder()
+         }
+     }
+ 
+@@ -821,20 +857,31 @@ open class ConversationPickerViewController: OWSTableViewController2 {
+         selection.add(conversation)
+         updateUIForCurrentSelection(animated: true)
+ 
+-        if
+-            let storyConversationItem = conversation as? StoryConversationItem,
+-            storyConversationItem.isMyStory,
+-            Self.databaseStorage.read(block: { !StoryManager.hasSetMyStoriesPrivacy(transaction: $0) }) {
+-            // Show first time story privacy settings if selecting my story and settings have'nt been
+-            // changed before.
+-
+-            // Reload the row when we show the sheet, and when it goes away, so we reflect changes.
+-            let reloadRowBlock = { [weak self] in
+-                self?.tableView.reloadData()
+-                self?.tableView.selectRow(at: IndexPath(row: 0, section: 0), animated: false, scrollPosition: .none)
++        if let storyConversationItem = conversation as? StoryConversationItem {
++            if
++                !isStorySectionExpanded,
++                let index = conversationCollection.storyConversations.firstIndex(where: {
++                    ($0 as? StoryConversationItem)?.threadId == storyConversationItem.threadId
++                }),
++                index >= maxStoryConversationsToRender - 1 {
++                // Expand so we can see the selection.
++                isStorySectionExpanded = true
++                updateTableContents(shouldReload: false)
++            }
++
++            if storyConversationItem.isMyStory,
++               Self.databaseStorage.read(block: { !StoryManager.hasSetMyStoriesPrivacy(transaction: $0) }) {
++                // Show first time story privacy settings if selecting my story and settings have'nt been
++                // changed before.
++
++                // Reload the row when we show the sheet, and when it goes away, so we reflect changes.
++                let reloadRowBlock = { [weak self] in
++                    self?.tableView.reloadData()
++                    self?.tableView.selectRow(at: IndexPath(row: 0, section: 0), animated: false, scrollPosition: .none)
++                }
++                let sheetController = MyStorySettingsSheetViewController(willDisappear: reloadRowBlock)
++                self.present(sheetController, animated: true, completion: reloadRowBlock)
+             }
+-            let sheetController = MyStorySettingsSheetViewController(willDisappear: reloadRowBlock)
+-            self.present(sheetController, animated: true, completion: reloadRowBlock)
+         }
+     }
+ 
+diff --git a/SignalUI/ViewControllers/Stories/NewStoryHeaderView.swift b/SignalUI/ViewControllers/Stories/NewStoryHeaderView.swift
+index 1b11f981e6a..63168ce2753 100644
+--- a/SignalUI/ViewControllers/Stories/NewStoryHeaderView.swift
++++ b/SignalUI/ViewControllers/Stories/NewStoryHeaderView.swift
+@@ -12,7 +12,11 @@ public protocol NewStoryHeaderDelegate: AnyObject, OWSTableViewController2 {
+ public class NewStoryHeaderView: UIStackView {
+     weak var delegate: NewStoryHeaderDelegate!
+ 
+-    public init(title: String, delegate: NewStoryHeaderDelegate) {
++    public init(
++        title: String,
++        showsNewStoryButton: Bool = true,
++        delegate: NewStoryHeaderDelegate
++    ) {
+         self.delegate = delegate
+ 
+         super.init(frame: .zero)
+@@ -54,6 +58,7 @@ public class NewStoryHeaderView: UIStackView {
+         newStoryButton.titleEdgeInsets = UIEdgeInsets(top: 0, leading: 6, bottom: 0, trailing: -6)
+         newStoryButton.tintColor = Theme.primaryIconColor
+         newStoryButton.clipsToBounds = true
++        newStoryButton.isHidden = !showsNewStoryButton
+ 
+         let pillWrapper = ManualLayoutView(name: "PillWrapper")
+         pillWrapper.shouldDeactivateConstraints = false

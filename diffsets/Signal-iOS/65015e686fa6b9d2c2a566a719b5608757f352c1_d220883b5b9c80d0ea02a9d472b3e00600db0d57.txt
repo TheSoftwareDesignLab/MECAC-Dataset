@@ -1,0 +1,327 @@
+diff --git a/Signal/src/ViewControllers/ConversationView/Cells/ConversationViewCell.h b/Signal/src/ViewControllers/ConversationView/Cells/ConversationViewCell.h
+index e4f5baec317..3172388f22e 100644
+--- a/Signal/src/ViewControllers/ConversationView/Cells/ConversationViewCell.h
++++ b/Signal/src/ViewControllers/ConversationView/Cells/ConversationViewCell.h
+@@ -12,6 +12,7 @@ NS_ASSUME_NONNULL_BEGIN
+ @class TSInteraction;
+ @class TSMessage;
+ @class TSOutgoingMessage;
++@class TSQuotedMessage;
+ 
+ @protocol ConversationViewCellDelegate <NSObject>
+ 
+@@ -26,6 +27,7 @@ NS_ASSUME_NONNULL_BEGIN
+ - (void)didTapFailedIncomingAttachment:(ConversationViewItem *)viewItem
+                      attachmentPointer:(TSAttachmentPointer *)attachmentPointer;
+ - (void)didTapFailedOutgoingMessage:(TSOutgoingMessage *)message;
++- (void)didTapQuotedMessage:(ConversationViewItem *)viewItem quotedMessage:(TSQuotedMessage *)quotedMessage;
+ - (void)didPanWithGestureRecognizer:(UIPanGestureRecognizer *)gestureRecognizer
+                            viewItem:(ConversationViewItem *)conversationItem;
+ 
+diff --git a/Signal/src/ViewControllers/ConversationView/Cells/OWSMessageCell.m b/Signal/src/ViewControllers/ConversationView/Cells/OWSMessageCell.m
+index 5e807b652d6..3a950c47169 100644
+--- a/Signal/src/ViewControllers/ConversationView/Cells/OWSMessageCell.m
++++ b/Signal/src/ViewControllers/ConversationView/Cells/OWSMessageCell.m
+@@ -515,7 +515,11 @@ - (void)handleTapGesture:(UITapGestureRecognizer *)sender
+             [self handleMediaTapGesture];
+             break;
+         case OWSMessageGestureLocation_QuotedReply:
+-            // TODO:
++            if (self.message.quotedMessage) {
++                [self.delegate didTapQuotedMessage:self.viewItem quotedMessage:self.message.quotedMessage];
++            } else {
++                OWSFail(@"%@ Missing quoted message.", self.logTag)
++            }
+             break;
+     }
+ }
+diff --git a/Signal/src/ViewControllers/ConversationView/ConversationViewController.m b/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
+index ef1de1c83ef..b83df414dfe 100644
+--- a/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
++++ b/Signal/src/ViewControllers/ConversationView/ConversationViewController.m
+@@ -90,6 +90,7 @@
+ #import <SignalServiceKit/TSQuotedMessage.h>
+ #import <SignalServiceKit/Threading.h>
+ #import <YapDatabase/YapDatabase.h>
++#import <YapDatabase/YapDatabaseAutoView.h>
+ #import <YapDatabase/YapDatabaseViewChange.h>
+ #import <YapDatabase/YapDatabaseViewConnection.h>
+ 
+@@ -1511,32 +1512,37 @@ - (void)autoLoadMoreIfNecessary
+     }
+     static const CGFloat kThreshold = 50.f;
+     if (self.collectionView.contentOffset.y < kThreshold) {
+-        [self loadMoreMessages];
++        [self loadAnotherPageOfMessages];
+     }
+ }
+ 
+-- (void)loadMoreMessages
++- (void)loadAnotherPageOfMessages
+ {
+     BOOL hasEarlierUnseenMessages = self.dynamicInteractions.hasMoreUnseenMessages;
+ 
++    [self loadNMoreMessages:kYapDatabasePageSize];
++
++    // Don’t auto-scroll after “loading more messages” unless we have “more unseen messages”.
++    //
++    // Otherwise, tapping on "load more messages" autoscrolls you downward which is completely wrong.
++    if (hasEarlierUnseenMessages) {
++        [self scrollToUnreadIndicatorAnimated];
++    }
++}
++
++- (void)loadNMoreMessages:(NSUInteger)numberOfMessagesToLoad
++{
+     // We want to restore the current scroll state after we update the range, update
+     // the dynamic interactions and re-layout.  Here we take a "before" snapshot.
+     CGFloat scrollDistanceToBottom = self.safeContentHeight - self.collectionView.contentOffset.y;
+ 
+-    self.lastRangeLength = MIN(self.lastRangeLength + kYapDatabasePageSize, (NSUInteger) kYapDatabaseRangeMaxLength);
++    self.lastRangeLength = MIN(self.lastRangeLength + numberOfMessagesToLoad, (NSUInteger)kYapDatabaseRangeMaxLength);
+ 
+     [self resetMappings];
+ 
+     [self.layout prepareLayout];
+ 
+     self.collectionView.contentOffset = CGPointMake(0, self.safeContentHeight - scrollDistanceToBottom);
+-
+-    // Don’t auto-scroll after “loading more messages” unless we have “more unseen messages”.
+-    //
+-    // Otherwise, tapping on "load more messages" autoscrolls you downward which is completely wrong.
+-    if (hasEarlierUnseenMessages) {
+-        [self scrollToUnreadIndicatorAnimated];
+-    }
+ }
+ 
+ - (void)updateShowLoadMoreHeader
+@@ -2124,6 +2130,150 @@ - (void)didTapFailedOutgoingMessage:(TSOutgoingMessage *)message
+     [self handleUnsentMessageTap:message];
+ }
+ 
++- (void)didTapQuotedMessage:(ConversationViewItem *)viewItem quotedMessage:(TSQuotedMessage *)quotedMessage
++{
++    OWSAssertIsOnMainThread();
++    OWSAssert(viewItem);
++    OWSAssert(quotedMessage);
++    OWSAssert(quotedMessage.timestamp > 0);
++    OWSAssert(quotedMessage.authorId.length > 0);
++
++    // We try to find the "quoted interaction" AND
++    // the range within the mapping that includes it.
++    __block TSInteraction *_Nullable quotedInteraction = nil;
++    // NOTE: Since the range _IS NOT_ filtered by author,
++    // and timestamp collisions are possible, it's possible
++    // for:
++    //
++    // * The range to include more than the "quoted interaction".
++    // * The range to be non-empty but NOT include the "quoted interaction",
++    //   although this would be a bug.
++    __block NSRange itemRange;
++    itemRange.location = NSNotFound;
++    __block NSUInteger threadInteractionCount = 0;
++
++    [self.uiDatabaseConnection readWithBlock:^(YapDatabaseReadTransaction *transaction) {
++        quotedInteraction = [self findInteractionInThreadByTimestamp:quotedMessage.timestamp
++                                                            authorId:quotedMessage.authorId
++                                                         transaction:transaction];
++        if (!quotedInteraction) {
++            return;
++        }
++
++        YapDatabaseAutoViewTransaction *_Nullable extension =
++            [transaction extension:TSMessageDatabaseViewExtensionName];
++        if (!extension) {
++            OWSFail(@"%@ Couldn't load view.", self.logTag);
++            return;
++        }
++
++        threadInteractionCount = [extension numberOfItemsInGroup:self.thread.uniqueId];
++
++        // See comments on YapDatabaseViewFind.
++        //
++        // Essentially we define a comparator/sort on timestamp.
++        YapDatabaseViewFind *viewFind =
++            [YapDatabaseViewFind withObjectBlock:^NSComparisonResult(NSString *collection, NSString *key, id object) {
++                if (![object isKindOfClass:[TSInteraction class]]) {
++                    OWSFail(@"%@ Unexpected type in database view.", self.logTag);
++                    return NSOrderedSame;
++                }
++
++                TSInteraction *interaction = object;
++
++                // For the findBlock, the "left operand" is the row that is passed,
++                // and the "right operand" is the desired range.
++                if (interaction.timestamp == quotedMessage.timestamp) {
++
++                    return NSOrderedSame;
++                } else if (interaction.timestamp < quotedMessage.timestamp) {
++                    // NSOrderedAscending  : The left operand is smaller than the right operand.
++                    return NSOrderedAscending;
++                } else {
++                    // NSOrderedDescending : The left operand is greater than the right operand.
++                    return NSOrderedDescending;
++                }
++            }];
++        itemRange = [extension findRangeInGroup:self.thread.uniqueId using:viewFind];
++    }];
++
++    if (itemRange.location == NSNotFound) {
++        OWSFail(@"%@ Couldn't find range of quoted reply.", self.logTag);
++        return;
++    }
++
++    NSInteger desiredWindowSize = MAX(0, 1 + (NSInteger)threadInteractionCount - (NSInteger)itemRange.location);
++    NSUInteger oldLoadWindowSize = [self.messageMappings numberOfItemsInGroup:self.thread.uniqueId];
++    NSInteger additionalItemsToLoad = MAX(0, desiredWindowSize - (NSInteger)oldLoadWindowSize);
++
++    NSInteger dstIndex = 0;
++    if (additionalItemsToLoad > 0) {
++        // Try to load more messages so that the quoted messages
++        // is in the load window.
++        //
++        // This may fail if the quoted message is very old, in which
++        // case we'll load the max number of messages.
++        [self loadNMoreMessages:(NSUInteger)additionalItemsToLoad];
++        // Scroll to the first item, which should be the quoted message,
++        // or if we couldn't load it, the oldest loadable message.
++        dstIndex = 0;
++    } else {
++        // Scroll to the quoted message, which is already in the load window.
++        dstIndex = 1 + (NSInteger)oldLoadWindowSize - desiredWindowSize;
++    }
++
++    NSIndexPath *indexPath = [NSIndexPath indexPathForRow:dstIndex inSection:0];
++    [self.collectionView scrollToItemAtIndexPath:indexPath
++                                atScrollPosition:UICollectionViewScrollPositionTop
++                                        animated:YES];
++
++    // TODO: Highlight the quoted message?
++}
++
++- (nullable TSInteraction *)findInteractionInThreadByTimestamp:(uint64_t)timestamp
++                                                      authorId:(NSString *)authorId
++                                                   transaction:(YapDatabaseReadTransaction *)transaction
++{
++    OWSAssert(timestamp > 0);
++    OWSAssert(authorId.length > 0);
++
++    NSString *localNumber = [TSAccountManager localNumber];
++    if (localNumber.length < 1) {
++        return nil;
++    }
++
++    NSArray<TSInteraction *> *interactions =
++        [TSInteraction interactionsWithTimestamp:timestamp ofClass:[TSMessage class] withTransaction:transaction];
++
++    TSInteraction *_Nullable result = nil;
++    for (TSInteraction *interaction in interactions) {
++        NSString *_Nullable messageAuthorId = nil;
++        if ([interaction isKindOfClass:[TSIncomingMessage class]]) {
++            TSIncomingMessage *incomingMessage = (TSIncomingMessage *)interaction;
++            messageAuthorId = incomingMessage.authorId;
++        } else if ([interaction isKindOfClass:[TSOutgoingMessage class]]) {
++            messageAuthorId = localNumber;
++        }
++        if (messageAuthorId.length < 1) {
++            OWSFail(@"%@ Message missing author id.", self.logTag);
++            continue;
++        }
++        if (![authorId isEqualToString:messageAuthorId]) {
++            continue;
++        }
++        if (![interaction.uniqueThreadId isEqualToString:self.thread.uniqueId]) {
++            continue;
++        }
++        if (result) {
++            // In case of collision, take the first.
++            DDLogError(@"%@ more than one matching interaction in thread.", self.logTag);
++            continue;
++        }
++        result = interaction;
++    }
++    return result;
++}
++
+ - (void)showMetadataViewForViewItem:(ConversationViewItem *)conversationItem
+ {
+     OWSAssertIsOnMainThread();
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSInteraction.h b/SignalServiceKit/src/Messages/Interactions/TSInteraction.h
+index 09e28fa5b6b..1ea070928b2 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSInteraction.h
++++ b/SignalServiceKit/src/Messages/Interactions/TSInteraction.h
+@@ -41,7 +41,7 @@ typedef NS_ENUM(NSInteger, OWSInteractionType) {
+ 
+ + (NSArray<TSInteraction *> *)interactionsWithTimestamp:(uint64_t)timestamp
+                                                 ofClass:(Class)clazz
+-                                        withTransaction:(YapDatabaseReadWriteTransaction *)transaction;
++                                        withTransaction:(YapDatabaseReadTransaction *)transaction;
+ 
+ + (NSArray<TSInteraction *> *)interactionsWithTimestamp:(uint64_t)timestamp
+                                                  filter:(BOOL (^_Nonnull)(TSInteraction *))filter
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSInteraction.m b/SignalServiceKit/src/Messages/Interactions/TSInteraction.m
+index 7bfa746eb77..b5319d9d0d8 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSInteraction.m
++++ b/SignalServiceKit/src/Messages/Interactions/TSInteraction.m
+@@ -14,7 +14,7 @@ @implementation TSInteraction
+ 
+ + (NSArray<TSInteraction *> *)interactionsWithTimestamp:(uint64_t)timestamp
+                                                 ofClass:(Class)clazz
+-                                        withTransaction:(YapDatabaseReadWriteTransaction *)transaction
++                                        withTransaction:(YapDatabaseReadTransaction *)transaction
+ {
+     OWSAssert(timestamp > 0);
+ 
+@@ -28,7 +28,7 @@ @implementation TSInteraction
+ 
+ + (NSArray<TSInteraction *> *)interactionsWithTimestamp:(uint64_t)timestamp
+                                                  filter:(BOOL (^_Nonnull)(TSInteraction *))filter
+-                                        withTransaction:(YapDatabaseReadWriteTransaction *)transaction
++                                        withTransaction:(YapDatabaseReadTransaction *)transaction
+ {
+     OWSAssert(timestamp > 0);
+ 
+diff --git a/SignalServiceKit/src/Storage/TSDatabaseSecondaryIndexes.h b/SignalServiceKit/src/Storage/TSDatabaseSecondaryIndexes.h
+index 6d3b4b82805..5db2ac8cb59 100644
+--- a/SignalServiceKit/src/Storage/TSDatabaseSecondaryIndexes.h
++++ b/SignalServiceKit/src/Storage/TSDatabaseSecondaryIndexes.h
+@@ -1,5 +1,5 @@
+ //
+-//  Copyright (c) 2017 Open Whisper Systems. All rights reserved.
++//  Copyright (c) 2018 Open Whisper Systems. All rights reserved.
+ //
+ 
+ #import <YapDatabase/YapDatabaseSecondaryIndex.h>
+@@ -11,6 +11,6 @@
+ 
+ + (void)enumerateMessagesWithTimestamp:(uint64_t)timestamp
+                              withBlock:(void (^)(NSString *collection, NSString *key, BOOL *stop))block
+-                      usingTransaction:(YapDatabaseReadWriteTransaction *)transaction;
++                      usingTransaction:(YapDatabaseReadTransaction *)transaction;
+ 
+ @end
+diff --git a/SignalServiceKit/src/Storage/TSDatabaseSecondaryIndexes.m b/SignalServiceKit/src/Storage/TSDatabaseSecondaryIndexes.m
+index f63e6336647..f61055edd1c 100644
+--- a/SignalServiceKit/src/Storage/TSDatabaseSecondaryIndexes.m
++++ b/SignalServiceKit/src/Storage/TSDatabaseSecondaryIndexes.m
+@@ -1,9 +1,8 @@
+ //
+-//  Copyright (c) 2017 Open Whisper Systems. All rights reserved.
++//  Copyright (c) 2018 Open Whisper Systems. All rights reserved.
+ //
+ 
+ #import "TSDatabaseSecondaryIndexes.h"
+-
+ #import "TSInteraction.h"
+ 
+ #define TSTimeStampSQLiteIndex @"messagesTimeStamp"
+@@ -34,7 +33,8 @@ + (YapDatabaseSecondaryIndex *)registerTimeStampIndex {
+ 
+ + (void)enumerateMessagesWithTimestamp:(uint64_t)timestamp
+                              withBlock:(void (^)(NSString *collection, NSString *key, BOOL *stop))block
+-                      usingTransaction:(YapDatabaseReadWriteTransaction *)transaction {
++                      usingTransaction:(YapDatabaseReadTransaction *)transaction
++{
+     NSString *formattedString = [NSString stringWithFormat:@"WHERE %@ = %lld", TSTimeStampSQLiteIndex, timestamp];
+     YapDatabaseQuery *query   = [YapDatabaseQuery queryWithFormat:formattedString];
+     [[transaction ext:@"idx"] enumerateKeysMatchingQuery:query usingBlock:block];

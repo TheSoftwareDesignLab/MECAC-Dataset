@@ -1,0 +1,1323 @@
+diff --git a/flutter/lib/common/widgets/toolbar.dart b/flutter/lib/common/widgets/toolbar.dart
+index cf5ed5c97bb..b158679eb4b 100644
+--- a/flutter/lib/common/widgets/toolbar.dart
++++ b/flutter/lib/common/widgets/toolbar.dart
+@@ -363,6 +363,11 @@ Future<List<TRadioMenu<String>>> toolbarViewStyle(
+         child: Text(translate('Scale adaptive')),
+         value: kRemoteViewStyleAdaptive,
+         groupValue: groupValue,
++        onChanged: onChanged),
++    TRadioMenu<String>(
++        child: Text(translate('Scale custom')),
++        value: kRemoteViewStyleCustom,
++        groupValue: groupValue,
+         onChanged: onChanged)
+   ];
+ }
+diff --git a/flutter/lib/consts.dart b/flutter/lib/consts.dart
+index b2b19055732..a7d8b158fe8 100644
+--- a/flutter/lib/consts.dart
++++ b/flutter/lib/consts.dart
+@@ -313,6 +313,10 @@ const kRemoteViewStyleOriginal = 'original';
+ /// [kRemoteViewStyleAdaptive] Show remote image scaling by ratio factor.
+ const kRemoteViewStyleAdaptive = 'adaptive';
+ 
++/// [kRemoteViewStyleCustom] Show remote image at a user-defined scale percent.
++const kRemoteViewStyleCustom = 'custom';
++
++
+ /// [kRemoteScrollStyleAuto] Scroll image auto by position.
+ const kRemoteScrollStyleAuto = 'scrollauto';
+ 
+@@ -345,6 +349,15 @@ const Set<PointerDeviceKind> kTouchBasedDeviceKinds = {
+   PointerDeviceKind.invertedStylus,
+ };
+ 
++// Scale custom related constants
++const String kCustomScalePercentKey = 'custom_scale_percent'; // Flutter option key for storing custom scale percent (integer 5-1000)
++const int kScaleCustomMinPercent = 5;
++const int kScaleCustomPivotPercent = 100; // 100% should be at 1/3 of track
++const int kScaleCustomMaxPercent = 1000;
++const double kScaleCustomPivotPos = 1.0 / 3.0; // first 1/3 → up to 100%
++const double kScaleCustomDetentEpsilon = 0.006; // snap range around pivot (~0.6%)
++const Duration kDebounceCustomScaleDuration = Duration(milliseconds: 300);
++
+ // ================================ mobile ================================
+ 
+ // Magic numbers, maybe need to avoid it or use a better way to get them.
+diff --git a/flutter/lib/desktop/widgets/remote_toolbar.dart b/flutter/lib/desktop/widgets/remote_toolbar.dart
+index 14b1fcd22b0..1458169c42e 100644
+--- a/flutter/lib/desktop/widgets/remote_toolbar.dart
++++ b/flutter/lib/desktop/widgets/remote_toolbar.dart
+@@ -25,6 +25,7 @@ import '../../models/platform_model.dart';
+ import '../../common/shared_state.dart';
+ import './popup_menu.dart';
+ import './kb_layout_type_chooser.dart';
++import 'package:flutter_hbb/utils/scale.dart';
+ 
+ class ToolbarState {
+   late RxBool _pin;
+@@ -175,6 +176,12 @@ class RemoteMenuEntry {
+           dismissOnClicked: true,
+           dismissCallback: dismissCallback,
+         ),
++        MenuEntryRadioOption(
++          text: translate('Scale custom'),
++          value: kRemoteViewStyleCustom,
++          dismissOnClicked: true,
++          dismissCallback: dismissCallback,
++        ),
+       ],
+       curOptionGetter: () async {
+         // null means peer id is not found, which there's no need to care about
+@@ -1024,6 +1031,7 @@ class _DisplayMenu extends StatefulWidget {
+ }
+ 
+ class _DisplayMenuState extends State<_DisplayMenu> {
++  final RxInt _customPercent = 100.obs;
+   late final ScreenAdjustor _screenAdjustor = ScreenAdjustor(
+     id: widget.id,
+     ffi: widget.ffi,
+@@ -1037,13 +1045,27 @@ class _DisplayMenuState extends State<_DisplayMenu> {
+   FFI get ffi => widget.ffi;
+   String get id => widget.id;
+ 
++  @override
++  void initState() {
++    super.initState();
++    // Initialize custom percent from stored option once
++    WidgetsBinding.instance.addPostFrameCallback((_) async {
++      try {
++        final v = await getSessionCustomScalePercent(widget.ffi.sessionId);
++        if (_customPercent.value != v) {
++          _customPercent.value = v;
++        }
++      } catch (_) {}
++    });
++  }
++
+   @override
+   Widget build(BuildContext context) {
+     _screenAdjustor.updateScreen();
+     menuChildrenGetter() {
+       final menuChildren = <Widget>[
+         _screenAdjustor.adjustWindow(context),
+-        viewStyle(),
++        viewStyle(customPercent: _customPercent),
+         scrollStyle(),
+         imageQuality(),
+         codec(),
+@@ -1108,30 +1130,69 @@ class _DisplayMenuState extends State<_DisplayMenu> {
+     );
+   }
+ 
+-  viewStyle() {
++  viewStyle({required RxInt customPercent}) {
+     return futureBuilder(
+         future: toolbarViewStyle(context, widget.id, widget.ffi),
+         hasData: (data) {
+           final v = data as List<TRadioMenu<String>>;
++          final bool isCustomSelected = v.isNotEmpty
++              ? v.first.groupValue == kRemoteViewStyleCustom
++              : false;
+           return Column(children: [
+-            ...v
+-                .map((e) => RdoMenuButton<String>(
+-                    value: e.value,
+-                    groupValue: e.groupValue,
+-                    onChanged: e.onChanged,
+-                    child: e.child,
+-                    ffi: ffi))
+-                .toList(),
+-            Divider(),
++            ...v.map((e) {
++              final isCustom = e.value == kRemoteViewStyleCustom;
++              final child = isCustom
++                  ? Text(translate('Scale custom'))
++                  : e.child;
++              // Whether the current selection is already custom
++              final bool isGroupCustomSelected =
++                  e.groupValue == kRemoteViewStyleCustom;
++              // Keep menu open when switching INTO custom so the slider is visible immediately
++              final bool keepOpenForThisItem = isCustom && !isGroupCustomSelected;
++              return RdoMenuButton<String>(
++                  value: e.value,
++                  groupValue: e.groupValue,
++                  onChanged: (value) {
++                    // Perform the original change
++                    e.onChanged?.call(value);
++                    // Only force a rebuild when we keep the menu open to reveal the slider
++                    if (keepOpenForThisItem) {
++                      setState(() {});
++                    }
++                  },
++                  child: child,
++                  ffi: ffi,
++                  // When entering custom, keep submenu open to show the slider controls
++                  closeOnActivate: !keepOpenForThisItem);
++            }).toList(),
++            // Only show a divider when custom is NOT selected
++            if (!isCustomSelected) Divider(),
++            _customControlsIfCustomSelected(onChanged: (v) => customPercent.value = v),
+           ]);
+         });
+   }
+ 
++  Widget _customControlsIfCustomSelected({ValueChanged<int>? onChanged}) {
++    return futureBuilder(future: () async {
++      final current = await bind.sessionGetViewStyle(sessionId: ffi.sessionId);
++      return current == kRemoteViewStyleCustom;
++    }(), hasData: (data) {
++      final isCustom = data as bool;
++      return AnimatedSwitcher(
++        duration: Duration(milliseconds: 220),
++        switchInCurve: Curves.easeOut,
++        switchOutCurve: Curves.easeIn,
++        child: isCustom ? _CustomScaleMenuControls(ffi: ffi, onChanged: onChanged) : SizedBox.shrink(),
++      );
++    });
++  }
++
+   scrollStyle() {
+     return futureBuilder(future: () async {
+       final viewStyle =
+           await bind.sessionGetViewStyle(sessionId: ffi.sessionId) ?? '';
+-      final visible = viewStyle == kRemoteViewStyleOriginal;
++      final visible = viewStyle == kRemoteViewStyleOriginal ||
++          viewStyle == kRemoteViewStyleCustom;
+       final scrollStyle =
+           await bind.sessionGetScrollStyle(sessionId: ffi.sessionId) ?? '';
+       return {'visible': visible, 'scrollStyle': scrollStyle};
+@@ -1146,24 +1207,27 @@ class _DisplayMenuState extends State<_DisplayMenu> {
+         widget.ffi.canvasModel.updateScrollStyle();
+       }
+ 
+-      final enabled = widget.ffi.canvasModel.imageOverflow.value;
+-      return Column(children: [
+-        RdoMenuButton<String>(
+-          child: Text(translate('ScrollAuto')),
+-          value: kRemoteScrollStyleAuto,
+-          groupValue: groupValue,
+-          onChanged: enabled ? (value) => onChange(value) : null,
+-          ffi: widget.ffi,
+-        ),
+-        RdoMenuButton<String>(
+-          child: Text(translate('Scrollbar')),
+-          value: kRemoteScrollStyleBar,
+-          groupValue: groupValue,
+-          onChanged: enabled ? (value) => onChange(value) : null,
+-          ffi: widget.ffi,
+-        ),
+-        Divider(),
+-      ]);
++      return Obx(() => Column(children: [
++            RdoMenuButton<String>(
++              child: Text(translate('ScrollAuto')),
++              value: kRemoteScrollStyleAuto,
++              groupValue: groupValue,
++              onChanged: widget.ffi.canvasModel.imageOverflow.value
++                  ? (value) => onChange(value)
++                  : null,
++              ffi: widget.ffi,
++            ),
++            RdoMenuButton<String>(
++              child: Text(translate('Scrollbar')),
++              value: kRemoteScrollStyleBar,
++              groupValue: groupValue,
++              onChanged: widget.ffi.canvasModel.imageOverflow.value
++                  ? (value) => onChange(value)
++                  : null,
++              ffi: widget.ffi,
++            ),
++            Divider(),
++          ]));
+     });
+   }
+ 
+@@ -1245,6 +1309,296 @@ class _DisplayMenuState extends State<_DisplayMenu> {
+   }
+ }
+ 
++class _CustomScaleMenuControls extends StatefulWidget {
++  final FFI ffi;
++  final ValueChanged<int>? onChanged;
++  const _CustomScaleMenuControls({Key? key, required this.ffi, this.onChanged}) : super(key: key);
++
++  @override
++  State<_CustomScaleMenuControls> createState() => _CustomScaleMenuControlsState();
++}
++
++class _CustomScaleMenuControlsState extends State<_CustomScaleMenuControls> {
++  late int _value;
++  late final Debouncer<int> _debouncerScale;
++  // Normalized slider position in [0, 1]. We map it nonlinearly to percent.
++  double _pos = 0.0;
++
++  // Piecewise mapping constants (moved to consts.dart)
++  static const int _minPercent = kScaleCustomMinPercent;
++  static const int _pivotPercent = kScaleCustomPivotPercent; // 100% should be at 1/3 of track
++  static const int _maxPercent = kScaleCustomMaxPercent;
++  static const double _pivotPos = kScaleCustomPivotPos; // first 1/3 → up to 100%
++  static const double _detentEpsilon = kScaleCustomDetentEpsilon; // snap range around pivot (~0.6%)
++
++  // Clamp helper for local use
++  int _clamp(int v) => clampCustomScalePercent(v);
++
++  // Map normalized position [0,1] → percent [5,1000] with 100 at 1/3 width.
++  int _mapPosToPercent(double p) {
++    if (p <= 0.0) return _minPercent;
++    if (p >= 1.0) return _maxPercent;
++    if (p <= _pivotPos) {
++      final q = p / _pivotPos; // 0..1
++      final v = _minPercent + q * (_pivotPercent - _minPercent);
++      return _clamp(v.round());
++    } else {
++      final q = (p - _pivotPos) / (1.0 - _pivotPos); // 0..1
++      final v = _pivotPercent + q * (_maxPercent - _pivotPercent);
++      return _clamp(v.round());
++    }
++  }
++
++  // Map percent [5,1000] → normalized position [0,1]
++  double _mapPercentToPos(int percent) {
++    final p = _clamp(percent);
++    if (p <= _pivotPercent) {
++      final q = (p - _minPercent) / (_pivotPercent - _minPercent);
++      return q * _pivotPos;
++    } else {
++      final q = (p - _pivotPercent) / (_maxPercent - _pivotPercent);
++      return _pivotPos + q * (1.0 - _pivotPos);
++    }
++  }
++
++  // Snap normalized position to the pivot when close to it
++  double _snapNormalizedPos(double p) {
++    if ((p - _pivotPos).abs() <= _detentEpsilon) return _pivotPos;
++    if (p < 0.0) return 0.0;
++    if (p > 1.0) return 1.0;
++    return p;
++  }
++
++  @override
++  void initState() {
++    super.initState();
++    _value = 100;
++    _debouncerScale = Debouncer<int>(
++      kDebounceCustomScaleDuration,
++      onChanged: (v) async {
++        await _apply(v);
++      },
++      initialValue: _value,
++    );
++    WidgetsBinding.instance.addPostFrameCallback((_) async {
++      try {
++        final v = await getSessionCustomScalePercent(widget.ffi.sessionId);
++        if (mounted) {
++          setState(() {
++            _value = v;
++            _pos = _mapPercentToPos(v);
++          });
++        }
++      } catch (e, st) {
++        debugPrint('[CustomScale] Failed to get initial value: $e');
++        debugPrintStack(stackTrace: st);
++      }
++    });
++  }
++
++
++  Future<void> _apply(int v) async {
++    v = clampCustomScalePercent(v);
++    setState(() {
++      _value = v;
++    });
++    try {
++      await bind.sessionSetFlutterOption(
++          sessionId: widget.ffi.sessionId,
++          k: kCustomScalePercentKey,
++          v: v.toString());
++      final curStyle = await bind.sessionGetViewStyle(sessionId: widget.ffi.sessionId);
++      if (curStyle != kRemoteViewStyleCustom) {
++        await bind.sessionSetViewStyle(
++            sessionId: widget.ffi.sessionId, value: kRemoteViewStyleCustom);
++      }
++      await widget.ffi.canvasModel.updateViewStyle();
++      if (isMobile) {
++        HapticFeedback.selectionClick();
++      }
++      widget.onChanged?.call(v);
++    } catch (e, st) {
++      debugPrint('[CustomScale] Apply failed: $e');
++      debugPrintStack(stackTrace: st);
++    }
++  }
++
++  void _nudge(int delta) {
++    final next = _clamp(_value + delta);
++    setState(() {
++      _value = next;
++      _pos = _mapPercentToPos(next);
++    });
++    widget.onChanged?.call(next);
++    _debouncerScale.value = next;
++  }
++
++  @override
++  void dispose() {
++    _debouncerScale.cancel();
++    super.dispose();
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final colorScheme = Theme.of(context).colorScheme;
++    const smallBtnConstraints = BoxConstraints(minWidth: 28, minHeight: 28);
++
++    final sliderControl = Semantics(
++      label: translate('Custom scale slider'),
++      value: '$_value%',
++      child: SliderTheme(
++        data: SliderTheme.of(context).copyWith(
++          activeTrackColor: colorScheme.primary,
++          thumbColor: colorScheme.primary,
++          overlayColor: colorScheme.primary.withOpacity(0.1),
++          showValueIndicator: ShowValueIndicator.never,
++          thumbShape: _RectValueThumbShape(
++            min: _minPercent.toDouble(),
++            max: _maxPercent.toDouble(),
++            width: 52,
++            height: 24,
++            radius: 4,
++            // Display the mapped percent for the current normalized value
++            displayValueForNormalized: (t) => _mapPosToPercent(t),
++          ),
++        ),
++        child: Slider(
++          value: _pos,
++          min: 0.0,
++          max: 1.0,
++          // Use a wide range of divisions (calculated as (_maxPercent - _minPercent)) to provide ~1% precision increments.
++          // This allows users to set precise scale values. Lower values would require more fine-tuning via the +/- buttons, which is undesirable for big ranges.
++          divisions: (_maxPercent - _minPercent).round(),
++          onChanged: (v) {
++            final snapped = _snapNormalizedPos(v);
++            final next = _mapPosToPercent(snapped);
++            if (next != _value || snapped != _pos) {
++              setState(() {
++                _pos = snapped;
++                _value = next;
++              });
++              widget.onChanged?.call(next);
++              _debouncerScale.value = next;
++            }
++          },
++        ),
++      ),
++    );
++
++    return Column(children: [
++      Padding(
++        padding: const EdgeInsets.symmetric(horizontal: 12.0),
++        child: Row(children: [
++          Tooltip(
++            message: translate('Decrease'),
++            child: IconButton(
++              iconSize: 16,
++              padding: EdgeInsets.all(1),
++              constraints: smallBtnConstraints,
++              icon: const Icon(Icons.remove),
++              onPressed: () => _nudge(-1),
++            ),
++          ),
++          Expanded(child: sliderControl),
++          Tooltip(
++            message: translate('Increase'),
++            child: IconButton(
++              iconSize: 16,
++              padding: EdgeInsets.all(1),
++              constraints: smallBtnConstraints,
++              icon: const Icon(Icons.add),
++              onPressed: () => _nudge(1),
++            ),
++          ),
++        ]),
++      ),
++      Divider(),
++    ]);
++  }
++}
++
++// Lightweight rectangular thumb that paints the current percentage.
++// Stateless and uses only SliderTheme colors; avoids allocations beyond a TextPainter per frame.
++class _RectValueThumbShape extends SliderComponentShape {
++  final double min;
++  final double max;
++  final double width;
++  final double height;
++  final double radius;
++  // Optional mapper to compute display value from normalized position [0,1]
++  // If null, falls back to linear interpolation between min and max.
++  final int Function(double normalized)? displayValueForNormalized;
++
++  const _RectValueThumbShape({
++    required this.min,
++    required this.max,
++    required this.width,
++    required this.height,
++    required this.radius,
++    this.displayValueForNormalized,
++  });
++
++  @override
++  Size getPreferredSize(bool isEnabled, bool isDiscrete) {
++    return Size(width, height);
++  }
++
++  @override
++  void paint(
++    PaintingContext context,
++    Offset center, {
++    required Animation<double> activationAnimation,
++    required Animation<double> enableAnimation,
++    required bool isDiscrete,
++    required TextPainter labelPainter,
++    required RenderBox parentBox,
++    required SliderThemeData sliderTheme,
++    required TextDirection textDirection,
++    required double value,
++    required double textScaleFactor,
++    required Size sizeWithOverflow,
++  }) {
++    final Canvas canvas = context.canvas;
++
++    // Resolve color based on enabled/disabled animation, with safe fallbacks.
++    final ColorTween colorTween = ColorTween(
++      begin: sliderTheme.disabledThumbColor,
++      end: sliderTheme.thumbColor,
++    );
++    final Color? evaluatedColor = colorTween.evaluate(enableAnimation);
++    final Color? thumbColor = sliderTheme.thumbColor;
++    final Color fillColor = evaluatedColor ?? thumbColor ?? Colors.blueAccent;
++
++    final RRect rrect = RRect.fromRectAndRadius(
++      Rect.fromCenter(center: center, width: width, height: height),
++      Radius.circular(radius),
++    );
++    final Paint paint = Paint()..color = fillColor;
++    canvas.drawRRect(rrect, paint);
++
++    // Compute displayed percent from normalized slider value.
++    final int percent = displayValueForNormalized != null
++        ? displayValueForNormalized!(value)
++        : (min + value * (max - min)).round();
++    final TextSpan span = TextSpan(
++      text: '$percent%',
++      style: const TextStyle(
++        color: Colors.white,
++        fontSize: 12,
++        fontWeight: FontWeight.w600,
++      ),
++    );
++    final TextPainter tp = TextPainter(
++      text: span,
++      textAlign: TextAlign.center,
++      textDirection: textDirection,
++    );
++    tp.layout(maxWidth: width - 4);
++    tp.paint(canvas, Offset(center.dx - tp.width / 2, center.dy - tp.height / 2));
++  }
++}
++
+ class _ResolutionsMenu extends StatefulWidget {
+   final String id;
+   final FFI ffi;
+@@ -2266,6 +2620,8 @@ class RdoMenuButton<T> extends StatelessWidget {
+   final ValueChanged<T?>? onChanged;
+   final Widget? child;
+   final FFI? ffi;
++  // When true, submenu will be dismissed on activate; when false, it stays open.
++  final bool closeOnActivate;
+   const RdoMenuButton({
+     Key? key,
+     required this.value,
+@@ -2273,6 +2629,7 @@ class RdoMenuButton<T> extends StatelessWidget {
+     required this.child,
+     this.ffi,
+     this.onChanged,
++    this.closeOnActivate = true,
+   }) : super(key: key);
+ 
+   @override
+@@ -2281,9 +2638,10 @@ class RdoMenuButton<T> extends StatelessWidget {
+       value: value,
+       groupValue: groupValue,
+       child: child,
++      closeOnActivate: closeOnActivate,
+       onChanged: onChanged != null
+           ? (T? value) {
+-              if (ffi != null) {
++              if (ffi != null && closeOnActivate) {
+                 _menuDismissCallback(ffi!);
+               }
+               onChanged?.call(value);
+diff --git a/flutter/lib/models/model.dart b/flutter/lib/models/model.dart
+index 36ccca790b4..066c148e540 100644
+--- a/flutter/lib/models/model.dart
++++ b/flutter/lib/models/model.dart
+@@ -42,6 +42,7 @@ import '../utils/image.dart' as img;
+ import '../common/widgets/dialog.dart';
+ import 'input_model.dart';
+ import 'platform_model.dart';
++import 'package:flutter_hbb/utils/scale.dart';
+ 
+ import 'package:flutter_hbb/generated_bridge.dart'
+     if (dart.library.html) 'package:flutter_hbb/web/bridge.dart';
+@@ -1699,6 +1700,8 @@ class ViewStyle {
+         final s2 = height / displayHeight;
+         s = s1 < s2 ? s1 : s2;
+       }
++    } else if (style == kRemoteViewStyleCustom) {
++      // Custom scale is session-scoped and applied in CanvasModel.updateViewStyle()
+     }
+     return s;
+   }
+@@ -1815,7 +1818,13 @@ class CanvasModel with ChangeNotifier {
+       displayWidth: displayWidth,
+       displayHeight: displayHeight,
+     );
+-    if (_lastViewStyle == viewStyle) {
++    // If only the Custom scale percent changed, proceed to update even if
++    // the basic ViewStyle fields are equal.
++    // In Custom scale mode, the scale percent can change independently of the other
++    // ViewStyle fields and is not captured by the equality check. Therefore, we must
++    // allow updates to proceed when style == kRemoteViewStyleCustom, even if the
++    // rest of the ViewStyle fields are unchanged.
++    if (_lastViewStyle == viewStyle && style != kRemoteViewStyleCustom) {
+       return;
+     }
+     if (_lastViewStyle.style != viewStyle.style) {
+@@ -1824,12 +1833,26 @@ class CanvasModel with ChangeNotifier {
+     _lastViewStyle = viewStyle;
+     _scale = viewStyle.scale;
+ 
++    // Apply custom scale percent when in Custom mode
++    if (style == kRemoteViewStyleCustom) {
++      try {
++        _scale = await getSessionCustomScale(sessionId);
++      } catch (e, stack) {
++        debugPrint('Error in getSessionCustomScale: $e');
++        debugPrintStack(stackTrace: stack);
++        _scale = 1.0;
++      }
++    }
++
+     _devicePixelRatio = ui.window.devicePixelRatio;
+     if (kIgnoreDpi && style == kRemoteViewStyleOriginal) {
+       _scale = 1.0 / _devicePixelRatio;
+     }
+     _resetCanvasOffset(displayWidth, displayHeight);
+-    _imageOverflow.value = _x < 0 || y < 0;
++    final overflow = _x < 0 || y < 0;
++    if (_imageOverflow.value != overflow) {
++      _imageOverflow.value = overflow;
++    }
+     if (notify) {
+       notifyListeners();
+     }
+@@ -1850,7 +1873,7 @@ class CanvasModel with ChangeNotifier {
+   tryUpdateScrollStyle(Duration duration, String? style) async {
+     if (_scrollStyle != ScrollStyle.scrollbar) return;
+     style ??= await bind.sessionGetViewStyle(sessionId: sessionId);
+-    if (style != kRemoteViewStyleOriginal) {
++    if (style != kRemoteViewStyleOriginal && style != kRemoteViewStyleCustom) {
+       return;
+     }
+ 
+diff --git a/flutter/lib/utils/scale.dart b/flutter/lib/utils/scale.dart
+new file mode 100644
+index 00000000000..d1f380a4cce
+--- /dev/null
++++ b/flutter/lib/utils/scale.dart
+@@ -0,0 +1,34 @@
++import 'package:flutter_hbb/consts.dart';
++import 'package:flutter_hbb/models/platform_model.dart';
++import 'package:uuid/uuid.dart';
++
++/// Clamp custom scale percent to supported bounds.
++/// Keep this in sync with the slider's minimum in the desktop toolbar UI.
++///
++/// This function exists to ensure consistent clamping behavior across the app
++/// and to provide a single point of reference for the valid scale range.
++int clampCustomScalePercent(int percent) {
++  return percent.clamp(kScaleCustomMinPercent, kScaleCustomMaxPercent);
++}
++
++/// Parse a string percent and clamp. Defaults to 100 when invalid.
++int parseCustomScalePercent(String? s, {int defaultPercent = 100}) {
++  final parsed = int.tryParse(s ?? '') ?? defaultPercent;
++  return clampCustomScalePercent(parsed);
++}
++
++/// Convert a percent value to scale factor after clamping.
++double percentToScale(int percent) => clampCustomScalePercent(percent) / 100.0;
++
++/// Fetch, parse and clamp the custom scale percent for a session.
++Future<int> getSessionCustomScalePercent(UuidValue sessionId) async {
++  final opt = await bind.sessionGetFlutterOption(
++      sessionId: sessionId, k: kCustomScalePercentKey);
++  return parseCustomScalePercent(opt);
++}
++
++/// Fetch and compute the custom scale factor for a session.
++Future<double> getSessionCustomScale(UuidValue sessionId) async {
++  final p = await getSessionCustomScalePercent(sessionId);
++  return percentToScale(p);
++}
+diff --git a/src/lang/ar.rs b/src/lang/ar.rs
+index 317354976ec..2afdc0b6c8d 100644
+--- a/src/lang/ar.rs
++++ b/src/lang/ar.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "يرجى إدخال اسم مستخدم بصلاحيات المسؤول للمتابعة."),
+         ("Preparing for installation ...", "جارٍ التحضير للتثبيت..."),
+         ("Show my cursor", "إظهار المؤشر الخاص بي"),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/be.rs b/src/lang/be.rs
+index b20bd75a593..18fb3b5b684 100644
+--- a/src/lang/be.rs
++++ b/src/lang/be.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/bg.rs b/src/lang/bg.rs
+index 6ce8c13eaa9..d72ae1cb17d 100644
+--- a/src/lang/bg.rs
++++ b/src/lang/bg.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/ca.rs b/src/lang/ca.rs
+index 4be5bcdec4e..9632bab293d 100644
+--- a/src/lang/ca.rs
++++ b/src/lang/ca.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", "Escala personalitzada"),
++        ("Custom scale slider", "Control lliscant d'escala personalitzada"),
++        ("Decrease", "Disminueix"),
++        ("Increase", "Augmenta"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/cn.rs b/src/lang/cn.rs
+index 080af0f3a0e..be984b5c1e0 100644
+--- a/src/lang/cn.rs
++++ b/src/lang/cn.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "输入用户名或域名\\用户名"),
+         ("Preparing for installation ...", "准备安装..."),
+         ("Show my cursor", "显示我的光标"),
++        ("Scale custom", "自定义缩放"),
++        ("Custom scale slider", "自定义缩放滑块"),
++        ("Decrease", "缩小"),
++        ("Increase", "放大"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/cs.rs b/src/lang/cs.rs
+index 81cb5042236..3b2c83fe52c 100644
+--- a/src/lang/cs.rs
++++ b/src/lang/cs.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/da.rs b/src/lang/da.rs
+index eb0bd426da7..ef87a3e382d 100644
+--- a/src/lang/da.rs
++++ b/src/lang/da.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/de.rs b/src/lang/de.rs
+index 157ae408427..b5d9c25eea1 100644
+--- a/src/lang/de.rs
++++ b/src/lang/de.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "Geben Sie Benutzername oder Domäne\\Benutzername ein"),
+         ("Preparing for installation ...", "Installation wird vorbereitet …"),
+         ("Show my cursor", "Meinen Cursor anzeigen"),
++        ("Scale custom", "Benutzerdefinierte Skalierung"),
++        ("Custom scale slider", "Schieberegler für benutzerdefinierte Skalierung"),
++        ("Decrease", "Verringern"),
++        ("Increase", "Erhöhen"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/el.rs b/src/lang/el.rs
+index 4adbb566a09..91e2512ef53 100644
+--- a/src/lang/el.rs
++++ b/src/lang/el.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/eo.rs b/src/lang/eo.rs
+index b7ee142fe44..0b81db30ba6 100644
+--- a/src/lang/eo.rs
++++ b/src/lang/eo.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/es.rs b/src/lang/es.rs
+index 947b1b462fd..ed4f60cc224 100644
+--- a/src/lang/es.rs
++++ b/src/lang/es.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "Introduzca el nombre de usuario o dominio\\NombreDeUsuario"),
+         ("Preparing for installation ...", "Preparando la instalación ..."),
+         ("Show my cursor", "Mostrar mi cursor"),
++        ("Scale custom", "Escala personalizada"),
++        ("Custom scale slider", "Control deslizante de escala personalizada"),
++        ("Decrease", "Disminuir"),
++        ("Increase", "Aumentar"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/et.rs b/src/lang/et.rs
+index ff649200438..ef71cafa532 100644
+--- a/src/lang/et.rs
++++ b/src/lang/et.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/eu.rs b/src/lang/eu.rs
+index a6ea2706a57..273f1f7e066 100644
+--- a/src/lang/eu.rs
++++ b/src/lang/eu.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/fa.rs b/src/lang/fa.rs
+index 9dff29f2a94..a102408938e 100644
+--- a/src/lang/fa.rs
++++ b/src/lang/fa.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "لطفاً نام کاربری مدیریتی را برای ارتقاء دسترسی وارد کنید."),
+         ("Preparing for installation ...", "در حال آماده‌سازی برای نصب..."),
+         ("Show my cursor", "نمایش نشانگر من"),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/fr.rs b/src/lang/fr.rs
+index f2768e91288..4da384bd36a 100644
+--- a/src/lang/fr.rs
++++ b/src/lang/fr.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "Saisissez un nom d’utilisateur ou un domaine\\utilisateur"),
+         ("Preparing for installation ...", "Préparation de l’installation…"),
+         ("Show my cursor", "Afficher mon curseur"),
++        ("Scale custom", "Mise à l’échelle personnalisée"),
++        ("Custom scale slider", "Curseur d’échelle personnalisée"),
++        ("Decrease", "Diminuer"),
++        ("Increase", "Augmenter"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/ge.rs b/src/lang/ge.rs
+index f3c0b718a0b..180df0ab741 100644
+--- a/src/lang/ge.rs
++++ b/src/lang/ge.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/he.rs b/src/lang/he.rs
+index 7d00bcc4e77..3b6c82f1acd 100644
+--- a/src/lang/he.rs
++++ b/src/lang/he.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "רמז_ליוזר_להעלאת_הרשאה"),
+         ("Preparing for installation ...", "הכנה להתקנה..."),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/hr.rs b/src/lang/hr.rs
+index 937ed36333e..1d657b996f8 100644
+--- a/src/lang/hr.rs
++++ b/src/lang/hr.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/hu.rs b/src/lang/hu.rs
+index eebcd4c20ed..232b6a2d480 100644
+--- a/src/lang/hu.rs
++++ b/src/lang/hu.rs
+@@ -711,5 +711,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "Felhasználónév vagy tartománynév megadása\\felhasználónév"),
+         ("Preparing for installation ...", "Felkészülés a telepítésre ..."),
+         ("Show my cursor", "Kurzor megjelenítése"),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/id.rs b/src/lang/id.rs
+index 6e356209a79..6c84af5e95e 100644
+--- a/src/lang/id.rs
++++ b/src/lang/id.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "panduan_elevasi_nama_pengguna"),
+         ("Preparing for installation ...", "Mempersiapkan instalasi ..."),
+         ("Show my cursor", "Tampilkan kursor saya"),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/it.rs b/src/lang/it.rs
+index fcd1146166c..7b4025621a1 100644
+--- a/src/lang/it.rs
++++ b/src/lang/it.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "Inserisci Nome utente o dominio sorgente\\nome Utente"),
+         ("Preparing for installation ...", "Preparazione per l'installazione..."),
+         ("Show my cursor", "Visualizza il mio cursore"),
++        ("Scale custom", "Scala personalizzata"),
++        ("Custom scale slider", "Cursore scala personalizzata"),
++        ("Decrease", "Diminuisci"),
++        ("Increase", "Aumenta"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/ja.rs b/src/lang/ja.rs
+index a19217a9638..9514cae1622 100644
+--- a/src/lang/ja.rs
++++ b/src/lang/ja.rs
+@@ -709,6 +709,10 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("Supported only in the installed version.", "インストールされたバージョンでのみサポートされます。"),
+         ("elevation_username_tip", "ユーザー名またはドメインのユーザー名を入力してください。"),
+         ("Preparing for installation ...", "インストールの準備中です..."),
+-        ("Show my cursor", ""),
++        ("Show my cursor", "自分のカーソルを表示"),
++        ("Scale custom", "カスタムスケーリング"),
++        ("Custom scale slider", "カスタムスケールのスライダー"),
++        ("Decrease", "縮小"),
++        ("Increase", "拡大"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/ko.rs b/src/lang/ko.rs
+index 7246d3ca2e8..d7a4f8a1756 100644
+--- a/src/lang/ko.rs
++++ b/src/lang/ko.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "사용자 이름 또는 도메인\\사용자 이름 입력"),
+         ("Preparing for installation ...", "설치 준비 중 ..."),
+         ("Show my cursor", "내 커서 표시"),
++        ("Scale custom", "사용자 지정 크기 조정"),
++        ("Custom scale slider", "사용자 지정 크기 조정 슬라이더"),
++        ("Decrease", "축소"),
++        ("Increase", "확대"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/kz.rs b/src/lang/kz.rs
+index 8e80a1b9d8a..1edf2207818 100644
+--- a/src/lang/kz.rs
++++ b/src/lang/kz.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/lt.rs b/src/lang/lt.rs
+index ea176b36c6b..1cb79317d00 100644
+--- a/src/lang/lt.rs
++++ b/src/lang/lt.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/lv.rs b/src/lang/lv.rs
+index 7c842dde6fb..7450cd1dd83 100644
+--- a/src/lang/lv.rs
++++ b/src/lang/lv.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "Ievadiet lietotājvārdu vai domēnu\\lietotājvārdu"),
+         ("Preparing for installation ...", "Gatavošanās instalēšanai..."),
+         ("Show my cursor", "Rādīt manu kursoru"),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/nb.rs b/src/lang/nb.rs
+index 31298140ca3..7ca3b2b415e 100644
+--- a/src/lang/nb.rs
++++ b/src/lang/nb.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/nl.rs b/src/lang/nl.rs
+index a750b87e57a..c5f6fcd7912 100644
+--- a/src/lang/nl.rs
++++ b/src/lang/nl.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "Voer je gebruikersnaam of domeinnaam in"),
+         ("Preparing for installation ...", "Installatie voorbereiden ..."),
+         ("Show my cursor", "Toon mijn cursor"),
++        ("Scale custom", "Aangepaste schaal"),
++        ("Custom scale slider", "Aangepaste schuifregelaar voor schaal"),
++        ("Decrease", "Verlagen"),
++        ("Increase", "Verhogen"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/pl.rs b/src/lang/pl.rs
+index 8d99112c078..487cf3bffea 100644
+--- a/src/lang/pl.rs
++++ b/src/lang/pl.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "Podaj nazwę użytkownika lub domena\\użytkownik"),
+         ("Preparing for installation ...", "Przygotowywanie do instalacji ..."),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/pt_PT.rs b/src/lang/pt_PT.rs
+index 9fa563aa016..bfc85835f02 100644
+--- a/src/lang/pt_PT.rs
++++ b/src/lang/pt_PT.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", "Escala personalizada"),
++        ("Custom scale slider", "Controlo deslizante de escala personalizada"),
++        ("Decrease", "Diminuir"),
++        ("Increase", "Aumentar"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/ptbr.rs b/src/lang/ptbr.rs
+index c94c5bedf21..ad08c58bf20 100644
+--- a/src/lang/ptbr.rs
++++ b/src/lang/ptbr.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", "Escala personalizada"),
++        ("Custom scale slider", "Controle deslizante de escala personalizada"),
++        ("Decrease", "Diminuir"),
++        ("Increase", "Aumentar"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/ro.rs b/src/lang/ro.rs
+index 41cbf4927e6..1409ff0d8f6 100644
+--- a/src/lang/ro.rs
++++ b/src/lang/ro.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", "Scalare personalizată"),
++        ("Custom scale slider", "Glisor pentru scalare personalizată"),
++        ("Decrease", "Micșorează"),
++        ("Increase", "Mărește"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/ru.rs b/src/lang/ru.rs
+index f129b28fd51..c518cd77c05 100644
+--- a/src/lang/ru.rs
++++ b/src/lang/ru.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "Введите пользователя или домен\\пользователя"),
+         ("Preparing for installation ...", "Подготовка к установке..."),
+         ("Show my cursor", "Показывать мой курсор"),
++        ("Scale custom", "Пользовательский масштаб"),
++        ("Custom scale slider", "Ползунок пользовательского масштаба"),
++        ("Decrease", "Уменьшить"),
++        ("Increase", "Увеличить"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/sc.rs b/src/lang/sc.rs
+index b1d5f62f62b..e0494aa8871 100644
+--- a/src/lang/sc.rs
++++ b/src/lang/sc.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "Inserta Nùmene utente o domìniu de fonte\\nùmene Utente"),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/sk.rs b/src/lang/sk.rs
+index af1c5cf6f9a..6d90eb7f788 100644
+--- a/src/lang/sk.rs
++++ b/src/lang/sk.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/sl.rs b/src/lang/sl.rs
+index 4032f0b658b..569fa9a74d7 100755
+--- a/src/lang/sl.rs
++++ b/src/lang/sl.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/sq.rs b/src/lang/sq.rs
+index e7ae5b74b91..ebca62081ff 100644
+--- a/src/lang/sq.rs
++++ b/src/lang/sq.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/sr.rs b/src/lang/sr.rs
+index 6a25605e3fe..bba9c8ba28f 100644
+--- a/src/lang/sr.rs
++++ b/src/lang/sr.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/sv.rs b/src/lang/sv.rs
+index 91a10e8b6d3..b9d37df3d04 100644
+--- a/src/lang/sv.rs
++++ b/src/lang/sv.rs
+@@ -709,6 +709,10 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("Supported only in the installed version.", "Stöds endast i den installerade versionen."),
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", "Förbereder för installation ..."),
+-        ("Show my cursor", "Via min muspekare"),
++        ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/ta.rs b/src/lang/ta.rs
+index dc4d5e855f8..7d5b2931f14 100644
+--- a/src/lang/ta.rs
++++ b/src/lang/ta.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/template.rs b/src/lang/template.rs
+index 75ec6de42fb..5d8c32b82dc 100644
+--- a/src/lang/template.rs
++++ b/src/lang/template.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/th.rs b/src/lang/th.rs
+index f5e7376795c..9c7f9b16f0a 100644
+--- a/src/lang/th.rs
++++ b/src/lang/th.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/tr.rs b/src/lang/tr.rs
+index d3c8c557fdd..40013a26cdf 100644
+--- a/src/lang/tr.rs
++++ b/src/lang/tr.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/tw.rs b/src/lang/tw.rs
+index 77b4e12cee1..144d9c706da 100644
+--- a/src/lang/tw.rs
++++ b/src/lang/tw.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", "輸入使用者名稱或網域\\使用者名稱"),
+         ("Preparing for installation ...", "正在準備安裝..."),
+         ("Show my cursor", "顯示我的游標"),
++        ("Scale custom", "自訂縮放"),
++        ("Custom scale slider", "自訂縮放滑桿"),
++        ("Decrease", "縮小"),
++        ("Increase", "放大"),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/uk.rs b/src/lang/uk.rs
+index 7254b29ead7..51e577c532f 100644
+--- a/src/lang/uk.rs
++++ b/src/lang/uk.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", "Користувацький масштаб"),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }
+diff --git a/src/lang/vi.rs b/src/lang/vi.rs
+index b5322abfce5..9bd3cc4bea6 100644
+--- a/src/lang/vi.rs
++++ b/src/lang/vi.rs
+@@ -710,5 +710,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
+         ("elevation_username_tip", ""),
+         ("Preparing for installation ...", ""),
+         ("Show my cursor", ""),
++        ("Scale custom", ""),
++        ("Custom scale slider", ""),
++        ("Decrease", ""),
++        ("Increase", ""),
+     ].iter().cloned().collect();
+ }

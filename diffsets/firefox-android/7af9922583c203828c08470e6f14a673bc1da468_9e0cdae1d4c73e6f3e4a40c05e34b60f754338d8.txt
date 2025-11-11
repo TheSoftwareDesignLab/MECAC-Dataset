@@ -1,0 +1,462 @@
+diff --git a/focus-android/tools/taskcluster/execute-firebase-test.sh b/focus-android/tools/taskcluster/execute-firebase-test.sh
+deleted file mode 100755
+index 7d110df6123f..000000000000
+--- a/focus-android/tools/taskcluster/execute-firebase-test.sh
++++ /dev/null
+@@ -1,60 +0,0 @@
+-#!/usr/bin/env bash
+-# This Source Code Form is subject to the terms of the Mozilla Public
+-# License, v. 2.0. If a copy of the MPL was not distributed with this
+-# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+-
+-# This script installs google cloud sdk, logs into google firebase, executes tests,
+-# and collects test artifacts into the test_artifacts folder
+-
+-# If a command fails then do not proceed and fail this script too.
+-set -ex
+-#########################
+-# The command line help #
+-#########################
+-display_help() {
+-    echo "Usage: $0 Build_Variant Apk_Name Device_Config [Device_Config...]" >&2
+-    echo
+-    echo "All Build Variants must be of Debug type, so the word 'debug' should be omitted"
+-    echo "E.g. KlarGeckoX86Debug should be KlarGeckoX86"
+-    echo
+-    echo "Do not put .apk prefix in Apk_Name"
+-}
+-
+-# Basic parameter check
+-if [ $# -lt 3 ]; then
+-    echo "Your command line contains $# arguments"
+-    display_help
+-    exit 1
+-fi
+-
+-# Get test configuration
+-config_count=`expr $# - 2`
+-config_param="--device $3"
+-for ((i=4; i <= $#; i++))
+-{
+-    config_param+=" --device ${!i}"
+-}
+-
+-# From now on disable exiting on error. If the tests fail we want to continue
+-# and try to download the artifacts. We will exit with the actual error code later.
+-set +e
+-
+-# Execute test set
+-/google-cloud-sdk/bin/gcloud --format="json" firebase test android run \
+---type instrumentation \
+---app app/build/outputs/apk/$1/debug/$2.apk \
+---test app/build/outputs/apk/androidTest/$1/debug/$2-androidTest.apk \
+---results-bucket focus_android_test_artifacts \
+---timeout 30m \
+---no-auto-google-login \
+---test-runner-class android.support.test.runner.AndroidJUnitRunner $config_param
+-
+-exitcode=$?
+-
+-echo "Downloading artifacts"
+-
+-mkdir test_artifacts
+-/google-cloud-sdk/bin/gsutil ls gs://focus_android_test_artifacts | tail -1 | /google-cloud-sdk/bin/gsutil -m cp -r -I ./test_artifacts
+-
+-# Now exit the script with the exit code from the test run. (Only 0 if all test executions passed)
+-exit $exitcode
+diff --git a/focus-android/tools/taskcluster/execute-firebase-tests.sh b/focus-android/tools/taskcluster/execute-firebase-tests.sh
+new file mode 100755
+index 000000000000..7351196ab52e
+--- /dev/null
++++ b/focus-android/tools/taskcluster/execute-firebase-tests.sh
+@@ -0,0 +1,98 @@
++#!/usr/bin/env bash
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++# This script uses the flank tool (https://github.com/TestArmada/flank)
++# to shard UI test execution on Google Firebase so tests can run in parallel.  
++#
++# NOTE: 
++#   Google Firebase does not currently allow renaming nor grouping of test
++#   jobs.  recommendation: look at test failure summary in taskcluster
++#   (not on Firebase dashboard)
++
++
++# If a command fails then do not proceed and fail this script too.
++set -e
++#########################
++# The command line help #
++#########################
++display_help() {
++    echo "Usage: $0 device_type [x86 | arm] build_variant [webview | geckoview]" >&2
++    echo
++    echo "NOTE: All Build Variants are be of Debug type"
++    echo
++}
++
++# Basic parameter check
++if [ $# -lt 2 ]; then
++    echo "Your command line contains $# arguments"
++    display_help
++    exit 1
++fi
++
++# From now on disable exiting on error. If the tests fail we want to continue
++# and try to download the artifacts. We will exit with the actual error code later.
++set +e
++
++
++URL_FLANK_BIN=`curl -s https://api.github.com/repos/TestArmada/flank/releases/latest | grep "browser_download_url*" | cut -d '"' -f 4`
++JAVA_BIN="/usr/bin/java"
++PATH_TEST="../../app/src/androidTest/java/org/mozilla/focus/activity"
++PACKAGE="org.mozilla.focus.activity"
++FLANK_BIN="flank.jar"
++FLANK_CONF="flank.yml"
++
++
++if [ "$1" == "x86" ] || [ "$1" == "arm" ]; then
++    FLANK_CONF_TEMPLATE="flank-conf-webview-${1}.yml"
++else
++    echo "ERROR: $1 does not match [x86 | arm]"
++    exit 1
++fi
++echo
++echo "FLANK_CONF: $FLANK_CONF_TEMPLATE"
++echo
++
++rm  -f TEST_TARGETS 
++rm  -f $FLANK_BIN
++
++wget $URL_FLANK_BIN
++echo
++echo "----------------------------"
++echo "FLANK VERSION"
++echo "----------------------------"
++chmod +x $FLANK_BIN
++$JAVA_BIN -jar $FLANK_BIN -v
++echo
++echo
++
++
++# create TEST_TARGETS 
++# (aka: get list of all tests in androidTest)
++file_list=$(ls $PATH_TEST | xargs -n 1 basename)
++array=( $file_list )
++
++test_targets=""
++for i in "${array[@]}"; do
++    test_list=`cat $PATH_TEST/$i | grep -hr "public void" | grep 'Test\|test'| sed 's/ \{1,\}/ /g'  | cut -d" " -f 4 | sed 's/()//g'`
++    array2=( $test_list)
++    test_file=$(basename $i .java)
++    
++    for j in "${array2[@]}"; do
++        echo "    - class $PACKAGE.$test_file#$j" >> TEST_TARGETS
++    done
++done
++
++test_targets=`cat TEST_TARGETS`
++test_targets=$(echo "${test_targets}" | sed '$!s~$~\\~g')
++
++# create flank.yml config file 
++sed "s/TEST_TARGETS/${test_targets}/g" $FLANK_CONF_TEMPLATE > $FLANK_CONF
++rm -f TEST_TARGETS
++$JAVA_BIN -jar ./$FLANK_BIN android run 
++
++exitcode=$?
++
++# Now exit the script with the exit code from the test run. (Only 0 if all test executions passed)
++exit $exitcode
+diff --git a/focus-android/tools/taskcluster/flank-conf-geckoview-arm.yml b/focus-android/tools/taskcluster/flank-conf-geckoview-arm.yml
+new file mode 100644
+index 000000000000..65799a66c60a
+--- /dev/null
++++ b/focus-android/tools/taskcluster/flank-conf-geckoview-arm.yml
+@@ -0,0 +1,56 @@
++# gcloud args match the official gcloud cli
++# https://cloud.google.com/sdk/gcloud/reference/firebase/test/android/run
++gcloud:
++  #results-bucket: focus_android_test_artifacts
++  results-bucket: focus_android_test_reports 
++  record-video: true
++
++  # The maximum possible testing time is 30m on physical devices and 60m on virtual devices.
++  timeout: 30m
++  # will start test then close socket. no reports will be generated.
++  # to retrieve results later, use the "refresh" command
++  # reports will be generated from /results/matrix_ids.json
++  #async: true 
++  # will start test then leave socket open. reports will be published
++  # to /results
++  # see: https://github.com/TestArmada/flank/issues/339
++  async: false 
++  project: moz-fx-mobile-firebase-testlab
++
++  # results-history-name
++  # by default, set to app name
++  # declare results-history-name to create a separate dropdown menu in Firebase 
++  # see: https://github.com/TestArmada/flank/issues/341
++  #results-history-name: tmp_parallel 
++
++  # test and app are the only required args
++  app: ../../app/build/outputs/apk/klarArm/debug/app-klar-arm-debug.apk
++  test: ../../app/build/outputs/apk/androidTest/klarArm/debug/app-klar-arm-debug-androidTest.apk
++  auto-google-login: true
++  use-orchestrator: true
++  environment-variables:
++    clearPackageData: true
++  directories-to-pull:
++    - /sdcard/screenshots
++  performance-metrics: true
++
++  # test-targets will be pulled dynamically from package.  DO NOT MODIFY
++  test-targets:
++TEST_TARGETS
++
++  device:
++    - model: sailfish 
++      version: 26 
++
++flank:
++  # test shards - the amount of groups to split the test suite into
++  # set to -1 to use one shard per test.
++  testShards: -1 
++  # repeat tests - the amount of times to run the tests.
++  # 1 runs the tests once. 10 runs all the tests 10x
++  repeatTests: 1
++  # always run - these tests are inserted at the beginning of every shard
++  # useful if you need to grant permissions or login before other tests run
++  #test-targets-always-run:
++    #- class com.example.app.ExampleUiTest#testPasses
++    # - class org.mozilla.klar.activty.SwitchContextTest#testPasses
+diff --git a/focus-android/tools/taskcluster/flank-conf-geckoview-x86.yml b/focus-android/tools/taskcluster/flank-conf-geckoview-x86.yml
+new file mode 100644
+index 000000000000..2208b093706b
+--- /dev/null
++++ b/focus-android/tools/taskcluster/flank-conf-geckoview-x86.yml
+@@ -0,0 +1,56 @@
++# gcloud args match the official gcloud cli
++# https://cloud.google.com/sdk/gcloud/reference/firebase/test/android/run
++gcloud:
++  #results-bucket: focus_android_test_artifacts
++  results-bucket: focus_android_test_reports 
++  record-video: true
++
++  # The maximum possible testing time is 30m on physical devices and 60m on virtual devices.
++  timeout: 30m
++  # will start test then close socket. no reports will be generated.
++  # to retrieve results later, use the "refresh" command
++  # reports will be generated from /results/matrix_ids.json
++  #async: true 
++  # will start test then leave socket open. reports will be published
++  # to /results
++  # see: https://github.com/TestArmada/flank/issues/339
++  async: false 
++  project: moz-fx-mobile-firebase-testlab
++
++  # results-history-name
++  # by default, set to app name
++  # declare results-history-name to create a separate dropdown menu in Firebase 
++  # see: https://github.com/TestArmada/flank/issues/341
++  #results-history-name: tmp_parallel 
++
++  # test and app are the only required args
++  app: ../../app/build/outputs/apk/klarX86/debug/app-klar-x86-debug.apk
++  test: ../../app/build/outputs/apk/androidTest/klarX86/debug/app-klar-x86-debug-androidTest.apk
++  auto-google-login: true
++  use-orchestrator: true
++  environment-variables:
++    clearPackageData: true
++  directories-to-pull:
++    - /sdcard/screenshots
++  performance-metrics: true
++
++  # test-targets will be pulled dynamically from package.  DO NOT MODIFY
++  test-targets:
++TEST_TARGETS
++
++  device:
++    - model: Nexus9 
++      version: 25 
++
++flank:
++  # test shards - the amount of groups to split the test suite into
++  # set to -1 to use one shard per test.
++  testShards: -1 
++  # repeat tests - the amount of times to run the tests.
++  # 1 runs the tests once. 10 runs all the tests 10x
++  repeatTests: 1
++  # always run - these tests are inserted at the beginning of every shard
++  # useful if you need to grant permissions or login before other tests run
++  #test-targets-always-run:
++    #- class com.example.app.ExampleUiTest#testPasses
++    # - class org.mozilla.focus.activty.SwitchContextTest#testPasses
+diff --git a/focus-android/tools/taskcluster/flank-conf-webview-arm.yml b/focus-android/tools/taskcluster/flank-conf-webview-arm.yml
+new file mode 100644
+index 000000000000..1947d8e1b47c
+--- /dev/null
++++ b/focus-android/tools/taskcluster/flank-conf-webview-arm.yml
+@@ -0,0 +1,58 @@
++# gcloud args match the official gcloud cli
++# https://cloud.google.com/sdk/gcloud/reference/firebase/test/android/run
++gcloud:
++  #results-bucket: focus_android_test_artifacts
++  results-bucket: focus_android_test_reports 
++  record-video: true
++
++  # The maximum possible testing time is 30m on physical devices and 60m on virtual devices.
++  timeout: 30m
++  # will start test then close socket. no reports will be generated.
++  # to retrieve results later, use the "refresh" command
++  # reports will be generated from /results/matrix_ids.json
++  #async: true 
++  # will start test then leave socket open. reports will be published
++  # to /results
++  # see: https://github.com/TestArmada/flank/issues/339
++  async: false 
++  project: moz-fx-mobile-firebase-testlab
++
++  # results-history-name
++  # by default, set to app name
++  # declare results-history-name to create a separate dropdown menu in Firebase 
++  # see: https://github.com/TestArmada/flank/issues/341
++  #results-history-name: tmp_parallel 
++
++  # test and app are the only required args
++  app: ../../app/build/outputs/apk/focusArm/debug/app-focus-arm-debug.apk
++  test: ../../app/build/outputs/apk/androidTest/focusArm/debug/app-focus-arm-debug-androidTest.apk
++  auto-google-login: true
++  use-orchestrator: true
++  environment-variables:
++    clearPackageData: true
++  directories-to-pull:
++    - /sdcard/screenshots
++  performance-metrics: true
++
++  # test-targets will be pulled dynamically from package.  DO NOT MODIFY
++  test-targets:
++TEST_TARGETS
++
++  device:
++    - model: shamu 
++      version: 23 
++    - model: walleye 
++      version: 26 
++
++flank:
++  # test shards - the amount of groups to split the test suite into
++  # set to -1 to use one shard per test.
++  testShards: -1 
++  # repeat tests - the amount of times to run the tests.
++  # 1 runs the tests once. 10 runs all the tests 10x
++  repeatTests: 1
++  # always run - these tests are inserted at the beginning of every shard
++  # useful if you need to grant permissions or login before other tests run
++  #test-targets-always-run:
++    #- class com.example.app.ExampleUiTest#testPasses
++    # - class org.mozilla.focus.activty.SwitchContextTest#testPasses
+diff --git a/focus-android/tools/taskcluster/flank-conf-webview-x86.yml b/focus-android/tools/taskcluster/flank-conf-webview-x86.yml
+new file mode 100644
+index 000000000000..9429d0802b5b
+--- /dev/null
++++ b/focus-android/tools/taskcluster/flank-conf-webview-x86.yml
+@@ -0,0 +1,58 @@
++# gcloud args match the official gcloud cli
++# https://cloud.google.com/sdk/gcloud/reference/firebase/test/android/run
++gcloud:
++  #results-bucket: focus_android_test_artifacts
++  results-bucket: focus_android_test_reports 
++  record-video: true
++
++  # The maximum possible testing time is 30m on physical devices and 60m on virtual devices.
++  timeout: 30m
++  # will start test then close socket. no reports will be generated.
++  # to retrieve results later, use the "refresh" command
++  # reports will be generated from /results/matrix_ids.json
++  #async: true 
++  # will start test then leave socket open. reports will be published
++  # to /results
++  # see: https://github.com/TestArmada/flank/issues/339
++  async: false 
++  project: moz-fx-mobile-firebase-testlab
++
++  # results-history-name
++  # by default, set to app name
++  # declare results-history-name to create a separate dropdown menu in Firebase 
++  # see: https://github.com/TestArmada/flank/issues/341
++  #results-history-name: tmp_parallel 
++
++  # test and app are the only required args
++  app: ../../app/build/outputs/apk/focusX86/debug/app-focus-x86-debug.apk
++  test: ../../app/build/outputs/apk/androidTest/focusX86/debug/app-focus-x86-debug-androidTest.apk
++  auto-google-login: true
++  use-orchestrator: true
++  environment-variables:
++    clearPackageData: true
++  directories-to-pull:
++    - /sdcard/screenshots
++  performance-metrics: true
++
++  # test-targets will be pulled dynamically from package.  DO NOT MODIFY
++  test-targets:
++TEST_TARGETS
++
++  device:
++    - model: Nexus9 
++      version: 23 
++    - model: Nexus9 
++      version: 25 
++
++flank:
++  # test shards - the amount of groups to split the test suite into
++  # set to -1 to use one shard per test.
++  testShards: -1 
++  # repeat tests - the amount of times to run the tests.
++  # 1 runs the tests once. 10 runs all the tests 10x
++  repeatTests: 1
++  # always run - these tests are inserted at the beginning of every shard
++  # useful if you need to grant permissions or login before other tests run
++  #test-targets-always-run:
++    #- class com.example.app.ExampleUiTest#testPasses
++    # - class org.mozilla.focus.activty.SwitchContextTest#testPasses
+diff --git a/focus-android/tools/taskcluster/schedule-master-build.py b/focus-android/tools/taskcluster/schedule-master-build.py
+index f94cbab6ff10..56b500d0ed07 100644
+--- a/focus-android/tools/taskcluster/schedule-master-build.py
++++ b/focus-android/tools/taskcluster/schedule-master-build.py
+@@ -52,7 +52,7 @@ def generate_webview_X86_ui_test_task(dependencies):
+ 			command = ('echo "--" > .adjust_token'
+ 					   ' && ./gradlew --no-daemon clean assembleFocusX86Debug assembleFocusX86DebugAndroidTest'
+ 					   ' && ./tools/taskcluster/google-firebase-testlab-login.sh'
+-					   ' && tools/taskcluster/execute-firebase-test.sh focusX86 app-focus-x86-debug model=Nexus9,version=23'),
++					   ' && tools/taskcluster/execute-firebase-tests.sh x86 webview'),
+ 			dependencies = dependencies,
+ 			scopes = [ 'secrets:get:project/focus/firebase' ],
+ 			artifacts = {
+@@ -70,7 +70,7 @@ def generate_webview_ARM_ui_test_task(dependencies):
+ 		command = ('echo "--" > .adjust_token'
+ 				   ' && ./gradlew --no-daemon clean assembleFocusArmDebug assembleFocusArmDebugAndroidTest'
+ 				   ' && ./tools/taskcluster/google-firebase-testlab-login.sh'
+-				   ' && tools/taskcluster/execute-firebase-test.sh focusArm app-focus-arm-debug model=walleye,version=26 model=shamu,version=23'),
++                                   ' && tools/taskcluster/execute-firebase-tests.sh arm webview'),
+ 		dependencies = dependencies,
+ 		scopes = [ 'secrets:get:project/focus/firebase' ],
+ 		artifacts = {
+@@ -88,7 +88,7 @@ def generate_gecko_X86_ui_test_task(dependencies):
+ 		command = ('echo "--" > .adjust_token'
+ 			' && ./gradlew --no-daemon clean assembleKlarX86Debug assembleKlarX86DebugAndroidTest'
+ 			' && ./tools/taskcluster/google-firebase-testlab-login.sh'
+-			' && tools/taskcluster/execute-firebase-test.sh klarX86 app-klar-x86-debug model=Nexus9,version=25'),
++                        ' && tools/taskcluster/execute-firebase-tests.sh x86 geckoview'),
+ 		dependencies = dependencies,
+ 		scopes = [ 'secrets:get:project/focus/firebase' ],
+ 		artifacts = {
+@@ -106,7 +106,7 @@ def generate_gecko_ARM_ui_test_task(dependencies):
+ 		command = ('echo "--" > .adjust_token'
+ 			' && ./gradlew --no-daemon clean assembleKlarArmDebug assembleKlarArmDebugAndroidTest'
+ 			' && ./tools/taskcluster/google-firebase-testlab-login.sh'
+-			' && tools/taskcluster/execute-firebase-test.sh klarArm app-klar-arm-debug model=sailfish,version=26'),
++                        ' && tools/taskcluster/execute-firebase-tests.sh arm geckoview'),
+ 		dependencies = dependencies,
+ 		scopes = [ 'secrets:get:project/focus/firebase' ],
+ 		artifacts = {

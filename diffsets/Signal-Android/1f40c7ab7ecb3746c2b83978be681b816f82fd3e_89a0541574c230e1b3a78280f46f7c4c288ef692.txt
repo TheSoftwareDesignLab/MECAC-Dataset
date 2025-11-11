@@ -1,0 +1,2750 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/MainActivity.kt b/app/src/main/java/org/thoughtcrime/securesms/MainActivity.kt
+index 9c69bf94108..b314247bd37 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/MainActivity.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/MainActivity.kt
+@@ -62,6 +62,8 @@ import androidx.recyclerview.widget.RecyclerView
+ import com.google.android.material.dialog.MaterialAlertDialogBuilder
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.collectLatest
++import kotlinx.coroutines.flow.distinctUntilChangedBy
++import kotlinx.coroutines.flow.filter
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import org.signal.core.ui.compose.theme.SignalTheme
+@@ -69,7 +71,7 @@ import org.signal.core.util.concurrent.LifecycleDisposable
+ import org.signal.core.util.getSerializableCompat
+ import org.signal.core.util.logging.Log
+ import org.signal.donations.StripeApi
+-import org.thoughtcrime.securesms.backup.RestoreState
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgress
+ import org.thoughtcrime.securesms.backup.v2.ui.verify.VerifyBackupKeyActivity
+ import org.thoughtcrime.securesms.calls.YouAreAlreadyInACallSnackbar.show
+ import org.thoughtcrime.securesms.calls.log.CallLogFilter
+@@ -258,13 +260,16 @@ class MainActivity : PassphraseRequiredActivity(), VoiceNoteMediaControllerOwner
+       }
+ 
+       launch {
+-        mainNavigationViewModel.backupStatus.collect { remainingRestoreSize ->
+-          val totalRestorableSize = SignalStore.backup.totalRestorableAttachmentSize
+-          if (SignalStore.backup.restoreState == RestoreState.RESTORING_MEDIA && remainingRestoreSize != 0L && totalRestorableSize != 0L) {
+-            Log.i(TAG, "Still restoring media, launching a service. Remaining restoration size: $remainingRestoreSize out of $totalRestorableSize ")
+-            BackupMediaRestoreService.resetTimeout()
+-            BackupMediaRestoreService.start(this@MainActivity, resources.getString(R.string.BackupStatus__restoring_media))
+-          }
++        repeatOnLifecycle(Lifecycle.State.STARTED) {
++          ArchiveRestoreProgress
++            .stateFlow
++            .distinctUntilChangedBy { it.needRestoreMediaService() }
++            .filter { it.needRestoreMediaService() }
++            .collect {
++              Log.i(TAG, "Still restoring media, launching a service. Remaining restoration size: ${it.remainingRestoreSize} out of ${it.totalRestoreSize} ")
++              BackupMediaRestoreService.resetTimeout()
++              BackupMediaRestoreService.start(this@MainActivity, resources.getString(R.string.BackupStatus__restoring_media))
++            }
+         }
+       }
+     }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/backup/RestoreState.kt b/app/src/main/java/org/thoughtcrime/securesms/backup/RestoreState.kt
+index 4b7110748b0..ae63da33c66 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/backup/RestoreState.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/backup/RestoreState.kt
+@@ -7,12 +7,16 @@ package org.thoughtcrime.securesms.backup
+ 
+ import org.signal.core.util.LongSerializer
+ 
+-enum class RestoreState(val id: Int, val inProgress: Boolean) {
+-  FAILED(-1, false),
++enum class RestoreState(private val id: Int, val inProgress: Boolean) {
+   NONE(0, false),
+   PENDING(1, true),
+   RESTORING_DB(2, true),
+-  RESTORING_MEDIA(3, true);
++  CALCULATING_MEDIA(4, true),
++  RESTORING_MEDIA(3, true),
++  CANCELING_MEDIA(5, true);
++
++  val isMediaRestoreOperation: Boolean
++    get() = this == CALCULATING_MEDIA || this == RESTORING_MEDIA || this == CANCELING_MEDIA
+ 
+   companion object {
+     val serializer: LongSerializer<RestoreState> = Serializer()
+@@ -23,14 +27,8 @@ enum class RestoreState(val id: Int, val inProgress: Boolean) {
+       return data.id.toLong()
+     }
+ 
+-    override fun deserialize(data: Long): RestoreState {
+-      return when (data.toInt()) {
+-        FAILED.id -> FAILED
+-        PENDING.id -> PENDING
+-        RESTORING_DB.id -> RESTORING_DB
+-        RESTORING_MEDIA.id -> RESTORING_MEDIA
+-        else -> NONE
+-      }
++    override fun deserialize(input: Long): RestoreState {
++      return entries.firstOrNull { it.id == input.toInt() } ?: throw IllegalStateException()
+     }
+   }
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ArchiveRestoreProgress.kt b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ArchiveRestoreProgress.kt
+index 2c0048c7ed8..ee29018484a 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ArchiveRestoreProgress.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ArchiveRestoreProgress.kt
+@@ -5,22 +5,239 @@
+ 
+ package org.thoughtcrime.securesms.backup.v2
+ 
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.content.IntentFilter
++import android.net.ConnectivityManager
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.flowOn
++import kotlinx.coroutines.flow.update
+ import org.signal.core.util.bytes
++import org.signal.core.util.concurrent.SignalExecutors
+ import org.signal.core.util.logging.Log
++import org.signal.core.util.throttleLatest
+ import org.thoughtcrime.securesms.BuildConfig
+ import org.thoughtcrime.securesms.attachments.AttachmentId
++import org.thoughtcrime.securesms.backup.RestoreState
++import org.thoughtcrime.securesms.database.DatabaseObserver
++import org.thoughtcrime.securesms.database.SignalDatabase
++import org.thoughtcrime.securesms.dependencies.AppDependencies
++import org.thoughtcrime.securesms.jobmanager.impl.BatteryNotLowConstraint
++import org.thoughtcrime.securesms.jobmanager.impl.NetworkConstraint
++import org.thoughtcrime.securesms.jobmanager.impl.WifiConstraint
++import org.thoughtcrime.securesms.keyvalue.SignalStore
++import org.thoughtcrime.securesms.util.safeUnregisterReceiver
+ import java.util.concurrent.ConcurrentHashMap
+ import java.util.concurrent.atomic.AtomicInteger
+ import java.util.concurrent.atomic.AtomicLong
++import java.util.concurrent.locks.ReentrantLock
++import kotlin.concurrent.withLock
+ import kotlin.time.Duration.Companion.milliseconds
++import kotlin.time.Duration.Companion.seconds
+ import kotlin.time.DurationUnit
+ 
+ /**
+- * A class for tracking restore progress, largely just for debugging purposes. It keeps no state on disk, and is therefore only useful for testing.
++ * A class for tracking restore progress as a whole, but with a primary focus on managing media restore.
++ *
++ * Also provides helpful debugging information for attachment download speeds.
+  */
+ object ArchiveRestoreProgress {
+   private val TAG = Log.tag(ArchiveRestoreProgress::class.java)
+ 
++  private var listenersRegistered = false
++  private val listenerLock = ReentrantLock()
++
++  private val attachmentObserver = DatabaseObserver.Observer {
++    update()
++  }
++
++  private val networkChangeReceiver = object : BroadcastReceiver() {
++    override fun onReceive(context: Context, intent: Intent) {
++      update()
++    }
++  }
++
++  private val store = MutableStateFlow(
++    ArchiveRestoreProgressState(
++      restoreState = SignalStore.backup.restoreState,
++      remainingRestoreSize = SignalStore.backup.totalRestorableAttachmentSize.bytes,
++      totalRestoreSize = SignalStore.backup.totalRestorableAttachmentSize.bytes,
++      hasActivelyRestoredThisRun = SignalStore.backup.totalRestorableAttachmentSize > 0,
++      totalToRestoreThisRun = SignalStore.backup.totalRestorableAttachmentSize.bytes,
++      restoreStatus = ArchiveRestoreProgressState.RestoreStatus.NONE
++    )
++  )
++
++  val state: ArchiveRestoreProgressState
++    get() = store.value
++
++  val stateFlow: Flow<ArchiveRestoreProgressState> = store
++    .throttleLatest(1.seconds)
++    .distinctUntilChanged()
++    .flowOn(Dispatchers.IO)
++
++  init {
++    SignalExecutors.BOUNDED.execute { update() }
++  }
++
++  fun onRestorePending() {
++    Log.i(TAG, "onRestorePending")
++    SignalStore.backup.restoreState = RestoreState.PENDING
++    update()
++  }
++
++  fun onStartMediaRestore() {
++    Log.i(TAG, "onStartMediaRestore")
++    SignalStore.backup.restoreState = RestoreState.CALCULATING_MEDIA
++    SignalStore.backup.totalRestorableAttachmentSize = SignalDatabase.attachments.getRemainingRestorableAttachmentSize()
++    update()
++  }
++
++  fun onRestoringMedia() {
++    Log.i(TAG, "onRestoringMedia")
++    SignalStore.backup.restoreState = RestoreState.RESTORING_MEDIA
++    SignalStore.backup.totalRestorableAttachmentSize = SignalDatabase.attachments.getRemainingRestorableAttachmentSize()
++    update()
++  }
++
++  fun onRestoringDb() {
++    Log.i(TAG, "onRestoringDb")
++    SignalStore.backup.restoreState = RestoreState.RESTORING_DB
++    update()
++  }
++
++  fun onCancelMediaRestore() {
++    Log.i(TAG, "onCancelMediaRestore")
++    SignalStore.backup.restoreState = RestoreState.CANCELING_MEDIA
++    update()
++  }
++
++  fun allMediaRestored() {
++    val shouldUpdate = if (SignalStore.backup.restoreState == RestoreState.CANCELING_MEDIA) {
++      Log.i(TAG, "allMediaCanceled")
++      store.update { state ->
++        if (state.restoreState == RestoreState.CANCELING_MEDIA) {
++          state.copy(
++            hasActivelyRestoredThisRun = false,
++            totalToRestoreThisRun = 0.bytes
++          )
++        } else {
++          state
++        }
++      }
++      true
++    } else if (SignalStore.backup.restoreState != RestoreState.NONE) {
++      Log.i(TAG, "allMediaRestored")
++      true
++    } else {
++      false
++    }
++
++    if (shouldUpdate) {
++      SignalStore.backup.totalRestorableAttachmentSize = 0
++      SignalStore.backup.restoreState = RestoreState.NONE
++      update()
++      onProcessEnd()
++    }
++  }
++
++  @JvmStatic
++  fun forceUpdate() {
++    update()
++  }
++
++  fun clearFinishedStatus() {
++    store.update { state ->
++      if (state.restoreStatus == ArchiveRestoreProgressState.RestoreStatus.FINISHED) {
++        state.copy(
++          restoreStatus = ArchiveRestoreProgressState.RestoreStatus.NONE,
++          hasActivelyRestoredThisRun = false,
++          totalToRestoreThisRun = 0.bytes
++        )
++      } else {
++        state
++      }
++    }
++  }
++
++  private fun update() {
++    store.update { state ->
++      val remainingRestoreSize = SignalDatabase.attachments.getRemainingRestorableAttachmentSize().bytes
++      var restoreState = SignalStore.backup.restoreState
++
++      val status = when {
++        !WifiConstraint.isMet(AppDependencies.application) && !SignalStore.backup.restoreWithCellular -> ArchiveRestoreProgressState.RestoreStatus.WAITING_FOR_WIFI
++        !NetworkConstraint.isMet(AppDependencies.application) -> ArchiveRestoreProgressState.RestoreStatus.WAITING_FOR_INTERNET
++        !BatteryNotLowConstraint.isMet() -> ArchiveRestoreProgressState.RestoreStatus.LOW_BATTERY
++        restoreState == RestoreState.NONE -> if (state.hasActivelyRestoredThisRun) ArchiveRestoreProgressState.RestoreStatus.FINISHED else ArchiveRestoreProgressState.RestoreStatus.NONE
++        else -> {
++          val availableBytes = SignalStore.backup.spaceAvailableOnDiskBytes
++
++          if (availableBytes > -1L && remainingRestoreSize > availableBytes.bytes) {
++            ArchiveRestoreProgressState.RestoreStatus.NOT_ENOUGH_DISK_SPACE
++          } else {
++            ArchiveRestoreProgressState.RestoreStatus.RESTORING
++          }
++        }
++      }
++
++      if (restoreState.isMediaRestoreOperation) {
++        if (remainingRestoreSize == 0.bytes && SignalStore.backup.totalRestorableAttachmentSize == 0L) {
++          restoreState = RestoreState.NONE
++          SignalStore.backup.restoreState = restoreState
++        } else {
++          registerUpdateListeners()
++        }
++      } else {
++        unregisterUpdateListeners()
++      }
++
++      val totalRestoreSize = SignalStore.backup.totalRestorableAttachmentSize.bytes
++
++      state.copy(
++        restoreState = restoreState,
++        remainingRestoreSize = remainingRestoreSize,
++        restoreStatus = status,
++        totalRestoreSize = totalRestoreSize,
++        hasActivelyRestoredThisRun = state.hasActivelyRestoredThisRun || SignalStore.backup.totalRestorableAttachmentSize > 0,
++        totalToRestoreThisRun = if (totalRestoreSize > 0.bytes) totalRestoreSize else state.totalToRestoreThisRun
++      )
++    }
++  }
++
++  private fun registerUpdateListeners() {
++    if (!listenersRegistered) {
++      listenerLock.withLock {
++        if (!listenersRegistered) {
++          Log.i(TAG, "Registering progress related listeners")
++          AppDependencies.databaseObserver.registerAttachmentUpdatedObserver(attachmentObserver)
++          AppDependencies.application.registerReceiver(networkChangeReceiver, IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION))
++          AppDependencies.application.registerReceiver(networkChangeReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
++          listenersRegistered = true
++        }
++      }
++    }
++  }
++
++  private fun unregisterUpdateListeners() {
++    if (listenersRegistered) {
++      listenerLock.withLock {
++        if (listenersRegistered) {
++          Log.i(TAG, "Unregistering listeners")
++          AppDependencies.databaseObserver.unregisterObserver(attachmentObserver)
++          AppDependencies.application.safeUnregisterReceiver(networkChangeReceiver)
++          listenersRegistered = false
++        }
++      }
++    }
++  }
++
++  //region Attachment Debug
++
+   private var debugAttachmentStartTime: Long = 0
+   private val debugTotalAttachments: AtomicInteger = AtomicInteger(0)
+   private val debugTotalBytes: AtomicLong = AtomicLong(0)
+@@ -53,7 +270,7 @@ object ArchiveRestoreProgress {
+     }
+   }
+ 
+-  fun onProcessEnd() {
++  private fun onProcessEnd() {
+     if (debugAttachmentStartTime <= 0 || debugTotalAttachments.get() <= 0 || debugTotalBytes.get() <= 0) {
+       Log.w(TAG, "Insufficient data to print debug stats.")
+       return
+@@ -84,4 +301,6 @@ object ArchiveRestoreProgress {
+       return "Duration=${System.currentTimeMillis() - startTimeMs}ms, TotalBytes=$totalBytes (${totalBytes.bytes.toUnitString()}), NetworkRate=$networkBytesPerSecond bytes/sec (${networkBytesPerSecond.bytes.toUnitString()}/sec), DiskRate=$diskBytesPerSecond bytes/sec (${diskBytesPerSecond.bytes.toUnitString()}/sec)"
+     }
+   }
++
++  //endregion Attachment Debug
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ArchiveRestoreProgressState.kt b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ArchiveRestoreProgressState.kt
+new file mode 100644
+index 00000000000..e4ae0fc0b71
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ArchiveRestoreProgressState.kt
+@@ -0,0 +1,70 @@
++/*
++ * Copyright 2025 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.backup.v2
++
++import org.signal.core.util.ByteSize
++import org.signal.core.util.bytes
++import org.thoughtcrime.securesms.backup.RestoreState
++
++/**
++ * In-memory view of the current state of an attachment restore process.
++ */
++data class ArchiveRestoreProgressState(
++  val restoreState: RestoreState,
++  val remainingRestoreSize: ByteSize,
++  val totalRestoreSize: ByteSize,
++  val hasActivelyRestoredThisRun: Boolean = false,
++  val totalToRestoreThisRun: ByteSize = 0.bytes,
++  val restoreStatus: RestoreStatus
++) {
++  val completedRestoredSize = totalRestoreSize - remainingRestoreSize
++
++  val progress: Float? = when (this.restoreState) {
++    RestoreState.CALCULATING_MEDIA,
++    RestoreState.CANCELING_MEDIA -> this.completedRestoredSize.percentageOf(this.totalRestoreSize)
++
++    RestoreState.RESTORING_MEDIA -> {
++      when (this.restoreStatus) {
++        RestoreStatus.NONE -> null
++        RestoreStatus.FINISHED -> 1f
++        else -> this.completedRestoredSize.percentageOf(this.totalRestoreSize)
++      }
++    }
++
++    RestoreState.NONE -> {
++      if (this.restoreStatus == RestoreStatus.FINISHED) {
++        1f
++      } else {
++        null
++      }
++    }
++
++    else -> null
++  }
++
++  fun activelyRestoring(): Boolean {
++    return restoreState.inProgress
++  }
++
++  fun needRestoreMediaService(): Boolean {
++    return (restoreState == RestoreState.CALCULATING_MEDIA || restoreState == RestoreState.RESTORING_MEDIA) &&
++      totalRestoreSize > 0.bytes &&
++      remainingRestoreSize != 0.bytes
++  }
++
++  /**
++   * Describes the status of an in-progress media download session.
++   */
++  enum class RestoreStatus {
++    NONE,
++    RESTORING,
++    LOW_BATTERY,
++    WAITING_FOR_INTERNET,
++    WAITING_FOR_WIFI,
++    NOT_ENOUGH_DISK_SPACE,
++    FINISHED
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/backup/v2/BackupRepository.kt b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/BackupRepository.kt
+index 2314c3db1cd..1d5257ce5d3 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/backup/v2/BackupRepository.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/BackupRepository.kt
+@@ -59,7 +59,6 @@ import org.thoughtcrime.securesms.attachments.Cdn
+ import org.thoughtcrime.securesms.attachments.DatabaseAttachment
+ import org.thoughtcrime.securesms.backup.ArchiveUploadProgress
+ import org.thoughtcrime.securesms.backup.DeletionState
+-import org.thoughtcrime.securesms.backup.RestoreState
+ import org.thoughtcrime.securesms.backup.v2.BackupRepository.copyAttachmentToArchive
+ import org.thoughtcrime.securesms.backup.v2.BackupRepository.exportForDebugging
+ import org.thoughtcrime.securesms.backup.v2.importer.ChatItemArchiveImporter
+@@ -105,11 +104,10 @@ import org.thoughtcrime.securesms.jobs.AvatarGroupsV2DownloadJob
+ import org.thoughtcrime.securesms.jobs.BackupDeleteJob
+ import org.thoughtcrime.securesms.jobs.BackupMessagesJob
+ import org.thoughtcrime.securesms.jobs.BackupRestoreMediaJob
+-import org.thoughtcrime.securesms.jobs.CheckRestoreMediaLeftJob
++import org.thoughtcrime.securesms.jobs.CancelRestoreMediaJob
+ import org.thoughtcrime.securesms.jobs.CreateReleaseChannelJob
+ import org.thoughtcrime.securesms.jobs.LocalBackupJob
+ import org.thoughtcrime.securesms.jobs.RequestGroupV2InfoJob
+-import org.thoughtcrime.securesms.jobs.RestoreAttachmentJob
+ import org.thoughtcrime.securesms.jobs.RestoreOptimizedMediaJob
+ import org.thoughtcrime.securesms.jobs.RetrieveProfileJob
+ import org.thoughtcrime.securesms.jobs.StickerPackDownloadJob
+@@ -362,11 +360,7 @@ object BackupRepository {
+    */
+   @JvmStatic
+   fun skipMediaRestore() {
+-    SignalStore.backup.userManuallySkippedMediaRestore = true
+-
+-    RestoreAttachmentJob.Queues.ALL.forEach { AppDependencies.jobManager.cancelAllInQueue(it) }
+-
+-    RestoreAttachmentJob.Queues.ALL.forEach { AppDependencies.jobManager.add(CheckRestoreMediaLeftJob(it)) }
++    CancelRestoreMediaJob.enqueue()
+   }
+ 
+   fun markBackupFailure() {
+@@ -1991,7 +1985,7 @@ object BackupRepository {
+ 
+   suspend fun restoreRemoteBackup(): RemoteRestoreResult {
+     val context = AppDependencies.application
+-    SignalStore.backup.restoreState = RestoreState.PENDING
++    ArchiveRestoreProgress.onRestorePending()
+ 
+     try {
+       DataRestoreConstraint.isRestoringData = true
+@@ -2006,7 +2000,7 @@ object BackupRepository {
+   }
+ 
+   private fun restoreRemoteBackup(controller: BackupProgressService.Controller, cancellationSignal: () -> Boolean): RemoteRestoreResult {
+-    SignalStore.backup.restoreState = RestoreState.RESTORING_DB
++    ArchiveRestoreProgress.onRestoringDb()
+ 
+     val progressListener = object : ProgressListener {
+       override fun onAttachmentProgress(progress: AttachmentTransferProgress) {
+@@ -2098,8 +2092,6 @@ object BackupRepository {
+       return RemoteRestoreResult.Failure
+     }
+ 
+-    SignalStore.backup.restoreState = RestoreState.RESTORING_MEDIA
+-
+     BackupMediaRestoreService.resetTimeout()
+     AppDependencies.jobManager.add(BackupRestoreMediaJob())
+ 
+@@ -2109,7 +2101,7 @@ object BackupRepository {
+ 
+   suspend fun restoreLinkAndSyncBackup(response: TransferArchiveResponse, ephemeralBackupKey: MessageBackupKey) {
+     val context = AppDependencies.application
+-    SignalStore.backup.restoreState = RestoreState.PENDING
++    ArchiveRestoreProgress.onRestorePending()
+ 
+     try {
+       DataRestoreConstraint.isRestoringData = true
+@@ -2124,7 +2116,7 @@ object BackupRepository {
+   }
+ 
+   private fun restoreLinkAndSyncBackup(response: TransferArchiveResponse, ephemeralBackupKey: MessageBackupKey, controller: BackupProgressService.Controller, cancellationSignal: () -> Boolean): RemoteRestoreResult {
+-    SignalStore.backup.restoreState = RestoreState.RESTORING_DB
++    ArchiveRestoreProgress.onRestoringDb()
+ 
+     val progressListener = object : ProgressListener {
+       override fun onAttachmentProgress(progress: AttachmentTransferProgress) {
+@@ -2175,8 +2167,6 @@ object BackupRepository {
+       return RemoteRestoreResult.Failure
+     }
+ 
+-    SignalStore.backup.restoreState = RestoreState.RESTORING_MEDIA
+-
+     BackupMediaRestoreService.resetTimeout()
+     AppDependencies.jobManager.add(BackupRestoreMediaJob())
+ 
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ui/status/BackupCreateErrorRow.kt b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ui/status/BackupCreateErrorRow.kt
+new file mode 100644
+index 00000000000..15a81f68c5a
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ui/status/BackupCreateErrorRow.kt
+@@ -0,0 +1,129 @@
++/*
++ * Copyright 2025 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.backup.v2.ui.status
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.text.InlineTextContent
++import androidx.compose.foundation.text.appendInlineContent
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.res.dimensionResource
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.AnnotatedString
++import androidx.compose.ui.text.LinkAnnotation
++import androidx.compose.ui.text.Placeholder
++import androidx.compose.ui.text.PlaceholderVerticalAlign
++import androidx.compose.ui.text.SpanStyle
++import androidx.compose.ui.text.TextLinkStyles
++import androidx.compose.ui.text.buildAnnotatedString
++import androidx.compose.ui.text.withLink
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import org.signal.core.ui.compose.Previews
++import org.signal.core.ui.compose.SignalPreview
++import org.thoughtcrime.securesms.R
++import org.signal.core.ui.R as CoreUiR
++
++private val YELLOW_DOT = Color(0xFFFFCC00)
++
++/**
++ * Show backup creation failures as a settings row.
++ */
++@Composable
++fun BackupCreateErrorRow(
++  showCouldNotComplete: Boolean,
++  showBackupFailed: Boolean,
++  onLearnMoreClick: () -> Unit = {}
++) {
++  if (showBackupFailed) {
++    val inlineContentMap = mapOf(
++      "yellow_bullet" to InlineTextContent(
++        Placeholder(20.sp, 12.sp, PlaceholderVerticalAlign.TextCenter)
++      ) {
++        Box(
++          modifier = Modifier
++            .size(12.dp)
++            .background(color = YELLOW_DOT, shape = CircleShape)
++        )
++      }
++    )
++
++    BackupAlertText(
++      text = buildAnnotatedString {
++        appendInlineContent("yellow_bullet")
++        append(" ")
++        append(stringResource(R.string.BackupStatusRow__your_last_backup_latest_version))
++        append(" ")
++        withLink(
++          LinkAnnotation.Clickable(
++            stringResource(R.string.BackupStatusRow__learn_more),
++            styles = TextLinkStyles(style = SpanStyle(color = MaterialTheme.colorScheme.primary))
++          ) {
++            onLearnMoreClick()
++          }
++        ) {
++          append(stringResource(R.string.BackupStatusRow__learn_more))
++        }
++      },
++      inlineContent = inlineContentMap
++    )
++  } else if (showCouldNotComplete) {
++    val inlineContentMap = mapOf(
++      "yellow_bullet" to InlineTextContent(
++        Placeholder(20.sp, 12.sp, PlaceholderVerticalAlign.TextCenter)
++      ) {
++        Box(
++          modifier = Modifier
++            .size(12.dp)
++            .background(color = YELLOW_DOT, shape = CircleShape)
++        )
++      }
++    )
++
++    BackupAlertText(
++      text = buildAnnotatedString {
++        appendInlineContent("yellow_bullet")
++        append(" ")
++        append(stringResource(R.string.BackupStatusRow__your_last_backup))
++      },
++      inlineContent = inlineContentMap
++    )
++  }
++}
++
++@Composable
++private fun BackupAlertText(text: AnnotatedString, inlineContent: Map<String, InlineTextContent>) {
++  Text(
++    text = text,
++    color = MaterialTheme.colorScheme.onSurfaceVariant,
++    style = MaterialTheme.typography.bodyMedium,
++    modifier = Modifier.padding(horizontal = dimensionResource(CoreUiR.dimen.gutter)),
++    inlineContent = inlineContent
++  )
++}
++
++@SignalPreview
++@Composable
++fun BackupStatusRowCouldNotCompleteBackupPreview() {
++  Previews.Preview {
++    BackupCreateErrorRow(showCouldNotComplete = true, showBackupFailed = false)
++  }
++}
++
++@SignalPreview
++@Composable
++fun BackupStatusRowBackupFailedPreview() {
++  Previews.Preview {
++    BackupCreateErrorRow(showCouldNotComplete = false, showBackupFailed = true)
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ui/status/BackupStatusBanner.kt b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ui/status/BackupStatusBanner.kt
+index dc757021caa..9acdea9f60b 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ui/status/BackupStatusBanner.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ui/status/BackupStatusBanner.kt
+@@ -5,8 +5,6 @@
+ 
+ package org.thoughtcrime.securesms.backup.v2.ui.status
+ 
+-import androidx.annotation.DrawableRes
+-import androidx.annotation.StringRes
+ import androidx.compose.foundation.border
+ import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.interaction.MutableInteractionSource
+@@ -31,6 +29,7 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.StrokeCap
+ import androidx.compose.ui.res.painterResource
+ import androidx.compose.ui.res.stringResource
+@@ -38,14 +37,12 @@ import androidx.compose.ui.unit.dp
+ import org.signal.core.ui.compose.Buttons
+ import org.signal.core.ui.compose.Previews
+ import org.signal.core.ui.compose.SignalPreview
+-import org.signal.core.util.ByteSize
+-import org.signal.core.util.bytes
+-import org.signal.core.util.kibiBytes
+ import org.signal.core.util.mebiBytes
+ import org.thoughtcrime.securesms.R
++import org.thoughtcrime.securesms.backup.RestoreState
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgressState
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgressState.RestoreStatus
+ import org.thoughtcrime.securesms.backup.v2.ui.BackupsIconColors
+-import kotlin.math.max
+-import kotlin.math.min
+ 
+ private const val NONE = -1
+ 
+@@ -56,12 +53,16 @@ private const val NONE = -1
+ @OptIn(ExperimentalLayoutApi::class)
+ @Composable
+ fun BackupStatusBanner(
+-  data: BackupStatusData,
++  data: ArchiveRestoreProgressState,
+   onBannerClick: () -> Unit = {},
+-  onActionClick: (BackupStatusData) -> Unit = {},
++  onActionClick: (ArchiveRestoreProgressState) -> Unit = {},
+   onDismissClick: () -> Unit = {},
+   contentPadding: PaddingValues = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+ ) {
++  if (!data.restoreState.isMediaRestoreOperation && data.restoreStatus != RestoreStatus.FINISHED) {
++    return
++  }
++
+   Row(
+     verticalAlignment = Alignment.CenterVertically,
+     modifier = Modifier
+@@ -73,9 +74,9 @@ fun BackupStatusBanner(
+       .padding(12.dp)
+   ) {
+     Icon(
+-      painter = painterResource(id = data.iconRes),
++      painter = painterResource(id = data.iconResource()),
+       contentDescription = null,
+-      tint = data.iconColors.foreground,
++      tint = data.iconColor(),
+       modifier = Modifier
+         .padding(start = 4.dp)
+         .size(24.dp)
+@@ -89,7 +90,7 @@ fun BackupStatusBanner(
+         .weight(1f)
+     ) {
+       Text(
+-        text = data.title,
++        text = data.title(),
+         style = MaterialTheme.typography.bodyLarge,
+         color = MaterialTheme.colorScheme.onSurface,
+         modifier = Modifier
+@@ -97,7 +98,7 @@ fun BackupStatusBanner(
+           .align(Alignment.CenterVertically)
+       )
+ 
+-      data.status?.let { status ->
++      data.status()?.let { status ->
+         Text(
+           text = status,
+           style = MaterialTheme.typography.bodySmall,
+@@ -109,9 +110,12 @@ fun BackupStatusBanner(
+       }
+     }
+ 
+-    if (data.progress >= 0f) {
++    if (data.restoreState == RestoreState.CALCULATING_MEDIA ||
++      data.restoreState == RestoreState.CANCELING_MEDIA ||
++      (data.restoreState == RestoreState.RESTORING_MEDIA && data.restoreStatus == RestoreStatus.RESTORING)
++    ) {
+       CircularProgressIndicator(
+-        progress = { data.progress },
++        progress = { data.progress!! },
+         strokeWidth = 3.dp,
+         strokeCap = StrokeCap.Round,
+         modifier = Modifier
+@@ -119,16 +123,16 @@ fun BackupStatusBanner(
+       )
+     }
+ 
+-    if (data.actionRes != NONE) {
++    if (data.actionResource() != NONE) {
+       Buttons.Small(
+         onClick = { onActionClick(data) },
+         modifier = Modifier.padding(start = 8.dp)
+       ) {
+-        Text(text = stringResource(id = data.actionRes))
++        Text(text = stringResource(id = data.actionResource()))
+       }
+     }
+ 
+-    if (data.showDismissAction) {
++    if (data.restoreStatus == RestoreStatus.FINISHED) {
+       val interactionSource = remember { MutableInteractionSource() }
+ 
+       Icon(
+@@ -147,195 +151,208 @@ fun BackupStatusBanner(
+   }
+ }
+ 
++private fun ArchiveRestoreProgressState.iconResource(): Int {
++  return when (this.restoreState) {
++    RestoreState.CALCULATING_MEDIA,
++    RestoreState.CANCELING_MEDIA -> R.drawable.symbol_backup_light
++
++    RestoreState.RESTORING_MEDIA -> {
++      when (this.restoreStatus) {
++        RestoreStatus.RESTORING,
++        RestoreStatus.WAITING_FOR_INTERNET,
++        RestoreStatus.WAITING_FOR_WIFI,
++        RestoreStatus.LOW_BATTERY -> R.drawable.symbol_backup_light
++
++        RestoreStatus.NOT_ENOUGH_DISK_SPACE -> R.drawable.symbol_backup_error_24
++        RestoreStatus.FINISHED -> R.drawable.symbol_check_circle_24
++        RestoreStatus.NONE -> throw IllegalStateException()
++      }
++    }
++
++    RestoreState.NONE -> {
++      if (this.restoreStatus == RestoreStatus.FINISHED) {
++        R.drawable.symbol_check_circle_24
++      } else {
++        throw IllegalStateException()
++      }
++    }
++
++    RestoreState.PENDING,
++    RestoreState.RESTORING_DB -> throw IllegalStateException()
++  }
++}
++
++@Composable
++private fun ArchiveRestoreProgressState.iconColor(): Color {
++  return when (this.restoreState) {
++    RestoreState.CALCULATING_MEDIA,
++    RestoreState.CANCELING_MEDIA -> BackupsIconColors.Normal.foreground
++
++    RestoreState.RESTORING_MEDIA -> {
++      when (this.restoreStatus) {
++        RestoreStatus.RESTORING -> BackupsIconColors.Normal.foreground
++        RestoreStatus.WAITING_FOR_INTERNET,
++        RestoreStatus.WAITING_FOR_WIFI,
++        RestoreStatus.LOW_BATTERY,
++        RestoreStatus.NOT_ENOUGH_DISK_SPACE -> BackupsIconColors.Warning.foreground
++
++        RestoreStatus.FINISHED -> BackupsIconColors.Success.foreground
++        RestoreStatus.NONE -> throw IllegalStateException()
++      }
++    }
++
++    RestoreState.NONE -> {
++      if (this.restoreStatus == RestoreStatus.FINISHED) {
++        BackupsIconColors.Success.foreground
++      } else {
++        throw IllegalStateException()
++      }
++    }
++
++    RestoreState.PENDING,
++    RestoreState.RESTORING_DB -> throw IllegalStateException()
++  }
++}
++
++@Composable
++private fun ArchiveRestoreProgressState.title(): String {
++  return when (this.restoreState) {
++    RestoreState.CALCULATING_MEDIA -> stringResource(R.string.BackupStatus__restoring_media)
++    RestoreState.CANCELING_MEDIA -> stringResource(R.string.BackupStatus__cancel_restore_media)
++    RestoreState.RESTORING_MEDIA -> {
++      when (this.restoreStatus) {
++        RestoreStatus.RESTORING -> stringResource(R.string.BackupStatus__restoring_media)
++        RestoreStatus.WAITING_FOR_INTERNET,
++        RestoreStatus.WAITING_FOR_WIFI,
++        RestoreStatus.LOW_BATTERY -> stringResource(R.string.BackupStatus__restore_paused)
++
++        RestoreStatus.NOT_ENOUGH_DISK_SPACE -> {
++          stringResource(R.string.BackupStatus__free_up_s_of_space_to_download_your_media, this.remainingRestoreSize.toUnitString())
++        }
++
++        RestoreStatus.FINISHED -> stringResource(R.string.BackupStatus__restore_complete)
++        RestoreStatus.NONE -> throw IllegalStateException()
++      }
++    }
++
++    RestoreState.NONE -> {
++      if (this.restoreStatus == RestoreStatus.FINISHED) {
++        stringResource(R.string.BackupStatus__restore_complete)
++      } else {
++        throw IllegalStateException()
++      }
++    }
++
++    RestoreState.PENDING,
++    RestoreState.RESTORING_DB -> throw IllegalStateException()
++  }
++}
++
++@Composable
++private fun ArchiveRestoreProgressState.status(): String? {
++  return when (this.restoreState) {
++    RestoreState.CALCULATING_MEDIA -> {
++      stringResource(
++        R.string.BackupStatus__status_size_of_size,
++        this.completedRestoredSize.toUnitString(),
++        this.totalRestoreSize.toUnitString()
++      )
++    }
++
++    RestoreState.CANCELING_MEDIA -> null
++    RestoreState.RESTORING_MEDIA -> {
++      when (this.restoreStatus) {
++        RestoreStatus.RESTORING -> {
++          stringResource(
++            R.string.BackupStatus__status_size_of_size,
++            this.completedRestoredSize.toUnitString(),
++            this.totalRestoreSize.toUnitString()
++          )
++        }
++
++        RestoreStatus.WAITING_FOR_INTERNET -> stringResource(R.string.BackupStatus__status_no_internet)
++        RestoreStatus.WAITING_FOR_WIFI -> stringResource(R.string.BackupStatus__status_waiting_for_wifi)
++        RestoreStatus.LOW_BATTERY -> stringResource(R.string.BackupStatus__status_device_has_low_battery)
++        RestoreStatus.NOT_ENOUGH_DISK_SPACE -> null
++        RestoreStatus.FINISHED -> this.totalToRestoreThisRun.toUnitString()
++        RestoreStatus.NONE -> throw IllegalStateException()
++      }
++    }
++
++    RestoreState.NONE -> {
++      if (this.restoreStatus == RestoreStatus.FINISHED) {
++        this.totalToRestoreThisRun.toUnitString()
++      } else {
++        throw IllegalStateException()
++      }
++    }
++
++    RestoreState.PENDING,
++    RestoreState.RESTORING_DB -> throw IllegalStateException()
++  }
++}
++
++private fun ArchiveRestoreProgressState.actionResource(): Int {
++  return when (this.restoreState) {
++    RestoreState.CALCULATING_MEDIA,
++    RestoreState.CANCELING_MEDIA -> NONE
++
++    RestoreState.RESTORING_MEDIA -> {
++      when (this.restoreStatus) {
++        RestoreStatus.NOT_ENOUGH_DISK_SPACE -> R.string.BackupStatus__details
++        RestoreStatus.WAITING_FOR_WIFI -> R.string.BackupStatus__resume
++        else -> NONE
++      }
++    }
++
++    else -> NONE
++  }
++}
++
+ @SignalPreview
+ @Composable
+ fun BackupStatusBannerPreview() {
+   Previews.Preview {
+     Column {
+       BackupStatusBanner(
+-        data = BackupStatusData.RestoringMedia(5755000.bytes, 1253.mebiBytes)
++        data = ArchiveRestoreProgressState(restoreState = RestoreState.RESTORING_MEDIA, restoreStatus = RestoreStatus.RESTORING, remainingRestoreSize = 800.mebiBytes, totalRestoreSize = 1024.mebiBytes)
+       )
+ 
+       HorizontalDivider()
+ 
+       BackupStatusBanner(
+-        data = BackupStatusData.RestoringMedia(
+-          bytesDownloaded = 55000.bytes,
+-          bytesTotal = 1253.mebiBytes,
+-          restoreStatus = BackupStatusData.RestoreStatus.WAITING_FOR_WIFI
+-        )
++        data = ArchiveRestoreProgressState(restoreState = RestoreState.CALCULATING_MEDIA, restoreStatus = RestoreStatus.RESTORING, remainingRestoreSize = 1024.mebiBytes, totalRestoreSize = 1024.mebiBytes)
+       )
+ 
+       HorizontalDivider()
+ 
+       BackupStatusBanner(
+-        data = BackupStatusData.RestoringMedia(
+-          bytesDownloaded = 55000.bytes,
+-          bytesTotal = 1253.mebiBytes,
+-          restoreStatus = BackupStatusData.RestoreStatus.WAITING_FOR_INTERNET
+-        )
++        data = ArchiveRestoreProgressState(restoreState = RestoreState.CANCELING_MEDIA, restoreStatus = RestoreStatus.RESTORING, remainingRestoreSize = 200.mebiBytes, totalRestoreSize = 1024.mebiBytes)
+       )
+ 
+       HorizontalDivider()
+ 
+       BackupStatusBanner(
+-        data = BackupStatusData.RestoringMedia(
+-          bytesDownloaded = 55000.bytes,
+-          bytesTotal = 1253.mebiBytes,
+-          restoreStatus = BackupStatusData.RestoreStatus.FINISHED
+-        )
++        data = ArchiveRestoreProgressState(restoreState = RestoreState.RESTORING_MEDIA, restoreStatus = RestoreStatus.WAITING_FOR_WIFI, remainingRestoreSize = 800.mebiBytes, totalRestoreSize = 1024.mebiBytes)
+       )
+ 
+       HorizontalDivider()
+ 
+       BackupStatusBanner(
+-        data = BackupStatusData.NotEnoughFreeSpace(40900.kibiBytes)
++        data = ArchiveRestoreProgressState(restoreState = RestoreState.RESTORING_MEDIA, restoreStatus = RestoreStatus.WAITING_FOR_INTERNET, remainingRestoreSize = 800.mebiBytes, totalRestoreSize = 1024.mebiBytes)
+       )
+ 
+       HorizontalDivider()
+ 
+       BackupStatusBanner(
+-        data = BackupStatusData.CouldNotCompleteBackup
++        data = ArchiveRestoreProgressState(restoreState = RestoreState.NONE, restoreStatus = RestoreStatus.FINISHED, remainingRestoreSize = 0.mebiBytes, totalRestoreSize = 0.mebiBytes, totalToRestoreThisRun = 1024.mebiBytes)
+       )
+ 
+       HorizontalDivider()
+ 
+       BackupStatusBanner(
+-        data = BackupStatusData.BackupFailed
+-      )
+-    }
+-  }
+-}
+-
+-/**
+- * Sealed interface describing status data to display in BackupStatus widget.
+- */
+-sealed interface BackupStatusData {
+-
+-  @get:DrawableRes
+-  val iconRes: Int
+-
+-  @get:Composable
+-  val title: String
+-
+-  val iconColors: BackupsIconColors
+-
+-  @get:StringRes
+-  val actionRes: Int get() = NONE
+-
+-  @get:Composable
+-  val status: String? get() = null
+-
+-  val progress: Float get() = NONE.toFloat()
+-
+-  val showDismissAction: Boolean get() = false
+-
+-  /**
+-   * Generic failure
+-   */
+-  data object CouldNotCompleteBackup : BackupStatusData {
+-    override val iconRes: Int = R.drawable.symbol_backup_error_24
+-
+-    override val title: String
+-      @Composable
+-      get() = stringResource(androidx.biometric.R.string.default_error_msg)
+-
+-    override val iconColors: BackupsIconColors = BackupsIconColors.Warning
+-  }
+-
+-  /**
+-   * Initial backup creation failure
+-   */
+-  data object BackupFailed : BackupStatusData {
+-    override val iconRes: Int = R.drawable.symbol_backup_error_24
+-
+-    override val title: String
+-      @Composable
+-      get() = stringResource(androidx.biometric.R.string.default_error_msg)
+-
+-    override val iconColors: BackupsIconColors = BackupsIconColors.Warning
+-  }
+-
+-  /**
+-   * User does not have enough space on their device to complete backup restoration
+-   */
+-  class NotEnoughFreeSpace(
+-    requiredSpace: ByteSize
+-  ) : BackupStatusData {
+-    val requiredSpace = requiredSpace.toUnitString()
+-
+-    override val iconRes: Int = R.drawable.symbol_backup_error_24
+-
+-    override val title: String
+-      @Composable
+-      get() = stringResource(R.string.BackupStatus__free_up_s_of_space_to_download_your_media, requiredSpace)
+-
+-    override val iconColors: BackupsIconColors = BackupsIconColors.Warning
+-    override val actionRes: Int = R.string.BackupStatus__details
+-  }
+-
+-  /**
+-   * Restoring media, finished, and paused states.
+-   */
+-  data class RestoringMedia(
+-    val bytesDownloaded: ByteSize = 0.bytes,
+-    val bytesTotal: ByteSize = 0.bytes,
+-    val restoreStatus: RestoreStatus = RestoreStatus.NORMAL
+-  ) : BackupStatusData {
+-    override val iconRes: Int = if (restoreStatus == RestoreStatus.FINISHED) R.drawable.symbol_check_circle_24 else R.drawable.symbol_backup_light
+-    override val iconColors: BackupsIconColors = when (restoreStatus) {
+-      RestoreStatus.FINISHED -> BackupsIconColors.Success
+-      RestoreStatus.NORMAL -> BackupsIconColors.Normal
+-      RestoreStatus.LOW_BATTERY,
+-      RestoreStatus.WAITING_FOR_INTERNET,
+-      RestoreStatus.WAITING_FOR_WIFI -> BackupsIconColors.Warning
+-    }
+-    override val showDismissAction: Boolean = restoreStatus == RestoreStatus.FINISHED
+-    override val actionRes: Int = when (restoreStatus) {
+-      RestoreStatus.WAITING_FOR_WIFI -> R.string.BackupStatus__resume
+-      else -> NONE
+-    }
+-
+-    override val title: String
+-      @Composable get() = stringResource(
+-        when (restoreStatus) {
+-          RestoreStatus.NORMAL -> R.string.BackupStatus__restoring_media
+-          RestoreStatus.LOW_BATTERY -> R.string.BackupStatus__restore_paused
+-          RestoreStatus.WAITING_FOR_INTERNET -> R.string.BackupStatus__restore_paused
+-          RestoreStatus.WAITING_FOR_WIFI -> R.string.BackupStatus__restore_paused
+-          RestoreStatus.FINISHED -> R.string.BackupStatus__restore_complete
+-        }
++        data = ArchiveRestoreProgressState(restoreState = RestoreState.RESTORING_MEDIA, restoreStatus = RestoreStatus.NOT_ENOUGH_DISK_SPACE, remainingRestoreSize = 500.mebiBytes, totalRestoreSize = 1024.mebiBytes)
+       )
+-
+-    override val status: String
+-      @Composable get() = when (restoreStatus) {
+-        RestoreStatus.NORMAL -> stringResource(
+-          R.string.BackupStatus__status_size_of_size,
+-          bytesDownloaded.toUnitString(),
+-          bytesTotal.toUnitString()
+-        )
+-
+-        RestoreStatus.LOW_BATTERY -> stringResource(R.string.BackupStatus__status_device_has_low_battery)
+-        RestoreStatus.WAITING_FOR_INTERNET -> stringResource(R.string.BackupStatus__status_no_internet)
+-        RestoreStatus.WAITING_FOR_WIFI -> stringResource(R.string.BackupStatus__status_waiting_for_wifi)
+-        RestoreStatus.FINISHED -> bytesTotal.toUnitString()
+-      }
+-
+-    override val progress: Float = if (bytesTotal.bytes > 0 && restoreStatus == RestoreStatus.NORMAL) {
+-      min(1f, max(0f, bytesDownloaded.bytes.toFloat() / bytesTotal.bytes.toFloat()))
+-    } else {
+-      NONE.toFloat()
+     }
+   }
+-
+-  /**
+-   * Describes the status of an in-progress media download session.
+-   */
+-  enum class RestoreStatus {
+-    NORMAL,
+-    LOW_BATTERY,
+-    WAITING_FOR_INTERNET,
+-    WAITING_FOR_WIFI,
+-    FINISHED
+-  }
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ui/status/BackupStatusRow.kt b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ui/status/BackupStatusRow.kt
+index 1312d58a975..825ab87e011 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ui/status/BackupStatusRow.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/backup/v2/ui/status/BackupStatusRow.kt
+@@ -5,48 +5,34 @@
+ 
+ package org.thoughtcrime.securesms.backup.v2.ui.status
+ 
+-import androidx.compose.foundation.background
+-import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.padding
+-import androidx.compose.foundation.layout.size
+-import androidx.compose.foundation.shape.CircleShape
+-import androidx.compose.foundation.text.InlineTextContent
+-import androidx.compose.foundation.text.appendInlineContent
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.IconButton
+ import androidx.compose.material3.LinearProgressIndicator
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.remember
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.res.dimensionResource
+ import androidx.compose.ui.res.painterResource
+ import androidx.compose.ui.res.stringResource
+-import androidx.compose.ui.text.AnnotatedString
+-import androidx.compose.ui.text.LinkAnnotation
+-import androidx.compose.ui.text.Placeholder
+-import androidx.compose.ui.text.PlaceholderVerticalAlign
+-import androidx.compose.ui.text.SpanStyle
+-import androidx.compose.ui.text.TextLinkStyles
+-import androidx.compose.ui.text.buildAnnotatedString
+-import androidx.compose.ui.text.withLink
+ import androidx.compose.ui.unit.dp
+-import androidx.compose.ui.unit.sp
+ import org.signal.core.ui.compose.Previews
+ import org.signal.core.ui.compose.Rows
+ import org.signal.core.ui.compose.SignalPreview
+-import org.signal.core.util.ByteSize
++import org.signal.core.util.mebiBytes
+ import org.thoughtcrime.securesms.R
++import org.thoughtcrime.securesms.backup.RestoreState
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgressState
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgressState.RestoreStatus
++import org.thoughtcrime.securesms.backup.v2.ui.BackupsIconColors
+ import kotlin.math.roundToInt
+ import org.signal.core.ui.R as CoreUiR
+ 
+-private val YELLOW_DOT = Color(0xFFFFCC00)
+-
+ /**
+  * Specifies what kind of restore this is. Slightly different messaging
+  * is utilized for downloads.
+@@ -69,11 +55,10 @@ enum class RestoreType {
+  */
+ @Composable
+ fun BackupStatusRow(
+-  backupStatusData: BackupStatusData,
++  backupStatusData: ArchiveRestoreProgressState,
+   restoreType: RestoreType = RestoreType.RESTORE,
+   onSkipClick: () -> Unit = {},
+-  onCancelClick: (() -> Unit)? = null,
+-  onLearnMoreClick: () -> Unit = {}
++  onCancelClick: (() -> Unit)? = null
+ ) {
+   val endPad = if (onCancelClick == null) {
+     dimensionResource(CoreUiR.dimen.gutter)
+@@ -84,183 +69,155 @@ fun BackupStatusRow(
+   Column(
+     modifier = Modifier.padding(top = 8.dp, bottom = 12.dp)
+   ) {
+-    if (backupStatusData !is BackupStatusData.CouldNotCompleteBackup &&
+-      backupStatusData !is BackupStatusData.BackupFailed
++    Row(
++      verticalAlignment = Alignment.CenterVertically,
++      modifier = Modifier.padding(
++        start = dimensionResource(CoreUiR.dimen.gutter),
++        end = endPad
++      )
+     ) {
+-      Row(
+-        verticalAlignment = Alignment.CenterVertically,
+-        modifier = Modifier.padding(
+-          start = dimensionResource(CoreUiR.dimen.gutter),
+-          end = endPad
+-        )
+-      ) {
+-        LinearProgressIndicator(
+-          color = progressColor(backupStatusData),
+-          progress = { backupStatusData.progress },
+-          modifier = Modifier.weight(1f).padding(vertical = 12.dp),
+-          gapSize = 0.dp,
+-          drawStopIndicator = {}
+-        )
++      LinearProgressIndicator(
++        color = progressColor(backupStatusData),
++        progress = { backupStatusData.progress ?: 0f },
++        modifier = Modifier.weight(1f).padding(vertical = 12.dp),
++        gapSize = 0.dp,
++        drawStopIndicator = {}
++      )
+ 
+-        val isFinished = backupStatusData is BackupStatusData.RestoringMedia && backupStatusData.restoreStatus == BackupStatusData.RestoreStatus.FINISHED
+-        if (onCancelClick != null && !isFinished) {
+-          IconButton(
+-            onClick = onCancelClick
+-          ) {
+-            Icon(
+-              painter = painterResource(R.drawable.symbol_x_24),
+-              contentDescription = stringResource(R.string.BackupStatusRow__cancel_download)
+-            )
+-          }
++      if (onCancelClick != null) {
++        IconButton(
++          onClick = onCancelClick
++        ) {
++          Icon(
++            painter = painterResource(R.drawable.symbol_x_24),
++            contentDescription = stringResource(R.string.BackupStatusRow__cancel_download)
++          )
+         }
+       }
+     }
+ 
+-    when (backupStatusData) {
+-      is BackupStatusData.RestoringMedia -> {
+-        val string = when (restoreType) {
+-          RestoreType.RESTORE -> getRestoringMediaString(backupStatusData)
+-          RestoreType.DOWNLOAD -> getDownloadingMediaString(backupStatusData)
+-        }
+-
+-        BackupAlertText(text = string)
+-      }
+-
+-      is BackupStatusData.NotEnoughFreeSpace -> {
+-        BackupAlertText(
+-          text = stringResource(
+-            R.string.BackupStatusRow__not_enough_space,
+-            backupStatusData.requiredSpace,
+-            "%d".format((backupStatusData.progress * 100).roundToInt())
+-          )
+-        )
+-
+-        Rows.TextRow(
+-          text = stringResource(R.string.BackupStatusRow__skip_download),
+-          onClick = onSkipClick
+-        )
+-      }
+-
+-      BackupStatusData.CouldNotCompleteBackup -> {
+-        val inlineContentMap = mapOf(
+-          "yellow_bullet" to InlineTextContent(
+-            Placeholder(20.sp, 12.sp, PlaceholderVerticalAlign.TextCenter)
+-          ) {
+-            Box(
+-              modifier = Modifier
+-                .size(12.dp)
+-                .background(color = YELLOW_DOT, shape = CircleShape)
+-            )
+-          }
+-        )
++    if (backupStatusData.restoreStatus == RestoreStatus.NOT_ENOUGH_DISK_SPACE) {
++      BackupAlertText(
++        text = stringResource(R.string.BackupStatusRow__not_enough_space, backupStatusData.remainingRestoreSize)
++      )
+ 
+-        BackupAlertText(
+-          text = buildAnnotatedString {
+-            appendInlineContent("yellow_bullet")
+-            append(" ")
+-            append(stringResource(R.string.BackupStatusRow__your_last_backup))
+-          },
+-          inlineContent = inlineContentMap
+-        )
++      Rows.TextRow(
++        text = stringResource(R.string.BackupStatusRow__skip_download),
++        onClick = onSkipClick
++      )
++    } else {
++      val string = when (restoreType) {
++        RestoreType.RESTORE -> getRestoringMediaString(backupStatusData)
++        RestoreType.DOWNLOAD -> getDownloadingMediaString(backupStatusData)
+       }
+-      BackupStatusData.BackupFailed -> {
+-        val inlineContentMap = mapOf(
+-          "yellow_bullet" to InlineTextContent(
+-            Placeholder(20.sp, 12.sp, PlaceholderVerticalAlign.TextCenter)
+-          ) {
+-            Box(
+-              modifier = Modifier
+-                .size(12.dp)
+-                .background(color = YELLOW_DOT, shape = CircleShape)
+-            )
+-          }
+-        )
+ 
+-        BackupAlertText(
+-          text = buildAnnotatedString {
+-            appendInlineContent("yellow_bullet")
+-            append(" ")
+-            append(stringResource(R.string.BackupStatusRow__your_last_backup_latest_version))
+-            append(" ")
+-            withLink(
+-              LinkAnnotation.Clickable(
+-                stringResource(R.string.BackupStatusRow__learn_more),
+-                styles = TextLinkStyles(style = SpanStyle(color = MaterialTheme.colorScheme.primary))
+-              ) {
+-                onLearnMoreClick()
+-              }
+-            ) {
+-              append(stringResource(R.string.BackupStatusRow__learn_more))
+-            }
+-          },
+-          inlineContent = inlineContentMap
+-        )
+-      }
++      BackupAlertText(text = string)
+     }
+   }
+ }
+ 
+ @Composable
+ private fun BackupAlertText(text: String) {
+-  BackupAlertText(
+-    text = remember(text) { AnnotatedString(text) },
+-    inlineContent = emptyMap()
+-  )
+-}
+-
+-@Composable
+-private fun BackupAlertText(text: AnnotatedString, inlineContent: Map<String, InlineTextContent>) {
+   Text(
+     text = text,
+     color = MaterialTheme.colorScheme.onSurfaceVariant,
+     style = MaterialTheme.typography.bodyMedium,
+-    modifier = Modifier.padding(horizontal = dimensionResource(CoreUiR.dimen.gutter)),
+-    inlineContent = inlineContent
++    modifier = Modifier.padding(horizontal = dimensionResource(CoreUiR.dimen.gutter))
+   )
+ }
+ 
+ @Composable
+-private fun getRestoringMediaString(backupStatusData: BackupStatusData.RestoringMedia): String {
+-  return when (backupStatusData.restoreStatus) {
+-    BackupStatusData.RestoreStatus.NORMAL -> {
++private fun getRestoringMediaString(backupStatusData: ArchiveRestoreProgressState): String {
++  return when (backupStatusData.restoreState) {
++    RestoreState.CALCULATING_MEDIA -> {
+       stringResource(
+         R.string.BackupStatusRow__restoring_s_of_s_s,
+-        backupStatusData.bytesDownloaded.toUnitString(2),
+-        backupStatusData.bytesTotal.toUnitString(2),
+-        "%d".format((backupStatusData.progress * 100).roundToInt())
++        backupStatusData.completedRestoredSize.toUnitString(2),
++        backupStatusData.totalRestoreSize.toUnitString(2),
++        "%d".format(((backupStatusData.progress ?: 0f) * 100).roundToInt())
+       )
+     }
+-    BackupStatusData.RestoreStatus.LOW_BATTERY -> stringResource(R.string.BackupStatusRow__restore_device_has_low_battery)
+-    BackupStatusData.RestoreStatus.WAITING_FOR_INTERNET -> stringResource(R.string.BackupStatusRow__restore_no_internet)
+-    BackupStatusData.RestoreStatus.WAITING_FOR_WIFI -> stringResource(R.string.BackupStatusRow__restore_waiting_for_wifi)
+-    BackupStatusData.RestoreStatus.FINISHED -> stringResource(R.string.BackupStatus__restore_complete)
++    RestoreState.CANCELING_MEDIA -> stringResource(R.string.BackupStatus__cancel_restore_media)
++    RestoreState.RESTORING_MEDIA -> {
++      when (backupStatusData.restoreStatus) {
++        RestoreStatus.RESTORING -> {
++          stringResource(
++            R.string.BackupStatusRow__restoring_s_of_s_s,
++            backupStatusData.completedRestoredSize.toUnitString(2),
++            backupStatusData.totalRestoreSize.toUnitString(2),
++            "%d".format(((backupStatusData.progress ?: 0f) * 100).roundToInt())
++          )
++        }
++        RestoreStatus.WAITING_FOR_INTERNET -> stringResource(R.string.BackupStatusRow__restore_no_internet)
++        RestoreStatus.WAITING_FOR_WIFI -> stringResource(R.string.BackupStatusRow__restore_waiting_for_wifi)
++        RestoreStatus.LOW_BATTERY -> stringResource(R.string.BackupStatusRow__restore_device_has_low_battery)
++        RestoreStatus.FINISHED -> stringResource(R.string.BackupStatus__restore_complete)
++        else -> throw IllegalStateException()
++      }
++    }
++    RestoreState.NONE -> {
++      if (backupStatusData.restoreStatus == RestoreStatus.FINISHED) {
++        stringResource(R.string.BackupStatus__restore_complete)
++      } else {
++        throw IllegalStateException()
++      }
++    }
++    RestoreState.PENDING,
++    RestoreState.RESTORING_DB -> throw IllegalStateException()
+   }
+ }
+ 
+ @Composable
+-private fun getDownloadingMediaString(backupStatusData: BackupStatusData.RestoringMedia): String {
+-  return when (backupStatusData.restoreStatus) {
+-    BackupStatusData.RestoreStatus.NORMAL -> {
++private fun getDownloadingMediaString(backupStatusData: ArchiveRestoreProgressState): String {
++  return when (backupStatusData.restoreState) {
++    RestoreState.CALCULATING_MEDIA -> {
+       stringResource(
+         R.string.BackupStatusRow__downloading_s_of_s_s,
+-        backupStatusData.bytesDownloaded.toUnitString(2),
+-        backupStatusData.bytesTotal.toUnitString(2),
+-        "%d".format((backupStatusData.progress * 100).roundToInt())
++        backupStatusData.completedRestoredSize.toUnitString(2),
++        backupStatusData.totalRestoreSize.toUnitString(2),
++        "%d".format(((backupStatusData.progress ?: 0f) * 100).roundToInt())
+       )
+     }
+-    BackupStatusData.RestoreStatus.LOW_BATTERY -> stringResource(R.string.BackupStatusRow__download_device_has_low_battery)
+-    BackupStatusData.RestoreStatus.WAITING_FOR_INTERNET -> stringResource(R.string.BackupStatusRow__download_no_internet)
+-    BackupStatusData.RestoreStatus.WAITING_FOR_WIFI -> stringResource(R.string.BackupStatusRow__download_waiting_for_wifi)
+-    BackupStatusData.RestoreStatus.FINISHED -> stringResource(R.string.BackupStatus__restore_complete)
++    RestoreState.CANCELING_MEDIA -> stringResource(R.string.BackupStatus__cancel_restore_media)
++    RestoreState.RESTORING_MEDIA -> {
++      when (backupStatusData.restoreStatus) {
++        RestoreStatus.RESTORING -> {
++          stringResource(
++            R.string.BackupStatusRow__downloading_s_of_s_s,
++            backupStatusData.completedRestoredSize.toUnitString(2),
++            backupStatusData.totalRestoreSize.toUnitString(2),
++            "%d".format(((backupStatusData.progress ?: 0f) * 100).roundToInt())
++          )
++        }
++        RestoreStatus.WAITING_FOR_INTERNET -> stringResource(R.string.BackupStatusRow__download_no_internet)
++        RestoreStatus.WAITING_FOR_WIFI -> stringResource(R.string.BackupStatusRow__download_waiting_for_wifi)
++        RestoreStatus.LOW_BATTERY -> stringResource(R.string.BackupStatusRow__download_device_has_low_battery)
++        RestoreStatus.FINISHED -> stringResource(R.string.BackupStatus__restore_complete)
++        else -> throw IllegalStateException()
++      }
++    }
++    RestoreState.NONE -> {
++      if (backupStatusData.restoreStatus == RestoreStatus.FINISHED) {
++        stringResource(R.string.BackupStatus__restore_complete)
++      } else {
++        throw IllegalStateException()
++      }
++    }
++    RestoreState.PENDING,
++    RestoreState.RESTORING_DB -> throw IllegalStateException()
+   }
+ }
+ 
+ @Composable
+-private fun progressColor(backupStatusData: BackupStatusData): Color {
+-  return if (backupStatusData is BackupStatusData.RestoringMedia && backupStatusData.restoreStatus == BackupStatusData.RestoreStatus.NORMAL) {
+-    MaterialTheme.colorScheme.primary
+-  } else {
+-    backupStatusData.iconColors.foreground
++private fun progressColor(backupStatusData: ArchiveRestoreProgressState): Color {
++  return when (backupStatusData.restoreStatus) {
++    RestoreStatus.RESTORING -> MaterialTheme.colorScheme.primary
++    RestoreStatus.WAITING_FOR_INTERNET,
++    RestoreStatus.WAITING_FOR_WIFI,
++    RestoreStatus.LOW_BATTERY,
++    RestoreStatus.NOT_ENOUGH_DISK_SPACE -> BackupsIconColors.Warning.foreground
++    RestoreStatus.FINISHED -> BackupsIconColors.Success.foreground
++    RestoreStatus.NONE -> BackupsIconColors.Normal.foreground
+   }
+ }
+ 
+@@ -269,11 +226,7 @@ private fun progressColor(backupStatusData: BackupStatusData): Color {
+ fun BackupStatusRowNormalPreview() {
+   Previews.Preview {
+     BackupStatusRow(
+-      backupStatusData = BackupStatusData.RestoringMedia(
+-        bytesTotal = ByteSize(100),
+-        bytesDownloaded = ByteSize(50),
+-        restoreStatus = BackupStatusData.RestoreStatus.NORMAL
+-      ),
++      backupStatusData = ArchiveRestoreProgressState(restoreState = RestoreState.RESTORING_MEDIA, restoreStatus = RestoreStatus.RESTORING, remainingRestoreSize = 800.mebiBytes, totalRestoreSize = 1024.mebiBytes),
+       onCancelClick = {}
+     )
+   }
+@@ -284,11 +237,7 @@ fun BackupStatusRowNormalPreview() {
+ fun BackupStatusRowWaitingForWifiPreview() {
+   Previews.Preview {
+     BackupStatusRow(
+-      backupStatusData = BackupStatusData.RestoringMedia(
+-        bytesTotal = ByteSize(100),
+-        bytesDownloaded = ByteSize(50),
+-        restoreStatus = BackupStatusData.RestoreStatus.WAITING_FOR_WIFI
+-      )
++      backupStatusData = ArchiveRestoreProgressState(restoreState = RestoreState.RESTORING_MEDIA, restoreStatus = RestoreStatus.WAITING_FOR_WIFI, remainingRestoreSize = 800.mebiBytes, totalRestoreSize = 1024.mebiBytes)
+     )
+   }
+ }
+@@ -298,11 +247,7 @@ fun BackupStatusRowWaitingForWifiPreview() {
+ fun BackupStatusRowWaitingForInternetPreview() {
+   Previews.Preview {
+     BackupStatusRow(
+-      backupStatusData = BackupStatusData.RestoringMedia(
+-        bytesTotal = ByteSize(100),
+-        bytesDownloaded = ByteSize(50),
+-        restoreStatus = BackupStatusData.RestoreStatus.WAITING_FOR_INTERNET
+-      )
++      backupStatusData = ArchiveRestoreProgressState(restoreState = RestoreState.RESTORING_MEDIA, restoreStatus = RestoreStatus.WAITING_FOR_INTERNET, remainingRestoreSize = 800.mebiBytes, totalRestoreSize = 1024.mebiBytes)
+     )
+   }
+ }
+@@ -312,11 +257,7 @@ fun BackupStatusRowWaitingForInternetPreview() {
+ fun BackupStatusRowLowBatteryPreview() {
+   Previews.Preview {
+     BackupStatusRow(
+-      backupStatusData = BackupStatusData.RestoringMedia(
+-        bytesTotal = ByteSize(100),
+-        bytesDownloaded = ByteSize(50),
+-        restoreStatus = BackupStatusData.RestoreStatus.LOW_BATTERY
+-      )
++      backupStatusData = ArchiveRestoreProgressState(restoreState = RestoreState.RESTORING_MEDIA, restoreStatus = RestoreStatus.LOW_BATTERY, remainingRestoreSize = 800.mebiBytes, totalRestoreSize = 1024.mebiBytes)
+     )
+   }
+ }
+@@ -326,11 +267,8 @@ fun BackupStatusRowLowBatteryPreview() {
+ fun BackupStatusRowFinishedPreview() {
+   Previews.Preview {
+     BackupStatusRow(
+-      backupStatusData = BackupStatusData.RestoringMedia(
+-        bytesTotal = ByteSize(100),
+-        bytesDownloaded = ByteSize(50),
+-        restoreStatus = BackupStatusData.RestoreStatus.FINISHED
+-      )
++      backupStatusData = ArchiveRestoreProgressState(restoreState = RestoreState.NONE, restoreStatus = RestoreStatus.FINISHED, remainingRestoreSize = 0.mebiBytes, totalRestoreSize = 0.mebiBytes, totalToRestoreThisRun = 1024.mebiBytes),
++      onCancelClick = {}
+     )
+   }
+ }
+@@ -340,29 +278,7 @@ fun BackupStatusRowFinishedPreview() {
+ fun BackupStatusRowNotEnoughFreeSpacePreview() {
+   Previews.Preview {
+     BackupStatusRow(
+-      backupStatusData = BackupStatusData.NotEnoughFreeSpace(
+-        requiredSpace = ByteSize(50)
+-      )
+-    )
+-  }
+-}
+-
+-@SignalPreview
+-@Composable
+-fun BackupStatusRowCouldNotCompleteBackupPreview() {
+-  Previews.Preview {
+-    BackupStatusRow(
+-      backupStatusData = BackupStatusData.CouldNotCompleteBackup
+-    )
+-  }
+-}
+-
+-@SignalPreview
+-@Composable
+-fun BackupStatusRowBackupFailedPreview() {
+-  Previews.Preview {
+-    BackupStatusRow(
+-      backupStatusData = BackupStatusData.BackupFailed
++      backupStatusData = ArchiveRestoreProgressState(restoreState = RestoreState.RESTORING_MEDIA, restoreStatus = RestoreStatus.NOT_ENOUGH_DISK_SPACE, remainingRestoreSize = 500.mebiBytes, totalRestoreSize = 1024.mebiBytes)
+     )
+   }
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/banner/banners/MediaRestoreProgressBanner.kt b/app/src/main/java/org/thoughtcrime/securesms/banner/banners/MediaRestoreProgressBanner.kt
+index 2362ab01259..d164f5df017 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/banner/banners/MediaRestoreProgressBanner.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/banner/banners/MediaRestoreProgressBanner.kt
+@@ -5,143 +5,53 @@
+ 
+ package org.thoughtcrime.securesms.banner.banners
+ 
+-import android.content.BroadcastReceiver
+-import android.content.Context
+-import android.content.Intent
+-import android.content.IntentFilter
+-import android.net.ConnectivityManager
+ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.runtime.Composable
+-import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+-import kotlinx.coroutines.channels.awaitClose
+ import kotlinx.coroutines.flow.Flow
+-import kotlinx.coroutines.flow.callbackFlow
+-import kotlinx.coroutines.flow.flatMapLatest
+-import kotlinx.coroutines.flow.flowOf
+-import kotlinx.coroutines.flow.flowOn
+-import kotlinx.coroutines.flow.map
+-import org.signal.core.util.bytes
+-import org.signal.core.util.throttleLatest
++import kotlinx.coroutines.flow.filter
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgress
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgressState
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgressState.RestoreStatus
+ import org.thoughtcrime.securesms.backup.v2.ui.status.BackupStatusBanner
+-import org.thoughtcrime.securesms.backup.v2.ui.status.BackupStatusData
+ import org.thoughtcrime.securesms.banner.Banner
+-import org.thoughtcrime.securesms.database.DatabaseObserver
+-import org.thoughtcrime.securesms.database.SignalDatabase
+-import org.thoughtcrime.securesms.dependencies.AppDependencies
+-import org.thoughtcrime.securesms.jobmanager.impl.BatteryNotLowConstraint
+-import org.thoughtcrime.securesms.jobmanager.impl.NetworkConstraint
+-import org.thoughtcrime.securesms.jobmanager.impl.WifiConstraint
+-import org.thoughtcrime.securesms.keyvalue.SignalStore
+-import org.thoughtcrime.securesms.util.safeUnregisterReceiver
+-import kotlin.time.Duration.Companion.seconds
+ 
+ @OptIn(ExperimentalCoroutinesApi::class)
+-class MediaRestoreProgressBanner(private val listener: RestoreProgressBannerListener = EmptyListener) : Banner<BackupStatusData>() {
+-
+-  private var totalRestoredSize: Long = 0
++class MediaRestoreProgressBanner(private val listener: RestoreProgressBannerListener = EmptyListener) : Banner<ArchiveRestoreProgressState>() {
+ 
+   override val enabled: Boolean
+-    get() = SignalStore.backup.isMediaRestoreInProgress || totalRestoredSize > 0
+-
+-  override val dataFlow: Flow<BackupStatusData> by lazy {
+-    SignalStore
+-      .backup
+-      .totalRestorableAttachmentSizeFlow
+-      .flatMapLatest { size ->
+-        when {
+-          size > 0 -> {
+-            totalRestoredSize = size
+-            getActiveRestoreFlow()
+-          }
+-
+-          totalRestoredSize > 0 -> {
+-            flowOf(
+-              BackupStatusData.RestoringMedia(
+-                bytesTotal = totalRestoredSize.bytes,
+-                restoreStatus = BackupStatusData.RestoreStatus.FINISHED
+-              )
+-            )
+-          }
++    get() = ArchiveRestoreProgress.state.let { it.restoreState.isMediaRestoreOperation || it.restoreStatus == RestoreStatus.FINISHED }
+ 
+-          else -> flowOf(BackupStatusData.RestoringMedia())
+-        }
++  override val dataFlow: Flow<ArchiveRestoreProgressState> by lazy {
++    ArchiveRestoreProgress
++      .stateFlow
++      .filter {
++        it.restoreStatus != RestoreStatus.NONE && (it.restoreState.isMediaRestoreOperation || it.restoreStatus == RestoreStatus.FINISHED)
+       }
+   }
+ 
+   @Composable
+-  override fun DisplayBanner(model: BackupStatusData, contentPadding: PaddingValues) {
++  override fun DisplayBanner(model: ArchiveRestoreProgressState, contentPadding: PaddingValues) {
+     BackupStatusBanner(
+       data = model,
+       onBannerClick = listener::onBannerClick,
+       onActionClick = listener::onActionClick,
+       onDismissClick = {
+-        totalRestoredSize = 0
++        ArchiveRestoreProgress.clearFinishedStatus()
+         listener.onDismissComplete()
+       }
+     )
+   }
+ 
+-  private fun getActiveRestoreFlow(): Flow<BackupStatusData> {
+-    val flow: Flow<Unit> = callbackFlow {
+-      val onChange = { trySend(Unit) }
+-
+-      val observer = DatabaseObserver.Observer {
+-        onChange()
+-      }
+-
+-      val receiver = object : BroadcastReceiver() {
+-        override fun onReceive(context: Context, intent: Intent) {
+-          onChange()
+-        }
+-      }
+-
+-      onChange()
+-
+-      AppDependencies.databaseObserver.registerAttachmentUpdatedObserver(observer)
+-      AppDependencies.application.registerReceiver(receiver, IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION))
+-      AppDependencies.application.registerReceiver(receiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+-
+-      awaitClose {
+-        AppDependencies.databaseObserver.unregisterObserver(observer)
+-        AppDependencies.application.safeUnregisterReceiver(receiver)
+-      }
+-    }
+-
+-    return flow
+-      .throttleLatest(1.seconds)
+-      .map {
+-        val totalRestoreSize = SignalStore.backup.totalRestorableAttachmentSize
+-        val remainingAttachmentSize = SignalDatabase.attachments.getRemainingRestorableAttachmentSize()
+-        val completedBytes = totalRestoreSize - remainingAttachmentSize
+-
+-        when {
+-          !WifiConstraint.isMet(AppDependencies.application) && !SignalStore.backup.restoreWithCellular -> BackupStatusData.RestoringMedia(completedBytes.bytes, totalRestoreSize.bytes, BackupStatusData.RestoreStatus.WAITING_FOR_WIFI)
+-          !NetworkConstraint.isMet(AppDependencies.application) -> BackupStatusData.RestoringMedia(completedBytes.bytes, totalRestoreSize.bytes, BackupStatusData.RestoreStatus.WAITING_FOR_INTERNET)
+-          !BatteryNotLowConstraint.isMet() -> BackupStatusData.RestoringMedia(completedBytes.bytes, totalRestoreSize.bytes, BackupStatusData.RestoreStatus.LOW_BATTERY)
+-          else -> {
+-            val availableBytes = SignalStore.backup.spaceAvailableOnDiskBytes
+-
+-            if (availableBytes > -1L && remainingAttachmentSize > availableBytes) {
+-              BackupStatusData.NotEnoughFreeSpace(requiredSpace = remainingAttachmentSize.bytes)
+-            } else {
+-              BackupStatusData.RestoringMedia(completedBytes.bytes, totalRestoreSize.bytes)
+-            }
+-          }
+-        }
+-      }
+-      .flowOn(Dispatchers.IO)
+-  }
+-
+   interface RestoreProgressBannerListener {
+     fun onBannerClick()
+-    fun onActionClick(data: BackupStatusData)
++    fun onActionClick(data: ArchiveRestoreProgressState)
+     fun onDismissComplete()
+   }
+ 
+   private object EmptyListener : RestoreProgressBannerListener {
+     override fun onBannerClick() = Unit
+-    override fun onActionClick(data: BackupStatusData) = Unit
++    override fun onActionClick(data: ArchiveRestoreProgressState) = Unit
+     override fun onDismissComplete() = Unit
+   }
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/BackupRestoreState.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/BackupRestoreState.kt
+index d6c1acbee01..b26d809eef6 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/BackupRestoreState.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/BackupRestoreState.kt
+@@ -5,17 +5,13 @@
+ 
+ package org.thoughtcrime.securesms.components.settings.app.backups.remote
+ 
+-import org.thoughtcrime.securesms.backup.v2.ui.status.BackupStatusData
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgressState
+ 
+ /**
+  * State container for BackupStatusData, including the enabled state.
+  */
+ sealed interface BackupRestoreState {
+   data object None : BackupRestoreState
+-  data class Ready(
+-    val bytes: String
+-  ) : BackupRestoreState
+-  data class FromBackupStatusData(
+-    val backupStatusData: BackupStatusData
+-  ) : BackupRestoreState
++  data class Ready(val bytes: String) : BackupRestoreState
++  data class Restoring(val state: ArchiveRestoreProgressState) : BackupRestoreState
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/RemoteBackupsSettingsFragment.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/RemoteBackupsSettingsFragment.kt
+index bb881d775d5..2a82c6943c1 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/RemoteBackupsSettingsFragment.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/RemoteBackupsSettingsFragment.kt
+@@ -90,11 +90,14 @@ import org.thoughtcrime.securesms.DevicePinAuthEducationSheet
+ import org.thoughtcrime.securesms.R
+ import org.thoughtcrime.securesms.backup.ArchiveUploadProgress
+ import org.thoughtcrime.securesms.backup.DeletionState
++import org.thoughtcrime.securesms.backup.RestoreState
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgressState
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgressState.RestoreStatus
+ import org.thoughtcrime.securesms.backup.v2.BackupFrequency
+ import org.thoughtcrime.securesms.backup.v2.MessageBackupTier
+ import org.thoughtcrime.securesms.backup.v2.ui.BackupAlert
+ import org.thoughtcrime.securesms.backup.v2.ui.BackupAlertBottomSheet
+-import org.thoughtcrime.securesms.backup.v2.ui.status.BackupStatusData
++import org.thoughtcrime.securesms.backup.v2.ui.status.BackupCreateErrorRow
+ import org.thoughtcrime.securesms.backup.v2.ui.status.BackupStatusRow
+ import org.thoughtcrime.securesms.backup.v2.ui.status.RestoreType
+ import org.thoughtcrime.securesms.backup.v2.ui.subscription.MessageBackupsType
+@@ -222,7 +225,7 @@ class RemoteBackupsSettingsFragment : ComposeFragment() {
+     }
+ 
+     override fun onCancelMediaRestore() {
+-      viewModel.requestDialog(RemoteBackupsSettingsState.Dialog.CANCEL_MEDIA_RESTORE_PROTECTION)
++      viewModel.cancelMediaRestore()
+     }
+ 
+     override fun onDisplaySkipMediaRestoreProtectionDialog() {
+@@ -512,28 +515,28 @@ private fun RemoteBackupsSettingsContent(
+         )
+       } else if (state.backupsEnabled) {
+         appendBackupDetailsItems(
+-          backupState = state.backupState,
+-          canViewBackupKey = state.canViewBackupKey,
++          state = state,
+           backupRestoreState = backupRestoreState,
+           backupProgress = backupProgress,
+-          canBackupMessagesRun = state.canBackupMessagesJobRun,
+-          lastBackupTimestamp = state.lastBackupTimestamp,
+-          backupMediaSize = state.backupMediaSize,
+-          canBackUpUsingCellular = state.canBackUpUsingCellular,
+-          canRestoreUsingCellular = state.canRestoreUsingCellular,
+-          canBackUpNow = !state.isOutOfStorageSpace,
+-          includeDebuglog = state.includeDebuglog,
+-          backupMediaDetails = state.backupMediaDetails,
+           contentCallbacks = contentCallbacks
+         )
+       } else {
+-        if (backupRestoreState is BackupRestoreState.FromBackupStatusData) {
++        if (state.showBackupCreateFailedError || state.showBackupCreateCouldNotCompleteError) {
++          item {
++            BackupCreateErrorRow(
++              showCouldNotComplete = state.showBackupCreateCouldNotCompleteError,
++              showBackupFailed = state.showBackupCreateFailedError,
++              onLearnMoreClick = contentCallbacks::onLearnMoreAboutBackupFailure
++            )
++          }
++        }
++
++        if (backupRestoreState is BackupRestoreState.Restoring) {
+           item {
+             BackupStatusRow(
+-              backupStatusData = backupRestoreState.backupStatusData,
++              backupStatusData = backupRestoreState.state,
+               onCancelClick = contentCallbacks::onCancelMediaRestore,
+-              onSkipClick = contentCallbacks::onSkipMediaRestore,
+-              onLearnMoreClick = contentCallbacks::onLearnMoreAboutBackupFailure
++              onSkipClick = contentCallbacks::onSkipMediaRestore
+             )
+           }
+         }
+@@ -665,24 +668,24 @@ private fun ReenableBackupsButton(contentCallbacks: ContentCallbacks) {
+ }
+ 
+ private fun LazyListScope.appendRestoreFromBackupStatusData(
+-  backupRestoreState: BackupRestoreState.FromBackupStatusData,
++  backupRestoreState: BackupRestoreState.Restoring,
+   canRestoreUsingCellular: Boolean,
+   contentCallbacks: ContentCallbacks,
+   isCancelable: Boolean = true
+ ) {
+   item {
+     BackupStatusRow(
+-      backupStatusData = backupRestoreState.backupStatusData,
++      backupStatusData = backupRestoreState.state,
+       restoreType = if (isCancelable) RestoreType.DOWNLOAD else RestoreType.RESTORE,
+       onCancelClick = if (isCancelable) contentCallbacks::onCancelMediaRestore else null,
+-      onSkipClick = contentCallbacks::onDisplaySkipMediaRestoreProtectionDialog,
+-      onLearnMoreClick = contentCallbacks::onLearnMoreAboutBackupFailure
++      onSkipClick = contentCallbacks::onDisplaySkipMediaRestoreProtectionDialog
+     )
+   }
+ 
+-  val displayResumeButton = when (val data = backupRestoreState.backupStatusData) {
+-    is BackupStatusData.RestoringMedia -> !canRestoreUsingCellular && data.restoreStatus == BackupStatusData.RestoreStatus.WAITING_FOR_WIFI
+-    else -> false
++  val displayResumeButton = if (backupRestoreState.state.restoreState == RestoreState.RESTORING_MEDIA) {
++    !canRestoreUsingCellular && backupRestoreState.state.restoreStatus == RestoreStatus.WAITING_FOR_WIFI
++  } else {
++    false
+   }
+ 
+   if (displayResumeButton) {
+@@ -744,7 +747,7 @@ private fun LazyListScope.appendBackupDeletionItems(
+         )
+       }
+ 
+-      if (backupRestoreState is BackupRestoreState.FromBackupStatusData) {
++      if (backupRestoreState is BackupRestoreState.Restoring) {
+         appendRestoreFromBackupStatusData(
+           backupRestoreState = backupRestoreState,
+           canRestoreUsingCellular = canRestoreUsingCellular,
+@@ -754,7 +757,9 @@ private fun LazyListScope.appendBackupDeletionItems(
+       } else {
+         item {
+           LinearProgressIndicator(
+-            modifier = Modifier.horizontalGutters().fillMaxWidth()
++            modifier = Modifier
++              .horizontalGutters()
++              .fillMaxWidth()
+           )
+         }
+       }
+@@ -819,18 +824,9 @@ private fun DescriptionText(
+ }
+ 
+ private fun LazyListScope.appendBackupDetailsItems(
+-  backupState: BackupState,
+-  canViewBackupKey: Boolean,
++  state: RemoteBackupsSettingsState,
+   backupRestoreState: BackupRestoreState,
+   backupProgress: ArchiveUploadProgressState?,
+-  canBackupMessagesRun: Boolean,
+-  lastBackupTimestamp: Long,
+-  backupMediaSize: Long,
+-  canBackUpUsingCellular: Boolean,
+-  canRestoreUsingCellular: Boolean,
+-  canBackUpNow: Boolean,
+-  includeDebuglog: Boolean?,
+-  backupMediaDetails: RemoteBackupsSettingsState.BackupMediaDetails?,
+   contentCallbacks: ContentCallbacks
+ ) {
+   item {
+@@ -841,45 +837,55 @@ private fun LazyListScope.appendBackupDetailsItems(
+     Texts.SectionHeader(text = stringResource(id = R.string.RemoteBackupsSettingsFragment__backup_details))
+   }
+ 
+-  if (backupMediaDetails != null) {
++  if (state.backupMediaDetails != null) {
+     item {
+       Column(modifier = Modifier.horizontalGutters()) {
+         Text("[Internal Only] Backup Media Details")
+-        Text("Awaiting Restore: ${backupMediaDetails.awaitingRestore.toUnitString()}")
+-        Text("Offloaded: ${backupMediaDetails.offloaded.toUnitString()}")
++        Text("Awaiting Restore: ${state.backupMediaDetails.awaitingRestore.toUnitString()}")
++        Text("Offloaded: ${state.backupMediaDetails.offloaded.toUnitString()}")
+       }
+     }
+   }
+ 
++  if (state.showBackupCreateFailedError || state.showBackupCreateCouldNotCompleteError) {
++    item {
++      BackupCreateErrorRow(
++        showCouldNotComplete = state.showBackupCreateCouldNotCompleteError,
++        showBackupFailed = state.showBackupCreateFailedError,
++        onLearnMoreClick = contentCallbacks::onLearnMoreAboutBackupFailure
++      )
++    }
++  }
++
+   if (backupRestoreState !is BackupRestoreState.None) {
+-    if (backupRestoreState is BackupRestoreState.FromBackupStatusData) {
++    if (backupRestoreState is BackupRestoreState.Restoring) {
+       appendRestoreFromBackupStatusData(
+         backupRestoreState = backupRestoreState,
+-        canRestoreUsingCellular = canRestoreUsingCellular,
++        canRestoreUsingCellular = state.canRestoreUsingCellular,
+         contentCallbacks = contentCallbacks
+       )
+     } else if (backupRestoreState is BackupRestoreState.Ready) {
+       item {
+         BackupReadyToDownloadRow(
+           ready = backupRestoreState,
+-          backupState = backupState,
++          backupState = state.backupState,
+           onDownloadClick = contentCallbacks::onStartMediaRestore
+         )
+       }
+     }
+   }
+ 
+-  if (includeDebuglog != null) {
++  if (state.includeDebuglog != null) {
+     item {
+-      IncludeDebuglogRow(includeDebuglog) { contentCallbacks.onIncludeDebuglogClick(it) }
++      IncludeDebuglogRow(state.includeDebuglog) { contentCallbacks.onIncludeDebuglogClick(it) }
+     }
+   }
+ 
+   if (backupProgress == null || backupProgress.state == ArchiveUploadProgressState.State.None || backupProgress.state == ArchiveUploadProgressState.State.UserCanceled) {
+     item {
+       LastBackupRow(
+-        lastBackupTimestamp = lastBackupTimestamp,
+-        enabled = canBackUpNow,
++        lastBackupTimestamp = state.lastBackupTimestamp,
++        enabled = !state.isOutOfStorageSpace,
+         onBackupNowClick = contentCallbacks::onBackupNowClick
+       )
+     }
+@@ -887,19 +893,19 @@ private fun LazyListScope.appendBackupDetailsItems(
+     item {
+       InProgressBackupRow(
+         archiveUploadProgressState = backupProgress,
+-        canBackupMessagesRun = canBackupMessagesRun,
+-        canBackupUsingCellular = canBackUpUsingCellular,
++        canBackupMessagesRun = state.canBackupMessagesJobRun,
++        canBackupUsingCellular = state.canBackUpUsingCellular,
+         cancelArchiveUpload = contentCallbacks::onCancelUploadClick
+       )
+     }
+   }
+ 
+-  if (backupState !is BackupState.ActiveFree) {
++  if (state.backupState !is BackupState.ActiveFree) {
+     item {
+-      val sizeText = if (backupMediaSize < 0L) {
++      val sizeText = if (state.backupMediaSize < 0L) {
+         stringResource(R.string.RemoteBackupsSettingsFragment__calculating)
+       } else {
+-        backupMediaSize.bytes.toUnitString()
++        state.backupMediaSize.bytes.toUnitString()
+       }
+ 
+       Rows.TextRow(text = {
+@@ -941,7 +947,7 @@ private fun LazyListScope.appendBackupDetailsItems(
+ 
+   item {
+     Rows.ToggleRow(
+-      checked = canBackUpUsingCellular,
++      checked = state.canBackUpUsingCellular,
+       text = stringResource(id = R.string.RemoteBackupsSettingsFragment__back_up_using_cellular),
+       onCheckChanged = contentCallbacks::onBackUpUsingCellularClick
+     )
+@@ -951,7 +957,7 @@ private fun LazyListScope.appendBackupDetailsItems(
+     Rows.TextRow(
+       text = stringResource(R.string.RemoteBackupsSettingsFragment__view_backup_key),
+       onClick = contentCallbacks::onViewBackupKeyClick,
+-      enabled = canViewBackupKey
++      enabled = state.canViewBackupKey
+     )
+   }
+ 
+@@ -1112,13 +1118,17 @@ private fun OutOfStorageSpaceBlock(
+   Dividers.Default()
+ 
+   Row(
+-    modifier = Modifier.horizontalGutters().padding(vertical = 12.dp)
++    modifier = Modifier
++      .horizontalGutters()
++      .padding(vertical = 12.dp)
+   ) {
+     Icon(
+       imageVector = ImageVector.vectorResource(R.drawable.symbol_error_circle_fill_24),
+       tint = MaterialTheme.colorScheme.error,
+       contentDescription = null,
+-      modifier = Modifier.padding(top = 4.dp, end = 4.dp, start = 2.dp).size(20.dp)
++      modifier = Modifier
++        .padding(top = 4.dp, end = 4.dp, start = 2.dp)
++        .size(20.dp)
+     )
+ 
+     Column {
+@@ -1716,7 +1726,7 @@ private fun RemoteBackupsSettingsContentPreview() {
+       ),
+       statusBarColorNestedScrollConnection = null,
+       backupDeleteState = DeletionState.NONE,
+-      backupRestoreState = BackupRestoreState.FromBackupStatusData(BackupStatusData.CouldNotCompleteBackup),
++      backupRestoreState = BackupRestoreState.None,
+       contentCallbacks = ContentCallbacks.Empty,
+       backupProgress = null
+     )
+@@ -1745,7 +1755,7 @@ private fun RemoteBackupsSettingsInternalUserContentPreview() {
+       ),
+       statusBarColorNestedScrollConnection = null,
+       backupDeleteState = DeletionState.NONE,
+-      backupRestoreState = BackupRestoreState.FromBackupStatusData(BackupStatusData.CouldNotCompleteBackup),
++      backupRestoreState = BackupRestoreState.None,
+       contentCallbacks = ContentCallbacks.Empty,
+       backupProgress = null
+     )
+@@ -2047,11 +2057,8 @@ private fun BackupDeletionCardPreview() {
+       for (state in DeletionState.entries.filter { it.hasUx() }) {
+         appendBackupDeletionItems(
+           backupDeleteState = state,
+-          backupRestoreState = BackupRestoreState.FromBackupStatusData(
+-            backupStatusData = BackupStatusData.RestoringMedia(
+-              bytesDownloaded = 80.mebiBytes,
+-              bytesTotal = 3.gibiBytes
+-            )
++          backupRestoreState = BackupRestoreState.Restoring(
++            state = ArchiveRestoreProgressState(restoreState = RestoreState.RESTORING_MEDIA, restoreStatus = RestoreStatus.RESTORING, remainingRestoreSize = 800.mebiBytes, totalRestoreSize = 1024.mebiBytes)
+           ),
+           contentCallbacks = ContentCallbacks.Empty,
+           canRestoreUsingCellular = true
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/RemoteBackupsSettingsState.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/RemoteBackupsSettingsState.kt
+index 8674000a5d5..c5e343f8b81 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/RemoteBackupsSettingsState.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/RemoteBackupsSettingsState.kt
+@@ -28,7 +28,9 @@ data class RemoteBackupsSettingsState(
+   val snackbar: Snackbar = Snackbar.NONE,
+   val includeDebuglog: Boolean? = null,
+   val canBackupMessagesJobRun: Boolean = false,
+-  val backupMediaDetails: BackupMediaDetails? = null
++  val backupMediaDetails: BackupMediaDetails? = null,
++  val showBackupCreateFailedError: Boolean = false,
++  val showBackupCreateCouldNotCompleteError: Boolean = false
+ ) {
+ 
+   data class BackupMediaDetails(
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/RemoteBackupsSettingsViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/RemoteBackupsSettingsViewModel.kt
+index 84deabb1012..fc8c78b64dc 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/RemoteBackupsSettingsViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/backups/remote/RemoteBackupsSettingsViewModel.kt
+@@ -30,10 +30,10 @@ import org.signal.core.util.throttleLatest
+ import org.signal.donations.InAppPaymentType
+ import org.thoughtcrime.securesms.backup.ArchiveUploadProgress
+ import org.thoughtcrime.securesms.backup.DeletionState
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgress
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgressState.RestoreStatus
+ import org.thoughtcrime.securesms.backup.v2.BackupRepository
+ import org.thoughtcrime.securesms.backup.v2.MessageBackupTier
+-import org.thoughtcrime.securesms.backup.v2.ui.status.BackupStatusData
+-import org.thoughtcrime.securesms.banner.banners.MediaRestoreProgressBanner
+ import org.thoughtcrime.securesms.components.settings.app.backups.BackupStateObserver
+ import org.thoughtcrime.securesms.components.settings.app.subscription.InAppPaymentsRepository
+ import org.thoughtcrime.securesms.database.InAppPaymentTable
+@@ -70,7 +70,9 @@ class RemoteBackupsSettingsViewModel : ViewModel() {
+       lastBackupTimestamp = SignalStore.backup.lastBackupTime,
+       canBackUpUsingCellular = SignalStore.backup.backupWithCellular,
+       canRestoreUsingCellular = SignalStore.backup.restoreWithCellular,
+-      includeDebuglog = SignalStore.internal.includeDebuglogInBackup.takeIf { RemoteConfig.internalUser }
++      includeDebuglog = SignalStore.internal.includeDebuglogInBackup.takeIf { RemoteConfig.internalUser },
++      showBackupCreateFailedError = BackupRepository.shouldDisplayBackupFailedSettingsRow(),
++      showBackupCreateCouldNotCompleteError = BackupRepository.shouldDisplayCouldNotCompleteBackupSettingsRow()
+     )
+   )
+ 
+@@ -111,16 +113,14 @@ class RemoteBackupsSettingsViewModel : ViewModel() {
+     }
+ 
+     viewModelScope.launch(Dispatchers.IO) {
+-      val restoreProgress = MediaRestoreProgressBanner()
+-
+       var optimizedRemainingBytes = 0L
+       while (isActive) {
+-        if (restoreProgress.enabled) {
++        if (ArchiveRestoreProgress.state.let { it.restoreState.isMediaRestoreOperation || it.restoreStatus == RestoreStatus.FINISHED }) {
+           Log.d(TAG, "Backup is being restored. Collecting updates.")
+-          restoreProgress
+-            .dataFlow
+-            .onEach { latest -> _restoreState.update { BackupRestoreState.FromBackupStatusData(latest) } }
+-            .takeWhile { it !is BackupStatusData.RestoringMedia || it.restoreStatus != BackupStatusData.RestoreStatus.FINISHED }
++          ArchiveRestoreProgress
++            .stateFlow
++            .takeWhile { it.restoreState.isMediaRestoreOperation || it.restoreStatus == RestoreStatus.FINISHED }
++            .onEach { latest -> _restoreState.update { BackupRestoreState.Restoring(latest) } }
+             .collect()
+         } else if (
+           !SignalStore.backup.optimizeStorage &&
+@@ -130,10 +130,6 @@ class RemoteBackupsSettingsViewModel : ViewModel() {
+           _restoreState.update { BackupRestoreState.Ready(optimizedRemainingBytes.bytes.toUnitString()) }
+         } else if (SignalStore.backup.totalRestorableAttachmentSize > 0L) {
+           _restoreState.update { BackupRestoreState.Ready(SignalStore.backup.totalRestorableAttachmentSize.bytes.toUnitString()) }
+-        } else if (BackupRepository.shouldDisplayBackupFailedSettingsRow()) {
+-          _restoreState.update { BackupRestoreState.FromBackupStatusData(BackupStatusData.BackupFailed) }
+-        } else if (BackupRepository.shouldDisplayCouldNotCompleteBackupSettingsRow()) {
+-          _restoreState.update { BackupRestoreState.FromBackupStatusData(BackupStatusData.CouldNotCompleteBackup) }
+         } else {
+           _restoreState.update { BackupRestoreState.None }
+         }
+@@ -186,6 +182,14 @@ class RemoteBackupsSettingsViewModel : ViewModel() {
+     BackupRepository.resumeMediaRestore()
+   }
+ 
++  fun cancelMediaRestore() {
++    if (ArchiveRestoreProgress.state.restoreStatus == RestoreStatus.FINISHED) {
++      ArchiveRestoreProgress.clearFinishedStatus()
++    } else {
++      requestDialog(RemoteBackupsSettingsState.Dialog.CANCEL_MEDIA_RESTORE_PROTECTION)
++    }
++  }
++
+   fun skipMediaRestore() {
+     BackupRepository.skipMediaRestore()
+ 
+@@ -295,7 +299,9 @@ class RemoteBackupsSettingsViewModel : ViewModel() {
+         canBackUpUsingCellular = SignalStore.backup.backupWithCellular,
+         canRestoreUsingCellular = SignalStore.backup.restoreWithCellular,
+         isOutOfStorageSpace = BackupRepository.shouldDisplayOutOfRemoteStorageSpaceUx(),
+-        hasRedemptionError = lastPurchase?.data?.error?.data_ == "409"
++        hasRedemptionError = lastPurchase?.data?.error?.data_ == "409",
++        showBackupCreateFailedError = BackupRepository.shouldDisplayBackupFailedSettingsRow(),
++        showBackupCreateCouldNotCompleteError = BackupRepository.shouldDisplayCouldNotCompleteBackupSettingsRow()
+       )
+     }
+   }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/internal/backup/InternalBackupPlaygroundFragment.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/internal/backup/InternalBackupPlaygroundFragment.kt
+index 8684e7bed09..838f2090220 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/internal/backup/InternalBackupPlaygroundFragment.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/internal/backup/InternalBackupPlaygroundFragment.kt
+@@ -68,6 +68,7 @@ import org.signal.core.ui.compose.TextFields.TextField
+ import org.signal.core.util.Base64
+ import org.signal.core.util.Hex
+ import org.signal.core.util.getLength
++import org.thoughtcrime.securesms.MainActivity
+ import org.thoughtcrime.securesms.R
+ import org.thoughtcrime.securesms.backup.v2.BackupRepository
+ import org.thoughtcrime.securesms.backup.v2.MessageBackupTier
+@@ -190,7 +191,12 @@ class InternalBackupPlaygroundFragment : ComposeFragment() {
+             MaterialAlertDialogBuilder(context)
+               .setTitle("Are you sure?")
+               .setMessage("This will delete all of your chats! Make sure you've finished a backup first, we don't check for you. Only do this on a test device!")
+-              .setPositiveButton("Wipe and restore") { _, _ -> viewModel.wipeAllDataAndRestoreFromRemote() }
++              .setPositiveButton("Wipe and restore") { _, _ ->
++                Toast.makeText(this@InternalBackupPlaygroundFragment.requireContext(), "Restoring backup...", Toast.LENGTH_SHORT).show()
++                viewModel.wipeAllDataAndRestoreFromRemote {
++                  startActivity(MainActivity.clearTop(this@InternalBackupPlaygroundFragment.requireActivity()))
++                }
++              }
+               .show()
+           },
+           onImportEncryptedBackupFromDiskClicked = {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/internal/backup/InternalBackupPlaygroundViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/internal/backup/InternalBackupPlaygroundViewModel.kt
+index 8742fb5e3c1..9453072ad73 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/internal/backup/InternalBackupPlaygroundViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/internal/backup/InternalBackupPlaygroundViewModel.kt
+@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import org.signal.core.util.Hex
++import org.signal.core.util.ThreadUtil
+ import org.signal.core.util.bytes
+ import org.signal.core.util.concurrent.SignalExecutors
+ import org.signal.core.util.copyTo
+@@ -305,10 +306,10 @@ class InternalBackupPlaygroundViewModel : ViewModel() {
+       }
+   }
+ 
+-  fun wipeAllDataAndRestoreFromRemote() {
++  fun wipeAllDataAndRestoreFromRemote(afterDbRestoreCallback: () -> Unit) {
+     SignalExecutors.BOUNDED_IO.execute {
+       SignalStore.backup.restoreWithCellular = false
+-      restoreFromRemote()
++      restoreFromRemote(afterDbRestoreCallback)
+     }
+   }
+ 
+@@ -352,12 +353,15 @@ class InternalBackupPlaygroundViewModel : ViewModel() {
+     _state.value = _state.value.copy(dialog = DialogState.None)
+   }
+ 
+-  private fun restoreFromRemote() {
++  private fun restoreFromRemote(afterDbRestoreCallback: () -> Unit) {
+     _state.value = _state.value.copy(statusMessage = "Importing from remote...")
+ 
+     viewModelScope.launch {
+       when (val result = BackupRepository.restoreRemoteBackup()) {
+-        RemoteRestoreResult.Success -> _state.value = _state.value.copy(statusMessage = "Import complete!")
++        RemoteRestoreResult.Success -> {
++          _state.value = _state.value.copy(statusMessage = "Import complete!")
++          ThreadUtil.runOnMain { afterDbRestoreCallback() }
++        }
+         RemoteRestoreResult.Canceled,
+         RemoteRestoreResult.Failure,
+         RemoteRestoreResult.PermanentSvrBFailure,
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/data/ConversationDataSource.kt b/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/data/ConversationDataSource.kt
+index dbb54e37688..839fdad1293 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/data/ConversationDataSource.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversation/v2/data/ConversationDataSource.kt
+@@ -10,6 +10,7 @@ import org.signal.core.util.Stopwatch
+ import org.signal.core.util.logging.Log
+ import org.signal.core.util.toInt
+ import org.signal.paging.PagedDataSource
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgress
+ import org.thoughtcrime.securesms.backup.v2.BackupRestoreManager
+ import org.thoughtcrime.securesms.conversation.ConversationData
+ import org.thoughtcrime.securesms.conversation.ConversationMessage
+@@ -21,7 +22,6 @@ import org.thoughtcrime.securesms.database.model.InMemoryMessageRecord.Universal
+ import org.thoughtcrime.securesms.database.model.MessageRecord
+ import org.thoughtcrime.securesms.database.model.MmsMessageRecord
+ import org.thoughtcrime.securesms.dependencies.AppDependencies
+-import org.thoughtcrime.securesms.keyvalue.SignalStore
+ import org.thoughtcrime.securesms.messagerequests.MessageRequestRepository
+ import org.thoughtcrime.securesms.recipients.Recipient
+ import org.thoughtcrime.securesms.util.RemoteConfig
+@@ -125,7 +125,7 @@ class ConversationDataSource(
+     records = MessageDataFetcher.updateModelsWithData(records, extraData).toMutableList()
+     stopwatch.split("models")
+ 
+-    if (RemoteConfig.messageBackups && SignalStore.backup.restoreState.inProgress) {
++    if (RemoteConfig.messageBackups && ArchiveRestoreProgress.state.activelyRestoring()) {
+       BackupRestoreManager.prioritizeAttachmentsIfNeeded(records)
+       stopwatch.split("restore")
+     }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/conversationlist/ConversationListFragment.java b/app/src/main/java/org/thoughtcrime/securesms/conversationlist/ConversationListFragment.java
+index dc6746098f0..abaf5738c07 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/conversationlist/ConversationListFragment.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/conversationlist/ConversationListFragment.java
+@@ -76,10 +76,12 @@
+ import org.thoughtcrime.securesms.MainNavigator;
+ import org.thoughtcrime.securesms.MuteDialog;
+ import org.thoughtcrime.securesms.R;
++import org.thoughtcrime.securesms.backup.RestoreState;
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgress;
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgressState;
+ import org.thoughtcrime.securesms.backup.v2.ui.BackupAlert;
+ import org.thoughtcrime.securesms.backup.v2.ui.BackupAlertBottomSheet;
+ import org.thoughtcrime.securesms.backup.v2.ui.BackupAlertDelegate;
+-import org.thoughtcrime.securesms.backup.v2.ui.status.BackupStatusData;
+ import org.thoughtcrime.securesms.badges.models.Badge;
+ import org.thoughtcrime.securesms.badges.self.expired.ExpiredOneTimeBadgeBottomSheetDialogFragment;
+ import org.thoughtcrime.securesms.badges.self.expired.MonthlyDonationCanceledBottomSheetDialogFragment;
+@@ -94,9 +96,9 @@
+ import org.thoughtcrime.securesms.banner.banners.ServiceOutageBanner;
+ import org.thoughtcrime.securesms.banner.banners.UnauthorizedBanner;
+ import org.thoughtcrime.securesms.banner.banners.UsernameOutOfSyncBanner;
+-import org.thoughtcrime.securesms.components.compose.DeleteSyncEducationDialog;
+ import org.thoughtcrime.securesms.components.RatingManager;
+ import org.thoughtcrime.securesms.components.SignalProgressDialog;
++import org.thoughtcrime.securesms.components.compose.DeleteSyncEducationDialog;
+ import org.thoughtcrime.securesms.components.menu.ActionItem;
+ import org.thoughtcrime.securesms.components.menu.SignalBottomActionBar;
+ import org.thoughtcrime.securesms.components.menu.SignalContextMenu;
+@@ -746,16 +748,20 @@ public void onBannerClick() {
+           }
+ 
+           @Override
+-          public void onActionClick(@NonNull BackupStatusData backupStatusData) {
+-            if (backupStatusData instanceof BackupStatusData.NotEnoughFreeSpace) {
+-              BackupAlertBottomSheet.create(new BackupAlert.DiskFull(((BackupStatusData.NotEnoughFreeSpace) backupStatusData).getRequiredSpace()))
+-                                    .show(getParentFragmentManager(), null);
+-            } else if (backupStatusData instanceof BackupStatusData.RestoringMedia && ((BackupStatusData.RestoringMedia) backupStatusData).getRestoreStatus() == BackupStatusData.RestoreStatus.WAITING_FOR_WIFI) {
++          public void onActionClick(@NonNull ArchiveRestoreProgressState data) {
++            if (data.getRestoreStatus() == ArchiveRestoreProgressState.RestoreStatus.NOT_ENOUGH_DISK_SPACE) {
++              BackupAlertBottomSheet.create(new BackupAlert.DiskFull(data.getRemainingRestoreSize().toUnitString())).show(getParentFragmentManager(), null);
++            } else if (data.getRestoreState() == RestoreState.RESTORING_MEDIA && data.getRestoreStatus() == ArchiveRestoreProgressState.RestoreStatus.WAITING_FOR_WIFI) {
+               new MaterialAlertDialogBuilder(requireContext())
+                   .setTitle(R.string.ResumeRestoreCellular_resume_using_cellular_title)
+                   .setMessage(R.string.ResumeRestoreCellular_resume_using_cellular_message)
+                   .setNegativeButton(android.R.string.cancel, null)
+-                  .setPositiveButton(R.string.BackupStatus__resume, (d, w) -> SignalStore.backup().setRestoreWithCellular(true))
++                  .setPositiveButton(R.string.BackupStatus__resume, (d, w) -> {
++                    SignalExecutors.BOUNDED.execute(() -> {
++                      SignalStore.backup().setRestoreWithCellular(true);
++                      ArchiveRestoreProgress.forceUpdate();
++                    });
++                  })
+                   .show();
+             }
+           }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/BackupMessagesJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/BackupMessagesJob.kt
+index 48d7fc3b842..f9630ba29b8 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/BackupMessagesJob.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/BackupMessagesJob.kt
+@@ -20,8 +20,8 @@ import org.signal.libsignal.net.SvrBStoreResponse
+ import org.signal.protos.resumableuploads.ResumableUpload
+ import org.thoughtcrime.securesms.R
+ import org.thoughtcrime.securesms.backup.ArchiveUploadProgress
+-import org.thoughtcrime.securesms.backup.RestoreState
+ import org.thoughtcrime.securesms.backup.v2.ArchiveMediaItemIterator
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgress
+ import org.thoughtcrime.securesms.backup.v2.ArchiveValidator
+ import org.thoughtcrime.securesms.backup.v2.BackupRepository
+ import org.thoughtcrime.securesms.backup.v2.ResumableMessagesBackupUploadSpec
+@@ -80,12 +80,7 @@ class BackupMessagesJob private constructor(
+           false
+         }
+ 
+-        SignalStore.backup.restoreState == RestoreState.PENDING -> {
+-          Log.i(TAG, "Backup not allowed: a restore is pending.")
+-          false
+-        }
+-
+-        SignalStore.backup.restoreState == RestoreState.RESTORING_DB -> {
++        ArchiveRestoreProgress.state.activelyRestoring() -> {
+           Log.i(TAG, "Backup not allowed: a restore is in progress.")
+           false
+         }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/BackupRestoreMediaJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/BackupRestoreMediaJob.kt
+index fb085ac5995..a1511a1cbb2 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/BackupRestoreMediaJob.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/BackupRestoreMediaJob.kt
+@@ -47,6 +47,10 @@ class BackupRestoreMediaJob private constructor(parameters: Parameters) : BaseJo
+ 
+   override fun onFailure() = Unit
+ 
++  override fun onAdded() {
++    ArchiveRestoreProgress.onStartMediaRestore()
++  }
++
+   override fun onRun() {
+     if (!SignalStore.account.isRegistered) {
+       Log.e(TAG, "Not registered, cannot restore!")
+@@ -121,7 +125,7 @@ class BackupRestoreMediaJob private constructor(parameters: Parameters) : BaseJo
+     } while (restoreThumbnailJobs.isNotEmpty() || restoreFullAttachmentJobs.isNotEmpty() || notRestorable.isNotEmpty())
+ 
+     BackupMediaRestoreService.start(context, context.getString(R.string.BackupStatus__restoring_media))
+-    SignalStore.backup.totalRestorableAttachmentSize = SignalDatabase.attachments.getRemainingRestorableAttachmentSize()
++    ArchiveRestoreProgress.onRestoringMedia()
+ 
+     RestoreAttachmentJob.Queues.INITIAL_RESTORE.forEach { queue ->
+       jobManager.add(CheckRestoreMediaLeftJob(queue))
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/CancelRestoreMediaJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/CancelRestoreMediaJob.kt
+new file mode 100644
+index 00000000000..ecfe28a0751
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/CancelRestoreMediaJob.kt
+@@ -0,0 +1,52 @@
++/*
++ * Copyright 2025 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.jobs
++
++import org.signal.core.util.logging.Log
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgress
++import org.thoughtcrime.securesms.dependencies.AppDependencies
++import org.thoughtcrime.securesms.jobmanager.Job
++import org.thoughtcrime.securesms.keyvalue.SignalStore
++
++class CancelRestoreMediaJob private constructor(parameters: Parameters) : Job(parameters) {
++
++  companion object {
++    private val TAG = Log.tag(CancelRestoreMediaJob::class)
++    const val KEY = "CancelRestoreMediaJob"
++
++    fun enqueue() {
++      AppDependencies.jobManager.add(
++        CancelRestoreMediaJob(parameters = Parameters.Builder().build())
++      )
++    }
++  }
++
++  override fun serialize(): ByteArray? = null
++
++  override fun getFactoryKey(): String = KEY
++
++  override fun run(): Result {
++    SignalStore.backup.userManuallySkippedMediaRestore = true
++
++    ArchiveRestoreProgress.onCancelMediaRestore()
++
++    Log.i(TAG, "Canceling all media restore jobs")
++    RestoreAttachmentJob.Queues.ALL.forEach { AppDependencies.jobManager.cancelAllInQueue(it) }
++
++    Log.i(TAG, "Enqueueing check restore media jobs to cleanup")
++    RestoreAttachmentJob.Queues.ALL.forEach { AppDependencies.jobManager.add(CheckRestoreMediaLeftJob(it)) }
++
++    return Result.success()
++  }
++
++  override fun onFailure() = Unit
++
++  class Factory : Job.Factory<CancelRestoreMediaJob?> {
++    override fun create(parameters: Parameters, serializedData: ByteArray?): CancelRestoreMediaJob {
++      return CancelRestoreMediaJob(parameters = parameters)
++    }
++  }
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/CheckRestoreMediaLeftJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/CheckRestoreMediaLeftJob.kt
+index 6be74760a20..75bf2e48d64 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/CheckRestoreMediaLeftJob.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/CheckRestoreMediaLeftJob.kt
+@@ -7,7 +7,6 @@ package org.thoughtcrime.securesms.jobs
+ 
+ import org.signal.core.util.logging.Log
+ import org.thoughtcrime.securesms.backup.DeletionState
+-import org.thoughtcrime.securesms.backup.RestoreState
+ import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgress
+ import org.thoughtcrime.securesms.database.SignalDatabase
+ import org.thoughtcrime.securesms.dependencies.AppDependencies
+@@ -46,21 +45,17 @@ class CheckRestoreMediaLeftJob private constructor(parameters: Parameters) : Job
+     val remainingAttachmentSize = SignalDatabase.attachments.getRemainingRestorableAttachmentSize()
+ 
+     if (remainingAttachmentSize == 0L) {
+-      if (SignalStore.backup.restoreState != RestoreState.NONE) {
+-        Log.d(TAG, "Media restore complete: there are no remaining restorable attachments.")
+-        SignalStore.backup.totalRestorableAttachmentSize = 0
+-        SignalStore.backup.restoreState = RestoreState.NONE
+-        ArchiveRestoreProgress.onProcessEnd()
+-        BackupMediaRestoreService.stop(context)
++      Log.d(TAG, "Media restore complete: there are no remaining restorable attachments.")
++      ArchiveRestoreProgress.allMediaRestored()
++      BackupMediaRestoreService.stop(context)
+ 
+-        if (SignalStore.backup.deletionState == DeletionState.AWAITING_MEDIA_DOWNLOAD) {
+-          SignalStore.backup.deletionState = DeletionState.MEDIA_DOWNLOAD_FINISHED
+-        }
++      if (SignalStore.backup.deletionState == DeletionState.AWAITING_MEDIA_DOWNLOAD) {
++        SignalStore.backup.deletionState = DeletionState.MEDIA_DOWNLOAD_FINISHED
++      }
+ 
+-        if (!SignalStore.backup.backsUpMedia) {
+-          SignalDatabase.attachments.markQuotesThatNeedReconstruction()
+-          AppDependencies.jobManager.add(QuoteThumbnailReconstructionJob())
+-        }
++      if (!SignalStore.backup.backsUpMedia) {
++        SignalDatabase.attachments.markQuotesThatNeedReconstruction()
++        AppDependencies.jobManager.add(QuoteThumbnailReconstructionJob())
+       }
+     } else if (runAttempt == 0) {
+       Log.w(TAG, "Still have remaining data to restore, will retry before checking job queues, queue: ${parameters.queue} estimated remaining: $remainingAttachmentSize")
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java b/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java
+index 67dfa82b4ff..edd1b3cadb4 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/JobManagerFactories.java
+@@ -149,6 +149,7 @@ public static Map<String, Job.Factory> getJobFactories(@NonNull Application appl
+       put(CallLinkUpdateSendJob.KEY,                   new CallLinkUpdateSendJob.Factory());
+       put(CallLogEventSendJob.KEY,                     new CallLogEventSendJob.Factory());
+       put(CallSyncEventJob.KEY,                        new CallSyncEventJob.Factory());
++      put(CancelRestoreMediaJob.KEY,                   new CancelRestoreMediaJob.Factory());
+       put(CheckRestoreMediaLeftJob.KEY,                new CheckRestoreMediaLeftJob.Factory());
+       put(CheckServiceReachabilityJob.KEY,             new CheckServiceReachabilityJob.Factory());
+       put(CleanPreKeysJob.KEY,                         new CleanPreKeysJob.Factory());
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/RestoreLocalAttachmentJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/RestoreLocalAttachmentJob.kt
+index b60aa6d8d7a..d3bc056ce58 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/RestoreLocalAttachmentJob.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/RestoreLocalAttachmentJob.kt
+@@ -12,6 +12,7 @@ import org.signal.core.util.logging.Log
+ import org.signal.libsignal.protocol.InvalidMacException
+ import org.signal.libsignal.protocol.InvalidMessageException
+ import org.thoughtcrime.securesms.attachments.AttachmentId
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgress
+ import org.thoughtcrime.securesms.backup.v2.local.ArchiveFileSystem
+ import org.thoughtcrime.securesms.database.AttachmentTable
+ import org.thoughtcrime.securesms.database.AttachmentTable.RestorableAttachment
+@@ -19,7 +20,6 @@ import org.thoughtcrime.securesms.database.SignalDatabase
+ import org.thoughtcrime.securesms.dependencies.AppDependencies
+ import org.thoughtcrime.securesms.jobmanager.Job
+ import org.thoughtcrime.securesms.jobs.protos.RestoreLocalAttachmentJobData
+-import org.thoughtcrime.securesms.keyvalue.SignalStore
+ import org.thoughtcrime.securesms.mms.MmsException
+ import org.whispersystems.signalservice.api.backup.MediaName
+ import org.whispersystems.signalservice.api.crypto.AttachmentCipherInputStream
+@@ -75,7 +75,7 @@ class RestoreLocalAttachmentJob private constructor(
+         restoreAttachmentJobs.forEach { jobManager.add(it) }
+       } while (restoreAttachmentJobs.isNotEmpty())
+ 
+-      SignalStore.backup.totalRestorableAttachmentSize = SignalDatabase.attachments.getRemainingRestorableAttachmentSize()
++      ArchiveRestoreProgress.onRestoringMedia()
+ 
+       val checkDoneJobs = (0 until CONCURRENT_QUEUES)
+         .map {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/RestoreOptimizedMediaJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/RestoreOptimizedMediaJob.kt
+index 1335eceeba5..b3dc7687382 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/RestoreOptimizedMediaJob.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/RestoreOptimizedMediaJob.kt
+@@ -6,10 +6,13 @@
+ package org.thoughtcrime.securesms.jobs
+ 
+ import org.signal.core.util.logging.Log
++import org.thoughtcrime.securesms.R
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgress
+ import org.thoughtcrime.securesms.database.SignalDatabase
+ import org.thoughtcrime.securesms.dependencies.AppDependencies
+ import org.thoughtcrime.securesms.jobmanager.Job
+ import org.thoughtcrime.securesms.keyvalue.SignalStore
++import org.thoughtcrime.securesms.service.BackupMediaRestoreService
+ 
+ /**
+  * Restores any media that was previously optimized and off-loaded into the user's archive. Leverages
+@@ -61,6 +64,8 @@ class RestoreOptimizedMediaJob private constructor(parameters: Parameters) : Job
+ 
+     val jobManager = AppDependencies.jobManager
+ 
++    ArchiveRestoreProgress.onStartMediaRestore()
++
+     restorableAttachments
+       .forEach {
+         val job = RestoreAttachmentJob.forOffloadedRestore(
+@@ -72,7 +77,8 @@ class RestoreOptimizedMediaJob private constructor(parameters: Parameters) : Job
+         jobManager.add(job)
+       }
+ 
+-    SignalStore.backup.totalRestorableAttachmentSize = SignalDatabase.attachments.getRemainingRestorableAttachmentSize()
++    BackupMediaRestoreService.start(context, context.getString(R.string.BackupStatus__restoring_media))
++    ArchiveRestoreProgress.onRestoringMedia()
+ 
+     RestoreAttachmentJob.Queues.OFFLOAD_RESTORE.forEach { queue ->
+       AppDependencies.jobManager.add(CheckRestoreMediaLeftJob(queue))
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/keyvalue/BackupValues.kt b/app/src/main/java/org/thoughtcrime/securesms/keyvalue/BackupValues.kt
+index 987ad00b806..9f2c229b1e9 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/keyvalue/BackupValues.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/keyvalue/BackupValues.kt
+@@ -116,7 +116,6 @@ class BackupValues(store: KeyValueStore) : SignalStoreValues(store) {
+ 
+   val deletionStateFlow: Flow<DeletionState> = deletionStateValue.toFlow()
+ 
+-  var restoreState: RestoreState by enumValue(KEY_RESTORE_STATE, RestoreState.NONE, RestoreState.serializer)
+   var optimizeStorage: Boolean by booleanValue(KEY_OPTIMIZE_STORAGE, false)
+   var backupWithCellular: Boolean
+     get() = getBoolean(KEY_BACKUP_OVER_CELLULAR, false)
+@@ -359,13 +358,8 @@ class BackupValues(store: KeyValueStore) : SignalStoreValues(store) {
+ 
+   var backupsInitialized: Boolean by booleanValue(KEY_BACKUPS_INITIALIZED, false)
+ 
+-  private val totalRestorableAttachmentSizeValue = longValue(KEY_TOTAL_RESTORABLE_ATTACHMENT_SIZE, 0)
+-  var totalRestorableAttachmentSize: Long by totalRestorableAttachmentSizeValue
+-  val totalRestorableAttachmentSizeFlow: Flow<Long>
+-    get() = totalRestorableAttachmentSizeValue.toFlow()
+-
+-  val isMediaRestoreInProgress: Boolean
+-    get() = totalRestorableAttachmentSize > 0
++  var restoreState: RestoreState by enumValue(KEY_RESTORE_STATE, RestoreState.NONE, RestoreState.serializer)
++  var totalRestorableAttachmentSize: Long by longValue(KEY_TOTAL_RESTORABLE_ATTACHMENT_SIZE, 0)
+ 
+   /** Store that lets you interact with message ZK credentials. */
+   val messageCredentials = CredentialStore(KEY_MESSAGE_CREDENTIALS, KEY_MESSAGE_CDN_READ_CREDENTIALS, KEY_MESSAGE_CDN_READ_CREDENTIALS_TIMESTAMP)
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/logsubmit/LogSectionRemoteBackups.kt b/app/src/main/java/org/thoughtcrime/securesms/logsubmit/LogSectionRemoteBackups.kt
+index 5aa1b3cf1df..9b11c1544e6 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/logsubmit/LogSectionRemoteBackups.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/logsubmit/LogSectionRemoteBackups.kt
+@@ -8,6 +8,7 @@ package org.thoughtcrime.securesms.logsubmit
+ import android.content.Context
+ import kotlinx.coroutines.runBlocking
+ import org.signal.donations.InAppPaymentType
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgress
+ import org.thoughtcrime.securesms.components.settings.app.subscription.DonationSerializationHelper.toFiatMoney
+ import org.thoughtcrime.securesms.components.settings.app.subscription.InAppPaymentsRepository
+ import org.thoughtcrime.securesms.database.SignalDatabase
+@@ -39,7 +40,7 @@ class LogSectionRemoteBackups : LogSection {
+     output.append("Optimize storage:                     ${SignalStore.backup.optimizeStorage}\n")
+     output.append("Detected subscription state mismatch: ${SignalStore.backup.subscriptionStateMismatchDetected}\n")
+     output.append("Last verified key time:               ${SignalStore.backup.lastVerifyKeyTime}\n")
+-    output.append("Media restore state:                  ${SignalStore.backup.restoreState}\n")
++    output.append("Restore state:                        ${ArchiveRestoreProgress.state}\n")
+     output.append("\n -- Subscription State\n")
+ 
+     val backupSubscriptionId = InAppPaymentsRepository.getSubscriber(InAppPaymentSubscriberRecord.Type.BACKUP)
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/main/MainNavigationViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/main/MainNavigationViewModel.kt
+index 7976d486bcb..32234518c77 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/main/MainNavigationViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/main/MainNavigationViewModel.kt
+@@ -21,9 +21,7 @@ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.reactive.asFlow
+ import kotlinx.coroutines.rx3.asObservable
+-import org.thoughtcrime.securesms.backup.RestoreState
+ import org.thoughtcrime.securesms.components.settings.app.notifications.profiles.NotificationProfilesRepository
+-import org.thoughtcrime.securesms.database.SignalDatabase
+ import org.thoughtcrime.securesms.dependencies.AppDependencies
+ import org.thoughtcrime.securesms.keyvalue.SignalStore
+ import org.thoughtcrime.securesms.megaphone.Megaphone
+@@ -64,9 +62,6 @@ class MainNavigationViewModel(
+   private val internalMainNavigationState = MutableStateFlow(MainNavigationState(currentListLocation = initialListLocation))
+   val mainNavigationState: StateFlow<MainNavigationState> = internalMainNavigationState
+ 
+-  private val internalBackupStatus = MutableStateFlow(0L)
+-  val backupStatus: StateFlow<Long> = internalBackupStatus
+-
+   /**
+    * This is Rx because these are still accessed from Java.
+    */
+@@ -89,8 +84,6 @@ class MainNavigationViewModel(
+     performStoreUpdate(MainNavigationRepository.getHasFailedOutgoingStories()) { hasFailedStories, state ->
+       state.copy(storyFailure = hasFailedStories)
+     }
+-
+-    getRemainingRestoreAttachmentSize()
+   }
+ 
+   /**
+@@ -219,18 +212,6 @@ class MainNavigationViewModel(
+     }
+   }
+ 
+-  private fun getRemainingRestoreAttachmentSize() {
+-    viewModelScope.launch {
+-      internalBackupStatus.update {
+-        if (SignalStore.backup.restoreState == RestoreState.RESTORING_MEDIA) {
+-          SignalDatabase.attachments.getRemainingRestorableAttachmentSize()
+-        } else {
+-          0L
+-        }
+-      }
+-    }
+-  }
+-
+   private fun <T : Any> performStoreUpdate(flow: Flow<T>, fn: (T, MainNavigationState) -> MainNavigationState) {
+     viewModelScope.launch {
+       flow.collectLatest { item ->
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/service/BackupMediaRestoreService.kt b/app/src/main/java/org/thoughtcrime/securesms/service/BackupMediaRestoreService.kt
+index 8344d6cc266..b76b229db03 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/service/BackupMediaRestoreService.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/service/BackupMediaRestoreService.kt
+@@ -13,8 +13,7 @@ import org.signal.core.util.logging.Log
+ import org.thoughtcrime.securesms.MainActivity
+ import org.thoughtcrime.securesms.R
+ import org.thoughtcrime.securesms.backup.RestoreState
+-import org.thoughtcrime.securesms.database.SignalDatabase
+-import org.thoughtcrime.securesms.keyvalue.SignalStore
++import org.thoughtcrime.securesms.backup.v2.ArchiveRestoreProgress
+ import org.thoughtcrime.securesms.notifications.NotificationChannels
+ import org.thoughtcrime.securesms.notifications.NotificationIds
+ import org.thoughtcrime.securesms.service.BackupMediaRestoreService.Companion.hasTimedOut
+@@ -176,12 +175,10 @@ class BackupMediaRestoreService : SafeForegroundService() {
+ 
+     val title: String = startingTitle
+     val downloadedBytes: ByteSize
+-      get() {
+-        val remainingAttachmentSize = SignalDatabase.attachments.getRemainingRestorableAttachmentSize()
+-        return totalBytes - remainingAttachmentSize.bytes
+-      }
++      get() = ArchiveRestoreProgress.state.completedRestoredSize
++
+     val totalBytes: ByteSize
+-      get() = SignalStore.backup.totalRestorableAttachmentSize.bytes
++      get() = ArchiveRestoreProgress.state.totalRestoreSize
+ 
+     fun closeFromTimeout() {
+       controllerLock.withLock {
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 57c678cfea5..d455478ed49 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -7960,6 +7960,8 @@
+     <string name="BackupStatus__free_up_s_of_space_to_download_your_media">Free up %1$s of space to restore your media.</string>
+     <!-- Status title for banner when user is actively restoring media from a backup -->
+     <string name="BackupStatus__restoring_media">Restoring media</string>
++    <!-- Status title for banner when user is canceling restore media from a backup -->
++    <string name="BackupStatus__cancel_restore_media">Canceling media restore</string>
+     <!-- Status title for banner when user has paused restore media from a backup -->
+     <string name="BackupStatus__restore_paused">Media restore paused</string>
+     <!-- Status title for banner when user has completed restoring restore media from a backup -->
+diff --git a/core-util-jvm/src/main/java/org/signal/core/util/ByteExtensions.kt b/core-util-jvm/src/main/java/org/signal/core/util/ByteExtensions.kt
+index 2d08a01f48d..4e01b70d8d7 100644
+--- a/core-util-jvm/src/main/java/org/signal/core/util/ByteExtensions.kt
++++ b/core-util-jvm/src/main/java/org/signal/core/util/ByteExtensions.kt
+@@ -116,6 +116,23 @@ class ByteSize(val bytes: Long) {
+     return ByteSize(this.inWholeBytes * other)
+   }
+ 
++  override fun toString(): String {
++    return "ByteSize(${toUnitString(maxPlaces = 4, spaced = false)})"
++  }
++
++  override fun equals(other: Any?): Boolean {
++    if (this === other) return true
++    if (javaClass != other?.javaClass) return false
++
++    other as ByteSize
++
++    return bytes == other.bytes
++  }
++
++  override fun hashCode(): Int {
++    return bytes.hashCode()
++  }
++
+   enum class Size(val label: String) {
+     BYTE("B"),
+     KIBIBYTE("KB"),

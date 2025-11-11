@@ -1,0 +1,220 @@
+diff --git a/app/src/main/java/org/tasks/injection/ApplicationModule.java b/app/src/main/java/org/tasks/injection/ApplicationModule.java
+index bca4f886d4..a167ebb95b 100644
+--- a/app/src/main/java/org/tasks/injection/ApplicationModule.java
++++ b/app/src/main/java/org/tasks/injection/ApplicationModule.java
+@@ -1,5 +1,7 @@
+ package org.tasks.injection;
+ 
++import static com.todoroo.andlib.utility.AndroidUtilities.atLeastMarshmallow;
++
+ import android.arch.persistence.room.Room;
+ import android.content.Context;
+ import com.evernote.android.job.JobManager;
+@@ -26,6 +28,9 @@
+ import org.tasks.db.Migrations;
+ import org.tasks.locale.Locale;
+ import org.tasks.notifications.NotificationDao;
++import org.tasks.security.Encryption;
++import org.tasks.security.KeyStoreEncryption;
++import org.tasks.security.NoEncryption;
+ 
+ @Module
+ public class ApplicationModule {
+@@ -149,4 +154,10 @@ public TaskDao getTaskDao(Database database) {
+   public JobManager getJobManager() {
+     return JobManager.create(context);
+   }
++
++  @Provides
++  @ApplicationScope
++  public Encryption getEncryption() {
++    return atLeastMarshmallow() ? new KeyStoreEncryption() : new NoEncryption();
++  }
+ }
+diff --git a/app/src/main/java/org/tasks/security/EncryptedString.java b/app/src/main/java/org/tasks/security/EncryptedString.java
+new file mode 100644
+index 0000000000..40e78fe899
+--- /dev/null
++++ b/app/src/main/java/org/tasks/security/EncryptedString.java
+@@ -0,0 +1,20 @@
++package org.tasks.security;
++
++public class EncryptedString {
++
++  private final String value;
++  private final byte[] iv;
++
++  public EncryptedString(String value, byte[] iv) {
++    this.value = value;
++    this.iv = iv;
++  }
++
++  public String getValue() {
++    return value;
++  }
++
++  public byte[] getIv() {
++    return iv;
++  }
++}
+diff --git a/app/src/main/java/org/tasks/security/Encryption.java b/app/src/main/java/org/tasks/security/Encryption.java
+new file mode 100644
+index 0000000000..1462a55ad0
+--- /dev/null
++++ b/app/src/main/java/org/tasks/security/Encryption.java
+@@ -0,0 +1,15 @@
++package org.tasks.security;
++
++import java.io.IOException;
++import java.io.UnsupportedEncodingException;
++import javax.crypto.BadPaddingException;
++import javax.crypto.IllegalBlockSizeException;
++
++public interface Encryption {
++
++  EncryptedString encrypt(String text)
++      throws UnsupportedEncodingException, BadPaddingException, IllegalBlockSizeException;
++
++  String decrypt(EncryptedString encryptedString)
++      throws IOException, BadPaddingException, IllegalBlockSizeException;
++}
+diff --git a/app/src/main/java/org/tasks/security/KeyStoreEncryption.java b/app/src/main/java/org/tasks/security/KeyStoreEncryption.java
+new file mode 100644
+index 0000000000..d5c496001c
+--- /dev/null
++++ b/app/src/main/java/org/tasks/security/KeyStoreEncryption.java
+@@ -0,0 +1,107 @@
++package org.tasks.security;
++
++import android.annotation.SuppressLint;
++import android.os.Build.VERSION_CODES;
++import android.security.keystore.KeyGenParameterSpec;
++import android.security.keystore.KeyProperties;
++import android.support.annotation.RequiresApi;
++import java.io.IOException;
++import java.io.UnsupportedEncodingException;
++import java.security.InvalidAlgorithmParameterException;
++import java.security.InvalidKeyException;
++import java.security.KeyStore;
++import java.security.KeyStore.Entry;
++import java.security.KeyStoreException;
++import java.security.NoSuchAlgorithmException;
++import java.security.NoSuchProviderException;
++import java.security.UnrecoverableEntryException;
++import java.security.cert.CertificateException;
++import javax.crypto.BadPaddingException;
++import javax.crypto.Cipher;
++import javax.crypto.IllegalBlockSizeException;
++import javax.crypto.KeyGenerator;
++import javax.crypto.NoSuchPaddingException;
++import javax.crypto.SecretKey;
++import javax.crypto.spec.GCMParameterSpec;
++import javax.inject.Inject;
++
++@RequiresApi(api = VERSION_CODES.M)
++public class KeyStoreEncryption implements Encryption {
++
++  private static final String ANDROID_KEYSTORE = "AndroidKeyStore";
++  private static final String ALIAS = "passwords";
++  private static final String ENCODING = "UTF-8";
++
++  private KeyStore keyStore;
++
++  @Inject
++  public KeyStoreEncryption() {
++    try {
++      keyStore = KeyStore.getInstance(ANDROID_KEYSTORE);
++      keyStore.load(null);
++    } catch (KeyStoreException | CertificateException | NoSuchAlgorithmException | IOException e) {
++      throw new IllegalStateException();
++    }
++  }
++
++  @Override
++  public EncryptedString encrypt(String text)
++      throws UnsupportedEncodingException, BadPaddingException, IllegalBlockSizeException {
++    Cipher cipher = getCipher(Cipher.ENCRYPT_MODE, null);
++    return new EncryptedString(
++        new String(cipher.doFinal(text.getBytes(ENCODING)), ENCODING), cipher.getIV());
++  }
++
++  @Override
++  public String decrypt(EncryptedString encryptedString)
++      throws IOException, BadPaddingException, IllegalBlockSizeException {
++    Cipher cipher = getCipher(Cipher.DECRYPT_MODE, encryptedString.getIv());
++    return new String(cipher.doFinal(encryptedString.getValue().getBytes(ENCODING)), ENCODING);
++  }
++
++  private Cipher getCipher(int cipherMode, byte[] iv) {
++    try {
++      Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
++      if (cipherMode == Cipher.ENCRYPT_MODE) {
++        cipher.init(cipherMode, getSecretKey());
++      } else {
++        cipher.init(cipherMode, getSecretKey(), new GCMParameterSpec(128, iv));
++      }
++      return cipher;
++    } catch (NoSuchAlgorithmException
++        | NoSuchPaddingException
++        | InvalidAlgorithmParameterException
++        | InvalidKeyException e) {
++      throw new IllegalArgumentException(e);
++    }
++  }
++
++  private SecretKey getSecretKey() {
++    try {
++      Entry entry = keyStore.getEntry(ALIAS, null);
++      return entry == null ? generateNewKey() : ((KeyStore.SecretKeyEntry) entry).getSecretKey();
++    } catch (NoSuchAlgorithmException | KeyStoreException | UnrecoverableEntryException e) {
++      throw new IllegalStateException();
++    }
++  }
++
++  @SuppressLint("TrulyRandom")
++  private SecretKey generateNewKey() {
++    try {
++      final KeyGenerator keyGenerator =
++          KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE);
++
++      keyGenerator.init(
++          new KeyGenParameterSpec.Builder(
++                  ALIAS, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
++              .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
++              .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
++              .build());
++      return keyGenerator.generateKey();
++    } catch (NoSuchAlgorithmException
++        | InvalidAlgorithmParameterException
++        | NoSuchProviderException e) {
++      throw new IllegalStateException();
++    }
++  }
++}
+diff --git a/app/src/main/java/org/tasks/security/NoEncryption.java b/app/src/main/java/org/tasks/security/NoEncryption.java
+new file mode 100644
+index 0000000000..eabdbbc3b5
+--- /dev/null
++++ b/app/src/main/java/org/tasks/security/NoEncryption.java
+@@ -0,0 +1,21 @@
++package org.tasks.security;
++
++import java.io.IOException;
++import java.io.UnsupportedEncodingException;
++import javax.crypto.BadPaddingException;
++import javax.crypto.IllegalBlockSizeException;
++
++public class NoEncryption implements Encryption {
++
++  @Override
++  public EncryptedString encrypt(String text)
++      throws UnsupportedEncodingException, BadPaddingException, IllegalBlockSizeException {
++    return new EncryptedString(text, null);
++  }
++
++  @Override
++  public String decrypt(EncryptedString encryptedString)
++      throws IOException, BadPaddingException, IllegalBlockSizeException {
++    return encryptedString.getValue();
++  }
++}

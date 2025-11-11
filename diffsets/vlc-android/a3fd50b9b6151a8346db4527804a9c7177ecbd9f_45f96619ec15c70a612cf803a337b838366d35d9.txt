@@ -1,0 +1,167 @@
+diff --git a/application/vlc-android/src/org/videolan/vlc/gui/audio/AudioPlayer.kt b/application/vlc-android/src/org/videolan/vlc/gui/audio/AudioPlayer.kt
+index 0e819cb37e..8458fe2a28 100644
+--- a/application/vlc-android/src/org/videolan/vlc/gui/audio/AudioPlayer.kt
++++ b/application/vlc-android/src/org/videolan/vlc/gui/audio/AudioPlayer.kt
+@@ -49,8 +49,8 @@ import androidx.vectordrawable.graphics.drawable.AnimatedVectorDrawableCompat
+ import com.google.android.material.bottomsheet.BottomSheetBehavior
+ import com.google.android.material.snackbar.Snackbar
+ import kotlinx.coroutines.*
+-import kotlinx.coroutines.flow.collect
+ import kotlinx.coroutines.flow.conflate
++import kotlinx.coroutines.flow.onEach
+ import org.videolan.medialibrary.Tools
+ import org.videolan.medialibrary.interfaces.media.MediaWrapper
+ import org.videolan.resources.*
+@@ -70,6 +70,7 @@ import org.videolan.vlc.gui.view.AudioMediaSwitcher
+ import org.videolan.vlc.gui.view.AudioMediaSwitcher.AudioMediaSwitcherListener
+ import org.videolan.vlc.manageAbRepeatStep
+ import org.videolan.vlc.media.PlaylistManager.Companion.hasMedia
++import org.videolan.vlc.util.launchWhenStarted
+ import org.videolan.vlc.util.share
+ import org.videolan.vlc.viewmodels.PlaybackProgress
+ import org.videolan.vlc.viewmodels.PlaylistModel
+@@ -110,13 +111,11 @@ class AudioPlayer : Fragment(), PlaylistAdapter.IPlayer, TextWatcher, IAudioPlay
+         playlistModel = PlaylistModel.get(this)
+         playlistModel.progress.observe(this@AudioPlayer, Observer { it?.let { updateProgress(it) } })
+         playlistAdapter.setModel(playlistModel)
+-        lifecycleScope.launchWhenStarted {
+-            playlistModel.dataset.asFlow().conflate().collect {
+-                doUpdate()
+-                playlistAdapter.update(it)
+-                delay(50L)
+-            }
+-        }
++        playlistModel.dataset.asFlow().conflate().onEach {
++            doUpdate()
++            playlistAdapter.update(it)
++            delay(50L)
++        }.launchWhenStarted(lifecycleScope)
+     }
+ 
+     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
+@@ -291,6 +290,7 @@ class AudioPlayer : Fragment(), PlaylistAdapter.IPlayer, TextWatcher, IAudioPlay
+     }
+ 
+     private fun updateProgress(progress: PlaybackProgress) {
++        if (playlistModel.currentMediaPosition == -1) return
+         binding.length.text = progress.lengthText
+         binding.timeline.max = progress.length.toInt()
+         binding.progressBar.max = progress.length.toInt()
+@@ -299,29 +299,23 @@ class AudioPlayer : Fragment(), PlaylistAdapter.IPlayer, TextWatcher, IAudioPlay
+             val displayTime = if (showRemainingTime) Tools.millisToString(progress.time - progress.length) else progress.timeText
+             binding.headerTime.text = displayTime
+             binding.time.text = displayTime
+-            binding.timeline.progress = playlistModel.service?.getTime(progress.time)
+-                    ?: progress.time.toInt()
++            binding.timeline.progress = progress.time.toInt()
+             binding.progressBar.progress = progress.time.toInt()
+         }
+ 
+-        val totalLength = playlistModel.medias?.map { if (it.length != 0L) it.length else it.time }?.sum()
+-                ?: 0L
+         val elapsedTracksTime = playlistModel.medias?.run {
+             subList(0, playlistModel.currentMediaPosition).map {
+                 if (it.length != 0L) it.length else it.time
+             }.sum()
+         } ?: 0L
+-        val mediaProgress = playlistModel.service?.getTime(progress.time)?.toLong() ?: progress.time
+-        val totalTime = elapsedTracksTime + mediaProgress
++        val totalTime = elapsedTracksTime + progress.time
++        val currentProgressText = if (totalTime == 0L) "0s" else Tools.millisToString(totalTime, true, false, false)
+ 
+         val textTrack = getString(R.string.track_index, "${playlistModel.currentMediaPosition + 1} / ${playlistModel.medias?.size}")
+-        val textProgress = getString(R.string.audio_queue_progress, "${if (totalTime == 0L) "0s" else Tools.millisToString(totalTime, true, false, false)} / ${Tools.millisToString(totalLength, true, false, false)}")
+-
++        val textProgress = getString(R.string.audio_queue_progress, "$currentProgressText / ${playlistModel.totalTime}")
+ 
+         binding.audioPlayProgress.text = "$textTrack • $textProgress"
+         binding.songsList.setPadding(binding.songsList.paddingLeft, binding.songsList.paddingTop, binding.songsList.paddingRight, binding.audioPlayProgress.height + 8.dp)
+-
+-
+     }
+ 
+     override fun onSelectionSet(position: Int) {
+diff --git a/application/vlc-android/src/org/videolan/vlc/media/MediaUtils.kt b/application/vlc-android/src/org/videolan/vlc/media/MediaUtils.kt
+index 234dbd6f55..fe2c225eba 100644
+--- a/application/vlc-android/src/org/videolan/vlc/media/MediaUtils.kt
++++ b/application/vlc-android/src/org/videolan/vlc/media/MediaUtils.kt
+@@ -3,11 +3,8 @@ package org.videolan.vlc.media
+ import android.app.Activity
+ import android.app.ProgressDialog
+ import android.content.Context
+-import android.content.DialogInterface
+ import android.content.Intent
+ import android.net.Uri
+-import android.os.Handler
+-import android.os.Looper
+ import android.provider.MediaStore
+ import android.provider.OpenableColumns
+ import android.text.TextUtils
+@@ -20,7 +17,8 @@ import com.google.android.material.snackbar.Snackbar
+ import kotlinx.coroutines.*
+ import kotlinx.coroutines.channels.Channel
+ import kotlinx.coroutines.channels.actor
+-import kotlinx.coroutines.flow.*
++import kotlinx.coroutines.flow.filterNotNull
++import kotlinx.coroutines.flow.first
+ import org.videolan.libvlc.util.AndroidUtil
+ import org.videolan.medialibrary.MLServiceLocator
+ import org.videolan.medialibrary.Tools
+diff --git a/application/vlc-android/src/org/videolan/vlc/viewmodels/PlaylistModel.kt b/application/vlc-android/src/org/videolan/vlc/viewmodels/PlaylistModel.kt
+index cf52478616..55c2060937 100644
+--- a/application/vlc-android/src/org/videolan/vlc/viewmodels/PlaylistModel.kt
++++ b/application/vlc-android/src/org/videolan/vlc/viewmodels/PlaylistModel.kt
+@@ -24,13 +24,10 @@ import android.support.v4.media.session.PlaybackStateCompat
+ import androidx.annotation.MainThread
+ import androidx.fragment.app.Fragment
+ import androidx.lifecycle.*
+-import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.ExperimentalCoroutinesApi
+-import kotlinx.coroutines.ObsoleteCoroutinesApi
++import kotlinx.coroutines.*
+ import kotlinx.coroutines.channels.actor
+ import kotlinx.coroutines.flow.launchIn
+ import kotlinx.coroutines.flow.onEach
+-import kotlinx.coroutines.withContext
+ import org.videolan.medialibrary.Tools
+ import org.videolan.medialibrary.interfaces.media.MediaWrapper
+ import org.videolan.tools.livedata.LiveDataset
+@@ -51,6 +48,7 @@ class PlaylistModel : ViewModel(), PlaybackService.Callback by EmptyPBSCallback
+     private var filtering = false
+     val progress = MediatorLiveData<PlaybackProgress>()
+     val playerState = MutableLiveData<PlayerState>()
++    var totalTime = ""
+     val connected : Boolean
+         get() = service !== null
+ 
+@@ -72,6 +70,7 @@ class PlaylistModel : ViewModel(), PlaybackService.Callback by EmptyPBSCallback
+     }
+ 
+     override fun update() {
++        updateTotalTime()
+         service?.run {
+             dataset.value = media.toMutableList()
+             playerState.value = PlayerState(isPlaying, title, artist)
+@@ -155,7 +154,7 @@ class PlaylistModel : ViewModel(), PlaybackService.Callback by EmptyPBSCallback
+         }
+ 
+     val length : Long
+-            get() = service?.length ?: 0L
++        get() = service?.length ?: 0L
+ 
+     val playing : Boolean
+         get() = service?.isPlaying ?: false
+@@ -226,6 +225,13 @@ class PlaylistModel : ViewModel(), PlaybackService.Callback by EmptyPBSCallback
+         }
+     }
+ 
++    private fun updateTotalTime() = viewModelScope.launch{
++        val totalLength = medias?.map {
++            if (it.length != 0L) it.length else it.time
++        }?.sum() ?: 0L
++        totalTime = Tools.millisToString(totalLength, true, false, false)
++    }
++
+     companion object {
+         fun get(fragment: Fragment) = ViewModelProviders.of(fragment.requireActivity()).get(PlaylistModel::class.java)
+     }

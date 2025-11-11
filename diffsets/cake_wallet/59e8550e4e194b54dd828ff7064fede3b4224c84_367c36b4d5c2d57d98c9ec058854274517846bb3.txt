@@ -1,0 +1,722 @@
+diff --git a/assets/bitcoin_electrum_server_list.yml b/assets/bitcoin_electrum_server_list.yml
+index 20a28cd245..83da6a0b29 100644
+--- a/assets/bitcoin_electrum_server_list.yml
++++ b/assets/bitcoin_electrum_server_list.yml
+@@ -1,6 +1,3 @@
+--
+-  uri: electrum.cakewallet.com:50002
+-  useSSL: true
+ -
+   uri: btc-electrum.cakewallet.com:50002
+   useSSL: true
+diff --git a/assets/node_list.yml b/assets/node_list.yml
+index 6191129b3c..49cc00a948 100644
+--- a/assets/node_list.yml
++++ b/assets/node_list.yml
+@@ -2,6 +2,7 @@
+   uri: xmr-node.cakewallet.com:18081
+   is_default: true
+   trusted: true
++  useSSL: true
+ -
+   uri: cakexmrl7bonq7ovjka5kuwuyd3f7qnkz6z6s6dmsy3uckwra7bvggyd.onion:18081
+   is_default: false
+diff --git a/cw_bitcoin/lib/electrum_wallet.dart b/cw_bitcoin/lib/electrum_wallet.dart
+index e58fad00f7..73f7e09f5d 100644
+--- a/cw_bitcoin/lib/electrum_wallet.dart
++++ b/cw_bitcoin/lib/electrum_wallet.dart
+@@ -486,10 +486,11 @@ abstract class ElectrumWalletBase
+ 
+   @action
+   Future<void> updateFeeRates() async {
+-    if (await checkIfMempoolAPIIsEnabled()) {
++    if (await checkIfMempoolAPIIsEnabled() && type == WalletType.bitcoin) {
+       try {
+-        final response =
+-            await http.get(Uri.parse("http://mempool.cakewallet.com:8999/api/v1/fees/recommended"));
++        final response = await http
++            .get(Uri.parse("https://mempool.cakewallet.com/api/v1/fees/recommended"))
++            .timeout(Duration(seconds: 5));
+ 
+         final result = json.decode(response.body) as Map<String, dynamic>;
+         final slowFee = (result['economyFee'] as num?)?.toInt() ?? 0;
+diff --git a/cw_monero/lib/api/wallet_manager.dart b/cw_monero/lib/api/wallet_manager.dart
+index 7f9dbd8fa4..d10f7e25a8 100644
+--- a/cw_monero/lib/api/wallet_manager.dart
++++ b/cw_monero/lib/api/wallet_manager.dart
+@@ -286,8 +286,18 @@ Future<void> loadWallet(
+     /// 0: Software Wallet
+     /// 1: Ledger
+     /// 2: Trezor
+-    final deviceType = monero.WalletManager_queryWalletDevice(wmPtr,
+-        keysFileName: "$path.keys", password: password, kdfRounds: 1);
++    late final deviceType;
++
++    if (Platform.isAndroid || Platform.isIOS) {
++      deviceType = monero.WalletManager_queryWalletDevice(
++        wmPtr,
++        keysFileName: "$path.keys",
++        password: password,
++        kdfRounds: 1,
++      );
++    } else {
++      deviceType = 0;
++    }
+ 
+     if (deviceType == 1) {
+       final dummyWPtr = wptr ??
+diff --git a/lib/buy/onramper/onramper_buy_provider.dart b/lib/buy/onramper/onramper_buy_provider.dart
+index dade41d436..e4bf38275d 100644
+--- a/lib/buy/onramper/onramper_buy_provider.dart
++++ b/lib/buy/onramper/onramper_buy_provider.dart
+@@ -251,8 +251,12 @@ class OnRamperBuyProvider extends BuyProvider {
+         return tag;
+       case 'POL':
+         return 'POLYGON';
+-      default:
+-        return CryptoCurrency.fromString(tag).fullName ?? tag;
++    default:
++        try {
++          return CryptoCurrency.fromString(tag).fullName!;
++        } catch (_) {
++          return tag;
++        }
+     }
+   }
+ 
+diff --git a/lib/entities/default_settings_migration.dart b/lib/entities/default_settings_migration.dart
+index f873314c05..9e0e3457de 100644
+--- a/lib/entities/default_settings_migration.dart
++++ b/lib/entities/default_settings_migration.dart
+@@ -260,10 +260,22 @@ Future<void> defaultSettingsMigration(
+           updateBtcElectrumNodeToUseSSL(nodes, sharedPreferences);
+           break;
+         case 43:
+-          _updateCakeXmrNode(nodes);
++          await _updateCakeXmrNode(nodes);
+           _deselectExchangeProvider(sharedPreferences, "THORChain");
+           _deselectExchangeProvider(sharedPreferences, "SimpleSwap");
+           break;
++        case 44:
++          await _updateCakeXmrNode(nodes);
++          await _changeDefaultNode(
++            nodes: nodes,
++            sharedPreferences: sharedPreferences,
++            type: WalletType.bitcoin,
++            newDefaultUri: newCakeWalletBitcoinUri,
++            currentNodePreferenceKey: PreferencesKey.currentBitcoinElectrumSererIdKey,
++            useSSL: true,
++            oldUri: 'cakewallet.com',
++          );
++          break;
+ 
+         default:
+           break;
+@@ -279,17 +291,54 @@ Future<void> defaultSettingsMigration(
+   await sharedPreferences.setInt(PreferencesKey.currentDefaultSettingsMigrationVersion, version);
+ }
+ 
+-void _updateCakeXmrNode(Box<Node> nodes) {
++/// generic function for changing any wallet default node
++/// instead of making a new function for each change
++Future<void> _changeDefaultNode({
++  required Box<Node> nodes,
++  required SharedPreferences sharedPreferences,
++  required WalletType type,
++  required String newDefaultUri,
++  required String currentNodePreferenceKey,
++  required bool useSSL,
++  required String oldUri, // leave empty if you want to force replace the node regardless of the user's current node
++}) async {
++  final currentNodeId = sharedPreferences.getInt(currentNodePreferenceKey);
++  final currentNode = nodes.values.firstWhere((node) => node.key == currentNodeId);
++  final shouldReplace = currentNode.uriRaw.contains(oldUri);
++
++  if (shouldReplace) {
++    var newNodeId =
++        nodes.values.firstWhereOrNull((element) => element.uriRaw == newDefaultUri)?.key;
++
++    // new node doesn't exist, then add it
++    if (newNodeId == null) {
++      final newNode = Node(
++        uri: newDefaultUri,
++        type: type,
++        useSSL: useSSL,
++      );
++
++      await nodes.add(newNode);
++      newNodeId = newNode.key;
++    }
++
++    await sharedPreferences.setInt(currentNodePreferenceKey, newNodeId as int);
++  }
++}
++
++Future<void> _updateCakeXmrNode(Box<Node> nodes) async {
+   final node = nodes.values.firstWhereOrNull((element) => element.uriRaw == newCakeWalletMoneroUri);
+ 
+-  if (node != null && !node.trusted) {
++  if (node != null) {
+     node.trusted = true;
+-    node.save();
++    node.useSSL = true;
++    await node.save();
+   }
+ }
+ 
+ void updateBtcElectrumNodeToUseSSL(Box<Node> nodes, SharedPreferences sharedPreferences) {
+-  final btcElectrumNode = nodes.values.firstWhereOrNull((element) => element.uriRaw == newCakeWalletBitcoinUri);
++  final btcElectrumNode =
++      nodes.values.firstWhereOrNull((element) => element.uriRaw == newCakeWalletBitcoinUri);
+ 
+   if (btcElectrumNode != null) {
+     btcElectrumNode.useSSL = true;
+@@ -538,7 +587,6 @@ Node? getBitcoinCashDefaultElectrumServer({required Box<Node> nodes}) {
+ }
+ 
+ Node getMoneroDefaultNode({required Box<Node> nodes}) {
+-  final timeZone = DateTime.now().timeZoneOffset.inHours;
+   var nodeUri = newCakeWalletMoneroUri;
+ 
+   try {
+@@ -858,7 +906,8 @@ Future<void> changeDefaultMoneroNode(
+     }
+   });
+ 
+-  final newCakeWalletNode = Node(uri: newCakeWalletMoneroUri, type: WalletType.monero, trusted: true);
++  final newCakeWalletNode =
++      Node(uri: newCakeWalletMoneroUri, type: WalletType.monero, trusted: true);
+ 
+   await nodeSource.add(newCakeWalletNode);
+ 
+@@ -897,7 +946,7 @@ Future<void> updateBtcNanoWalletInfos(Box<WalletInfo> walletsInfoSource) async {
+ Future<void> changeDefaultNanoNode(
+     Box<Node> nodeSource, SharedPreferences sharedPreferences) async {
+   const oldNanoNodeUriPattern = 'rpc.nano.to';
+-  final currentNanoNodeId = sharedPreferences.getInt(PreferencesKey.currentNodeIdKey);
++  final currentNanoNodeId = sharedPreferences.getInt(PreferencesKey.currentNanoNodeIdKey);
+   final currentNanoNode = nodeSource.values.firstWhere((node) => node.key == currentNanoNodeId);
+ 
+   final newCakeWalletNode = Node(
+@@ -909,7 +958,8 @@ Future<void> changeDefaultNanoNode(
+   await nodeSource.add(newCakeWalletNode);
+ 
+   if (currentNanoNode.uri.toString().contains(oldNanoNodeUriPattern)) {
+-    await sharedPreferences.setInt(PreferencesKey.currentNodeIdKey, newCakeWalletNode.key as int);
++    await sharedPreferences.setInt(
++        PreferencesKey.currentNanoNodeIdKey, newCakeWalletNode.key as int);
+   }
+ }
+ 
+@@ -924,7 +974,7 @@ Future<void> changeDefaultBitcoinNode(
+       currentBitcoinNode.uri.toString().contains(cakeWalletBitcoinNodeUriPattern);
+ 
+   final newCakeWalletBitcoinNode =
+-      Node(uri: newCakeWalletBitcoinUri, type: WalletType.bitcoin, useSSL: false);
++      Node(uri: newCakeWalletBitcoinUri, type: WalletType.bitcoin, useSSL: true);
+ 
+   if (!nodeSource.values.any((element) => element.uriRaw == newCakeWalletBitcoinUri)) {
+     await nodeSource.add(newCakeWalletBitcoinNode);
+diff --git a/lib/entities/main_actions.dart b/lib/entities/main_actions.dart
+index 94be0d2b7a..29c161c5f6 100644
+--- a/lib/entities/main_actions.dart
++++ b/lib/entities/main_actions.dart
+@@ -1,7 +1,5 @@
+ import 'package:cake_wallet/generated/i18n.dart';
+ import 'package:cake_wallet/routes.dart';
+-import 'package:cake_wallet/src/widgets/alert_with_one_action.dart';
+-import 'package:cake_wallet/utils/show_pop_up.dart';
+ import 'package:cake_wallet/view_model/dashboard/dashboard_view_model.dart';
+ import 'package:flutter/material.dart';
+ 
+@@ -68,7 +66,7 @@ class MainActions {
+ 
+ 
+   static MainActions tradeAction = MainActions._(
+-    name: (context) => '${S.of(context).buy} / ${S.of(context).sell}',
++    name: (context) => '${S.of(context).buy}/${S.of(context).sell}',
+     image: 'assets/images/buy_sell.png',
+     isEnabled: (viewModel) => viewModel.isEnabledTradeAction,
+     canShow: (viewModel) => viewModel.hasTradeAction,
+diff --git a/lib/entities/parse_address_from_domain.dart b/lib/entities/parse_address_from_domain.dart
+index 11ba4724c6..42ab19b312 100644
+--- a/lib/entities/parse_address_from_domain.dart
++++ b/lib/entities/parse_address_from_domain.dart
+@@ -26,23 +26,80 @@ class AddressResolver {
+   final SettingsStore settingsStore;
+ 
+   static const unstoppableDomains = [
+-    'crypto',
+-    'zil',
+-    'x',
+-    'wallet',
+-    'bitcoin',
+-    '888',
+-    'nft',
+-    'dao',
+-    'blockchain',
+-    'polygon',
+-    'klever',
+-    'hi',
+-    'kresus',
+-    'anime',
+-    'manga',
+-    'binanceus',
+-    'xmr',
++    "888",
++    "altimist",
++    "anime",
++    "austin",
++    "bald",
++    "benji",
++    "bet",
++    "binanceus",
++    "bitcoin",
++    "bitget",
++    "blockchain",
++    "ca",
++    "chomp",
++    "clay",
++    "co",
++    "com",
++    "crypto",
++    "dao",
++    "dfz",
++    "digital",
++    "dream",
++    "eth",
++    "ethermail",
++    "farms",
++    "fun",
++    "go",
++    "group",
++    "hi",
++    "host",
++    "info",
++    "io",
++    "klever",
++    "kresus",
++    "kryptic",
++    "lfg",
++    "life",
++    "live",
++    "ltd",
++    "manga",
++    "metropolis",
++    "moon",
++    "mumu",
++    "net",
++    "nft",
++    "online",
++    "org",
++    "pog",
++    "polygon",
++    "press",
++    "pro",
++    "propykeys",
++    "pudgy",
++    "pw",
++    "raiin",
++    "secret",
++    "site",
++    "smobler",
++    "space",
++    "stepn",
++    "store",
++    "tball",
++    "tech",
++    "ubu",
++    "uno",
++    "unstoppable",
++    "wallet",
++    "website",
++    "wifi",
++    "witg",
++    "wrkx",
++    "x",
++    "xmr",
++    "xyz",
++    "zil",
+   ];
+ 
+   static String? extractAddressByType({required String raw, required CryptoCurrency type}) {
+diff --git a/lib/main.dart b/lib/main.dart
+index 51fab4dd1d..d67fda098c 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -16,7 +16,6 @@ import 'package:cake_wallet/exchange/exchange_template.dart';
+ import 'package:cake_wallet/exchange/trade.dart';
+ import 'package:cake_wallet/generated/i18n.dart';
+ import 'package:cake_wallet/locales/locale.dart';
+-import 'package:cake_wallet/monero/monero.dart';
+ import 'package:cake_wallet/reactions/bootstrap.dart';
+ import 'package:cake_wallet/router.dart' as Router;
+ import 'package:cake_wallet/routes.dart';
+@@ -204,7 +203,7 @@ Future<void> initializeAppConfigs() async {
+     transactionDescriptions: transactionDescriptions,
+     secureStorage: secureStorage,
+     anonpayInvoiceInfo: anonpayInvoiceInfo,
+-    initialMigrationVersion: 43,
++    initialMigrationVersion: 44,
+   );
+ }
+ 
+diff --git a/lib/reactions/on_current_wallet_change.dart b/lib/reactions/on_current_wallet_change.dart
+index d7e6f90c0d..b804ff14ef 100644
+--- a/lib/reactions/on_current_wallet_change.dart
++++ b/lib/reactions/on_current_wallet_change.dart
+@@ -63,6 +63,8 @@ void startCurrentWalletChangeReaction(
+       startWalletSyncStatusChangeReaction(wallet, fiatConversionStore);
+       startCheckConnectionReaction(wallet, settingsStore);
+ 
++      await Future.delayed(Duration.zero);
++
+       if (wallet.type == WalletType.monero ||
+           wallet.type == WalletType.wownero ||
+           wallet.type == WalletType.bitcoin ||
+diff --git a/lib/src/screens/dashboard/dashboard_page.dart b/lib/src/screens/dashboard/dashboard_page.dart
+index 9c012d518e..cabf73b210 100644
+--- a/lib/src/screens/dashboard/dashboard_page.dart
++++ b/lib/src/screens/dashboard/dashboard_page.dart
+@@ -291,32 +291,34 @@ class _DashboardPageView extends BasePage {
+                           children: MainActions.all
+                               .where((element) => element.canShow?.call(dashboardViewModel) ?? true)
+                               .map(
+-                                (action) => Semantics(
+-                                  button: true,
+-                                  enabled: (action.isEnabled?.call(dashboardViewModel) ?? true),
+-                                  child: ActionButton(
+-                                    key: ValueKey(
+-                                        'dashboard_page_${action.name(context)}_action_button_key'),
+-                                    image: Image.asset(
+-                                      action.image,
+-                                      height: 24,
+-                                      width: 24,
+-                                      color: action.isEnabled?.call(dashboardViewModel) ?? true
+-                                          ? Theme.of(context)
+-                                              .extension<DashboardPageTheme>()!
+-                                              .mainActionsIconColor
++                                (action) => Expanded(
++                                  child: Semantics(
++                                    button: true,
++                                    enabled: (action.isEnabled?.call(dashboardViewModel) ?? true),
++                                    child: ActionButton(
++                                      key: ValueKey(
++                                          'dashboard_page_${action.name(context)}_action_button_key'),
++                                      image: Image.asset(
++                                        action.image,
++                                        height: 24,
++                                        width: 24,
++                                        color: action.isEnabled?.call(dashboardViewModel) ?? true
++                                            ? Theme.of(context)
++                                                .extension<DashboardPageTheme>()!
++                                                .mainActionsIconColor
++                                            : Theme.of(context)
++                                                .extension<BalancePageTheme>()!
++                                                .labelTextColor,
++                                      ),
++                                      title: action.name(context),
++                                      onClick: () async =>
++                                          await action.onTap(context, dashboardViewModel),
++                                      textColor: action.isEnabled?.call(dashboardViewModel) ?? true
++                                          ? null
+                                           : Theme.of(context)
+                                               .extension<BalancePageTheme>()!
+                                               .labelTextColor,
+                                     ),
+-                                    title: action.name(context),
+-                                    onClick: () async =>
+-                                        await action.onTap(context, dashboardViewModel),
+-                                    textColor: action.isEnabled?.call(dashboardViewModel) ?? true
+-                                        ? null
+-                                        : Theme.of(context)
+-                                            .extension<BalancePageTheme>()!
+-                                            .labelTextColor,
+                                   ),
+                                 ),
+                               )
+diff --git a/lib/src/screens/dashboard/pages/cake_features_page.dart b/lib/src/screens/dashboard/pages/cake_features_page.dart
+index 37bc3a55ff..775cb6c3fa 100644
+--- a/lib/src/screens/dashboard/pages/cake_features_page.dart
++++ b/lib/src/screens/dashboard/pages/cake_features_page.dart
+@@ -10,91 +10,81 @@ import 'package:cake_wallet/view_model/dashboard/cake_features_view_model.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_mobx/flutter_mobx.dart';
+ import 'package:url_launcher/url_launcher.dart';
+-import 'package:flutter_svg/flutter_svg.dart';
+ 
+ class CakeFeaturesPage extends StatelessWidget {
+   CakeFeaturesPage({required this.dashboardViewModel, required this.cakeFeaturesViewModel});
+ 
+   final DashboardViewModel dashboardViewModel;
+   final CakeFeaturesViewModel cakeFeaturesViewModel;
+-  final _scrollController = ScrollController();
+ 
+   @override
+   Widget build(BuildContext context) {
+     return Padding(
+       padding: const EdgeInsets.symmetric(horizontal: 10.0),
+-      child: RawScrollbar(
+-        thumbColor: Colors.white.withOpacity(0.15),
+-        radius: Radius.circular(20),
+-        thumbVisibility: true,
+-        thickness: 2,
+-        controller: _scrollController,
+-        child: Padding(
+-          padding: const EdgeInsets.symmetric(horizontal: 10.0),
+-          child: Column(
+-            crossAxisAlignment: CrossAxisAlignment.start,
+-            children: [
+-              SizedBox(height: 50),
+-              Text(
+-                'Cake ${S.of(context).features}',
+-                style: TextStyle(
+-                  fontSize: 24,
+-                  fontWeight: FontWeight.w500,
+-                  color: Theme.of(context).extension<DashboardPageTheme>()!.pageTitleTextColor,
+-                ),
++      child: Padding(
++        padding: const EdgeInsets.symmetric(horizontal: 10.0),
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            SizedBox(height: 50),
++            Text(
++              'Cake ${S.of(context).features}',
++              style: TextStyle(
++                fontSize: 24,
++                fontWeight: FontWeight.w500,
++                color: Theme.of(context).extension<DashboardPageTheme>()!.pageTitleTextColor,
+               ),
+-              Expanded(
+-                child: ListView(
+-                  controller: _scrollController,
+-                  children: <Widget>[
+-                    SizedBox(height: 20),
+-                    DashBoardRoundedCardWidget(
+-                      onTap: () => _navigatorToGiftCardsPage(context),
+-                      title: 'Cake Pay',
+-                      subTitle: S.of(context).cake_pay_subtitle,
+-                      image: Image.asset(
+-                        'assets/images/cards.png',
+-                        height: 100,
+-                        width: 115,
+-                        fit: BoxFit.cover,
+-                      ),
++            ),
++            Expanded(
++              child: ListView(
++                children: <Widget>[
++                  SizedBox(height: 20),
++                  DashBoardRoundedCardWidget(
++                    onTap: () => _navigatorToGiftCardsPage(context),
++                    title: 'Cake Pay',
++                    subTitle: S.of(context).cake_pay_subtitle,
++                    image: Image.asset(
++                      'assets/images/cards.png',
++                      height: 100,
++                      width: 115,
++                      fit: BoxFit.cover,
+                     ),
+-                    SizedBox(height: 10),
+-                    DashBoardRoundedCardWidget(
+-                      onTap: () => _launchUrl("cake.nano-gpt.com"),
+-                      title: "NanoGPT",
+-                      subTitle: S.of(context).nanogpt_subtitle,
+-                      image: Image.asset(
+-                        'assets/images/nanogpt.png',
+-                        height: 80,
+-                        width: 80,
+-                        fit: BoxFit.cover,
+-                      ),
++                  ),
++                  SizedBox(height: 10),
++                  DashBoardRoundedCardWidget(
++                    onTap: () => _launchUrl("cake.nano-gpt.com"),
++                    title: "NanoGPT",
++                    subTitle: S.of(context).nanogpt_subtitle,
++                    image: Image.asset(
++                      'assets/images/nanogpt.png',
++                      height: 80,
++                      width: 80,
++                      fit: BoxFit.cover,
+                     ),
+-                    SizedBox(height: 10),
+-                    Observer(
+-                      builder: (context) {
+-                        if (!dashboardViewModel.hasSignMessages) {
+-                          return const SizedBox();
+-                        }
+-                        return DashBoardRoundedCardWidget(
+-                          onTap: () => Navigator.of(context).pushNamed(Routes.signPage),
+-                          title: S.current.sign_verify_message,
+-                          subTitle: S.current.sign_verify_message_sub,
+-                          icon: Icon(
+-                            Icons.speaker_notes_rounded,
+-                            color:
+-                            Theme.of(context).extension<DashboardPageTheme>()!.pageTitleTextColor,
+-                            size: 75,
+-                          ),
+-                        );
+-                      },
+-                    ),
+-                  ],
+-                ),
++                  ),
++                  SizedBox(height: 10),
++                  Observer(
++                    builder: (context) {
++                      if (!dashboardViewModel.hasSignMessages) {
++                        return const SizedBox();
++                      }
++                      return DashBoardRoundedCardWidget(
++                        onTap: () => Navigator.of(context).pushNamed(Routes.signPage),
++                        title: S.current.sign_verify_message,
++                        subTitle: S.current.sign_verify_message_sub,
++                        icon: Icon(
++                          Icons.speaker_notes_rounded,
++                          color:
++                          Theme.of(context).extension<DashboardPageTheme>()!.pageTitleTextColor,
++                          size: 75,
++                        ),
++                      );
++                    },
++                  ),
++                ],
+               ),
+-            ],
+-          ),
++            ),
++          ],
+         ),
+       ),
+     );
+diff --git a/lib/src/screens/dashboard/widgets/sync_indicator_icon.dart b/lib/src/screens/dashboard/widgets/sync_indicator_icon.dart
+index 21133a4382..aca3231ec8 100644
+--- a/lib/src/screens/dashboard/widgets/sync_indicator_icon.dart
++++ b/lib/src/screens/dashboard/widgets/sync_indicator_icon.dart
+@@ -8,7 +8,7 @@ class SyncIndicatorIcon extends StatelessWidget {
+       {this.boolMode = true,
+       this.isSynced = false,
+       this.value = waiting,
+-      this.size = 4.0});
++      this.size = 6.0});
+ 
+   final bool boolMode;
+   final bool isSynced;
+diff --git a/lib/src/widgets/blockchain_height_widget.dart b/lib/src/widgets/blockchain_height_widget.dart
+index 1c6b6da028..650ee684de 100644
+--- a/lib/src/widgets/blockchain_height_widget.dart
++++ b/lib/src/widgets/blockchain_height_widget.dart
+@@ -191,11 +191,13 @@ class BlockchainHeightState extends State<BlockchainHeightWidget> {
+           height = wownero!.getHeightByDate(date: date);
+         }
+       }
+-      setState(() {
+-        dateController.text = DateFormat('yyyy-MM-dd').format(date);
+-        restoreHeightController.text = '$height';
+-        _changeHeight(height);
+-      });
++      if (mounted) {
++        setState(() {
++          dateController.text = DateFormat('yyyy-MM-dd').format(date);
++          restoreHeightController.text = '$height';
++          _changeHeight(height);
++        });
++      }
+     }
+   }
+ 
+diff --git a/lib/src/widgets/services_updates_widget.dart b/lib/src/widgets/services_updates_widget.dart
+index 1787b71180..17f231303a 100644
+--- a/lib/src/widgets/services_updates_widget.dart
++++ b/lib/src/widgets/services_updates_widget.dart
+@@ -92,15 +92,17 @@ class _ServicesUpdatesWidgetState extends State<ServicesUpdatesWidget> {
+                           );
+                         }
+                         return Padding(
+-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 20),
+-                          child: Stack(
++                          padding: const EdgeInsets.symmetric(horizontal: 12),
++                          child: Column(
+                             children: [
+-                              body,
++                              Expanded(child: body),
+                               Align(
+                                 alignment: Alignment.bottomCenter,
+                                 child: Padding(
+                                   padding: EdgeInsets.symmetric(
+-                                      horizontal: MediaQuery.of(context).size.width / 8),
++                                    horizontal: MediaQuery.of(context).size.width / 8,
++                                    vertical: 20,
++                                  ),
+                                   child: PrimaryImageButton(
+                                     onPressed: () {
+                                       try {
+diff --git a/lib/store/app_store.dart b/lib/store/app_store.dart
+index 24d5dc6a42..ff3ba0535e 100644
+--- a/lib/store/app_store.dart
++++ b/lib/store/app_store.dart
+@@ -50,8 +50,8 @@ abstract class AppStoreBase with Store {
+       getIt.get<Web3WalletService>().create();
+       await getIt.get<Web3WalletService>().init();
+     }
+-    await getIt.get<SharedPreferences>().setString(PreferencesKey.currentWalletName, wallet.name);
+-    await getIt
++    getIt.get<SharedPreferences>().setString(PreferencesKey.currentWalletName, wallet.name);
++    getIt
+         .get<SharedPreferences>()
+         .setInt(PreferencesKey.currentWalletType, serializeToInt(wallet.type));
+   }
+diff --git a/lib/view_model/cake_pay/cake_pay_cards_list_view_model.dart b/lib/view_model/cake_pay/cake_pay_cards_list_view_model.dart
+index 8585da9da5..442bd51b4a 100644
+--- a/lib/view_model/cake_pay/cake_pay_cards_list_view_model.dart
++++ b/lib/view_model/cake_pay/cake_pay_cards_list_view_model.dart
+@@ -204,7 +204,11 @@ abstract class CakePayCardsListViewModelBase with Store {
+   }
+ 
+   @action
+-  void setSelectedCountry(Country country) => settingsStore.selectedCakePayCountry = country;
++  void setSelectedCountry(Country country) {
++    // just so it triggers the reaction even when selecting the default country
++    settingsStore.selectedCakePayCountry = null;
++    settingsStore.selectedCakePayCountry = country;
++  }
+ 
+   @action
+   void togglePrepaidCards() => displayPrepaidCards = !displayPrepaidCards;
+diff --git a/res/values/strings_fr.arb b/res/values/strings_fr.arb
+index 549ec52759..741adc472c 100644
+--- a/res/values/strings_fr.arb
++++ b/res/values/strings_fr.arb
+@@ -919,7 +919,7 @@
+   "wallet_seed_legacy": "Graine de portefeuille hérité",
+   "wallet_store_monero_wallet": "Portefeuille (Wallet) Monero",
+   "walletConnect": "WalletConnect",
+-  "wallets": "Portefeuilles (Wallets)",
++  "wallets": "Portefeuilles",
+   "warning": "Avertissement",
+   "welcome": "Bienvenue sur",
+   "welcome_to_cakepay": "Bienvenue sur Cake Pay !",
+diff --git a/scripts/macos/app_env.sh b/scripts/macos/app_env.sh
+index 8f3b68ab53..930a1e5edf 100755
+--- a/scripts/macos/app_env.sh
++++ b/scripts/macos/app_env.sh
+@@ -16,13 +16,13 @@ if [ -n "$1" ]; then
+ fi
+ 
+ MONERO_COM_NAME="Monero.com"
+-MONERO_COM_VERSION="1.8.0"
+-MONERO_COM_BUILD_NUMBER=36
++MONERO_COM_VERSION="1.8.1"
++MONERO_COM_BUILD_NUMBER=37
+ MONERO_COM_BUNDLE_ID="com.cakewallet.monero"
+ 
+ CAKEWALLET_NAME="Cake Wallet"
+-CAKEWALLET_VERSION="1.14.0"
+-CAKEWALLET_BUILD_NUMBER=95
++CAKEWALLET_VERSION="1.14.1"
++CAKEWALLET_BUILD_NUMBER=96
+ CAKEWALLET_BUNDLE_ID="com.fotolockr.cakewallet"
+ 
+ if ! [[ " ${TYPES[*]} " =~ " ${APP_MACOS_TYPE} " ]]; then

@@ -1,0 +1,311 @@
+diff --git a/mobile/lib/app.dart b/mobile/lib/app.dart
+index 332fd4226b5..b9672197699 100644
+--- a/mobile/lib/app.dart
++++ b/mobile/lib/app.dart
+@@ -64,11 +64,9 @@ class _EnteAppState extends State<EnteApp> with WidgetsBindingObserver {
+   void setupSubscription() {
+     _memoriesChangedSubscription =
+         Bus.instance.on<MemoriesChangedEvent>().listen(
+-      (event) async {
+-        await HomeWidgetService.instance
+-            .initHomeWidget(false, bypassCount: true);
+-      },
+-    );
++              (event) async =>
++                  await HomeWidgetService.instance.initHomeWidget(false),
++            );
+   }
+ 
+   @override
+diff --git a/mobile/lib/main.dart b/mobile/lib/main.dart
+index c405a10e9cc..36163e4be46 100644
+--- a/mobile/lib/main.dart
++++ b/mobile/lib/main.dart
+@@ -252,13 +252,15 @@ Future<void> _init(bool isBackground, {String via = ''}) async {
+     _logger.info("LocalSyncService init done $tlog");
+ 
+     RemoteSyncService.instance.init(preferences);
++    _logger.info("RemoteFileMLService done $tlog");
+ 
+     _logger.info("SyncService init $tlog");
+     await SyncService.instance.init(preferences);
+     _logger.info("SyncService init done $tlog");
+ 
+-    _logger.info("RemoteFileMLService done $tlog");
+-    unawaited(HomeWidgetService.instance.initHomeWidget(isBackground));
++    if (!isBackground) {
++      await _scheduleFGHomeWidgetSync();
++    }
+ 
+     if (Platform.isIOS) {
+       // ignore: unawaited_futures
+diff --git a/mobile/lib/services/home_widget_service.dart b/mobile/lib/services/home_widget_service.dart
+index 5dc80a272a6..77d744bf8d6 100644
+--- a/mobile/lib/services/home_widget_service.dart
++++ b/mobile/lib/services/home_widget_service.dart
+@@ -1,7 +1,6 @@
+ import "dart:convert";
+ import "dart:io";
+ 
+-import "package:crypto/crypto.dart";
+ import "package:figma_squircle/figma_squircle.dart";
+ import "package:flutter/material.dart";
+ import "package:flutter/scheduler.dart";
+@@ -15,6 +14,7 @@ import "package:photos/service_locator.dart";
+ import "package:photos/services/smart_memories_service.dart";
+ import "package:photos/utils/preload_util.dart";
+ import "package:photos/utils/thumbnail_util.dart";
++import "package:shared_preferences/shared_preferences.dart";
+ 
+ class HomeWidgetService {
+   final Logger _logger = Logger((HomeWidgetService).toString());
+@@ -24,13 +24,33 @@ class HomeWidgetService {
+   static final HomeWidgetService instance =
+       HomeWidgetService._privateConstructor();
+ 
+-  bool _isBusyLoadingWidget = false;
++  init(SharedPreferences prefs) {
++    _prefs = prefs;
++  }
++
++  static const memoryChangedKey = "memoryChanged.widget";
++
++  late final SharedPreferences _prefs;
++
++  Future<void> checkPendingMemorySync() async {
++    final memoryChanged = _prefs.getBool(memoryChangedKey);
++    if (memoryChanged == null || !memoryChanged) {
++      await initHomeWidget(false, memoryChanged: false);
++      return;
++    }
++
++    await initHomeWidget(false, memoryChanged: true);
++  }
+ 
+   Future<void> initHomeWidget(
+     bool isBackground, {
+-    bool bypass = false,
+     bool bypassCount = false,
++    bool memoryChanged = false,
+   }) async {
++    if (memoryChanged) {
++      await _prefs.setBool(memoryChangedKey, true);
++    }
++
+     if (isBackground) {
+       _logger.warning("app is running in background");
+       return;
+@@ -38,15 +58,8 @@ class HomeWidgetService {
+ 
+     await hw.HomeWidget.setAppGroupId(iOSGroupID);
+ 
+-    final homeWidgetCount = await HomeWidgetService.instance.countHomeWidgets();
+-    if (!bypassCount && homeWidgetCount == 0) {
+-      _logger.warning("no home widget active");
+-      return;
+-    }
+-
+     final isLoggedIn = Configuration.instance.isLoggedIn();
+     if (!isLoggedIn) {
+-      await clearHomeWidget();
+       _logger.warning("user not logged in");
+       return;
+     }
+@@ -58,16 +71,33 @@ class HomeWidgetService {
+       return;
+     }
+ 
+-    if (!_isBusyLoadingWidget) {
+-      _isBusyLoadingWidget = true;
+-      try {
+-        await _lockAndLoadMemories(bypass: bypass);
+-      } finally {
+-        _isBusyLoadingWidget = false;
+-      }
++    if (memoryChanged) {
++      await _memoryChanged();
++    } else {
++      await _memorySync(
++        bypassCount: bypassCount,
++      );
+     }
+   }
+ 
++  Future<void> _memoryChanged() async {
++    await _lockAndLoadMemories();
++    await _prefs.setBool(memoryChangedKey, false);
++  }
++
++  Future<void> _memorySync({
++    bool bypassCount = false,
++  }) async {
++    final homeWidgetCount = await HomeWidgetService.instance.countHomeWidgets();
++    if (!bypassCount && homeWidgetCount == 0) {
++      _logger.warning("no home widget active");
++      return;
++    }
++
++    await _updateWidget(text: "[i] refreshing from same set");
++    _logger.info(">>> Refreshing memory from same set");
++  }
++
+   Future<Size?> _renderFile(
+     EnteFile randomFile,
+     String key,
+@@ -94,21 +124,12 @@ class HomeWidgetService {
+ 
+     _logger.info("Clearing SlideshowWidget");
+ 
+-    await _setFilesHash(null);
+     await _setTotal(0);
+ 
+     await _updateWidget(text: "[i] SlideshowWidget cleared & updated");
+     _logger.info(">>> SlideshowWidget cleared");
+   }
+ 
+-  Future<String?> _getFilesHash() async {
+-    return await hw.HomeWidget.getWidgetData<String>("filesHash");
+-  }
+-
+-  Future<void> _setFilesHash(String? fileHash) async {
+-    await hw.HomeWidget.saveWidgetData("filesHash", fileHash);
+-  }
+-
+   Future<bool> _captureFile(
+     EnteFile ogFile,
+     String key,
+@@ -180,7 +201,6 @@ class HomeWidgetService {
+   Future<void> onLaunchFromWidget(Uri? uri, BuildContext context) async {
+     if (uri == null) {
+       _logger.warning("onLaunchFromWidget: uri is null");
+-      await initHomeWidget(false);
+       return;
+     }
+ 
+@@ -216,18 +236,6 @@ class HomeWidgetService {
+     return files;
+   }
+ 
+-  String _getFilesKey(Map<String, Iterable<EnteFile>> files) {
+-    // 1: file1_file2_file3, 2: file4_file5_file6 -> md5 hash
+-    final key = files.entries
+-        .map(
+-          (entry) =>
+-              entry.key + ": " + entry.value.map((e) => e.cacheKey()).join("_"),
+-        )
+-        .join(", ");
+-    final hash = md5.convert(key.codeUnits).toString();
+-    return hash;
+-  }
+-
+   Future<void> _updateWidget({String? text}) async {
+     await hw.HomeWidget.updateWidget(
+       name: 'SlideshowWidgetProvider',
+@@ -257,7 +265,7 @@ class HomeWidgetService {
+     await hw.HomeWidget.saveWidgetData("totalSet", total);
+   }
+ 
+-  Future<void> _lockAndLoadMemories({bool bypass = false}) async {
++  Future<void> _lockAndLoadMemories() async {
+     final files = await _getMemories();
+ 
+     if (files.isEmpty) {
+@@ -266,16 +274,6 @@ class HomeWidgetService {
+       return;
+     }
+ 
+-    final keyHash = _getFilesKey(files);
+-
+-    final value = await _getFilesHash();
+-    if (!bypass && value != null && value == keyHash) {
+-      _logger.info("No changes detected in memories");
+-      await _updateWidget(text: "[i] No changes, refreshing from same set");
+-      _logger.info(">>> Refreshing memory from same set");
+-      return;
+-    }
+-
+     int index = 0;
+ 
+     for (final i in files.entries) {
+@@ -292,9 +290,7 @@ class HomeWidgetService {
+           await _setTotal(index);
+           if (index == 1) {
+             await _updateWidget(
+-              text: bypass
+-                  ? "[i] First memory after bypass, updating widget"
+-                  : "[i] First memory fetched. updating widget",
++              text: "[i] First memory fetched. updating widget",
+             );
+           }
+           index++;
+@@ -306,11 +302,7 @@ class HomeWidgetService {
+       return;
+     }
+ 
+-    await _setFilesHash(keyHash);
+-
+-    await _updateWidget(
+-      text: bypass ? "[i] Bypassing memory set check, updated widget" : null,
+-    );
++    await _updateWidget();
+     _logger.info(">>> Switching to next memory set");
+   }
+ }
+diff --git a/mobile/lib/ui/settings/debug/ml_debug_section_widget.dart b/mobile/lib/ui/settings/debug/ml_debug_section_widget.dart
+index cb1ac1aa199..293949598a0 100644
+--- a/mobile/lib/ui/settings/debug/ml_debug_section_widget.dart
++++ b/mobile/lib/ui/settings/debug/ml_debug_section_widget.dart
+@@ -320,6 +320,17 @@ class _MLDebugSectionWidgetState extends State<MLDebugSectionWidget> {
+           },
+         ),
+         sectionOptionSpacing,
++        MenuItemWidget(
++          captionedTextWidget: const CaptionedTextWidget(
++            title: "Force changed memory widget",
++          ),
++          pressedColor: getEnteColorScheme(context).fillFaint,
++          trailingIcon: Icons.chevron_right_outlined,
++          trailingIconIsMuted: true,
++          onTap: () async => await HomeWidgetService.instance
++              .initHomeWidget(false, memoryChanged: true),
++        ),
++        sectionOptionSpacing,
+         MenuItemWidget(
+           captionedTextWidget: const CaptionedTextWidget(
+             title: "Force sync memory widget",
+@@ -327,12 +338,8 @@ class _MLDebugSectionWidgetState extends State<MLDebugSectionWidget> {
+           pressedColor: getEnteColorScheme(context).fillFaint,
+           trailingIcon: Icons.chevron_right_outlined,
+           trailingIconIsMuted: true,
+-          onTap: () async {
+-            await HomeWidgetService.instance.initHomeWidget(
+-              false,
+-              bypass: true,
+-            );
+-          },
++          onTap: () async =>
++              await HomeWidgetService.instance.initHomeWidget(false),
+         ),
+         sectionOptionSpacing,
+         MenuItemWidget(
+diff --git a/mobile/lib/ui/tabs/home_widget.dart b/mobile/lib/ui/tabs/home_widget.dart
+index 4357297f4e8..b744adb5ad7 100644
+--- a/mobile/lib/ui/tabs/home_widget.dart
++++ b/mobile/lib/ui/tabs/home_widget.dart
+@@ -37,6 +37,7 @@ import "package:photos/service_locator.dart";
+ import 'package:photos/services/account/user_service.dart';
+ import 'package:photos/services/app_lifecycle_service.dart';
+ import 'package:photos/services/collections_service.dart';
++import "package:photos/services/home_widget_service.dart";
+ import "package:photos/services/machine_learning/face_ml/person/person_service.dart";
+ import "package:photos/services/notification_service.dart";
+ import "package:photos/services/sync/diff_fetcher.dart";
+@@ -122,6 +123,8 @@ class _HomeWidgetState extends State<HomeWidget> {
+   void initState() {
+     _logger.info("Building initstate");
+     super.initState();
++
++    HomeWidgetService.instance.checkPendingMemorySync();
+     _tabChangedEventSubscription =
+         Bus.instance.on<TabChangedEvent>().listen((event) {
+       _selectedTabIndex = event.selectedIndex;

@@ -1,0 +1,116 @@
+diff --git a/WMF Framework/CharacterSet+LinkParsing.swift b/WMF Framework/CharacterSet+LinkParsing.swift
+index a5c5371e8e7..5516f4007b0 100644
+--- a/WMF Framework/CharacterSet+LinkParsing.swift	
++++ b/WMF Framework/CharacterSet+LinkParsing.swift	
+@@ -7,6 +7,10 @@ extension CharacterSet {
+         return NSCharacterSet.wmf_relativePathAndFragmentAllowed()
+     }
+     
++    public static var ascii: CharacterSet {
++        return CharacterSet(charactersIn: Unicode.Scalar(0)..<Unicode.Scalar(128))
++    }
++    
+     static let urlQueryComponentAllowed: CharacterSet = {
+         var characterSet = CharacterSet.urlQueryAllowed
+         characterSet.remove(charactersIn: "+&=")
+diff --git a/WMF Framework/URLComponents+Extensions.swift b/WMF Framework/URLComponents+Extensions.swift
+index 4613fdc15e7..05cd48eba70 100644
+--- a/WMF Framework/URLComponents+Extensions.swift	
++++ b/WMF Framework/URLComponents+Extensions.swift	
+@@ -80,6 +80,20 @@ extension URLComponents {
+         percentEncodedPath = fullComponents.joined(separator: "/") // NSString.path(with: components) removes the trailing slash that the reading list API needs
+     }
+     
++    /// Encodes charcters in each component that are not allowed for that component (also encodes non-ASCII characters)
++    mutating func encodeByComponent() {
++        // The getters remove percent-encoding, then the setters add encoding
++        // where necessary for that component
++        scheme = scheme
++        host = host // may use punycode in some versions of iOS
++        port = port
++        path = path
++        query = query
++        fragment = fragment
++        user = user
++        password = password
++    }
++    
+     public func wmf_URLWithLanguageVariantCode(_ code: String?) -> URL? {
+         return (self as NSURLComponents).wmf_URL(withLanguageVariantCode: code)
+     }
+diff --git a/Wikipedia/Code/URL+LinkParsing.swift b/Wikipedia/Code/URL+LinkParsing.swift
+index 3cf91013b12..e705ea5c363 100644
+--- a/Wikipedia/Code/URL+LinkParsing.swift
++++ b/Wikipedia/Code/URL+LinkParsing.swift
+@@ -30,17 +30,18 @@ extension URL {
+     /// Resolves a relative href from a wiki page against the callee.
+     /// The callee should be a standardized page URL generated with wmf_databaseURL, non-article namespaces are OK
+     public func resolvingRelativeWikiHref(_ href: String) -> URL? {
+-        let urlComponentsString: String
+-
+-        /// The link is sometimes encoded, and sometimes unencoded. (In some cases, this depends on whether an editor put added an escaped or unescaped version of the URL.) So we remove any potential encoding, so that we can be assured we are starting with an unencoded string.
+-        let hrefWithoutEncoding = href.removingPercentEncoding ?? href
+-
+-        if hrefWithoutEncoding.hasPrefix(".") || hrefWithoutEncoding.hasPrefix("/") {
+-            urlComponentsString = hrefWithoutEncoding.addingPercentEncoding(withAllowedCharacters: .relativePathAndFragmentAllowed) ?? href
+-        } else {
+-            urlComponentsString = hrefWithoutEncoding
++        // The link is sometimes encoded, and sometimes unencoded. (In some cases, this depends on
++        // whether an editor put an escaped or unescaped version of the URL). We percent-encode
++        // non-ASCII characters first because URLComponents cannot ingest strings with
++        // international chacters in some versions of iOS (e.g. 15.5).
++        let urlComponentsString = href.addingPercentEncoding(withAllowedCharacters: .ascii) ?? href
++        var components = URLComponents(string: urlComponentsString)
++        
++        // Encode the URL if it is relative
++        if href.hasPrefix(".") || href.hasPrefix("/") {
++            components?.encodeByComponent() // handle unsafe/disallowed characters
+         }
+-        let components = URLComponents(string: urlComponentsString)
++        
+         // Encode this URL to handle titles with forward slashes, otherwise URLComponents thinks they're separate path components
+         let encodedBaseURL = encodedWikiURL
+         var resolvedURL = components?.url(relativeTo: encodedBaseURL)?.absoluteURL
+diff --git a/WikipediaUnitTests/Code/URLParsingAndRoutingTests.swift b/WikipediaUnitTests/Code/URLParsingAndRoutingTests.swift
+index 076c9fcd27c..a7d1cbce58a 100644
+--- a/WikipediaUnitTests/Code/URLParsingAndRoutingTests.swift
++++ b/WikipediaUnitTests/Code/URLParsingAndRoutingTests.swift
+@@ -148,12 +148,24 @@ class URLParsingAndRoutingTests: XCTestCase {
+ 
+     func testSpecialCharactersEncodedOffWiki() {
+         let url = URL(string: "https://de.wikipedia.org/wiki/Grinnell_College")!
+-        XCTAssertEqual(url.resolvingRelativeWikiHref("//www.p%C3%BCzzledpint.com")?.absoluteString, "https://www.p%C3%BCzzledpint.com")
++        
++        // Both strings below are valid. Output depends on iOS version
++        let resolved = [
++            "https://www.p%C3%BCzzledpint.com",
++            "https://www.xn--pzzledpint-9db.com"
++        ]
++        XCTAssertTrue(resolved.contains(url.resolvingRelativeWikiHref("//www.p%C3%BCzzledpint.com")?.absoluteString ?? ""))
+     }
+ 
+     func testSpecialCharactersUnencodedOffWiki() {
+         let url = URL(string: "https://de.wikipedia.org/wiki/Grinnell_College")!
+-        XCTAssertEqual(url.resolvingRelativeWikiHref("//www.püzzledpint.com")?.absoluteString, "https://www.p%C3%BCzzledpint.com")
++        
++        // Both strings below are valid. Output depends on iOS version
++        let resolved = [
++            "https://www.p%C3%BCzzledpint.com",
++            "https://www.xn--pzzledpint-9db.com"
++        ]
++        XCTAssertTrue(resolved.contains(url.resolvingRelativeWikiHref("//www.püzzledpint.com")?.absoluteString ?? ""))
+     }
+ 
+     func testQuestionMark() {
+@@ -171,6 +183,11 @@ class URLParsingAndRoutingTests: XCTestCase {
+         XCTAssertEqual(url.resolvingRelativeWikiHref("//commons.wikimedia.org/wiki/Category:COVID-19_pandemic_in_Baden-Württemberg?uselang=de")?.absoluteString, "https://commons.wikimedia.org/wiki/Category:COVID-19_pandemic_in_Baden-W%C3%BCrttemberg?uselang=de")
+     }
+     
++    func testQuestionMarkInPath() {
++        let url = URL(string: "https://en.wikipedia.org/wiki/Main_Page")!
++        XCTAssertEqual(url.resolvingRelativeWikiHref("./Who's_the_Man%3F")?.absoluteString, "https://en.wikipedia.org/wiki/Who's_the_Man%3F")
++    }
++    
+     func testLanguageVariantCodeProperty() {
+         var url = URL(string: "https://zh.wikipedia.org")!
+         XCTAssertNil(url.wmf_languageVariantCode)

@@ -1,0 +1,880 @@
+diff --git a/Mastodon/Coordinator/SceneCoordinator.swift b/Mastodon/Coordinator/SceneCoordinator.swift
+index f03c055ecd..a5fe7505a2 100644
+--- a/Mastodon/Coordinator/SceneCoordinator.swift
++++ b/Mastodon/Coordinator/SceneCoordinator.swift
+@@ -23,7 +23,9 @@ final public class SceneCoordinator {
+     private weak var sceneDelegate: SceneDelegate!
+     private(set) weak var appContext: AppContext!
+     
+-    private(set) var authenticationBox: MastodonAuthenticationBox?
++    var authenticationBox: MastodonAuthenticationBox? {
++        AuthenticationServiceProvider.shared.currentActiveUser.value
++    }
+     
+     let id = UUID().uuidString
+     
+@@ -61,13 +63,9 @@ final public class SceneCoordinator {
+                     } else {
+                         // switch to notification's account
+                         do {
+-                            guard let authentication = AuthenticationServiceProvider.shared.authentications.first(where: { $0.userAccessToken == accessToken }) else {
++                            guard let authenticationBox = AuthenticationServiceProvider.shared.activateExistingUserToken(accessToken) else {
+                                 return
+                             }
+-                            let domain = authentication.domain
+-                            let userID = authentication.userID
+-                            let isSuccess = AuthenticationServiceProvider.shared.activateUser(userID, inDomain: domain)
+-                            guard isSuccess else { return }
+ 
+                             self.setup()
+                             try await Task.sleep(nanoseconds: .second * 1)
+@@ -93,7 +91,6 @@ final public class SceneCoordinator {
+ 
+                             // show notification related content
+                             guard let type = Mastodon.Entity.Notification.NotificationType(rawValue: pushNotification.notificationType) else { return }
+-                            guard let authenticationBox = self.authenticationBox else { return }
+                             guard let me = authenticationBox.cachedAccount else { return }
+                             let notificationID = String(pushNotification.notificationID)
+ 
+@@ -254,9 +251,6 @@ extension SceneCoordinator {
+         let rootViewController: UIViewController
+ 
+         AuthenticationServiceProvider.shared.prepareForUse()
+-        if let _authentication = AuthenticationServiceProvider.shared.authenticationSortedByActivation().first {
+-            self.authenticationBox = MastodonAuthenticationBox(authentication: _authentication)
+-        }
+ 
+         switch UIDevice.current.userInterfaceIdiom {
+             case .phone:
+@@ -544,11 +538,11 @@ private extension SceneCoordinator {
+             activityViewController.popoverPresentationController?.barButtonItem = barButtonItem
+             viewController = activityViewController
+         case .settings(let setting):
+-            guard let presentedOn = sender,
+-                  let accountName = authenticationBox?.authentication.username,
+-                  let authenticationBox
++            guard let presentedOn = sender, let authenticationBox = self.authenticationBox
+             else { return nil }
+-
++            
++            let accountName = authenticationBox.authentication.username
++            
+             let settingsCoordinator = SettingsCoordinator(presentedOn: presentedOn,
+                                                           accountName: accountName,
+                                                           setting: setting,
+diff --git a/Mastodon/Scene/Account/AccountListViewModel.swift b/Mastodon/Scene/Account/AccountListViewModel.swift
+index db6af86ea9..45fef2deee 100644
+--- a/Mastodon/Scene/Account/AccountListViewModel.swift
++++ b/Mastodon/Scene/Account/AccountListViewModel.swift
+@@ -35,7 +35,7 @@ final class AccountListViewModel: NSObject {
+         super.init()
+         // end init
+ 
+-        AuthenticationServiceProvider.shared.$authentications
++        AuthenticationServiceProvider.shared.$mastodonAuthenticationBoxes
+             .receive(on: DispatchQueue.main)
+             .sink { [weak self] authentications in
+                 guard let self = self else { return }
+@@ -44,7 +44,7 @@ final class AccountListViewModel: NSObject {
+                 var snapshot = NSDiffableDataSourceSnapshot<Section, Item>()
+                 snapshot.appendSections([.main])
+                 let authenticationItems: [Item] = authentications.map {
+-                    Item.authentication(record: $0)
++                    Item.authentication(record: $0.authentication)
+                 }
+                 snapshot.appendItems(authenticationItems, toSection: .main)
+                 snapshot.appendItems([.addAccount], toSection: .main)
+@@ -76,12 +76,12 @@ extension AccountListViewModel {
+             switch item {
+             case .authentication(let record):
+                 let cell = tableView.dequeueReusableCell(withIdentifier: String(describing: AccountListTableViewCell.self), for: indexPath) as! AccountListTableViewCell
+-                if let activeAuthentication = AuthenticationServiceProvider.shared.authenticationSortedByActivation().first
++                if let activeAuthentication = AuthenticationServiceProvider.shared.currentActiveUser.value
+                 {
+                     AccountListViewModel.configure(
+                         cell: cell,
+                         authentication: record,
+-                        activeAuthentication: activeAuthentication
++                        activeAuthentication: activeAuthentication.authentication
+                     )
+                 }
+                 return cell
+diff --git a/Mastodon/Scene/Account/AccountViewController.swift b/Mastodon/Scene/Account/AccountViewController.swift
+index 7a93db2678..710234f5a9 100644
+--- a/Mastodon/Scene/Account/AccountViewController.swift
++++ b/Mastodon/Scene/Account/AccountViewController.swift
+@@ -144,7 +144,7 @@ extension AccountListViewController: UITableViewDelegate {
+         case .authentication(let record):
+             assert(Thread.isMainThread)
+             Task { @MainActor in
+-                let isActive = AuthenticationServiceProvider.shared.activateUser(record.userID, inDomain: record.domain)
++                let isActive = AuthenticationServiceProvider.shared.activateExistingUser(record.userID, inDomain: record.domain)
+                 guard isActive else { return }
+                 self.coordinator.setup()
+             }   // end Task
+diff --git a/Mastodon/Scene/HomeTimeline/HomeTimelineViewModel+Donation.swift b/Mastodon/Scene/HomeTimeline/HomeTimelineViewModel+Donation.swift
+index b5f6cb98ad..7f384ad5ea 100644
+--- a/Mastodon/Scene/HomeTimeline/HomeTimelineViewModel+Donation.swift
++++ b/Mastodon/Scene/HomeTimeline/HomeTimelineViewModel+Donation.swift
+@@ -11,8 +11,11 @@ extension HomeTimelineViewModel {
+         let userAuthentication = authenticationBox
+             .authentication
+         guard let accountCreatedAt = userAuthentication.accountCreatedAt else {
+-            let updated = try? await APIService.shared.accountVerifyCredentials(domain: userAuthentication.domain, authorization: authenticationBox.userAuthorization)
+-            guard let accountCreatedAt = updated?.createdAt else { return }
++            let updated = try? await APIService.shared.verifyAndActivateUser(domain: userAuthentication.domain,
++                                                                                clientID: userAuthentication.clientID,
++                                                                                clientSecret: userAuthentication.clientSecret,
++                                                                                    authorization: authenticationBox.userAuthorization)
++            guard let accountCreatedAt = updated?.1.authentication.createdAt else { return }
+             AuthenticationServiceProvider.shared.updateAccountCreatedAt(accountCreatedAt, forAuthentication: userAuthentication)
+             return
+         }
+diff --git a/Mastodon/Scene/Notification/Notification Filtering/Policy/NotificationPolicyViewController.swift b/Mastodon/Scene/Notification/Notification Filtering/Policy/NotificationPolicyViewController.swift
+index 6039be8d2f..d7d0dfe091 100644
+--- a/Mastodon/Scene/Notification/Notification Filtering/Policy/NotificationPolicyViewController.swift	
++++ b/Mastodon/Scene/Notification/Notification Filtering/Policy/NotificationPolicyViewController.swift	
+@@ -143,7 +143,7 @@ class NotificationPolicyViewController: UIViewController {
+     // MARK: - Action
+ 
+     @objc private func save(_ sender: UIButton) {
+-        guard let authenticationBox = AuthenticationServiceProvider.shared.activeAuthentication else { return }
++        guard let authenticationBox = AuthenticationServiceProvider.shared.currentActiveUser.value else { return }
+ 
+         Task { [weak self] in
+             guard let self else { return }
+diff --git a/Mastodon/Scene/Onboarding/ConfirmEmail/MastodonConfirmEmailViewController.swift b/Mastodon/Scene/Onboarding/ConfirmEmail/MastodonConfirmEmailViewController.swift
+index ad51a7e1e5..6eb5cba8c4 100644
+--- a/Mastodon/Scene/Onboarding/ConfirmEmail/MastodonConfirmEmailViewController.swift
++++ b/Mastodon/Scene/Onboarding/ConfirmEmail/MastodonConfirmEmailViewController.swift
+@@ -99,7 +99,7 @@ extension MastodonConfirmEmailViewController {
+         self.viewModel.timestampUpdatePublisher
+             .sink { [weak self] _ in
+                 guard let self = self else { return }
+-                AuthenticationViewModel.verifyAndSaveAuthentication(context: self.context, info: self.viewModel.authenticateInfo, userToken: self.viewModel.userToken)
++                AuthenticationViewModel.verifyAndActivateAuthentication(info: self.viewModel.authenticateInfo, userToken: self.viewModel.userToken)
+                     .receive(on: DispatchQueue.main)
+                     .sink { completion in
+                         switch completion {
+diff --git a/Mastodon/Scene/Onboarding/Login/MastodonLoginViewController.swift b/Mastodon/Scene/Onboarding/Login/MastodonLoginViewController.swift
+index fc84ca1750..3d4067e9c7 100644
+--- a/Mastodon/Scene/Onboarding/Login/MastodonLoginViewController.swift
++++ b/Mastodon/Scene/Onboarding/Login/MastodonLoginViewController.swift
+@@ -122,11 +122,9 @@ class MastodonLoginViewController: UIViewController, NeedsDependency {
+     
+     func login(on server: Mastodon.Entity.Server) {
+         authenticationViewModel
+-            .authenticated.sink { (domain, account) in
++            .authenticated.sink { authBox in
+                 Task { @MainActor in
+                     do {
+-                        AuthenticationServiceProvider.shared.activateUser(account.id, inDomain: domain)
+-
+                         self.coordinator.setup()
+                     } catch {
+                         assertionFailure(error.localizedDescription)
+diff --git a/Mastodon/Scene/Onboarding/PickServer/MastodonPickServerViewController.swift b/Mastodon/Scene/Onboarding/PickServer/MastodonPickServerViewController.swift
+index d41c45722c..2832b00c59 100644
+--- a/Mastodon/Scene/Onboarding/PickServer/MastodonPickServerViewController.swift
++++ b/Mastodon/Scene/Onboarding/PickServer/MastodonPickServerViewController.swift
+@@ -149,9 +149,9 @@ extension MastodonPickServerViewController {
+ 
+         authenticationViewModel
+             .authenticated
+-            .asyncMap { domain, user -> Result<Bool, Error> in
++            .asyncMap { authBox -> Result<Bool, Error> in
+                 do {
+-                    let activated = AuthenticationServiceProvider.shared.activateUser(user.id, inDomain: domain)
++                    let activated = AuthenticationServiceProvider.shared.activateExistingUser(authBox.userID, inDomain: authBox.domain)
+                     return .success(activated)
+                 } catch {
+                     return .failure(error)
+diff --git a/Mastodon/Scene/Onboarding/Share/AuthenticationViewModel.swift b/Mastodon/Scene/Onboarding/Share/AuthenticationViewModel.swift
+index d747fac3e1..bf75a2eee7 100644
+--- a/Mastodon/Scene/Onboarding/Share/AuthenticationViewModel.swift
++++ b/Mastodon/Scene/Onboarding/Share/AuthenticationViewModel.swift
+@@ -19,8 +19,8 @@ final class AuthenticationViewModel {
+     var disposeBag = Set<AnyCancellable>()
+     
+     // input
+-    let context: AppContext
+-    let coordinator: SceneCoordinator
++    private let context: AppContext
++    private let coordinator: SceneCoordinator
+     let isAuthenticationExist: Bool
+     let input = CurrentValueSubject<String, Never>("")
+     
+@@ -31,7 +31,7 @@ final class AuthenticationViewModel {
+     let isAuthenticating = CurrentValueSubject<Bool, Never>(false)
+     let isRegistering = CurrentValueSubject<Bool, Never>(false)
+     let isIdle = CurrentValueSubject<Bool, Never>(true)
+-    let authenticated = PassthroughSubject<(domain: String, account: Mastodon.Entity.Account), Never>()
++    let authenticated = PassthroughSubject<MastodonAuthenticationBox, Never>()
+     let error = CurrentValueSubject<Error?, Never>(nil)
+         
+     init(context: AppContext, coordinator: SceneCoordinator, isAuthenticationExist: Bool) {
+@@ -150,12 +150,11 @@ extension AuthenticationViewModel {
+                             redirectURI: info.redirectURI,
+                             code: code
+                         )
+-                    let account = try await AuthenticationViewModel.verifyAndSaveAuthentication(
+-                        context: self.context,
++                    let authBox = try await AuthenticationViewModel.verifyAndActivateAuthentication(
+                         info: info,
+                         userToken: token
+                     )
+-                    self.authenticated.send((domain: info.domain, account: account))
++                    self.authenticated.send(authBox)
+                     self.authenticated.send(completion: .finished)
+                 }
+             } catch let error {
+@@ -166,70 +165,38 @@ extension AuthenticationViewModel {
+                         return
+                     }
+                 } else {
++                    self.error.value = error
+                     authenticated.send(completion: .finished)
+                 }
+             }
+         }
+     }
+     
+-    static func verifyAndSaveAuthentication(
+-        context: AppContext,
++    static func verifyAndActivateAuthentication(
+         info: AuthenticateInfo,
+         userToken: Mastodon.Entity.Token
+-    ) -> AnyPublisher<MastodonAuthentication, Error> {
++    ) -> AnyPublisher<(Mastodon.Entity.Account, MastodonAuthenticationBox), Error> {
+         let authorization = Mastodon.API.OAuth.Authorization(accessToken: userToken.accessToken)
+-
+-        return APIService.shared.accountVerifyCredentials(
++        return APIService.shared.verifyAndActivateUser(
+             domain: info.domain,
++            clientID: info.clientID,
++            clientSecret: info.clientSecret,
+             authorization: authorization
+         )
+-        .tryMap { response -> MastodonAuthentication in
+-            let account = response.value
+-
+-            let authentication = MastodonAuthentication.createFrom(domain: info.domain,
+-                                                                   userID: account.id,
+-                                                                   username: account.username,
+-                                                                   appAccessToken: userToken.accessToken,  // TODO: swap app token
+-                                                                   userAccessToken: userToken.accessToken,
+-                                                                   clientID: info.clientID,
+-                                                                   clientSecret: info.clientSecret,
+-                                                                   accountCreatedAt: account.createdAt)
+-
+-            AuthenticationServiceProvider.shared
+-                .authentications
+-                .insert(authentication, at: 0)
+-
+-            return authentication
+-        }
+-        .eraseToAnyPublisher()
+     }
+     
+-    static func verifyAndSaveAuthentication(
+-        context: AppContext,
++    static func verifyAndActivateAuthentication(
+         info: AuthenticateInfo,
+         userToken: Mastodon.Entity.Token
+-    ) async throws -> Mastodon.Entity.Account {
++    ) async throws -> MastodonAuthenticationBox {
+         let authorization = Mastodon.API.OAuth.Authorization(accessToken: userToken.accessToken)
+         
+-        let account = try await APIService.shared.accountVerifyCredentials(
++        let (_, authBox) = try await APIService.shared.verifyAndActivateUser(
+             domain: info.domain,
++            clientID: info.clientID,
++            clientSecret: info.clientSecret,
+             authorization: authorization
+         )
+-        
+-        let authentication = MastodonAuthentication
+-            .createFrom(domain: info.domain,
+-                        userID: account.id,
+-                        username: account.username,
+-                        appAccessToken: userToken.accessToken,  // TODO: swap app token
+-                        userAccessToken: userToken.accessToken,
+-                        clientID: info.clientID,
+-                        clientSecret: info.clientSecret,
+-                        accountCreatedAt: account.createdAt)
+-        
+-        AuthenticationServiceProvider.shared
+-            .authentications
+-            .insert(authentication, at: 0) // TODO: this should not be happening. authentications should be readonly.
+-        
+-        return account
++        return authBox
+     }
+ }
+diff --git a/Mastodon/Scene/Profile/ProfileViewController.swift b/Mastodon/Scene/Profile/ProfileViewController.swift
+index 8fb31bb21d..b9e2d73136 100644
+--- a/Mastodon/Scene/Profile/ProfileViewController.swift
++++ b/Mastodon/Scene/Profile/ProfileViewController.swift
+@@ -851,11 +851,11 @@ extension ProfileViewController: ProfileHeaderViewControllerDelegate {
+                         self.profileHeaderViewController?.viewModel.isEditing = true
+                         profileAboutViewModel.isEditing = true
+                     }
+-                } receiveValue: { [weak self] response in
++                } receiveValue: { [weak self] account in
+                     guard let self else { return }
+ 
+-                    self.profileHeaderViewController?.viewModel.setProfileInfo(accountForEdit: response.value)
+-                    viewModel.accountForEdit = response.value
++                    self.profileHeaderViewController?.viewModel.setProfileInfo(accountForEdit: account)
++                    viewModel.accountForEdit = account
+                 }
+                 .store(in: &disposeBag)
+         } else if isEdited == false {
+diff --git a/Mastodon/Scene/Profile/ProfileViewModel.swift b/Mastodon/Scene/Profile/ProfileViewModel.swift
+index e149ef0485..e4506703ae 100644
+--- a/Mastodon/Scene/Profile/ProfileViewModel.swift
++++ b/Mastodon/Scene/Profile/ProfileViewModel.swift
+@@ -172,16 +172,19 @@ class ProfileViewModel: NSObject {
+     }
+     
+     // fetch profile info before edit
+-    func fetchEditProfileInfo() -> AnyPublisher<Mastodon.Response.Content<Mastodon.Entity.Account>, Error> {
++    func fetchEditProfileInfo() -> AnyPublisher<Mastodon.Entity.Account, Error> {
+         guard let domain = me.domain else {
+             return Fail(error: APIService.APIError.implicit(.authenticationMissing)).eraseToAnyPublisher()
+         }
+ 
+         let mastodonAuthentication = authenticationBox.authentication
+         let authorization = Mastodon.API.OAuth.Authorization(accessToken: mastodonAuthentication.userAccessToken)
+-        return APIService.shared.accountVerifyCredentials(domain: domain, authorization: authorization)
+-            .tryMap { response in
+-                return response
++        return APIService.shared.verifyAndActivateUser(domain: domain,
++                                                          clientID: mastodonAuthentication.clientID,
++                                                          clientSecret: mastodonAuthentication.clientSecret,
++                                                            authorization: authorization)
++            .tryMap { (account, _) in
++                return account
+             }.eraseToAnyPublisher()
+     }
+ }
+diff --git a/Mastodon/Scene/Settings/Privacy and Safety/PrivacySafetyViewModel.swift b/Mastodon/Scene/Settings/Privacy and Safety/PrivacySafetyViewModel.swift
+index 321a228af7..0eee809f45 100644
+--- a/Mastodon/Scene/Settings/Privacy and Safety/PrivacySafetyViewModel.swift	
++++ b/Mastodon/Scene/Settings/Privacy and Safety/PrivacySafetyViewModel.swift	
+@@ -145,10 +145,12 @@ extension PrivacySafetyViewModel {
+             let domain = authenticationBox.domain
+             let userAuthorization = authenticationBox.userAuthorization
+             
+-            let account = try await APIService.shared.accountVerifyCredentials(
++            let (account, _) = try await APIService.shared.verifyAndActivateUser(
+                 domain: domain,
++                clientID: authenticationBox.authentication.clientID,
++                clientSecret: authenticationBox.authentication.clientSecret,
+                 authorization: userAuthorization
+-            ).singleOutput().value
++            )
+             
+             if let privacy = account.source?.privacy {
+                 visibility = .from(privacy)
+diff --git a/Mastodon/Supporting Files/SceneDelegate.swift b/Mastodon/Supporting Files/SceneDelegate.swift
+index 91d01b640b..bf9f07c1d7 100644
+--- a/Mastodon/Supporting Files/SceneDelegate.swift	
++++ b/Mastodon/Supporting Files/SceneDelegate.swift	
+@@ -208,7 +208,7 @@ extension SceneDelegate {
+                 return false
+             }
+ 
+-            let _isActive = AuthenticationServiceProvider.shared.activateUser(authentication.userID,
++            let _isActive = AuthenticationServiceProvider.shared.activateExistingUser(authentication.userID,
+                 inDomain: authentication.domain
+             )
+             
+diff --git a/MastodonIntent/Handler/FollowersCountIntentHandler.swift b/MastodonIntent/Handler/FollowersCountIntentHandler.swift
+index 2eed52a197..e8d356c747 100644
+--- a/MastodonIntent/Handler/FollowersCountIntentHandler.swift
++++ b/MastodonIntent/Handler/FollowersCountIntentHandler.swift
+@@ -19,7 +19,7 @@ class FollowersCountIntentHandler: INExtension, FollowersCountIntentHandling {
+     func provideAccountOptionsCollection(for intent: FollowersCountIntent, searchTerm: String?) async throws -> INObjectCollection<NSString> {
+         guard
+             let searchTerm = searchTerm,
+-            let authenticationBox = AuthenticationServiceProvider.shared.activeAuthentication
++            let authenticationBox = AuthenticationServiceProvider.shared.currentActiveUser.value
+         else {
+             return INObjectCollection(items: [])
+         }
+diff --git a/MastodonIntent/Handler/HashtagIntentHandler.swift b/MastodonIntent/Handler/HashtagIntentHandler.swift
+index ad1395c554..4613701db4 100644
+--- a/MastodonIntent/Handler/HashtagIntentHandler.swift
++++ b/MastodonIntent/Handler/HashtagIntentHandler.swift
+@@ -8,7 +8,7 @@ import MastodonCore
+ class HashtagIntentHandler: INExtension, HashtagIntentHandling {
+     func provideHashtagOptionsCollection(for intent: HashtagIntent, searchTerm: String?) async throws -> INObjectCollection<NSString> {
+ 
+-        guard let authenticationBox = AuthenticationServiceProvider.shared.activeAuthentication
++        guard let authenticationBox = AuthenticationServiceProvider.shared.currentActiveUser.value
+         else {
+             return INObjectCollection(items: [])
+         }
+diff --git a/MastodonIntent/Handler/MultiFollowersCountIntentHandler.swift b/MastodonIntent/Handler/MultiFollowersCountIntentHandler.swift
+index fe21e7ad54..6e95e24ada 100644
+--- a/MastodonIntent/Handler/MultiFollowersCountIntentHandler.swift
++++ b/MastodonIntent/Handler/MultiFollowersCountIntentHandler.swift
+@@ -11,7 +11,7 @@ class MultiFollowersCountIntentHandler: INExtension, MultiFollowersCountIntentHa
+     func provideAccountsOptionsCollection(for intent: MultiFollowersCountIntent, searchTerm: String?) async throws -> INObjectCollection<NSString> {
+         guard
+             let searchTerm = searchTerm,
+-            let authenticationBox = AuthenticationServiceProvider.shared.activeAuthentication
++            let authenticationBox = AuthenticationServiceProvider.shared.currentActiveUser.value
+         else {
+             return INObjectCollection(items: [])
+         }
+diff --git a/MastodonIntent/Handler/SendPostIntentHandler.swift b/MastodonIntent/Handler/SendPostIntentHandler.swift
+index 9202678543..9158b6be46 100644
+--- a/MastodonIntent/Handler/SendPostIntentHandler.swift
++++ b/MastodonIntent/Handler/SendPostIntentHandler.swift
+@@ -45,29 +45,20 @@ extension SendPostIntentHandler: SendPostIntentHandling {
+             // fetch authentications from
+             // user pick accounts
+             // or fallback to active account
+-            let mastodonAuthentications: [MastodonAuthentication]
++            let authBoxes: [MastodonAuthenticationBox]
+             let accounts = intent.accounts ?? []
+             if accounts.isEmpty {
+-                // fixme: refactor this and implemented method on AuthenticationServiceProvider
+-                let _authentication = AuthenticationServiceProvider.shared.authentications.sorted(by: { $0.activedAt > $1.activedAt }).first
+-    
+-                guard let authentication = _authentication else {
++                guard let authBox = AuthenticationServiceProvider.shared.currentActiveUser.value else {
+                     let failureReason = APIService.APIError.implicit(.authenticationMissing).errorDescription ?? "Fail to Send Post"
+                     return SendPostIntentResponse.failure(failureReason: failureReason)
+                 }
+-                mastodonAuthentications = [authentication]
++                authBoxes = [authBox]
+             } else {
+-                mastodonAuthentications = try accounts.mastodonAuthentications()
+-            }
+-
+-            let authenticationBoxes = mastodonAuthentications.map { authentication in
+-                MastodonAuthenticationBox(
+-                    authentication: authentication
+-                )
++                authBoxes = try accounts.mastodonAuthenticationBoxes()
+             }
+             
+             var posts: [Post] = []
+-            for authenticationBox in authenticationBoxes {
++            for authenticationBox in authBoxes {
+                 let idempotencyKey = UUID().uuidString
+                 let response = try await api.publishStatus(
+                     domain: authenticationBox.domain,
+@@ -142,7 +133,7 @@ extension SendPostIntentHandler: SendPostIntentHandling {
+     }
+     
+     func provideAccountsOptionsCollection(for intent: SendPostIntent) async throws -> INObjectCollection<Account> {
+-        let accounts = try await Account.fetch()
++        let accounts = Account.loadFromCache()
+         return .init(items: accounts)
+     }
+ 
+@@ -155,11 +146,11 @@ extension SendPostIntentHandler: SendPostIntentHandling {
+ 
+ extension Array where Element == Account {
+     @MainActor
+-    func mastodonAuthentications() throws -> [MastodonAuthentication] {
++    func mastodonAuthenticationBoxes() throws -> [MastodonAuthenticationBox] {
+         let identifiers = self
+             .compactMap { $0.identifier }
+             .compactMap { UUID(uuidString: $0) }
+-        let results = AuthenticationServiceProvider.shared.authentications.filter({ identifiers.contains($0.identifier) })
++        let results = AuthenticationServiceProvider.shared.mastodonAuthenticationBoxes.filter({ identifiers.contains($0.authentication.identifier) })
+         return results
+     }
+ 
+diff --git a/MastodonIntent/Model/Account+Fetch.swift b/MastodonIntent/Model/Account+Fetch.swift
+index aeeaec52a8..63b6afc742 100644
+--- a/MastodonIntent/Model/Account+Fetch.swift
++++ b/MastodonIntent/Model/Account+Fetch.swift
+@@ -14,13 +14,13 @@ import MastodonCore
+ extension Account {
+ 
+     @MainActor
+-    static func fetch() async throws -> [Account] {
+-        let accounts = AuthenticationServiceProvider.shared.authentications.compactMap { mastodonAuthentication -> Account? in
+-            guard let authenticatedAccount = mastodonAuthentication.cachedAccount() else {
++    static func loadFromCache() -> [Account] {
++        let accounts = AuthenticationServiceProvider.shared.mastodonAuthenticationBoxes.compactMap { authBox -> Account? in
++            guard let authenticatedAccount = authBox.cachedAccount else {
+                 return nil
+             }
+             let account = Account(
+-                identifier: mastodonAuthentication.identifier.uuidString,
++                identifier: authBox.authentication.identifier.uuidString,
+                 display: authenticatedAccount.displayNameWithFallback,
+                 subtitle: authenticatedAccount.acctWithDomain,
+                 image: authenticatedAccount.avatarImageURL().flatMap { INImage(url: $0) }
+diff --git a/MastodonSDK/Sources/MastodonCore/AuthenticationServiceProvider.swift b/MastodonSDK/Sources/MastodonCore/AuthenticationServiceProvider.swift
+index e22f12295e..78095de70c 100644
+--- a/MastodonSDK/Sources/MastodonCore/AuthenticationServiceProvider.swift
++++ b/MastodonSDK/Sources/MastodonCore/AuthenticationServiceProvider.swift
+@@ -18,16 +18,17 @@ public class AuthenticationServiceProvider: ObservableObject {
+ 
+     var disposeBag = Set<AnyCancellable>()
+     
++    public let currentActiveUser = CurrentValueSubject<MastodonAuthenticationBox?, Never>(nil)
+     @Published public var mastodonAuthenticationBoxes: [MastodonAuthenticationBox] = []
+     public let updateActiveUserAccountPublisher = PassthroughSubject<Void, Never>()
+     
+     private init() {
+         prepareForUse()
+-        authentications = authenticationSortedByActivation()
+         
+         $mastodonAuthenticationBoxes
+             .throttle(for: 3, scheduler: DispatchQueue.main, latest: true)
+             .sink { [weak self] boxes in
++                self?.currentActiveUser.send(boxes.first)
+                 Task { [weak self] in
+                     for authBox in boxes {
+                         do { try await self?.fetchFollowedBlockedUserIds(authBox) }
+@@ -59,7 +60,7 @@ public class AuthenticationServiceProvider: ObservableObject {
+         }
+     }
+     
+-    @Published public var authentications: [MastodonAuthentication] = [] {
++    @Published private var authentications: [MastodonAuthentication] = [] {
+         didSet {
+             persist(authentications)
+         }
+@@ -101,7 +102,7 @@ public class AuthenticationServiceProvider: ObservableObject {
+         authentications.removeAll(where: { $0 == authentication })
+     }
+     
+-    public func activateUser(_ userID: String, inDomain domain: String) -> Bool {
++    public func activateExistingUser(_ userID: String, inDomain domain: String) -> Bool {
+         var found = false
+         authentications = authentications.map { authentication in
+             guard authentication.domain == domain, authentication.userID == userID else {
+@@ -113,8 +114,20 @@ public class AuthenticationServiceProvider: ObservableObject {
+         return found
+     }
+     
+-    func getAuthentication(in domain: String, for userID: String) -> MastodonAuthentication? {
+-        authentications.first(where: { $0.domain == domain && $0.userID == userID })
++    public func activateExistingUserToken(_ accessToken: String) -> MastodonAuthenticationBox? {
++        guard let match = mastodonAuthenticationBoxes.first(where: { $0.authentication.userAccessToken == accessToken }) else { return nil }
++        guard activateExistingUser(match.userID, inDomain: match.domain) else { return nil }
++        return match
++    }
++    
++    public func activateAuthentication(_ authenticationBox: MastodonAuthenticationBox) {
++        if activateExistingUser(authenticationBox.userID, inDomain: authenticationBox.domain) {
++            return
++        } else {
++            authentications.insert(authenticationBox.authentication, at: 0)
++            _ = activateExistingUser(authenticationBox.userID, inDomain: authenticationBox.domain)
++        }
++        
+     }
+ }
+ 
+@@ -124,20 +137,13 @@ public extension AuthenticationServiceProvider {
+         authentications.first(where: { $0.userAccessToken == userAccessToken })
+     }
+ 
+-    func authenticationSortedByActivation() -> [MastodonAuthentication] { // fixme: why do we need this?
+-        return authentications.sorted(by: { $0.activedAt > $1.activedAt })
+-    }
+     
+-    var activeAuthentication: MastodonAuthenticationBox? {
+-        guard let active =  authenticationSortedByActivation().first else { return nil }
+-        return MastodonAuthenticationBox(authentication: active)
+-    }
+     
+     func fetchFollowingAndBlockedAsync() {
+         /// We're dispatching this as a separate async call to not block the caller
+         /// Also we'll only be updating the current active user as the state will be refreshed upon user-change anyways
+         Task {
+-            if let authBox = activeAuthentication {
++            if let authBox = currentActiveUser.value {
+                 do { try await fetchFollowedBlockedUserIds(authBox) }
+                 catch {}
+             }
+@@ -145,7 +151,7 @@ public extension AuthenticationServiceProvider {
+     }
+     
+     func signOutMastodonUser(authentication: MastodonAuthentication) async throws {
+-        try await AuthenticationServiceProvider.shared.delete(authentication: authentication)
++        try AuthenticationServiceProvider.shared.delete(authentication: authentication)
+         _ = try await APIService.shared.cancelSubscription(domain: authentication.domain, authorization: authentication.authorization)
+     }
+     
+@@ -165,6 +171,7 @@ public extension AuthenticationServiceProvider {
+             else { return nil }
+             return try? JSONDecoder().decode(MastodonAuthentication.self, from: data)
+         }
++        .sorted(by: { $0.activedAt > $1.activedAt })
+     }
+     
+     func updateAccountCreatedAt(_ newCreatedAt: Date, forAuthentication outdated: MastodonAuthentication) {
+diff --git a/MastodonSDK/Sources/MastodonCore/Service/API/APIService+Account.swift b/MastodonSDK/Sources/MastodonCore/Service/API/APIService+Account.swift
+index 84d8198daf..81c445d64b 100644
+--- a/MastodonSDK/Sources/MastodonCore/Service/API/APIService+Account.swift
++++ b/MastodonSDK/Sources/MastodonCore/Service/API/APIService+Account.swift
+@@ -30,28 +30,57 @@ extension APIService {
+ 
+ extension APIService {
+     
+-    public func accountVerifyCredentials(
++    private func saveAndActivateVerifiedUser(account: Mastodon.Entity.Account,
++                           domain: String,
++                           clientID: String,
++                           clientSecret: String,
++                           authorization: Mastodon.API.OAuth.Authorization) -> MastodonAuthenticationBox {
++        let authentication = MastodonAuthentication.createFrom(domain: domain,
++                                                               userID: account.id,
++                                                               username: account.username,
++                                                               appAccessToken: authorization.accessToken,  // TODO: swap app token
++                                                               userAccessToken: authorization.accessToken,
++                                                               clientID: clientID,
++                                                               clientSecret: clientSecret,
++                                                               accountCreatedAt: account.createdAt)
++        
++        let authBox = MastodonAuthenticationBox(authentication: authentication)
++        PersistenceManager.shared.cacheAccount(account, for: authBox)
++        AuthenticationServiceProvider.shared.activateAuthentication(authBox)
++        return authBox
++    }
++    
++    public func verifyAndActivateUser(
+         domain: String,
++        clientID: String,
++        clientSecret: String,
+         authorization: Mastodon.API.OAuth.Authorization
+-    ) -> AnyPublisher<Mastodon.Response.Content<Mastodon.Entity.Account>, Error> {
++    ) -> AnyPublisher<(Mastodon.Entity.Account, MastodonAuthenticationBox), Error> {
+         return Mastodon.API.Account.verifyCredentials(
+             session: session,
+             domain: domain,
+             authorization: authorization
+-        )
++        ).tryMap { response -> (Mastodon.Entity.Account, MastodonAuthenticationBox) in
++            let account = response.value
++            let authBox = self.saveAndActivateVerifiedUser(account: account, domain: domain, clientID: clientID, clientSecret: clientSecret, authorization: authorization)
++            return (account, authBox)
++        }
++        .eraseToAnyPublisher()
+     }
+     
+-    public func accountVerifyCredentials(
++    public func verifyAndActivateUser(
+         domain: String,
++        clientID: String,
++        clientSecret: String,
+         authorization: Mastodon.API.OAuth.Authorization
+-    ) async throws -> Mastodon.Entity.Account {
++    ) async throws -> (Mastodon.Entity.Account, MastodonAuthenticationBox) {
+         let account = try await Mastodon.API.Account.verifyCredentials(
+             session: session,
+             domain: domain,
+             authorization: authorization
+         )
+-        PersistenceManager.shared.cacheAccount(account, forUserID: MastodonUserIdentifier(domain: domain, userID: account.id))
+-        return account
++        let authBox = self.saveAndActivateVerifiedUser(account: account, domain: domain, clientID: clientID, clientSecret: clientSecret, authorization: authorization)
++        return (account, authBox)
+     }
+     
+     public func accountUpdateCredentials(
+diff --git a/MastodonSDK/Sources/MastodonCore/Service/Emoji/EmojiService+CustomEmojiViewModel+LoadState.swift b/MastodonSDK/Sources/MastodonCore/Service/Emoji/EmojiService+CustomEmojiViewModel+LoadState.swift
+index c5081d4f55..4ea0247719 100644
+--- a/MastodonSDK/Sources/MastodonCore/Service/Emoji/EmojiService+CustomEmojiViewModel+LoadState.swift
++++ b/MastodonSDK/Sources/MastodonCore/Service/Emoji/EmojiService+CustomEmojiViewModel+LoadState.swift
+@@ -35,7 +35,7 @@ extension EmojiService.CustomEmojiViewModel.LoadState {
+         override func didEnter(from previousState: GKState?) {
+             super.didEnter(from: previousState)
+             guard let viewModel,
+-                  let authenticationBox = AuthenticationServiceProvider.shared.activeAuthentication,
++                  let authenticationBox = AuthenticationServiceProvider.shared.currentActiveUser.value,
+                   let stateMachine else { return }
+ 
+             let apiService = APIService.shared
+diff --git a/MastodonSDK/Sources/MastodonCore/Service/InstanceService.swift b/MastodonSDK/Sources/MastodonCore/Service/InstanceService.swift
+index c0c590437c..ba3e910beb 100644
+--- a/MastodonSDK/Sources/MastodonCore/Service/InstanceService.swift
++++ b/MastodonSDK/Sources/MastodonCore/Service/InstanceService.swift
+@@ -45,16 +45,16 @@ extension InstanceService {
+     func updateInstance(domain: String) async {
+         guard let apiService else { return }
+         
+-        let response = try? await apiService.instance(domain: domain, authenticationBox: AuthenticationServiceProvider.shared.activeAuthentication)
++        let response = try? await apiService.instance(domain: domain, authenticationBox: AuthenticationServiceProvider.shared.currentActiveUser.value)
+             .singleOutput()
+             
+         if response?.value.version?.majorServerVersion(greaterThanOrEquals: 4) == true {
+-            guard let instanceV2 = try? await apiService.instanceV2(domain: domain, authenticationBox: AuthenticationServiceProvider.shared.activeAuthentication).singleOutput() else {
++            guard let instanceV2 = try? await apiService.instanceV2(domain: domain, authenticationBox: AuthenticationServiceProvider.shared.currentActiveUser.value).singleOutput() else {
+                 return
+             }
+             
+             self.updateInstanceV2(domain: domain, response: instanceV2)
+-            if let translationResponse = try? await apiService.translationLanguages(domain: domain, authenticationBox: AuthenticationServiceProvider.shared.activeAuthentication).singleOutput() {
++            if let translationResponse = try? await apiService.translationLanguages(domain: domain, authenticationBox: AuthenticationServiceProvider.shared.currentActiveUser.value).singleOutput() {
+                 updateTranslationLanguages(domain: domain, response: translationResponse)
+             }
+         } else if let response {
+diff --git a/MastodonSDK/Sources/MastodonCore/Service/Notification/NotificationService.swift b/MastodonSDK/Sources/MastodonCore/Service/Notification/NotificationService.swift
+index e3abb468fa..52eaf7f973 100644
+--- a/MastodonSDK/Sources/MastodonCore/Service/Notification/NotificationService.swift
++++ b/MastodonSDK/Sources/MastodonCore/Service/Notification/NotificationService.swift
+@@ -36,12 +36,12 @@ public final class NotificationService {
+     public let requestRevealNotificationPublisher = PassthroughSubject<MastodonPushNotification, Never>()
+     
+     private init() {
+-        AuthenticationServiceProvider.shared.$authentications
+-            .sink(receiveValue: { [weak self] mastodonAuthentications in
++        AuthenticationServiceProvider.shared.currentActiveUser
++            .sink(receiveValue: { [weak self] auth in
+                 guard let self = self else { return }
+                 
+                 // request permission when sign-in
+-                guard !mastodonAuthentications.isEmpty else { return }
++                guard auth != nil else { return }
+                 self.requestNotificationPermission()
+             })
+             .store(in: &disposeBag)
+@@ -93,9 +93,9 @@ extension NotificationService {
+     public func unreadApplicationShortcutItems() async throws -> [UIApplicationShortcutItem] {
+ 
+         var items: [UIApplicationShortcutItem] = []
+-        for authentication in AuthenticationServiceProvider.shared.authentications {
+-            guard let account = authentication.cachedAccount() else { continue }
+-            let accessToken = authentication.userAccessToken
++        for authBox in AuthenticationServiceProvider.shared.mastodonAuthenticationBoxes {
++            guard let account = authBox.authentication.cachedAccount() else { continue }
++            let accessToken = authBox.authentication.userAccessToken
+             let count = UserDefaults.shared.getNotificationCountWithAccessToken(accessToken: accessToken)
+             guard count > 0 else { continue }
+ 
+@@ -157,7 +157,7 @@ extension NotificationService {
+ 
+ extension NotificationService {
+     public func clearNotificationCountForActiveUser() {
+-        if let accessToken = AuthenticationServiceProvider.shared.activeAuthentication?.userAuthorization.accessToken {
++        if let accessToken = AuthenticationServiceProvider.shared.currentActiveUser.value?.userAuthorization.accessToken {
+             UserDefaults.shared.setNotificationCountWithAccessToken(accessToken: accessToken, value: 0)
+         }
+         
+@@ -189,7 +189,7 @@ extension NotificationService {
+ 
+         let needsCancelSubscription: Bool = try await managedObjectContext.perform {
+             // check authentication exists
+-            let results = AuthenticationServiceProvider.shared.authentications.filter { $0.userAccessToken == userAccessToken }
++            let results = AuthenticationServiceProvider.shared.mastodonAuthenticationBoxes.filter { $0.authentication.userAccessToken == userAccessToken }
+             return results.first == nil
+         }
+         
+@@ -224,13 +224,9 @@ extension NotificationService {
+         }
+     }
+     
+-    private func authenticationBox(for pushNotification: MastodonPushNotification) async throws -> MastodonAuthenticationBox? {
+-        let results = AuthenticationServiceProvider.shared.authentications.filter { $0.userAccessToken == pushNotification.accessToken }
+-        guard let authentication = results.first else { return nil }
+-
+-        return MastodonAuthenticationBox(
+-            authentication: authentication
+-        )
++    private func authenticationBox(for pushNotification: MastodonPushNotification) -> MastodonAuthenticationBox? {
++        return AuthenticationServiceProvider.shared.mastodonAuthenticationBoxes.first { $0.authentication.userAccessToken == pushNotification.accessToken
++        }
+     }
+     
+ }
+diff --git a/OpenInActionExtension/ActionRequestHandler.swift b/OpenInActionExtension/ActionRequestHandler.swift
+index ead528e130..24f7ed1c4f 100644
+--- a/OpenInActionExtension/ActionRequestHandler.swift
++++ b/OpenInActionExtension/ActionRequestHandler.swift
+@@ -61,7 +61,7 @@ class ActionRequestHandler: NSObject, NSExtensionRequestHandling {
+ private extension ActionRequestHandler {
+     func performSearch(for url: String) async {
+         guard
+-            let activeAuthenticationBox = await AuthenticationServiceProvider.shared.activeAuthentication
++            let activeAuthenticationBox = await AuthenticationServiceProvider.shared.currentActiveUser.value
+         else {
+             return doneWithResults(nil)
+         }
+@@ -109,7 +109,7 @@ private extension ActionRequestHandler {
+         guard
+             let url = URL(string: query),
+             let host = url.host,
+-            let activeAuthenticationBox = await AuthenticationServiceProvider.shared.activeAuthentication
++            let activeAuthenticationBox = await AuthenticationServiceProvider.shared.currentActiveUser.value
+ 
+         else {
+             return doneWithInvalidLink()
+diff --git a/ShareActionExtension/Scene/ShareViewController.swift b/ShareActionExtension/Scene/ShareViewController.swift
+index 6b567edc05..311af1147b 100644
+--- a/ShareActionExtension/Scene/ShareViewController.swift
++++ b/ShareActionExtension/Scene/ShareViewController.swift
+@@ -162,8 +162,7 @@ extension ShareViewController {
+     private func setupAuthContext() throws -> MastodonAuthenticationBox? {
+         AuthenticationServiceProvider.shared.prepareForUse()
+ 
+-        guard let authentication = AuthenticationServiceProvider.shared.authenticationSortedByActivation().first else { return nil }
+-        return MastodonAuthenticationBox(authentication: authentication)
++        return AuthenticationServiceProvider.shared.currentActiveUser.value
+     }
+     
+     private func setupHintLabel() {
+diff --git a/WidgetExtension/Variants/FollowersCount/FollowersCountWidget.swift b/WidgetExtension/Variants/FollowersCount/FollowersCountWidget.swift
+index a87c9b71ad..edbaf6c372 100644
+--- a/WidgetExtension/Variants/FollowersCount/FollowersCountWidget.swift
++++ b/WidgetExtension/Variants/FollowersCount/FollowersCountWidget.swift
+@@ -76,7 +76,7 @@ private extension FollowersCountWidgetProvider {
+             AuthenticationServiceProvider.shared.prepareForUse()
+ 
+             guard
+-                let authBox = AuthenticationServiceProvider.shared.activeAuthentication
++                let authBox = AuthenticationServiceProvider.shared.currentActiveUser.value
+             else {
+                 guard !context.isPreview else {
+                     return completion(.placeholder)
+diff --git a/WidgetExtension/Variants/Hashtag/HashtagWidget.swift b/WidgetExtension/Variants/Hashtag/HashtagWidget.swift
+index deaa4c8c27..a72b75fd7a 100644
+--- a/WidgetExtension/Variants/Hashtag/HashtagWidget.swift
++++ b/WidgetExtension/Variants/Hashtag/HashtagWidget.swift
+@@ -31,7 +31,7 @@ extension HashtagWidgetProvider {
+                 AuthenticationServiceProvider.shared.prepareForUse()
+                 
+                 guard
+-                    let authBox = AuthenticationServiceProvider.shared.activeAuthentication
++                    let authBox = AuthenticationServiceProvider.shared.currentActiveUser.value
+                 else {
+                     if context.isPreview {
+                         return completion(.placeholder)
+diff --git a/WidgetExtension/Variants/LatestFollowers/LatestFollowersWidget.swift b/WidgetExtension/Variants/LatestFollowers/LatestFollowersWidget.swift
+index fe93e4ffc8..71c78e9b12 100644
+--- a/WidgetExtension/Variants/LatestFollowers/LatestFollowersWidget.swift
++++ b/WidgetExtension/Variants/LatestFollowers/LatestFollowersWidget.swift
+@@ -83,7 +83,7 @@ private extension LatestFollowersWidgetProvider {
+             AuthenticationServiceProvider.shared.prepareForUse()
+ 
+             guard
+-                let authBox = AuthenticationServiceProvider.shared.activeAuthentication
++                let authBox = AuthenticationServiceProvider.shared.currentActiveUser.value
+             else {
+                 guard !context.isPreview else {
+                     return completion(.placeholder)
+diff --git a/WidgetExtension/Variants/MultiFollowersCount/MultiFollowersCountWidget.swift b/WidgetExtension/Variants/MultiFollowersCount/MultiFollowersCountWidget.swift
+index 08e864947c..2cd78be4ef 100644
+--- a/WidgetExtension/Variants/MultiFollowersCount/MultiFollowersCountWidget.swift
++++ b/WidgetExtension/Variants/MultiFollowersCount/MultiFollowersCountWidget.swift
+@@ -76,7 +76,7 @@ private extension MultiFollowersCountWidgetProvider {
+             AuthenticationServiceProvider.shared.prepareForUse()
+ 
+             guard
+-                let authBox = AuthenticationServiceProvider.shared.activeAuthentication
++                let authBox = AuthenticationServiceProvider.shared.currentActiveUser.value
+             else {
+                 guard !context.isPreview else {
+                     return completion(.placeholder)

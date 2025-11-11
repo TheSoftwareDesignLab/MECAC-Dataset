@@ -1,0 +1,173 @@
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
+index 43cef4ed80f9..08253a58f08a 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
+@@ -96,32 +96,41 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+         (if (isCustomTabMode)
+             sessionManager.customTabSessions
+         else
+-            sessionManager.sessions).observe(this, object : NonNullObserver<List<Session>>() {
+-            private var wasSessionsEmpty = false
++            sessionManager.sessions).observe(this, createSessionObserver())
++    }
+ 
+-            public override fun onValueChanged(t: List<Session>) {
+-                if (t.isEmpty()) {
+-                    // There's no active session. Show the URL input screen so that the user can
+-                    // start a new session.
+-                    showUrlInputScreen()
+-                    wasSessionsEmpty = true
++    private fun createSessionObserver() = object : NonNullObserver<List<Session>>() {
++        private var wasSessionsEmpty = false
++
++        public override fun onValueChanged(t: List<Session>) {
++            // If needed show the first run tour on top of the browser or url input fragment.
++            val showFirstrun = Settings.getInstance(this@MainActivity).shouldShowFirstrun()
++
++            if (t.isEmpty()) {
++                // There's no active session. Show the URL input screen so that the user can
++                // start a new session.
++                if (showFirstrun) {
++                    showFirstrun()
+                 } else {
+-                    // This happens when we move from 0 to 1 sessions: either on startup or after an erase.
+-                    if (wasSessionsEmpty) {
+-                        WebViewProvider.performNewBrowserSessionCleanup()
+-                        wasSessionsEmpty = false
+-                    }
++                    showUrlInputScreen()
++                }
+ 
+-                    // We have at least one session. Show a fragment for the current session.
+-                    showBrowserScreenForCurrentSession()
++                wasSessionsEmpty = true
++            } else {
++                // This happens when we move from 0 to 1 sessions: either on startup or after an erase.
++                if (wasSessionsEmpty) {
++                    WebViewProvider.performNewBrowserSessionCleanup()
++                    wasSessionsEmpty = false
+                 }
+ 
+-                // If needed show the first run tour on top of the browser or url input fragment.
+-                if (Settings.getInstance(this@MainActivity).shouldShowFirstrun()) {
+-                    showFirstrun()
++                if (showFirstrun) {
++                    showFirstrun(currentSessionForActivity)
++                } else {
++                    // We have at least one session. Show a fragment for the current session.
++                    showBrowserScreenForCurrentSession()
+                 }
+             }
+-        })
++        }
+     }
+ 
+     override fun applyLocale() {
+@@ -235,10 +244,10 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+                 .commit()
+     }
+ 
+-    private fun showFirstrun() {
++    private fun showFirstrun(currentSession: Session? = null) {
+         supportFragmentManager
+                 .beginTransaction()
+-                .add(R.id.container, FirstrunFragment.create(), FirstrunFragment.FRAGMENT_TAG)
++                .add(R.id.container, FirstrunFragment.create(currentSession), FirstrunFragment.FRAGMENT_TAG)
+                 .commit()
+     }
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt b/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
+index 0e98091d3e62..3396ee6807a3 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/fragment/BrowserFragment.kt
+@@ -1348,6 +1348,7 @@ class BrowserFragment : WebFragment(), LifecycleObserver, View.OnClickListener,
+         private const val REQUEST_CODE_ADD_TO_HOMESCREEN_DIALOG = 301
+         private const val REQUEST_CODE_BIOMETRIC_PROMPT = 302
+ 
++        @JvmStatic
+         fun createForSession(session: Session): BrowserFragment {
+             val arguments = Bundle()
+             arguments.putString(ARGUMENT_SESSION_UUID, session.uuid)
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/fragment/FirstrunFragment.java b/focus-android/app/src/main/java/org/mozilla/focus/fragment/FirstrunFragment.java
+index 21fde3544092..3a04e1a4587d 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/fragment/FirstrunFragment.java
++++ b/focus-android/app/src/main/java/org/mozilla/focus/fragment/FirstrunFragment.java
+@@ -21,6 +21,9 @@
+ 
+ import org.mozilla.focus.R;
+ import org.mozilla.focus.firstrun.FirstrunPagerAdapter;
++import org.mozilla.focus.session.NullSession;
++import org.mozilla.focus.session.Session;
++import org.mozilla.focus.session.SessionManager;
+ import org.mozilla.focus.telemetry.TelemetryWrapper;
+ import org.mozilla.focus.utils.StatusBarUtils;
+ 
+@@ -29,8 +32,18 @@ public class FirstrunFragment extends Fragment implements View.OnClickListener {
+ 
+     public static final String FIRSTRUN_PREF = "firstrun_shown";
+ 
+-    public static FirstrunFragment create() {
+-        return new FirstrunFragment();
++    private static final String ARGUMENT_SESSION_UUID = "sessionUUID";
++
++    public static FirstrunFragment create(@Nullable Session currentSession) {
++        String uuid = currentSession != null ? currentSession.getUUID() : null;
++
++        Bundle arguments = new Bundle();
++        arguments.putString(ARGUMENT_SESSION_UUID, uuid);
++
++        FirstrunFragment fragment = new FirstrunFragment();
++        fragment.setArguments(arguments);
++
++        return fragment;
+     }
+ 
+     private ViewPager viewPager;
+@@ -100,12 +113,6 @@ public void onPageScrollStateChanged(int state) {}
+         final TabLayout tabLayout = view.findViewById(R.id.tabs);
+         tabLayout.setupWithViewPager(viewPager, true);
+ 
+-        final FragmentManager fragmentManager = getActivity().getSupportFragmentManager();
+-        final UrlInputFragment urlInputFragment = (UrlInputFragment) fragmentManager.findFragmentByTag(UrlInputFragment.FRAGMENT_TAG);
+-        if (urlInputFragment != null) {
+-            fragmentManager.beginTransaction().detach(urlInputFragment).commit();
+-        }
+-
+         return view;
+     }
+ 
+@@ -139,15 +146,28 @@ private void finishFirstrun() {
+                 .putBoolean(FIRSTRUN_PREF, true)
+                 .apply();
+ 
++        @Nullable String sessionUUID = getArguments().getString(ARGUMENT_SESSION_UUID);
++        SessionManager sessionManager = SessionManager.getInstance();
++
++        Fragment fragment;
++        if (sessionUUID == null) {
++            fragment = UrlInputFragment.createWithoutSession();
++        } else {
++            Session session;
++
++            if (sessionManager.hasSessionWithUUID(sessionUUID)) {
++                session = sessionManager.getSessionByUUID(sessionUUID);
++            } else {
++                session = new NullSession();
++            }
++
++            fragment =  BrowserFragment.createForSession(session);
++        }
++
+         fragmentManager
+                 .beginTransaction()
+-                .remove(this)
++                .replace(R.id.container, fragment, UrlInputFragment.FRAGMENT_TAG)
+                 .commit();
+-
+-        final UrlInputFragment inputFragment = (UrlInputFragment) fragmentManager.findFragmentByTag(UrlInputFragment.FRAGMENT_TAG);
+-        if (inputFragment != null) {
+-            fragmentManager.beginTransaction().attach(inputFragment).commit();
+-        }
+     }
+ 
+     @Override

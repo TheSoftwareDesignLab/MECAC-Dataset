@@ -1,0 +1,526 @@
+diff --git a/taskcluster/android_taskgraph/transforms/build_apk.py b/taskcluster/android_taskgraph/transforms/build_android_app.py
+similarity index 77%
+rename from taskcluster/android_taskgraph/transforms/build_apk.py
+rename to taskcluster/android_taskgraph/transforms/build_android_app.py
+index 68da458ee1b2..d67c5b7ebf7c 100644
+--- a/taskcluster/android_taskgraph/transforms/build_apk.py
++++ b/taskcluster/android_taskgraph/transforms/build_android_app.py
+@@ -2,40 +2,62 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ """
+-Apply some defaults and minor modifications to the jobs defined in the build
+-kind.
++Apply some defaults and minor modifications to the jobs defined in the
++build-apk and build-bundle kinds.
+ """
+ 
+ 
+ from android_taskgraph.build_config import get_variant
+ from taskgraph.transforms.base import TransformSequence
+-from taskgraph.util.schema import resolve_keyed_by
+ 
+ transforms = TransformSequence()
+ 
+ 
+ @transforms.add
+-def add_variant_config(config, tasks):
++def add_common_config(config, tasks):
+     for task in tasks:
+-        attributes = task.setdefault("attributes", {})
+-        if not attributes.get("build-type"):
+-            attributes["build-type"] = task["name"]
++        fetches = task.setdefault("fetches", {})
++        fetches["toolchain"] = ["android-sdk-linux"]
++        fetches["external-gradle-dependencies"] = [
++            "external-gradle-dependencies.tar.xz"
++        ]
++
++        optimization = task.setdefault("optimization", {})
++        if config.params["tasks_for"] == "github-push" or config.params[
++            "tasks_for"
++        ].startswith("github-pull-request"):
++            optimization[
++                "skip-unless-changed"
++            ] = []  # Paths are dynamically added by transforms
++
++        task.setdefault("run-on-tasks-for", [])
++
++        run = task.setdefault("run", {})
++        run["using"] = "gradlew"
++        run["use-caches"] = False
++        run["workdir"] = "/builds/worker"
++
++        treeherder = task.setdefault("treeherder", {})
++        treeherder["kind"] = "build"
++        treeherder["tier"] = 1
++
++        task["worker-type"] = "b-android-large"
++
++        worker = task.setdefault("worker", {})
++        worker["docker-image"] = {}
++        worker["docker-image"]["in-tree"] = "base"
++        worker["max-run-time"] = 7200
++        worker["chain-of-trust"] = True
++
+         yield task
+ 
+ 
+ @transforms.add
+-def resolve_keys(config, tasks):
++def add_variant_config(config, tasks):
+     for task in tasks:
+-        for field in ("optimization",):
+-            resolve_keyed_by(
+-                task,
+-                field,
+-                item_name=task["name"],
+-                **{
+-                    "tasks-for": config.params["tasks_for"],
+-                },
+-            )
+-
++        attributes = task.setdefault("attributes", {})
++        if not attributes.get("build-type"):
++            attributes["build-type"] = task["name"]
+         yield task
+ 
+ 
+@@ -128,9 +150,10 @@ def build_gradle_command(config, tasks):
+         variant_config = get_variant(gradle_build_type, gradle_build_name)
+         variant_name = variant_config["name"][0].upper() + variant_config["name"][1:]
+ 
++        package_command = task["run"].pop("gradle-package-command", "assemble")
+         gradle_command = [
+             "clean",
+-            f"assemble{variant_name}",
++            f"{package_command}{variant_name}",
+         ]
+ 
+         if task["run"].pop("track-apk-size", False):
+@@ -229,5 +252,21 @@ def add_artifacts(config, tasks):
+                         **apk,
+                     ),
+                 }
++        elif "aab-artifact-template" in task:
++            variant_name = variant_config["name"]
++            artifact_template = task.pop("aab-artifact-template")
++            artifacts.append(
++                {
++                    "type": artifact_template["type"],
++                    "name": artifact_template["name"],
++                    "path": artifact_template["path"].format(
++                        gradle_build_type=gradle_build_type,
++                        gradle_build=gradle_build,
++                        source_project_name=source_project_name,
++                        variant_name=variant_name,
++                    ),
++                }
++            )
++            task["attributes"]["aab"] = artifact_template["name"]
+ 
+         yield task
+diff --git a/taskcluster/ci/build-apk/kind.yml b/taskcluster/ci/build-apk/kind.yml
+index 8189ea26fca7..3fb41ffe9f51 100644
+--- a/taskcluster/ci/build-apk/kind.yml
++++ b/taskcluster/ci/build-apk/kind.yml
+@@ -5,7 +5,7 @@
+ loader: taskgraph.loader.transform:loader
+ 
+ transforms:
+-    - android_taskgraph.transforms.build_apk:transforms
++    - android_taskgraph.transforms.build_android_app:transforms
+     - android_taskgraph.transforms.gradle_optimization:transforms
+     - taskgraph.transforms.job:transforms
+     - taskgraph.transforms.task:transforms
+@@ -20,31 +20,6 @@ task-defaults:
+         name: 'public/build/target.{abi}.apk'
+         github-name: '{gradle_build}-{version}-{abi}.apk'
+         path: '/builds/worker/checkouts/vcs/{source_project_name}/app/build/outputs/apk/{gradle_build}/{gradle_build_type}/{fileName}'
+-    fetches:
+-        toolchain:
+-            - android-sdk-linux
+-        external-gradle-dependencies:
+-            - external-gradle-dependencies.tar.xz
+-    optimization:
+-        by-tasks-for:
+-            github-pu(sh|ll-request.*):
+-                skip-unless-changed: [] # Paths are dynamically added by transforms
+-            default: {}
+-    run:
+-        using: gradlew
+-        use-caches: false
+-        workdir: '/builds/worker'
+-    run-on-tasks-for: []
+-    treeherder:
+-        kind: build
+-        symbol: B
+-        platform: focus-android-all/opt
+-        tier: 1
+-    worker-type: b-android-large
+-    worker:
+-        docker-image: {in-tree: base}
+-        max-run-time: 7200
+-        chain-of-trust: true
+ 
+ 
+ tasks:
+@@ -66,6 +41,7 @@ tasks:
+         source-project-name: "focus-android"
+         treeherder:
+             symbol: focus-debug(Bf)
++            platform: focus-android-all/opt
+ 
+     klar-debug:
+         attributes:
+@@ -85,6 +61,7 @@ tasks:
+         source-project-name: "focus-android"
+         treeherder:
+             symbol: focus-debug(Bkl)
++            platform: focus-android-all/opt
+ 
+     fenix-debug:
+         attributes:
+@@ -116,7 +93,6 @@ tasks:
+             shipping-product: focus
+         dependencies:
+             external-gradle-dependencies: external-gradle-dependencies-focus
+-        run-on-tasks-for: []
+         include-shippable-secrets: true
+         include-release-version: true
+         run:
+@@ -127,6 +103,7 @@ tasks:
+         source-project-name: "focus-android"
+         treeherder:
+             symbol: focus-release(Bf)
++            platform: focus-android-all/opt
+ 
+     klar-release:
+         description: 'Release Klar build'
+@@ -135,7 +112,6 @@ tasks:
+             shipping-product: focus
+         dependencies:
+             external-gradle-dependencies: external-gradle-dependencies-focus
+-        run-on-tasks-for: []
+         include-shippable-secrets: true
+         include-release-version: true
+         run:
+@@ -146,6 +122,7 @@ tasks:
+         source-project-name: "focus-android"
+         treeherder:
+             symbol: focus-release(Bkl)
++            platform: focus-android-all/opt
+ 
+     fenix-release:
+         description: 'Release Fenix build'
+@@ -154,7 +131,6 @@ tasks:
+             shipping-product: fenix
+         dependencies:
+             external-gradle-dependencies: external-gradle-dependencies-fenix
+-        run-on-tasks-for: []
+         include-shippable-secrets: true
+         include-release-version: true
+         run:
+@@ -177,7 +153,6 @@ tasks:
+             shipping-product: focus
+         dependencies:
+             external-gradle-dependencies: external-gradle-dependencies-focus
+-        run-on-tasks-for: []
+         include-shippable-secrets: true
+         include-nightly-version: true
+         run:
+@@ -187,6 +162,7 @@ tasks:
+         source-project-name: "focus-android"
+         treeherder:
+             symbol: focus-nightly(B)
++            platform: focus-android-all/opt
+ 
+     fenix-nightly:
+         description: 'Nightly fenix build'
+@@ -197,7 +173,6 @@ tasks:
+             shipping-product: fenix
+         dependencies:
+             external-gradle-dependencies: external-gradle-dependencies-fenix
+-        run-on-tasks-for: []
+         include-shippable-secrets: true
+         include-nightly-version: true
+         source-project-name: "fenix"
+@@ -217,7 +192,6 @@ tasks:
+             shipping-product: focus
+         dependencies:
+             external-gradle-dependencies: external-gradle-dependencies-focus
+-        run-on-tasks-for: []
+         include-shippable-secrets: true
+         include-release-version: true
+         run:
+@@ -228,6 +202,7 @@ tasks:
+         source-project-name: "focus-android"
+         treeherder:
+             symbol: focus-beta(B)
++            platform: focus-android-all/opt
+ 
+     fenix-beta:
+         description: 'Beta fenix build'
+@@ -236,7 +211,6 @@ tasks:
+             shipping-product: fenix
+         dependencies:
+             external-gradle-dependencies: external-gradle-dependencies-fenix
+-        run-on-tasks-for: []
+         include-shippable-secrets: true
+         include-release-version: true
+         run:
+@@ -267,6 +241,7 @@ tasks:
+         source-project-name: "focus-android"
+         treeherder:
+             symbol: focus-nightly(Bf)
++            platform: focus-android-all/opt
+ 
+     fenix-nightly-firebase:
+         attributes:
+@@ -304,6 +279,7 @@ tasks:
+         source-project-name: "focus-android"
+         treeherder:
+             symbol: focus-beta(Bf)
++            platform: focus-android-all/opt
+ 
+     fenix-beta-firebase:
+         attributes:
+@@ -346,6 +322,7 @@ tasks:
+             path: '/builds/worker/checkouts/vcs/focus-android/app/build/outputs/apk/androidTest/focus/debug/app-focus-debug-androidTest.apk'
+         treeherder:
+             symbol: focus-debug(Bat)
++            platform: focus-android-all/opt
+ 
+     fenix-android-test-debug:
+         attributes:
+@@ -397,6 +374,7 @@ tasks:
+             path: '/builds/worker/checkouts/vcs/focus-android/app/build/outputs/apk/androidTest/focus/nightly/app-focus-nightly-androidTest.apk'
+         treeherder:
+             symbol: focus-nightly(Bat)
++            platform: focus-android-all/opt
+ 
+     # android-test-nightly and android-test-beta, while still being debug builds, are meant to be signed
+     # with the nightly/beta key. The Firebase testing infrastructure requires both the androidTest APK
+@@ -449,6 +427,7 @@ tasks:
+             path: '/builds/worker/checkouts/vcs/focus-android/app/build/outputs/apk/androidTest/focus/beta/app-focus-beta-androidTest.apk'
+         treeherder:
+             symbol: focus-beta(Bat)
++            platform: focus-android-all/opt
+ 
+     fenix-android-test-beta:
+         attributes:
+diff --git a/taskcluster/ci/build-bundle/kind.yml b/taskcluster/ci/build-bundle/kind.yml
+new file mode 100644
+index 000000000000..663471d90548
+--- /dev/null
++++ b/taskcluster/ci/build-bundle/kind.yml
+@@ -0,0 +1,209 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++---
++loader: taskgraph.loader.transform:loader
++
++transforms:
++    - android_taskgraph.transforms.build_android_app:transforms
++    - android_taskgraph.transforms.gradle_optimization:transforms
++    - taskgraph.transforms.job:transforms
++    - taskgraph.transforms.task:transforms
++
++kind-dependencies:
++    - toolchain
++    - external-gradle-dependencies
++
++task-defaults:
++    aab-artifact-template:
++        type: file
++        name: 'public/build/target.aab'
++        path: '/builds/worker/checkouts/vcs/{source_project_name}/app/build/outputs/bundle/{variant_name}/app-{gradle_build}-{gradle_build_type}.aab'
++    run:
++        gradle-package-command: bundle
++
++
++tasks:
++    focus-debug:
++        attributes:
++            code-review: true
++            shipping-product: focus
++        dependencies:
++            external-gradle-dependencies: external-gradle-dependencies-focus
++        description: 'Focus debug AAB build from source code'
++        run-on-tasks-for:
++            - github-pull-request
++            - github-pull-request-untrusted
++            - github-push
++        run:
++            gradle-build-type: debug
++            gradle-build-name: focusDebug
++            gradle-build: focus
++        source-project-name: "focus-android"
++        treeherder:
++            platform: focus-android-all/opt
++            symbol: focus-debug(AABf)
++
++    klar-debug:
++        attributes:
++            code-review: true
++            shipping-product: focus
++        dependencies:
++            external-gradle-dependencies: external-gradle-dependencies-focus
++        description: 'Klar debug AAB build from source code'
++        run-on-tasks-for:
++            - github-pull-request
++            - github-pull-request-untrusted
++            - github-push
++        run:
++            gradle-build-type: debug
++            gradle-build-name: klarDebug
++            gradle-build: klar
++        source-project-name: "focus-android"
++        treeherder:
++            platform: focus-android-all/opt
++            symbol: focus-debug(AABkl)
++
++    fenix-debug:
++        attributes:
++            code-review: true
++            shipping-product: fenix
++        dependencies:
++            external-gradle-dependencies: external-gradle-dependencies-fenix
++        description: 'Fenix debug AAB build from source code'
++        run-on-tasks-for:
++            - github-pull-request
++            - github-pull-request-untrusted
++            - github-push
++        run:
++            gradle-build-type: debug
++            gradle-build-name: fenixDebug
++            gradle-build: fenix
++        source-project-name: "fenix"
++        treeherder:
++            platform: fenix-android-all/opt
++            symbol: fenix-debug(AAB)
++
++    focus-release:
++        attributes:
++            release-type: release
++            shipping-product: focus
++        dependencies:
++            external-gradle-dependencies: external-gradle-dependencies-focus
++        description: 'Focus release AAB build from source code'
++        include-release-version: true
++        run:
++            gradle-build-type: release
++            gradle-build-name: focusRelease
++            gradle-build: focus
++        shipping-phase: promote
++        source-project-name: "focus-android"
++        treeherder:
++            platform: focus-android-all/opt
++            symbol: focus-release(AABf)
++
++    klar-release:
++        attributes:
++            release-type: release
++            shipping-product: focus
++        dependencies:
++            external-gradle-dependencies: external-gradle-dependencies-focus
++        description: 'Klar release AAB build from source code'
++        include-release-version: true
++        run:
++            gradle-build-type: release
++            gradle-build-name: klarRelease
++            gradle-build: klar
++        shipping-phase: promote
++        source-project-name: "focus-android"
++        treeherder:
++            platform: focus-android-all/opt
++            symbol: focus-release(AABkl)
++
++    fenix-release:
++        attributes:
++            release-type: release
++            shipping-product: fenix
++        dependencies:
++            external-gradle-dependencies: external-gradle-dependencies-fenix
++        description: 'Fenix release AAB build from source code'
++        include-release-version: true
++        run:
++            gradle-build-type: release
++            gradle-build-name: fenixRelease
++            gradle-build: fenix
++        shipping-phase: promote
++        source-project-name: "fenix"
++        treeherder:
++            platform: fenix-android-all/opt
++            symbol: fenix-release(AAB)
++
++    focus-nightly:
++        attributes:
++            nightly-task: true
++            shipping-product: focus
++        dependencies:
++            external-gradle-dependencies: external-gradle-dependencies-focus
++        description: 'Focus nightly AAB build from source code'
++        include-nightly-version: true
++        run:
++            gradle-build-type: nightly
++            gradle-build-name: focusNightly
++            gradle-build: focus
++        source-project-name: "focus-android"
++        treeherder:
++            platform: focus-android-all/opt
++            symbol: focus-nightly(AABf)
++
++    fenix-nightly:
++        attributes:
++            nightly-task: true
++            shipping-product: fenix
++        dependencies:
++            external-gradle-dependencies: external-gradle-dependencies-fenix
++        description: 'Fenix nightly AAB build from source code'
++        include-nightly-version: true
++        run:
++            gradle-build-type: nightly
++            gradle-build-name: fenixNightly
++            gradle-build: fenix
++        source-project-name: "fenix"
++        treeherder:
++            platform: fenix-android-all/opt
++            symbol: fenix-nightly(AAB)
++
++    focus-beta:
++        attributes:
++            release-type: beta
++            shipping-product: focus
++        dependencies:
++            external-gradle-dependencies: external-gradle-dependencies-focus
++        description: 'Focus beta AAB build from source code'
++        include-release-version: true
++        run:
++            gradle-build-type: beta
++            gradle-build-name: focusBeta
++            gradle-build: focus
++        shipping-phase: promote
++        source-project-name: "focus-android"
++        treeherder:
++            platform: focus-android-all/opt
++            symbol: focus-beta(AABf)
++
++    fenix-beta:
++        attributes:
++            release-type: beta
++            shipping-product: fenix
++        dependencies:
++            external-gradle-dependencies: external-gradle-dependencies-fenix
++        description: 'Fenix beta AAB build from source code'
++        include-release-version: true
++        run:
++            gradle-build-type: beta
++            gradle-build-name: fenixBeta
++            gradle-build: fenix
++        shipping-phase: promote
++        source-project-name: "fenix"
++        treeherder:
++            platform: fenix-android-all/opt
++            symbol: fenix-beta(AAB)

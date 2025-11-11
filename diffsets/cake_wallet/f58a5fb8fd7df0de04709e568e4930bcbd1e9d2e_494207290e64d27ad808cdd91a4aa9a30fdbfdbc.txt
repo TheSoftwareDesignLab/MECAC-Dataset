@@ -1,0 +1,2066 @@
+diff --git a/.github/workflows/pr_test_build_linux.yml b/.github/workflows/pr_test_build_linux.yml
+index a341aed0d8..476a033a08 100644
+--- a/.github/workflows/pr_test_build_linux.yml
++++ b/.github/workflows/pr_test_build_linux.yml
+@@ -283,6 +283,9 @@ jobs:
+           xmessage -timeout 30 "restore_wallet_through_seeds_flow_test" &
+           rm -rf ~/.local/share/com.example.cake_wallet/ ~/Documents/cake_wallet/ ~/cake_wallet
+           exec timeout --signal=SIGKILL 900 flutter drive --driver=test_driver/integration_test.dart --target=integration_test/test_suites/restore_wallet_through_seeds_flow_test.dart
++      - name: Test [cw_monero]
++        timeout-minutes: 2
++        run: cd cw_monero && flutter test
+       - name: Stop screen recording, encrypt and upload
+         if: always()
+         run: |
+diff --git a/cw_monero/.gitignore b/cw_monero/.gitignore
+index ebb19df826..2bf094c851 100644
+--- a/cw_monero/.gitignore
++++ b/cw_monero/.gitignore
+@@ -11,4 +11,5 @@ android/.externalNativeBuild/
+ android/.cxx/
+ 
+ macos/cw_monero.podspec
+-macos/External/
+\ No newline at end of file
++macos/External/
++*monero_libwallet2_api_c.*
+\ No newline at end of file
+diff --git a/cw_monero/lib/api/wallet.dart b/cw_monero/lib/api/wallet.dart
+index f520c65997..7e64c7f088 100644
+--- a/cw_monero/lib/api/wallet.dart
++++ b/cw_monero/lib/api/wallet.dart
+@@ -62,6 +62,11 @@ String getSeed() {
+     }
+     return cakepolyseed;
+   }
++
++  final bip39 = monero.Wallet_getCacheAttribute(wptr!, key: "cakewallet.seed.bip39");
++
++  if(bip39.isNotEmpty) return bip39;
++
+   final legacy = getSeedLegacy(null);
+   return legacy;
+ }
+diff --git a/cw_monero/lib/bip39_seed.dart b/cw_monero/lib/bip39_seed.dart
+new file mode 100644
+index 0000000000..338516e662
+--- /dev/null
++++ b/cw_monero/lib/bip39_seed.dart
+@@ -0,0 +1,59 @@
++import 'dart:typed_data';
++
++import 'package:bip32/bip32.dart' as bip32;
++import 'package:bip39/bip39.dart' as bip39;
++import 'package:polyseed/polyseed.dart';
++
++bool isBip39Seed(String mnemonic) => bip39.validateMnemonic(mnemonic);
++
++String getBip39Seed() => bip39.generateMnemonic();
++
++String getLegacySeedFromBip39(String mnemonic,
++  {int accountIndex = 0, String passphrase = ""}) {
++  final seed = bip39.mnemonicToSeed(mnemonic, passphrase: passphrase);
++
++  final bip32KeyPair =
++      bip32.BIP32.fromSeed(seed).derivePath("m/44'/128'/$accountIndex'/0/0");
++
++  final spendKey = _reduceECKey(bip32KeyPair.privateKey!);
++
++  return LegacySeedLang.getByEnglishName("English")
++      .encodePhrase(spendKey.toHexString());
++}
++
++const _ed25519CurveOrder =
++    "1000000000000000000000000000000014DEF9DEA2F79CD65812631A5CF5D3ED";
++
++Uint8List _reduceECKey(Uint8List buffer) {
++  final curveOrder = BigInt.parse(_ed25519CurveOrder, radix: 16);
++  final bigNumber = _readBytes(buffer);
++
++  var result = bigNumber % curveOrder;
++
++  final resultBuffer = Uint8List(32);
++  for (var i = 0; i < 32; i++) {
++    resultBuffer[i] = (result & BigInt.from(0xff)).toInt();
++    result = result >> 8;
++  }
++
++  return resultBuffer;
++}
++
++/// Read BigInt from a little-endian Uint8List
++/// From https://github.com/dart-lang/sdk/issues/32803#issuecomment-387405784
++BigInt _readBytes(Uint8List bytes) {
++  BigInt read(int start, int end) {
++    if (end - start <= 4) {
++      var result = 0;
++      for (int i = end - 1; i >= start; i--) {
++        result = result * 256 + bytes[i];
++      }
++      return BigInt.from(result);
++    }
++    final mid = start + ((end - start) >> 1);
++    return read(start, mid) +
++        read(mid, end) * (BigInt.one << ((mid - start) * 8));
++  }
++
++  return read(0, bytes.length);
++}
+diff --git a/cw_monero/lib/monero_wallet_service.dart b/cw_monero/lib/monero_wallet_service.dart
+index ad726ef8cf..e289f9f17d 100644
+--- a/cw_monero/lib/monero_wallet_service.dart
++++ b/cw_monero/lib/monero_wallet_service.dart
+@@ -1,6 +1,7 @@
+ import 'dart:ffi';
+ import 'dart:io';
+ 
++import 'package:collection/collection.dart';
+ import 'package:cw_core/get_height_by_date.dart';
+ import 'package:cw_core/monero_wallet_utils.dart';
+ import 'package:cw_core/pathForWallet.dart';
+@@ -14,29 +15,38 @@ import 'package:cw_core/wallet_type.dart';
+ import 'package:cw_monero/api/account_list.dart';
+ import 'package:cw_monero/api/wallet_manager.dart' as monero_wallet_manager;
+ import 'package:cw_monero/api/wallet_manager.dart';
++import 'package:cw_monero/bip39_seed.dart';
+ import 'package:cw_monero/ledger.dart';
+ import 'package:cw_monero/monero_wallet.dart';
+-import 'package:collection/collection.dart';
+ import 'package:hive/hive.dart';
+ import 'package:ledger_flutter_plus/ledger_flutter_plus.dart';
+ import 'package:monero/monero.dart' as monero;
+ import 'package:polyseed/polyseed.dart';
+ 
++enum MoneroSeedType { polyseed, legacy, bip39 }
++
+ class MoneroNewWalletCredentials extends WalletCredentials {
+   MoneroNewWalletCredentials(
+-      {required String name, required this.language, required this.isPolyseed, String? password, this.passphrase})
++      {required String name,
++      required this.language,
++      required this.seedType,
++      String? password,
++      this.passphrase,
++      this.mnemonic})
+       : super(name: name, password: password);
+ 
+   final String language;
+-  final bool isPolyseed;
++  final MoneroSeedType seedType;
+   final String? passphrase;
++  final String? mnemonic;
+ }
+ 
+ class MoneroRestoreWalletFromHardwareCredentials extends WalletCredentials {
+-  MoneroRestoreWalletFromHardwareCredentials({required String name,
+-    required this.ledgerConnection,
+-    int height = 0,
+-    String? password})
++  MoneroRestoreWalletFromHardwareCredentials(
++      {required String name,
++      required this.ledgerConnection,
++      int height = 0,
++      String? password})
+       : super(name: name, password: password, height: height);
+   LedgerConnection ledgerConnection;
+ }
+@@ -60,13 +70,14 @@ class MoneroWalletLoadingException implements Exception {
+ }
+ 
+ class MoneroRestoreWalletFromKeysCredentials extends WalletCredentials {
+-  MoneroRestoreWalletFromKeysCredentials({required String name,
+-    required String password,
+-    required this.language,
+-    required this.address,
+-    required this.viewKey,
+-    required this.spendKey,
+-    int height = 0})
++  MoneroRestoreWalletFromKeysCredentials(
++      {required String name,
++      required String password,
++      required this.language,
++      required this.address,
++      required this.viewKey,
++      required this.spendKey,
++      int height = 0})
+       : super(name: name, password: password, height: height);
+ 
+   final String language;
+@@ -97,27 +108,42 @@ class MoneroWalletService extends WalletService<
+   @override
+   WalletType getType() => WalletType.monero;
+ 
+-  @override 
+-  Future<MoneroWallet> create(MoneroNewWalletCredentials credentials, {bool? isTestnet}) async {
++  @override
++  Future<MoneroWallet> create(MoneroNewWalletCredentials credentials,
++      {bool? isTestnet}) async {
+     try {
+       final path = await pathForWallet(name: credentials.name, type: getType());
+ 
+-      if (credentials.isPolyseed) {
++      if (credentials.seedType == MoneroSeedType.bip39) {
++        return _restoreFromBip39(
++          path: path,
++          password: credentials.password!,
++          mnemonic: credentials.mnemonic ?? getBip39Seed(),
++          passphrase: credentials.passphrase,
++          walletInfo: credentials.walletInfo!,
++        );
++      }
++
++      if (credentials.seedType == MoneroSeedType.polyseed) {
+         final polyseed = Polyseed.create();
+         final lang = PolyseedLang.getByEnglishName(credentials.language);
+ 
+-        if (credentials.passphrase != null) polyseed.crypt(credentials.passphrase!);
++        if (credentials.passphrase != null)
++          polyseed.crypt(credentials.passphrase!);
+ 
+-        final heightOverride =
+-        getMoneroHeigthByDate(date: DateTime.now().subtract(Duration(days: 2)));
++        final heightOverride = getMoneroHeigthByDate(
++            date: DateTime.now().subtract(Duration(days: 2)));
+ 
+-        return _restoreFromPolyseed(
+-            path, credentials.password!, polyseed, credentials.walletInfo!, lang,
++        return _restoreFromPolyseed(path, credentials.password!, polyseed,
++            credentials.walletInfo!, lang,
+             overrideHeight: heightOverride, passphrase: credentials.passphrase);
+       }
+ 
+       await monero_wallet_manager.createWallet(
+-          path: path, password: credentials.password!, language: credentials.language, passphrase: credentials.passphrase??"");
++          path: path,
++          password: credentials.password!,
++          language: credentials.language,
++          passphrase: credentials.passphrase ?? "");
+       final wallet = MoneroWallet(
+           walletInfo: credentials.walletInfo!,
+           unspentCoinsInfo: unspentCoinsInfoSource,
+@@ -145,7 +171,8 @@ class MoneroWalletService extends WalletService<
+   }
+ 
+   @override
+-  Future<MoneroWallet> openWallet(String name, String password, {OpenWalletTry openWalletTry = OpenWalletTry.initial}) async {
++  Future<MoneroWallet> openWallet(String name, String password,
++      {OpenWalletTry openWalletTry = OpenWalletTry.initial}) async {
+     try {
+       final path = await pathForWallet(name: name, type: getType());
+ 
+@@ -303,8 +330,28 @@ class MoneroWalletService extends WalletService<
+       rethrow;
+     }
+ 
++    try {
++      if (isBip39Seed(credentials.mnemonic)) {
++        final path =
++            await pathForWallet(name: credentials.name, type: getType());
++
++        return _restoreFromBip39(
++          path: path,
++          password: credentials.password!,
++          mnemonic: credentials.mnemonic,
++          walletInfo: credentials.walletInfo!,
++          overrideHeight: credentials.height!,
++          passphrase: credentials.passphrase,
++        );
++      }
++    } catch (e) {
++      printV("Bip39 restore failed: $e");
++      rethrow;
++    }
++
+     try {
+       final path = await pathForWallet(name: credentials.name, type: getType());
++
+       monero_wallet_manager.restoreFromSeed(
+           path: path,
+           password: credentials.password!,
+@@ -325,6 +372,50 @@ class MoneroWalletService extends WalletService<
+     }
+   }
+ 
++  Future<MoneroWallet> _restoreFromBip39({
++    required String path,
++    required String password,
++    required String mnemonic,
++    required WalletInfo walletInfo,
++    String? passphrase,
++    int? overrideHeight,
++  }) async {
++    walletInfo.derivationInfo = DerivationInfo(
++        derivationType: DerivationType.bip39,
++        derivationPath: "m/44'/128'/0'/0/0",
++    );
++
++    final legacyMnemonic =
++        getLegacySeedFromBip39(mnemonic, passphrase: passphrase ?? "");
++    final height =
++        overrideHeight ?? getMoneroHeigthByDate(date: DateTime.now());
++
++    walletInfo.isRecovery = true;
++    walletInfo.restoreHeight = height;
++
++    monero_wallet_manager.restoreFromSeed(
++      path: path,
++      password: password,
++      passphrase: '',
++      seed: legacyMnemonic,
++      restoreHeight: height,
++    );
++
++    monero.Wallet_setCacheAttribute(wptr!,
++        key: "cakewallet.seed.bip39", value: mnemonic);
++
++    monero.Wallet_store(wptr!);
++
++    final wallet = MoneroWallet(
++      walletInfo: walletInfo,
++      unspentCoinsInfo: unspentCoinsInfoSource,
++      password: password,
++    );
++    await wallet.init();
++
++    return wallet;
++  }
++
+   Future<MoneroWallet> restoreFromPolyseed(
+       MoneroRestoreWalletFromSeedCredentials credentials) async {
+     try {
+@@ -344,23 +435,21 @@ class MoneroWalletService extends WalletService<
+     }
+   }
+ 
+-  Future<MoneroWallet> _restoreFromPolyseed(
+-      String path, String password, Polyseed polyseed, WalletInfo walletInfo, PolyseedLang lang,
++  Future<MoneroWallet> _restoreFromPolyseed(String path, String password,
++      Polyseed polyseed, WalletInfo walletInfo, PolyseedLang lang,
+       {PolyseedCoin coin = PolyseedCoin.POLYSEED_MONERO,
+       int? overrideHeight,
+       String? passphrase}) async {
+-    
+-    if (polyseed.isEncrypted == false &&
+-        (passphrase??'') != "") {
++    if (polyseed.isEncrypted == false && (passphrase ?? '') != "") {
+       // Fallback to the different passphrase offset method, when a passphrase
+       // was provided but the polyseed is not encrypted.
+       monero_wallet_manager.restoreWalletFromPolyseedWithOffset(
+-        path: path,
+-        password: password,
+-        seed: polyseed.encode(lang, coin),
+-        seedOffset: passphrase??'',
+-        language: "English");
+-      
++          path: path,
++          password: password,
++          seed: polyseed.encode(lang, coin),
++          seedOffset: passphrase ?? '',
++          language: "English");
++
+       final wallet = MoneroWallet(
+         walletInfo: walletInfo,
+         unspentCoinsInfo: unspentCoinsInfoSource,
+@@ -437,7 +526,8 @@ class MoneroWalletService extends WalletService<
+ 
+       if (walletFilesExist(path)) await repairOldAndroidWallet(name);
+ 
+-      await monero_wallet_manager.openWalletAsync({'path': path, 'password': password});
++      await monero_wallet_manager
++          .openWalletAsync({'path': path, 'password': password});
+       final walletInfo = walletInfoSource.values
+           .firstWhere((info) => info.id == WalletBase.idFor(name, getType()));
+       final wallet = MoneroWallet(
+diff --git a/cw_monero/pubspec.lock b/cw_monero/pubspec.lock
+index c808e5edb4..278226b078 100644
+--- a/cw_monero/pubspec.lock
++++ b/cw_monero/pubspec.lock
+@@ -5,18 +5,23 @@ packages:
+     dependency: transitive
+     description:
+       name: _fe_analyzer_shared
+-      sha256: "4897882604d919befd350648c7f91926a9d5de99e67b455bf0917cc2362f4bb8"
++      sha256: "16e298750b6d0af7ce8a3ba7c18c69c3785d11b15ec83f6dcd0ad2a0009b3cab"
+       url: "https://pub.dev"
+     source: hosted
+-    version: "47.0.0"
++    version: "76.0.0"
++  _macros:
++    dependency: transitive
++    description: dart
++    source: sdk
++    version: "0.3.3"
+   analyzer:
+     dependency: transitive
+     description:
+       name: analyzer
+-      sha256: "690e335554a8385bc9d787117d9eb52c0c03ee207a607e593de3c9d71b1cfe80"
++      sha256: "1f14db053a8c23e260789e9b0980fa27f2680dd640932cae5e1137cce0e46e1e"
+       url: "https://pub.dev"
+     source: hosted
+-    version: "4.7.0"
++    version: "6.11.0"
+   args:
+     dependency: transitive
+     description:
+@@ -41,6 +46,22 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "2.11.0"
++  bip32:
++    dependency: "direct main"
++    description:
++      name: bip32
++      sha256: "54787cd7a111e9d37394aabbf53d1fc5e2e0e0af2cd01c459147a97c0e3f8a97"
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.0.0"
++  bip39:
++    dependency: "direct main"
++    description:
++      name: bip39
++      sha256: de1ee27ebe7d96b84bb3a04a4132a0a3007dcdd5ad27dd14aa87a29d97c45edc
++      url: "https://pub.dev"
++    source: hosted
++    version: "1.0.6"
+   blockchain_utils:
+     dependency: transitive
+     description:
+@@ -66,6 +87,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "2.1.1"
++  bs58check:
++    dependency: transitive
++    description:
++      name: bs58check
++      sha256: c4a164d42b25c2f6bc88a8beccb9fc7d01440f3c60ba23663a20a70faf484ea9
++      url: "https://pub.dev"
++    source: hosted
++    version: "1.0.2"
+   build:
+     dependency: transitive
+     description:
+@@ -94,10 +123,10 @@ packages:
+     dependency: "direct dev"
+     description:
+       name: build_resolvers
+-      sha256: "687cf90a3951affac1bd5f9ecb5e3e90b60487f3d9cdc359bb310f8876bb02a6"
++      sha256: b9e4fda21d846e192628e7a4f6deda6888c36b5b69ba02ff291a01fd529140f0
+       url: "https://pub.dev"
+     source: hosted
+-    version: "2.0.10"
++    version: "2.4.4"
+   build_runner:
+     dependency: "direct dev"
+     description:
+@@ -222,10 +251,10 @@ packages:
+     dependency: transitive
+     description:
+       name: dart_style
+-      sha256: "7a03456c3490394c8e7665890333e91ae8a49be43542b616e414449ac358acd4"
++      sha256: "7306ab8a2359a48d22310ad823521d723acfed60ee1f7e37388e8986853b6820"
+       url: "https://pub.dev"
+     source: hosted
+-    version: "2.2.4"
++    version: "2.3.8"
+   dbus:
+     dependency: transitive
+     description:
+@@ -348,6 +377,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "2.6.0"
++  hex:
++    dependency: transitive
++    description:
++      name: hex
++      sha256: "4e7cd54e4b59ba026432a6be2dd9d96e4c5205725194997193bf871703b82c4a"
++      url: "https://pub.dev"
++    source: hosted
++    version: "0.2.0"
+   hive:
+     dependency: transitive
+     description:
+@@ -360,10 +397,10 @@ packages:
+     dependency: "direct dev"
+     description:
+       name: hive_generator
+-      sha256: "81fd20125cb2ce8fd23623d7744ffbaf653aae93706c9bd3bf7019ea0ace3938"
++      sha256: "06cb8f58ace74de61f63500564931f9505368f45f98958bd7a6c35ba24159db4"
+       url: "https://pub.dev"
+     source: hosted
+-    version: "1.1.3"
++    version: "2.0.1"
+   http:
+     dependency: "direct main"
+     description:
+@@ -468,6 +505,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "1.3.0"
++  macros:
++    dependency: transitive
++    description:
++      name: macros
++      sha256: "1d9e801cd66f7ea3663c45fc708450db1fa57f988142c64289142c9b7ee80656"
++      url: "https://pub.dev"
++    source: hosted
++    version: "0.1.3-main.0"
+   matcher:
+     dependency: transitive
+     description:
+@@ -512,10 +557,18 @@ packages:
+     dependency: "direct dev"
+     description:
+       name: mobx_codegen
+-      sha256: d4beb9cea4b7b014321235f8fdc7c2193ee0fe1d1198e9da7403f8bc85c4407c
++      sha256: "990da80722f7d7c0017dec92040b31545d625b15d40204c36a1e63d167c73cdc"
+       url: "https://pub.dev"
+     source: hosted
+-    version: "2.3.0"
++    version: "2.7.0"
++  mockito:
++    dependency: "direct dev"
++    description:
++      name: mockito
++      sha256: f99d8d072e249f719a5531735d146d8cf04c580d93920b04de75bef6dfb2daf6
++      url: "https://pub.dev"
++    source: hosted
++    version: "5.4.5"
+   monero:
+     dependency: "direct main"
+     description:
+@@ -735,18 +788,18 @@ packages:
+     dependency: transitive
+     description:
+       name: source_gen
+-      sha256: "2d79738b6bbf38a43920e2b8d189e9a3ce6cc201f4b8fc76be5e4fe377b1c38d"
++      sha256: "14658ba5f669685cd3d63701d01b31ea748310f7ab854e471962670abcf57832"
+       url: "https://pub.dev"
+     source: hosted
+-    version: "1.2.6"
++    version: "1.5.0"
+   source_helper:
+     dependency: transitive
+     description:
+       name: source_helper
+-      sha256: "3b67aade1d52416149c633ba1bb36df44d97c6b51830c2198e934e3fca87ca1f"
++      sha256: "86d247119aedce8e63f4751bd9626fc9613255935558447569ad42f9f5b48b3c"
+       url: "https://pub.dev"
+     source: hosted
+-    version: "1.3.3"
++    version: "1.3.5"
+   source_span:
+     dependency: transitive
+     description:
+@@ -924,5 +977,5 @@ packages:
+     source: hosted
+     version: "3.1.3"
+ sdks:
+-  dart: ">=3.5.0 <4.0.0"
++  dart: ">=3.6.0 <4.0.0"
+   flutter: ">=3.24.0"
+diff --git a/cw_monero/pubspec.yaml b/cw_monero/pubspec.yaml
+index 862109e947..0e1537ee0a 100644
+--- a/cw_monero/pubspec.yaml
++++ b/cw_monero/pubspec.yaml
+@@ -12,6 +12,8 @@ environment:
+ dependencies:
+   flutter:
+     sdk: flutter
++  bip39: ^1.0.6
++  bip32: ^2.0.0
+   ffi: ^2.0.1
+   http: ^1.1.0
+   path_provider: ^2.0.11
+@@ -36,7 +38,8 @@ dev_dependencies:
+   build_runner: ^2.4.7
+   build_resolvers: ^2.0.9
+   mobx_codegen: ^2.0.7
+-  hive_generator: ^1.1.3
++  mockito: ^5.4.5
++  hive_generator: ^2.0.1
+ 
+ dependency_overrides:
+   watcher: ^1.1.0
+diff --git a/cw_monero/test/bip39_seed_test.dart b/cw_monero/test/bip39_seed_test.dart
+new file mode 100644
+index 0000000000..add4615537
+--- /dev/null
++++ b/cw_monero/test/bip39_seed_test.dart
+@@ -0,0 +1,39 @@
++import 'package:cw_monero/bip39_seed.dart';
++import 'package:flutter_test/flutter_test.dart';
++
++void main() {
++  group("Exodus Style bip39", () {
++    group("Test Wallet 1", () {
++      final bip39Seed = 'meadow tip best belt boss eyebrow control affair eternal piece very shiver';
++      final expectedLegacySeed0 = "tasked eight afraid laboratory tail feline rift reinvest vane cafe bailed foggy dormant paper jigsaw king hazard suture king dapper dummy jolted dating dwindling king";
++      final expectedLegacySeed1 = "palace pairing axes mohawk rekindle excess awful juvenile shipped talent nibs efficient dapper biggest swung fight pact innocent emerge issued titans affair nearby noises emerge";
++
++      test("Get legacy Seed from bip39", () {
++        final legacySeed = getLegacySeedFromBip39(bip39Seed);
++        expect(legacySeed, expectedLegacySeed0);
++      });
++
++      test("Get legacy Seed from bip39 with account index", () {
++        final legacySeed = getLegacySeedFromBip39(bip39Seed, accountIndex: 1);
++        expect(legacySeed, expectedLegacySeed1);
++      });
++    });
++
++    group("Test Wallet 2", () {
++      final bip39Seed = "color ranch color remove subway public water embrace before begin liberty fault";
++      final expectedLegacySeed0 = "somewhere problems gauze gigantic intended foxes upcoming saved waffle pipeline lurk bogeys empty wipeout abbey italics novelty tucks rafts elite lunar obnoxious awful bugs elite";
++      final expectedLegacySeed1 = "playful toxic wildly eluded mesh fainted february mugged maps repent vigilant hitched seventh threaten clue fetches sample diet number alkaline future cottage tuition vegan alkaline";
++
++      test("Get legacy Seed from bip39", () {
++        final legacySeed = getLegacySeedFromBip39(bip39Seed);
++        expect(legacySeed, expectedLegacySeed0);
++      });
++
++      test("Get legacy Seed from bip39 with account index", () {
++        final legacySeed = getLegacySeedFromBip39(bip39Seed, accountIndex: 1);
++        expect(legacySeed, expectedLegacySeed1);
++      });
++    });
++
++  });
++}
+diff --git a/cw_monero/test/mock/path_provider.dart b/cw_monero/test/mock/path_provider.dart
+new file mode 100644
+index 0000000000..7902d5bf0f
+--- /dev/null
++++ b/cw_monero/test/mock/path_provider.dart
+@@ -0,0 +1,29 @@
++import 'package:mockito/mockito.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
++import 'package:plugin_platform_interface/plugin_platform_interface.dart';
++
++class MockPathProviderPlatform extends Mock
++    with MockPlatformInterfaceMixin
++    implements PathProviderPlatform {
++  Future<String> getTemporaryPath() => throw UnimplementedError();
++
++  Future<String> getApplicationSupportPath() => throw UnimplementedError();
++
++  Future<String> getLibraryPath() => throw UnimplementedError();
++
++  Future<String> getApplicationDocumentsPath() async => "./test/data";
++
++  Future<String> getExternalStoragePath() => throw UnimplementedError();
++
++  Future<List<String>> getExternalCachePaths() => throw UnimplementedError();
++
++  Future<String> getDownloadsPath() => throw UnimplementedError();
++
++  @override
++  Future<String?> getApplicationCachePath() => throw UnimplementedError();
++
++  @override
++  Future<List<String>?> getExternalStoragePaths({StorageDirectory? type}) =>
++      throw UnimplementedError();
++}
+diff --git a/cw_monero/test/monero_wallet_service_test.dart b/cw_monero/test/monero_wallet_service_test.dart
+new file mode 100644
+index 0000000000..a809dbc230
+--- /dev/null
++++ b/cw_monero/test/monero_wallet_service_test.dart
+@@ -0,0 +1,148 @@
++import 'dart:io';
++
++import 'package:cw_core/unspent_coins_info.dart';
++import 'package:cw_core/wallet_base.dart';
++import 'package:cw_core/wallet_info.dart';
++import 'package:cw_core/wallet_type.dart';
++import 'package:cw_monero/monero_wallet_service.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:hive/hive.dart';
++import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
++
++import 'mock/path_provider.dart';
++import 'utils/setup_monero_c.dart';
++
++Future<void> main() async {
++  group("MoneroWalletService Tests", () {
++    Hive.init('./test/data/db');
++    late MoneroWalletService walletService;
++    late File moneroCBinary;
++
++    setUpAll(() async {
++      PathProviderPlatform.instance = MockPathProviderPlatform();
++
++      final Box<WalletInfo> walletInfoSource =
++          await Hive.openBox('testWalletInfo');
++      final Box<UnspentCoinsInfo> unspentCoinsInfoSource =
++          await Hive.openBox('testUnspentCoinsInfo');
++
++      walletService = MoneroWalletService(walletInfoSource, unspentCoinsInfoSource);
++      moneroCBinary = getMoneroCBinary().copySync(moneroCBinaryName);
++    });
++
++    tearDownAll(() {
++      Directory('./test/data').deleteSync(recursive: true);
++      moneroCBinary.deleteSync();
++    });
++
++    group("Create wallet", () {
++      test("Create Legacy Wallet", () async {
++        final credentials = _getTestCreateCredentials(
++            name: 'Create Wallet LS',
++            language: 'English',
++            seedType: MoneroSeedType.legacy);
++        final wallet = await walletService.create(credentials);
++
++        expect(wallet.seed.split(" ").length, 25);
++        expect(wallet.restoreHeight, greaterThan(3000000));
++      });
++
++      test("Create Polyseed Wallet", () async {
++        final credentials = _getTestCreateCredentials(
++            name: 'Create Wallet PS',
++            language: 'English',
++            seedType: MoneroSeedType.polyseed);
++        final wallet = await walletService.create(credentials);
++
++        expect(wallet.seed.split(" ").length, 16);
++        expect(wallet.restoreHeight, greaterThan(3000000));
++      });
++
++      test("Create Bip39 Wallet", () async {
++        final credentials = _getTestCreateCredentials(
++            name: 'Create Wallet BS',
++            language: 'English',
++            seedType: MoneroSeedType.bip39);
++        final wallet = await walletService.create(credentials);
++
++        expect(wallet.seed.split(" ").length, 12);
++        expect(wallet.restoreHeight, greaterThan(3000000));
++      });
++    });
++
++    group("Restore wallet", () {
++      test('Legacy Seed', () async {
++        final credentials = _getTestRestoreCredentials(
++          name: 'Test Wallet LS',
++          mnemonic:
++              'ability pockets lordship tomorrow gypsy match neutral uncle avatar betting bicycle junk unzip pyramid lynx mammal edgy empty uneven knowledge juvenile wiring paradise psychic betting',
++        );
++
++        final wallet = await walletService.restoreFromSeed(credentials);
++        expect(wallet.walletAddresses.primaryAddress,
++            '48tLyQXpcwt8w6uKHyb5Zs3vdnoDWAEKFQr1c198o7aX9dBzXP3BTSMVsDiuH3ozDCNqwojb4vNeQZf7xg6URimDLaNtGSN');
++      });
++
++      test('Bip39 Seed', () async {
++        final credentials = _getTestRestoreCredentials(
++            name: 'Test Wallet BS',
++            mnemonic:
++                'color ranch color remove subway public water embrace before begin liberty fault');
++
++        final wallet = await walletService.restoreFromSeed(credentials);
++        expect(wallet.walletAddresses.primaryAddress,
++            '49MggvPosJugF8Zq7WAKbsSchz6vbyL6YiUxM4ryfGQDXphs6wiWiXLFWCSshnLPcceGTWUaKfWWMHQAAKESV3TQJVQsL9a');
++      });
++    });
++  });
++}
++
++MoneroRestoreWalletFromSeedCredentials _getTestRestoreCredentials({
++  required String name,
++  required String mnemonic,
++}) {
++  final credentials = MoneroRestoreWalletFromSeedCredentials(
++      name: name, mnemonic: mnemonic, passphrase: '', password: "test");
++
++  credentials.walletInfo = WalletInfo.external(
++    id: WalletBase.idFor(name, WalletType.monero),
++    name: name,
++    type: WalletType.monero,
++    isRecovery: true,
++    restoreHeight: credentials.height ?? 0,
++    date: DateTime.now(),
++    path: '',
++    dirPath: '',
++    address: '',
++  );
++  return credentials;
++}
++
++MoneroNewWalletCredentials _getTestCreateCredentials({
++  required String name,
++  required String language,
++  required MoneroSeedType seedType,
++  String? mnemonic,
++}) {
++  final credentials = MoneroNewWalletCredentials(
++    name: name,
++    language: language,
++    seedType: seedType,
++    password: "test",
++    mnemonic: mnemonic,
++    passphrase: '',
++  );
++
++  credentials.walletInfo = WalletInfo.external(
++    id: WalletBase.idFor(name, WalletType.monero),
++    name: name,
++    type: WalletType.monero,
++    isRecovery: false,
++    restoreHeight: credentials.height ?? 0,
++    date: DateTime.now(),
++    path: '',
++    dirPath: '',
++    address: '',
++  );
++  return credentials;
++}
+diff --git a/cw_monero/test/utils/setup_monero_c.dart b/cw_monero/test/utils/setup_monero_c.dart
+new file mode 100644
+index 0000000000..1a09810001
+--- /dev/null
++++ b/cw_monero/test/utils/setup_monero_c.dart
+@@ -0,0 +1,16 @@
++import 'dart:io';
++
++File getMoneroCBinary() {
++  if (Platform.isWindows)
++    return File(
++        '../scripts/monero_c/release/monero/x86_64-w64-mingw32_libwallet2_api_c.dll');
++  if (Platform.isMacOS) return File('../macos/monero_libwallet2_api_c.dylib');
++  return File('../scripts/monero_c/release/monero/x86_64-linux-gnu_libwallet2_api_c.so');
++}
++
++String get moneroCBinaryName {
++  if (Platform.isWindows)
++    return "monero_libwallet2_api_c.dll";
++  if (Platform.isMacOS) return "monero_libwallet2_api_c.dylib";
++  return "/usr/lib/monero_libwallet2_api_c.so";
++}
+diff --git a/lib/entities/seed_type.dart b/lib/entities/seed_type.dart
+index 20600e7045..0548d9ceef 100644
+--- a/lib/entities/seed_type.dart
++++ b/lib/entities/seed_type.dart
+@@ -1,17 +1,17 @@
+-import 'package:cake_wallet/generated/i18n.dart';
+ import 'package:cw_core/enumerable_item.dart';
+ import 'package:cw_core/wallet_info.dart';
+ 
+ class MoneroSeedType extends EnumerableItem<int> with Serializable<int> {
+   const MoneroSeedType({required String title, required int raw}) : super(title: title, raw: raw);
+ 
+-  static const all = [MoneroSeedType.legacy, MoneroSeedType.polyseed];
++  static const all = [legacy, polyseed, bip39];
+ 
+   static const defaultSeedType = polyseed;
+ 
+-  static const legacy = MoneroSeedType(raw: 0, title: 'Legacy (25 words)');
+-  static const polyseed = MoneroSeedType(raw: 1, title: 'Polyseed (16 words)');
+-  static const wowneroSeed = MoneroSeedType(raw: 2, title: 'Wownero (14 words)');
++  static const legacy = MoneroSeedType(raw: 0, title: 'Legacy');
++  static const polyseed = MoneroSeedType(raw: 1, title: 'Polyseed');
++  static const wowneroSeed = MoneroSeedType(raw: 2, title: 'Wownero');
++  static const bip39 = MoneroSeedType(raw: 3, title: 'BIP39');
+ 
+   static MoneroSeedType deserialize({required int raw}) {
+     switch (raw) {
+@@ -21,24 +21,15 @@ class MoneroSeedType extends EnumerableItem<int> with Serializable<int> {
+         return polyseed;
+       case 2:
+         return wowneroSeed;
++      case 3:
++        return bip39;
+       default:
+         throw Exception('Unexpected token: $raw for SeedType deserialize');
+     }
+   }
+ 
+   @override
+-  String toString() {
+-    switch (this) {
+-      case MoneroSeedType.legacy:
+-        return S.current.seedtype_legacy;
+-      case MoneroSeedType.polyseed:
+-        return S.current.seedtype_polyseed;
+-      case MoneroSeedType.wowneroSeed:
+-        return S.current.seedtype_wownero;
+-      default:
+-        return '';
+-    }
+-  }
++  String toString() => title;
+ }
+ 
+ class BitcoinSeedType extends EnumerableItem<int> with Serializable<int> {
+diff --git a/lib/monero/cw_monero.dart b/lib/monero/cw_monero.dart
+index 6c72cbe674..b6be123c22 100644
+--- a/lib/monero/cw_monero.dart
++++ b/lib/monero/cw_monero.dart
+@@ -252,11 +252,21 @@ class CWMonero extends Monero {
+   WalletCredentials createMoneroNewWalletCredentials({
+     required String name,
+     required String language,
+-    required bool isPolyseed,
++    required int seedType,
+     required String? passphrase,
+-    String? password}) =>
++    String? password,
++    String? mnemonic,
++  }) =>
+       MoneroNewWalletCredentials(
+-        name: name, password: password, language: language, isPolyseed: isPolyseed, passphrase: passphrase);
++        name: name,
++        password: password,
++        language: language,
++        seedType: seedType == 1
++            ? MoneroSeedType.polyseed
++            : (seedType == 3 ? MoneroSeedType.bip39 : MoneroSeedType.legacy),
++        passphrase: passphrase,
++        mnemonic: mnemonic,
++      );
+ 
+   @override
+   Map<String, String> getKeys(Object wallet) {
+diff --git a/lib/reactions/bip39_wallet_utils.dart b/lib/reactions/bip39_wallet_utils.dart
+index 0c58bc76f9..a46adb6b1e 100644
+--- a/lib/reactions/bip39_wallet_utils.dart
++++ b/lib/reactions/bip39_wallet_utils.dart
+@@ -11,8 +11,8 @@ bool isBIP39Wallet(WalletType walletType) {
+     case WalletType.bitcoinCash:
+     case WalletType.nano:
+     case WalletType.banano:
+-      return true;
+     case WalletType.monero:
++      return true;
+     case WalletType.wownero:
+     case WalletType.haven:
+     case WalletType.zano:
+diff --git a/lib/src/screens/new_wallet/advanced_privacy_settings_page.dart b/lib/src/screens/new_wallet/advanced_privacy_settings_page.dart
+index f8901918f3..d03f334a1b 100644
+--- a/lib/src/screens/new_wallet/advanced_privacy_settings_page.dart
++++ b/lib/src/screens/new_wallet/advanced_privacy_settings_page.dart
+@@ -144,7 +144,9 @@ class _AdvancedPrivacySettingsBodyState extends State<_AdvancedPrivacySettingsBo
+                 ),
+               );
+             }),
+-            if (widget.privacySettingsViewModel.isMoneroSeedTypeOptionsEnabled)
++            if (widget
++                    .privacySettingsViewModel.isMoneroSeedTypeOptionsEnabled &&
++                !widget.isChildWallet)
+               Observer(builder: (_) {
+                 return SettingsChoicesCell(
+                   ChoicesListItem<MoneroSeedType>(
+diff --git a/lib/src/screens/new_wallet/new_wallet_page.dart b/lib/src/screens/new_wallet/new_wallet_page.dart
+index 368b3440d7..83c14cd56c 100644
+--- a/lib/src/screens/new_wallet/new_wallet_page.dart
++++ b/lib/src/screens/new_wallet/new_wallet_page.dart
+@@ -305,7 +305,7 @@ class _WalletNameFormState extends State<WalletNameForm> {
+                       ),
+                     ),
+                   ),
+-                  if (_walletNewVM.hasLanguageSelector) ...[
++                  if (_walletNewVM.showLanguageSelector) ...[
+                     if (_walletNewVM.hasSeedType) ...[
+                       Observer(
+                         builder: (BuildContext build) => Padding(
+@@ -401,7 +401,11 @@ class _WalletNameFormState extends State<WalletNameForm> {
+       } else {
+         await _walletNewVM.create(
+             options: _walletNewVM.hasLanguageSelector
+-                ? [_languageSelectorKey.currentState!.selected, isPolyseed]
++                ? [
++                    _languageSelectorKey.currentState?.selected ??
++                        defaultSeedLanguage,
++                    widget._seedSettingsViewModel.moneroSeedType
++                  ]
+                 : null);
+       }
+     } catch (e) {
+diff --git a/lib/src/screens/restore/wallet_restore_from_seed_form.dart b/lib/src/screens/restore/wallet_restore_from_seed_form.dart
+index d089f8c1c4..af82616629 100644
+--- a/lib/src/screens/restore/wallet_restore_from_seed_form.dart
++++ b/lib/src/screens/restore/wallet_restore_from_seed_form.dart
+@@ -11,13 +11,15 @@ import 'package:cake_wallet/themes/extensions/send_page_theme.dart';
+ import 'package:cake_wallet/utils/show_pop_up.dart';
+ import 'package:cake_wallet/view_model/restore/restore_wallet.dart';
+ import 'package:cake_wallet/view_model/seed_settings_view_model.dart';
++import 'package:cw_core/utils/print_verbose.dart';
+ import 'package:cw_core/wallet_type.dart';
+ import 'package:flutter/material.dart';
+ import 'package:mobx/mobx.dart';
+ import 'package:polyseed/polyseed.dart';
+ 
+ class WalletRestoreFromSeedForm extends StatefulWidget {
+-  WalletRestoreFromSeedForm({Key? key,
++  WalletRestoreFromSeedForm({
++    Key? key,
+     required this.displayLanguageSelector,
+     required this.displayBlockHeightSelector,
+     required this.type,
+@@ -47,21 +49,23 @@ class WalletRestoreFromSeedForm extends StatefulWidget {
+ 
+   @override
+   WalletRestoreFromSeedFormState createState() =>
+-      WalletRestoreFromSeedFormState('English', displayWalletPassword: displayWalletPassword);
++      WalletRestoreFromSeedFormState('English',
++          displayWalletPassword: displayWalletPassword);
+ }
+ 
+ class WalletRestoreFromSeedFormState extends State<WalletRestoreFromSeedForm> {
+-  WalletRestoreFromSeedFormState(this.language, {required bool displayWalletPassword})
++  WalletRestoreFromSeedFormState(this.language,
++      {required bool displayWalletPassword})
+       : seedWidgetStateKey = GlobalKey<SeedWidgetState>(),
+         blockchainHeightKey = GlobalKey<BlockchainHeightState>(),
+         formKey = GlobalKey<FormState>(),
+         languageController = TextEditingController(),
+         nameTextEditingController = TextEditingController(),
+-        passwordTextEditingController = displayWalletPassword ? TextEditingController() : null,
+-        repeatedPasswordTextEditingController = displayWalletPassword
+-            ? TextEditingController()
+-            : null,
+-      seedTypeController = TextEditingController();
++        passwordTextEditingController =
++            displayWalletPassword ? TextEditingController() : null,
++        repeatedPasswordTextEditingController =
++            displayWalletPassword ? TextEditingController() : null,
++        seedTypeController = TextEditingController();
+ 
+   final GlobalKey<SeedWidgetState> seedWidgetStateKey;
+   final GlobalKey<BlockchainHeightState> blockchainHeightKey;
+@@ -83,27 +87,30 @@ class WalletRestoreFromSeedFormState extends State<WalletRestoreFromSeedForm> {
+     _setLanguageLabel(language);
+ 
+     if (passwordTextEditingController != null) {
+-      passwordListener = () => widget.onPasswordChange?.call(passwordTextEditingController!.text);
++      passwordListener = () =>
++          widget.onPasswordChange?.call(passwordTextEditingController!.text);
+       passwordTextEditingController?.addListener(passwordListener!);
+     }
+ 
+     if (repeatedPasswordTextEditingController != null) {
+-      repeatedPasswordListener =
+-          () => widget.onRepeatedPasswordChange?.call(repeatedPasswordTextEditingController!.text);
+-      repeatedPasswordTextEditingController?.addListener(repeatedPasswordListener!);
++      repeatedPasswordListener = () => widget.onRepeatedPasswordChange
++          ?.call(repeatedPasswordTextEditingController!.text);
++      repeatedPasswordTextEditingController
++          ?.addListener(repeatedPasswordListener!);
+     }
+ 
+     moneroSeedTypeReaction =
+-        reaction((_) => widget.seedSettingsViewModel.moneroSeedType, (MoneroSeedType item) {
+-          _setSeedType(item);
+-          _changeLanguage('English');
+-        });
++        reaction((_) => widget.seedSettingsViewModel.moneroSeedType,
++            (MoneroSeedType item) {
++      _setSeedType(item);
++      _changeLanguage('English');
++    });
+ 
+     super.initState();
+   }
+ 
+   @override
+-  void dispose() {    
++  void dispose() {
+     moneroSeedTypeReaction();
+ 
+     if (passwordListener != null) {
+@@ -118,16 +125,22 @@ class WalletRestoreFromSeedFormState extends State<WalletRestoreFromSeedForm> {
+   }
+ 
+   void onSeedChange(String seed) {
+-    if ((widget.type == WalletType.monero || widget.type == WalletType.wownero) &&
+-        Polyseed.isValidSeed(seed)) {
+-      final lang = PolyseedLang.getByPhrase(seed);
++    if ([WalletType.monero, WalletType.wownero].contains(widget.type) &&
++        (seed.split(" ").length == 12 || Polyseed.isValidSeed(seed))) {
++      try {
++        final lang = PolyseedLang.getByPhrase(seed);
+ 
+-      _changeSeedType(MoneroSeedType.polyseed);
+-      _changeLanguage(lang.nameEnglish);
++        if (widget.type == WalletType.monero && seed.split(" ").length == 12) {
++          _changeSeedType(MoneroSeedType.bip39);
++        } else {
++          _changeSeedType(MoneroSeedType.polyseed);
++        }
++        _changeLanguage(lang.nameEnglish, true);
++      } catch (e) {
++        printV(e);
++      }
+     }
+-    if (widget.type == WalletType.wownero && seed
+-        .split(" ")
+-        .length == 14) {
++    if (widget.type == WalletType.wownero && seed.split(" ").length == 14) {
+       _changeSeedType(MoneroSeedType.wowneroSeed);
+       _changeLanguage("English");
+     }
+@@ -147,9 +160,7 @@ class WalletRestoreFromSeedFormState extends State<WalletRestoreFromSeedForm> {
+                   BaseTextFormField(
+                     key: ValueKey('wallet_restore_from_seed_wallet_name_textfield_key'),
+                     controller: nameTextEditingController,
+-                    hintText: S
+-                        .of(context)
+-                        .wallet_name,
++                    hintText: S.of(context).wallet_name,
+                     suffixIcon: IconButton(
+                       key: ValueKey('wallet_restore_from_seed_wallet_name_refresh_button_key'),
+                       onPressed: () async {
+@@ -158,17 +169,17 @@ class WalletRestoreFromSeedFormState extends State<WalletRestoreFromSeedForm> {
+ 
+                         setState(() {
+                           nameTextEditingController.text = rName;
+-                          nameTextEditingController.selection = TextSelection.fromPosition(
+-                              TextPosition(offset: nameTextEditingController.text.length));
++                          nameTextEditingController.selection =
++                              TextSelection.fromPosition(TextPosition(
++                                  offset:
++                                      nameTextEditingController.text.length));
+                         });
+                       },
+                       icon: Container(
+                         padding: const EdgeInsets.all(8),
+                         decoration: BoxDecoration(
+                           borderRadius: BorderRadius.circular(6.0),
+-                          color: Theme
+-                              .of(context)
+-                              .hintColor,
++                          color: Theme.of(context).hintColor,
+                         ),
+                         width: 34,
+                         height: 34,
+@@ -194,14 +205,13 @@ class WalletRestoreFromSeedFormState extends State<WalletRestoreFromSeedForm> {
+             seedTextFieldKey: ValueKey('wallet_restore_from_seed_wallet_seeds_textfield_key'),
+             pasteButtonKey: ValueKey('wallet_restore_from_seed_wallet_seeds_paste_button_key'),
+           ),
+-          if (widget.type == WalletType.monero || widget.type == WalletType.wownero)
++          if ([WalletType.monero, WalletType.wownero].contains(widget.type))
+             GestureDetector(
+               key: ValueKey('wallet_restore_from_seed_seedtype_picker_button_key'),
+               onTap: () async {
+                 await showPopUp<void>(
+                     context: context,
+-                    builder: (_) =>
+-                        Picker(
++                    builder: (_) => Picker(
+                           items: _getItems(),
+                           selectedAtIndex: isPolyseed
+                               ? 1
+@@ -226,33 +236,30 @@ class WalletRestoreFromSeedFormState extends State<WalletRestoreFromSeedForm> {
+                 ),
+               ),
+             ),
+-          if (widget.displayWalletPassword)
+-            ...[BaseTextFormField(
++          if (widget.displayWalletPassword) ...[
++            BaseTextFormField(
+                 key: ValueKey('password'),
+                 controller: passwordTextEditingController,
+-                hintText: S
+-                    .of(context)
+-                    .password,
++                hintText: S.of(context).password,
+                 obscureText: true),
+-              BaseTextFormField(
+-                  key: ValueKey('repeat_wallet_password'),
+-                  controller: repeatedPasswordTextEditingController,
+-                  hintText: S
+-                      .of(context)
+-                      .repeat_wallet_password,
+-                  obscureText: true)
+-            ],
++            BaseTextFormField(
++                key: ValueKey('repeat_wallet_password'),
++                controller: repeatedPasswordTextEditingController,
++                hintText: S.of(context).repeat_wallet_password,
++                obscureText: true)
++          ],
+           if (widget.displayLanguageSelector)
+             if (!seedTypeController.value.text.contains("14") && widget.displayLanguageSelector)
+               GestureDetector(
+                 onTap: () async {
+                   await showPopUp<void>(
+                       context: context,
+-                      builder: (_) =>
+-                          SeedLanguagePicker(
++                      builder: (_) => SeedLanguagePicker(
+                             selected: language,
+-                            onItemSelected: _changeLanguage,
+-                            seedType: isPolyseed ? MoneroSeedType.polyseed : MoneroSeedType.legacy,
++                            onItemSelected: (lang) =>
++                                _changeLanguage(lang, isPolyseed || isBip39),
++                            seedType:
++                                widget.seedSettingsViewModel.moneroSeedType,
+                           ));
+                 },
+                 child: Container(
+@@ -274,7 +281,8 @@ class WalletRestoreFromSeedFormState extends State<WalletRestoreFromSeedForm> {
+               key: blockchainHeightKey,
+               blockHeightTextFieldKey: ValueKey('wallet_restore_from_seed_blockheight_textfield_key'),
+               onHeightOrDateEntered: widget.onHeightOrDateEntered,
+-              hasDatePicker: widget.type == WalletType.monero || widget.type == WalletType.wownero,
++              hasDatePicker:
++                  [WalletType.monero, WalletType.wownero].contains(widget.type),
+               walletType: widget.type,
+             ),
+         ]));
+@@ -282,28 +290,29 @@ class WalletRestoreFromSeedFormState extends State<WalletRestoreFromSeedForm> {
+ 
+   bool get isPolyseed =>
+       widget.seedSettingsViewModel.moneroSeedType == MoneroSeedType.polyseed &&
+-          (widget.type == WalletType.monero || widget.type == WalletType.wownero);
++      [WalletType.monero, WalletType.wownero].contains(widget.type);
++
++  bool get isBip39 =>
++      widget.seedSettingsViewModel.moneroSeedType == MoneroSeedType.bip39 &&
++      WalletType.monero == widget.type;
+ 
+-  Widget get expandIcon =>
+-      Container(
++  Widget get expandIcon => Container(
+         padding: EdgeInsets.all(18),
+         width: 24,
+         height: 24,
+         child: Image.asset(
+           'assets/images/arrow_bottom_purple_icon.png',
+           height: 8,
+-          color: Theme
+-              .of(context)
+-              .hintColor,
++          color: Theme.of(context).hintColor,
+         ),
+       );
+ 
+-  void _changeLanguage(String language) {
+-    final setLang = isPolyseed
++  void _changeLanguage(String language, [bool useBip39Wordlist = false]) {
++    final setLang = useBip39Wordlist
+         ? "POLYSEED_$language"
+         : seedTypeController.value.text.contains("14")
+-        ? "WOWSEED_" + language
+-        : language;
++            ? "WOWSEED_" + language
++            : language;
+     setState(() {
+       this.language = setLang;
+       seedWidgetStateKey.currentState!.changeSeedLanguage(setLang);
+@@ -312,8 +321,8 @@ class WalletRestoreFromSeedFormState extends State<WalletRestoreFromSeedForm> {
+     });
+   }
+ 
+-  void _setLanguageLabel(String language) =>
+-      languageController.text = '${language.replaceAll("POLYSEED_", "")} (Seed language)';
++  void _setLanguageLabel(String language) => languageController.text =
++      '${language.replaceAll("POLYSEED_", "")} (Seed language)';
+ 
+   void _changeSeedType(MoneroSeedType item) {
+     _setSeedType(item);
+@@ -328,9 +337,17 @@ class WalletRestoreFromSeedFormState extends State<WalletRestoreFromSeedForm> {
+   List<MoneroSeedType> _getItems() {
+     switch (widget.type) {
+       case WalletType.monero:
+-        return [MoneroSeedType.legacy, MoneroSeedType.polyseed];
++        return [
++          MoneroSeedType.legacy,
++          MoneroSeedType.polyseed,
++          MoneroSeedType.bip39
++        ];
+       case WalletType.wownero:
+-        return [MoneroSeedType.legacy, MoneroSeedType.polyseed, MoneroSeedType.wowneroSeed];
++        return [
++          MoneroSeedType.legacy,
++          MoneroSeedType.polyseed,
++          MoneroSeedType.wowneroSeed
++        ];
+       default:
+         return [MoneroSeedType.legacy];
+     }
+diff --git a/lib/src/screens/restore/wallet_restore_page.dart b/lib/src/screens/restore/wallet_restore_page.dart
+index ce8595ba47..e2e1496442 100644
+--- a/lib/src/screens/restore/wallet_restore_page.dart
++++ b/lib/src/screens/restore/wallet_restore_page.dart
+@@ -527,25 +527,42 @@ class _WalletRestorePageBodyState extends State<_WalletRestorePageBody>
+   }
+ 
+   bool _isValidSeed() {
+-    final seedPhrase =
+-        walletRestoreFromSeedFormKey.currentState!.seedWidgetStateKey.currentState!.text;
++    final seedPhrase = walletRestoreFromSeedFormKey
++        .currentState!.seedWidgetStateKey.currentState!.text;
+     if (walletRestoreViewModel.isPolyseed(seedPhrase)) return true;
+ 
+     final seedWords = seedPhrase.split(' ');
+ 
+-    if (seedWords.length == 14 && walletRestoreViewModel.type == WalletType.wownero) return true;
+-    if (seedWords.length == 26 && walletRestoreViewModel.type == WalletType.zano) return true;
++    if (seedWords.length == 14 &&
++        walletRestoreViewModel.type == WalletType.wownero) return true;
++    if (seedWords.length == 26 &&
++        walletRestoreViewModel.type == WalletType.zano) return true;
++
++    if (seedWords.length == 12 &&
++        walletRestoreViewModel.type == WalletType.monero) {
++      return walletRestoreFromSeedFormKey
++          .currentState
++          ?.blockchainHeightKey
++          .currentState
++          ?.restoreHeightController
++          .text
++          .isNotEmpty == true;
++    }
+ 
+-    if ((walletRestoreViewModel.type == WalletType.monero ||
+-            walletRestoreViewModel.type == WalletType.wownero ||
+-            walletRestoreViewModel.type == WalletType.haven) &&
+-        seedWords.length != WalletRestoreViewModelBase.moneroSeedMnemonicLength) {
+-      return false;
++    if ([WalletType.monero, WalletType.wownero, WalletType.haven]
++            .contains(walletRestoreViewModel.type) &&
++        seedWords.length ==
++            WalletRestoreViewModelBase.moneroSeedMnemonicLength) {
++      return true;
+     }
+ 
+     // bip39:
+     final validBip39SeedLengths = [12, 18, 24];
+-    final nonBip39WalletTypes = [WalletType.monero, WalletType.wownero, WalletType.haven, WalletType.decred];
++    final nonBip39WalletTypes = [
++      WalletType.wownero,
++      WalletType.haven,
++      WalletType.decred
++    ];
+     // if it's a bip39 wallet and the length is not valid return false
+     if (!nonBip39WalletTypes.contains(walletRestoreViewModel.type) &&
+         !(validBip39SeedLengths.contains(seedWords.length))) {
+@@ -558,8 +575,9 @@ class _WalletRestorePageBodyState extends State<_WalletRestorePageBody>
+       return false;
+     }
+ 
+-    final words =
+-        walletRestoreFromSeedFormKey.currentState!.seedWidgetStateKey.currentState!.words.toSet();
++    final words = walletRestoreFromSeedFormKey
++        .currentState!.seedWidgetStateKey.currentState!.words
++        .toSet();
+     return seedWords.toSet().difference(words).toSet().isEmpty;
+   }
+ 
+diff --git a/lib/src/widgets/seed_language_picker.dart b/lib/src/widgets/seed_language_picker.dart
+index 4a63e30924..e2b10aa4cb 100644
+--- a/lib/src/widgets/seed_language_picker.dart
++++ b/lib/src/widgets/seed_language_picker.dart
+@@ -16,7 +16,7 @@ class SeedLanguagePickerOption {
+ 
+ final List<SeedLanguagePickerOption> seedLanguages = [
+   SeedLanguagePickerOption('English', S.current.seed_language_english,
+-      Image.asset('assets/images/flags/usa.png'), [MoneroSeedType.legacy, MoneroSeedType.polyseed]),
++      Image.asset('assets/images/flags/usa.png'), [MoneroSeedType.legacy, MoneroSeedType.polyseed, MoneroSeedType.bip39]),
+   SeedLanguagePickerOption('Chinese (Simplified)', S.current.seed_language_chinese,
+       Image.asset('assets/images/flags/chn.png'), [MoneroSeedType.legacy, MoneroSeedType.polyseed]),
+   SeedLanguagePickerOption('Chinese (Traditional)', S.current.seed_language_chinese_traditional,
+diff --git a/lib/view_model/wallet_groups_display_view_model.dart b/lib/view_model/wallet_groups_display_view_model.dart
+index 056d713aab..ef5b245baf 100644
+--- a/lib/view_model/wallet_groups_display_view_model.dart
++++ b/lib/view_model/wallet_groups_display_view_model.dart
+@@ -6,6 +6,7 @@ import 'package:cake_wallet/store/app_store.dart';
+ import 'package:cake_wallet/view_model/wallet_list/wallet_list_item.dart';
+ import 'package:cake_wallet/view_model/wallet_list/wallet_list_view_model.dart';
+ import 'package:cake_wallet/wallet_types.g.dart';
++import 'package:cw_core/utils/print_verbose.dart';
+ import 'package:cw_core/wallet_info.dart';
+ import 'package:cw_core/wallet_type.dart';
+ import 'package:mobx/mobx.dart';
+@@ -127,12 +128,16 @@ abstract class WalletGroupsDisplayViewModelBase with Store {
+ 
+         bool isNonSeedWallet = wallet.isNonSeedWallet;
+ 
++        bool isNotMoneroBip39Wallet = wallet.type == WalletType.monero &&
++            wallet.derivationInfo?.derivationType != DerivationType.bip39;
++
+         // Exclude if any of these conditions are true
+         return isNonBIP39Wallet ||
+             isNanoDerivationType ||
+             isElectrumDerivationType ||
+             isSameTypeAsSelectedWallet ||
+-            isNonSeedWallet;
++            isNonSeedWallet ||
++            isNotMoneroBip39Wallet;
+       });
+ 
+       if (shouldExcludeGroup) continue;
+diff --git a/lib/view_model/wallet_keys_view_model.dart b/lib/view_model/wallet_keys_view_model.dart
+index 246227a804..da5d04f59d 100644
+--- a/lib/view_model/wallet_keys_view_model.dart
++++ b/lib/view_model/wallet_keys_view_model.dart
+@@ -63,14 +63,15 @@ abstract class WalletKeysViewModelBase with Store {
+   String get seed => _wallet.seed != null ? _wallet.seed! : '';
+ 
+   bool get isLegacySeedOnly =>
+-      (_wallet.type == WalletType.monero || _wallet.type == WalletType.wownero) &&
++      [WalletType.monero, WalletType.wownero].contains(_wallet.type) &&
+       _wallet.seed != null &&
+-      !Polyseed.isValidSeed(_wallet.seed!);
++      !(Polyseed.isValidSeed(_wallet.seed!) ||
++          _wallet.seed!.split(' ').length == 12);
+ 
+   String get legacySeed {
+     if ((_wallet.type == WalletType.monero || _wallet.type == WalletType.wownero) &&
+         _wallet.seed != null &&
+-        Polyseed.isValidSeed(_wallet.seed!)) {
++        (Polyseed.isValidSeed(_wallet.seed!) || _wallet.seed!.split(' ').length == 12)) {
+       final langName = PolyseedLang.getByPhrase(_wallet.seed!).nameEnglish;
+ 
+       if (_wallet.type == WalletType.monero) {
+diff --git a/lib/view_model/wallet_new_vm.dart b/lib/view_model/wallet_new_vm.dart
+index f4117f8ab8..7b4b7e7887 100644
+--- a/lib/view_model/wallet_new_vm.dart
++++ b/lib/view_model/wallet_new_vm.dart
+@@ -49,6 +49,9 @@ abstract class WalletNewVMBase extends WalletCreationVM with Store {
+   bool get hasLanguageSelector =>
+       [WalletType.monero, WalletType.haven, WalletType.wownero].contains(type);
+ 
++  bool get showLanguageSelector =>
++      newWalletArguments?.mnemonic == null && hasLanguageSelector;
++
+   int get seedPhraseWordsLength {
+     switch (type) {
+       case WalletType.monero:
+@@ -81,7 +84,9 @@ abstract class WalletNewVMBase extends WalletCreationVM with Store {
+     }
+   }
+ 
+-  bool get hasSeedType => [WalletType.monero, WalletType.wownero].contains(type);
++  bool get hasSeedType =>
++      newWalletArguments?.mnemonic == null &&
++      [WalletType.monero, WalletType.wownero].contains(type);
+ 
+   @override
+   WalletCredentials getCredentials(dynamic _options) {
+@@ -92,11 +97,15 @@ abstract class WalletNewVMBase extends WalletCreationVM with Store {
+     switch (type) {
+       case WalletType.monero:
+         return monero!.createMoneroNewWalletCredentials(
+-            name: name,
+-            language: options!.first as String,
+-            password: walletPassword,
+-            passphrase: passphrase,
+-            isPolyseed: options.last as bool);
++          name: name,
++          language: options!.first as String,
++          password: walletPassword,
++          passphrase: passphrase,
++          seedType: newWalletArguments!.mnemonic != null
++              ? MoneroSeedType.bip39.raw
++              : (options.last as MoneroSeedType).raw,
++          mnemonic: newWalletArguments!.mnemonic,
++        );
+       case WalletType.bitcoin:
+       case WalletType.litecoin:
+         return bitcoin!.createBitcoinNewWalletCredentials(
+diff --git a/res/values/strings_ar.arb b/res/values/strings_ar.arb
+index f30f7d6145..7d16c3cd67 100644
+--- a/res/values/strings_ar.arb
++++ b/res/values/strings_ar.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "البذور",
+   "seedtype_alert_content": "مشاركة البذور مع محافظ أخرى ممكن فقط مع BIP39 Seedtype.",
+   "seedtype_alert_title": "تنبيه البذور",
+-  "seedtype_legacy": "إرث (25 كلمة)",
+-  "seedtype_polyseed": "بوليسيد (16 كلمة)",
+-  "seedtype_wownero": "Wownero (14 كلمة)",
+   "select_backup_file": "حدد ملف النسخ الاحتياطي",
+   "select_buy_provider_notice": "حدد مزود شراء أعلاه. يمكنك تخطي هذه الشاشة عن طريق تعيين مزود شراء الافتراضي في إعدادات التطبيق.",
+   "select_destination": ".ﻲﻃﺎﻴﺘﺣﻻ﻿ﺍ ﺦﺴﻨﻟﺍ ﻒﻠﻣ ﺔﻬﺟﻭ ﺪﻳﺪﺤﺗ ءﺎﺟﺮﻟﺍ",
+@@ -1027,4 +1024,4 @@
+   "you_will_receive_estimated_amount": "سوف تتلقى(ooded )",
+   "you_will_send": "تحويل من",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_bg.arb b/res/values/strings_bg.arb
+index 2d8527b83e..db62231a8a 100644
+--- a/res/values/strings_bg.arb
++++ b/res/values/strings_bg.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "Семенна тип",
+   "seedtype_alert_content": "Споделянето на семена с други портфейли е възможно само с BIP39 Seedtype.",
+   "seedtype_alert_title": "Сигнал за семена",
+-  "seedtype_legacy": "Наследство (25 думи)",
+-  "seedtype_polyseed": "Поли семе (16 думи)",
+-  "seedtype_wownero": "Wownero (14 думи)",
+   "select_backup_file": "Избор на резервно копие",
+   "select_buy_provider_notice": "Изберете доставчик на покупка по -горе. Можете да пропуснете този екран, като зададете вашия доставчик по подразбиране по подразбиране в настройките на приложението.",
+   "select_destination": "Моля, изберете дестинация за архивния файл.",
+@@ -1027,4 +1024,4 @@
+   "you_will_receive_estimated_amount": "Ще получите(прогнозно )",
+   "you_will_send": "Обръщане от",
+   "yy": "гг"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_cs.arb b/res/values/strings_cs.arb
+index 968e45a814..c7c60b266c 100644
+--- a/res/values/strings_cs.arb
++++ b/res/values/strings_cs.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "SeedType",
+   "seedtype_alert_content": "Sdílení semen s jinými peněženkami je možné pouze u BIP39 SeedType.",
+   "seedtype_alert_title": "Upozornění seedtype",
+-  "seedtype_legacy": "Legacy (25 slov)",
+-  "seedtype_polyseed": "Polyseed (16 slov)",
+-  "seedtype_wownero": "Wownero (14 slov)",
+   "select_backup_file": "Vybrat soubor se zálohou",
+   "select_buy_provider_notice": "Vyberte výše uvedeného poskytovatele nákupu. Tuto obrazovku můžete přeskočit nastavením výchozího poskytovatele nákupu v nastavení aplikace.",
+   "select_destination": "Vyberte cíl pro záložní soubor.",
+@@ -1027,4 +1024,4 @@
+   "you_will_receive_estimated_amount": "Obdržíte(odhadovaný )",
+   "you_will_send": "Směnit z",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_de.arb b/res/values/strings_de.arb
+index e23c41675c..04f11ff024 100644
+--- a/res/values/strings_de.arb
++++ b/res/values/strings_de.arb
+@@ -684,9 +684,6 @@
+   "seedtype": "Seedtyp",
+   "seedtype_alert_content": "Das Teilen von Seeds mit anderen Wallet ist nur mit bip39 Seedype möglich.",
+   "seedtype_alert_title": "Seedype-Alarm",
+-  "seedtype_legacy": "Veraltet (25 Wörter)",
+-  "seedtype_polyseed": "Polyseed (16 Wörter)",
+-  "seedtype_wownero": "WOWNO (14 Wörter)",
+   "select_backup_file": "Sicherungsdatei auswählen",
+   "select_buy_provider_notice": "Wählen Sie oben einen Anbieter kaufen. Sie können diese Seite überspringen, indem Sie Ihren Standard-Kaufanbieter in den App-Einstellungen festlegen.",
+   "select_destination": "Bitte wählen Sie das Ziel für die Sicherungsdatei aus.",
+@@ -1030,4 +1027,4 @@
+   "you_will_receive_estimated_amount": "Sie erhalten(geschätzt )",
+   "you_will_send": "Konvertieren von",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_en.arb b/res/values/strings_en.arb
+index 9586e98680..5f8fd29310 100644
+--- a/res/values/strings_en.arb
++++ b/res/values/strings_en.arb
+@@ -684,9 +684,6 @@
+   "seedtype": "Seedtype",
+   "seedtype_alert_content": "Sharing seeds with other wallets is only possible with BIP39 SeedType.",
+   "seedtype_alert_title": "SeedType Alert",
+-  "seedtype_legacy": "Legacy (25 words)",
+-  "seedtype_polyseed": "Polyseed (16 words)",
+-  "seedtype_wownero": "Wownero (14 words)",
+   "select_backup_file": "Select backup file",
+   "select_buy_provider_notice": "Select a buy provider above. You can skip this screen by setting your default buy provider in app settings.",
+   "select_destination": "Please select destination for the backup file.",
+@@ -1028,4 +1025,4 @@
+   "you_will_receive_estimated_amount": "You will receive (estimated)",
+   "you_will_send": "Convert from",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_es.arb b/res/values/strings_es.arb
+index a17c84d19c..32b6c9d132 100644
+--- a/res/values/strings_es.arb
++++ b/res/values/strings_es.arb
+@@ -684,9 +684,6 @@
+   "seedtype": "Tipos de semillas",
+   "seedtype_alert_content": "Compartir semillas con otras billeteras solo es posible con semillas bip39 - un tipo específico de semilla.",
+   "seedtype_alert_title": "Alerta de tipo de semillas",
+-  "seedtype_legacy": "Semilla clásica-legacy (25 palabras)",
+-  "seedtype_polyseed": "Poli-semilla (16 palabras)",
+-  "seedtype_wownero": "Wownero (14 palabras)",
+   "select_backup_file": "Seleccionar archivo de respaldo",
+   "select_buy_provider_notice": "Selecciona un proveedor de compra arriba. Puede omitir esta pantalla configurando su proveedor de compra predeterminado en la configuración de la aplicación.",
+   "select_destination": "Selecciona el destino del archivo de copia de seguridad.",
+@@ -1028,4 +1025,4 @@
+   "you_will_receive_estimated_amount": "Recibirá(estimado )",
+   "you_will_send": "Convertir de",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_fr.arb b/res/values/strings_fr.arb
+index 405f6abb3a..01b8e566bc 100644
+--- a/res/values/strings_fr.arb
++++ b/res/values/strings_fr.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "Type de graine",
+   "seedtype_alert_content": "Le partage de graines avec d'autres portefeuilles n'est possible qu'avec le type de graine BIP39.",
+   "seedtype_alert_title": "Alerte Type de Graine",
+-  "seedtype_legacy": "Legacy (25 words)",
+-  "seedtype_polyseed": "Polyseed (16 mots)",
+-  "seedtype_wownero": "WOWNERO (14 mots)",
+   "select_backup_file": "Sélectionnez le fichier de sauvegarde",
+   "select_buy_provider_notice": "Sélectionnez un fournisseur d'achat ci-dessus. Vous pouvez ignorer cet écran en définissant votre fournisseur d'achat par défaut dans les paramètres de l'application.",
+   "select_destination": "Veuillez sélectionner la destination du fichier de sauvegarde.",
+@@ -1027,4 +1024,4 @@
+   "you_will_receive_estimated_amount": "Vous recevrez ( estimé )",
+   "you_will_send": "Convertir depuis",
+   "yy": "AA"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_ha.arb b/res/values/strings_ha.arb
+index 3355aea6f1..9afd645878 100644
+--- a/res/values/strings_ha.arb
++++ b/res/values/strings_ha.arb
+@@ -685,9 +685,6 @@
+   "seedtype": "Seedtype",
+   "seedtype_alert_content": "Raba tsaba tare da sauran wallets yana yiwuwa ne kawai tare da Bip39 seedtype.",
+   "seedtype_alert_title": "Seedtype farke",
+-  "seedtype_legacy": "Legacy (25 kalmomi)",
+-  "seedtype_polyseed": "Polyseed (16 kalmomi)",
+-  "seedtype_wownero": "WowRero (kalmomi 14)",
+   "select_backup_file": "Zaɓi fayil ɗin madadin",
+   "select_buy_provider_notice": "Zaɓi mai ba da kyauta a sama. Zaka iya tsallake wannan allon ta hanyar saita mai ba da isasshen busasshen mai ba da isasshen busasshiyar saiti.",
+   "select_destination": "Da fatan za a zaɓi wurin da za a yi wa madadin fayil ɗin.",
+@@ -1029,4 +1026,4 @@
+   "you_will_receive_estimated_amount": "Za ku (karɓi )",
+   "you_will_send": "Maida daga",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_hi.arb b/res/values/strings_hi.arb
+index cef53d58e0..0dd684dabc 100644
+--- a/res/values/strings_hi.arb
++++ b/res/values/strings_hi.arb
+@@ -685,9 +685,6 @@
+   "seedtype": "बीज",
+   "seedtype_alert_content": "अन्य पर्स के साथ बीज साझा करना केवल BIP39 सीडटाइप के साथ संभव है।",
+   "seedtype_alert_title": "बीजगणित अलर्ट",
+-  "seedtype_legacy": "विरासत (25 शब्द)",
+-  "seedtype_polyseed": "पॉलीसीड (16 शब्द)",
+-  "seedtype_wownero": "Wownero (14 शब्द)",
+   "select_backup_file": "बैकअप फ़ाइल का चयन करें",
+   "select_buy_provider_notice": "ऊपर एक खरीद प्रदाता का चयन करें। आप इस स्क्रीन को ऐप सेटिंग्स में अपना डिफ़ॉल्ट बाय प्रदाता सेट करके छोड़ सकते हैं।",
+   "select_destination": "कृपया बैकअप फ़ाइल के लिए गंतव्य का चयन करें।",
+@@ -1029,4 +1026,4 @@
+   "you_will_receive_estimated_amount": "आपको#अनुमानित ( प्राप्त होगा)",
+   "you_will_send": "से रूपांतरित करें",
+   "yy": "वाईवाई"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_hr.arb b/res/values/strings_hr.arb
+index 63d698c3d3..291fadc704 100644
+--- a/res/values/strings_hr.arb
++++ b/res/values/strings_hr.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "Sjemenska vrsta",
+   "seedtype_alert_content": "Dijeljenje sjemena s drugim novčanicima moguće je samo s BIP39 sjemenom.",
+   "seedtype_alert_title": "Upozorenje o sjemenu",
+-  "seedtype_legacy": "Nasljeđe (25 riječi)",
+-  "seedtype_polyseed": "Poliseed (16 riječi)",
+-  "seedtype_wownero": "WANERO (14 riječi)",
+   "select_backup_file": "Odaberite datoteku sigurnosne kopije",
+   "select_buy_provider_notice": "Odaberite gornji davatelj kupnje. Ovaj zaslon možete preskočiti postavljanjem zadanog davatelja usluga kupnje u postavkama aplikacija.",
+   "select_destination": "Odaberite odredište za datoteku sigurnosne kopije.",
+@@ -1027,4 +1024,4 @@
+   "you_will_receive_estimated_amount": "Primit ćete(procijenjeno )",
+   "you_will_send": "Razmijeni iz",
+   "yy": "GG"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_hy.arb b/res/values/strings_hy.arb
+index 3692643626..c782d153eb 100644
+--- a/res/values/strings_hy.arb
++++ b/res/values/strings_hy.arb
+@@ -682,9 +682,6 @@
+   "seedtype": "Սերմի տեսակ",
+   "seedtype_alert_content": "Այլ դրամապանակներով սերմերի փոխանակումը հնարավոր է միայն BIP39 SEEDTYPE- ով:",
+   "seedtype_alert_title": "SEEDTYPE ALERT",
+-  "seedtype_legacy": "Legacy (25 բառ)",
+-  "seedtype_polyseed": "Polyseed (16 բառ)",
+-  "seedtype_wownero": "Wownero (14 բառ)",
+   "select_backup_file": "Ընտրել կրկնօրինակ ֆայլ",
+   "select_buy_provider_notice": "Ընտրեք գնման մատակարարը վերևում։ Դուք կարող եք բաց թողնել այս էկրանը ձեր լռելայն գնման մատակարարը հավելվածի կարգավորումներում սահմանելով",
+   "select_destination": "Խնդրում ենք ընտրել կրկնօրինակ ֆայլի նպատակակետը",
+@@ -1025,4 +1022,4 @@
+   "you_will_receive_estimated_amount": "Դուք կստանաք ( գնահատված )",
+   "you_will_send": "Փոխանակեք",
+   "yy": "ՏՏ"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_id.arb b/res/values/strings_id.arb
+index b7794d485b..b83a960837 100644
+--- a/res/values/strings_id.arb
++++ b/res/values/strings_id.arb
+@@ -686,9 +686,6 @@
+   "seedtype": "Seedtype",
+   "seedtype_alert_content": "Berbagi biji dengan dompet lain hanya dimungkinkan dengan BIP39 seedtype.",
+   "seedtype_alert_title": "Peringatan seedtype",
+-  "seedtype_legacy": "Legacy (25 kata)",
+-  "seedtype_polyseed": "Polyseed (16 kata)",
+-  "seedtype_wownero": "Wownero (14 kata)",
+   "select_backup_file": "Pilih file cadangan",
+   "select_buy_provider_notice": "Pilih penyedia beli di atas. Anda dapat melewatkan layar ini dengan mengatur penyedia pembelian default Anda di pengaturan aplikasi.",
+   "select_destination": "Silakan pilih tujuan untuk file cadangan.",
+@@ -1030,4 +1027,4 @@
+   "you_will_receive_estimated_amount": "Anda akan menerima(estimasi )",
+   "you_will_send": "Konversi dari",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_it.arb b/res/values/strings_it.arb
+index 2c214da67b..dca278d5e3 100644
+--- a/res/values/strings_it.arb
++++ b/res/values/strings_it.arb
+@@ -684,9 +684,6 @@
+   "seedtype": "Seedtype",
+   "seedtype_alert_content": "La condivisione di semi con altri portafogli è possibile solo con Bip39 SeedType.",
+   "seedtype_alert_title": "Avviso seedType",
+-  "seedtype_legacy": "Legacy (25 parole)",
+-  "seedtype_polyseed": "Polyseed (16 parole)",
+-  "seedtype_wownero": "Wownero (14 parole)",
+   "select_backup_file": "Seleziona file di backup",
+   "select_buy_provider_notice": "Seleziona un provider di acquisto sopra. È possibile saltare questa schermata impostando il provider di acquisto predefinito nelle impostazioni dell'app.",
+   "select_destination": "Seleziona la destinazione per il file di backup.",
+@@ -1029,4 +1026,4 @@
+   "you_will_receive_estimated_amount": "Riceverai(stimato )",
+   "you_will_send": "Conveti da",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_ja.arb b/res/values/strings_ja.arb
+index 52d837fd01..d6071b4fb9 100644
+--- a/res/values/strings_ja.arb
++++ b/res/values/strings_ja.arb
+@@ -684,9 +684,6 @@
+   "seedtype": "SeedType",
+   "seedtype_alert_content": "他の財布と種子を共有することは、BIP39 SeedTypeでのみ可能です。",
+   "seedtype_alert_title": "SeedTypeアラート",
+-  "seedtype_legacy": "レガシー（25語）",
+-  "seedtype_polyseed": "ポリシード（16語）",
+-  "seedtype_wownero": "wownero（14ワード）",
+   "select_backup_file": "バックアップファイルを選択",
+   "select_buy_provider_notice": "上記の購入プロバイダーを選択してください。デフォルトの購入プロバイダーをアプリ設定で設定して、この画面をスキップできます。",
+   "select_destination": "バックアップファイルの保存先を選択してください。",
+@@ -1028,4 +1025,4 @@
+   "you_will_receive_estimated_amount": "あなたは(推定)を受け取ります",
+   "you_will_send": "から変換",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_ko.arb b/res/values/strings_ko.arb
+index 08ad157da7..e0ccee417b 100644
+--- a/res/values/strings_ko.arb
++++ b/res/values/strings_ko.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "시드 타입",
+   "seedtype_alert_content": "다른 지갑과 씨앗을 공유하는 것은 BIP39 SeedType에서만 가능합니다.",
+   "seedtype_alert_title": "종자 경보",
+-  "seedtype_legacy": "레거시 (25 단어)",
+-  "seedtype_polyseed": "다문 (16 단어)",
+-  "seedtype_wownero": "Wownero (14 단어)",
+   "select_backup_file": "백업 파일 선택",
+   "select_buy_provider_notice": "위의 구매 제공자를 선택하십시오. 앱 설정에서 기본 구매 제공자를 설정 하여이 화면을 건너 뛸 수 있습니다.",
+   "select_destination": "백업 파일의 대상을 선택하십시오.",
+@@ -1028,4 +1025,4 @@
+   "you_will_send": "다음에서 변환",
+   "YY": "YY",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_my.arb b/res/values/strings_my.arb
+index 1115931507..8dcffb219a 100644
+--- a/res/values/strings_my.arb
++++ b/res/values/strings_my.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "မျိုးပွားခြင်း",
+   "seedtype_alert_content": "အခြားပိုက်ဆံအိတ်များနှင့်မျိုးစေ့များကိုမျှဝေခြင်းသည် BIP39 sebyspe ဖြင့်သာဖြစ်သည်။",
+   "seedtype_alert_title": "ပျိုးပင်သတိပေးချက်",
+-  "seedtype_legacy": "အမွေအနှစ် (စကားလုံး 25 လုံး)",
+-  "seedtype_polyseed": "polyseed (စကားလုံး 16 လုံး)",
+-  "seedtype_wownero": "Wownero (စကားလုံး 14 လုံး)",
+   "select_backup_file": "အရန်ဖိုင်ကို ရွေးပါ။",
+   "select_buy_provider_notice": "အပေါ်ကဝယ်သူတစ် ဦး ကိုရွေးချယ်ပါ။ သင်၏ default 0 ယ်သူအား app settings တွင် setting လုပ်ခြင်းဖြင့်ဤ screen ကိုကျော်သွားနိုင်သည်။",
+   "select_destination": "အရန်ဖိုင်အတွက် ဦးတည်ရာကို ရွေးပါ။",
+@@ -1027,4 +1024,4 @@
+   "you_will_receive_estimated_amount": "သင် ( ခန့်မှန်းခြေ ) လက်ခံရရှိလိမ့်မည်",
+   "you_will_send": "မှပြောင်းပါ။",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_nl.arb b/res/values/strings_nl.arb
+index 8b7939de8e..60d6a7df29 100644
+--- a/res/values/strings_nl.arb
++++ b/res/values/strings_nl.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "Zaadtype",
+   "seedtype_alert_content": "Het delen van zaden met andere portefeuilles is alleen mogelijk met BIP39 SeedType.",
+   "seedtype_alert_title": "Zaadtype alert",
+-  "seedtype_legacy": "Legacy (25 woorden)",
+-  "seedtype_polyseed": "Polyseed (16 woorden)",
+-  "seedtype_wownero": "WOWNERO (14 woorden)",
+   "select_backup_file": "Selecteer een back-upbestand",
+   "select_buy_provider_notice": "Selecteer hierboven een koopprovider. U kunt dit scherm overslaan door uw standaard kopenprovider in te stellen in app -instellingen.",
+   "select_destination": "Selecteer de bestemming voor het back-upbestand.",
+@@ -1028,4 +1025,4 @@
+   "you_will_receive_estimated_amount": "U ontvangt(geschat )",
+   "you_will_send": "Converteren van",
+   "yy": "JJ"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_pl.arb b/res/values/strings_pl.arb
+index d60e97ef4d..3e5550424d 100644
+--- a/res/values/strings_pl.arb
++++ b/res/values/strings_pl.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "Sedtype",
+   "seedtype_alert_content": "Dzielenie się nasionami z innymi portfelami jest możliwe tylko z BIP39 sededType.",
+   "seedtype_alert_title": "Ustanowienie typu sedype",
+-  "seedtype_legacy": "Legacy (25 słów)",
+-  "seedtype_polyseed": "Polyseed (16 słów)",
+-  "seedtype_wownero": "Wowero (14 słów)",
+   "select_backup_file": "Wybierz plik kopii zapasowej",
+   "select_buy_provider_notice": "Wybierz powyższe dostawcę zakupu. Możesz pominąć ten ekran, ustawiając domyślnego dostawcę zakupu w ustawieniach aplikacji.",
+   "select_destination": "Wybierz miejsce docelowe dla pliku kopii zapasowej.",
+@@ -1027,4 +1024,4 @@
+   "you_will_receive_estimated_amount": "Otrzymasz(oszacowane )",
+   "you_will_send": "Konwertuj z",
+   "yy": "RR"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_pt.arb b/res/values/strings_pt.arb
+index 732865567e..494694af07 100644
+--- a/res/values/strings_pt.arb
++++ b/res/values/strings_pt.arb
+@@ -685,9 +685,6 @@
+   "seedtype": "SeedType",
+   "seedtype_alert_content": "Compartilhar sementes com outras carteiras só é possível com o BIP39 SeedType.",
+   "seedtype_alert_title": "Alerta de SeedType",
+-  "seedtype_legacy": "Legado (25 palavras)",
+-  "seedtype_polyseed": "Polyseed (16 palavras)",
+-  "seedtype_wownero": "Wowrone (14 palavras)",
+   "select_backup_file": "Selecione o arquivo de backup",
+   "select_buy_provider_notice": "Selecione um provedor de compra acima. Você pode pular esta tela definindo seu provedor de compra padrão nas configurações de aplicativos.",
+   "select_destination": "Selecione o destino para o arquivo de backup.",
+@@ -1030,4 +1027,4 @@
+   "you_will_receive_estimated_amount": "Você receberá(estimado )",
+   "you_will_send": "Converter de",
+   "yy": "aa"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_ru.arb b/res/values/strings_ru.arb
+index 63241530b9..238eb0c959 100644
+--- a/res/values/strings_ru.arb
++++ b/res/values/strings_ru.arb
+@@ -684,9 +684,6 @@
+   "seedtype": "SEEDTYPE",
+   "seedtype_alert_content": "Обмен семенами с другими кошельками возможно только с BIP39 SeedType.",
+   "seedtype_alert_title": "SEEDTYPE ALERT",
+-  "seedtype_legacy": "Наследие (25 слов)",
+-  "seedtype_polyseed": "Полиса (16 слов)",
+-  "seedtype_wownero": "Wownero (14 слов)",
+   "select_backup_file": "Выберите файл резервной копии",
+   "select_buy_provider_notice": "Выберите поставщика покупки выше. Вы можете пропустить этот экран, установив поставщика покупки по умолчанию в настройках приложения.",
+   "select_destination": "Пожалуйста, выберите место для файла резервной копии.",
+@@ -1028,4 +1025,4 @@
+   "you_will_receive_estimated_amount": "Вы получите(Оценку )",
+   "you_will_send": "Конвертировать из",
+   "yy": "ГГ"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_th.arb b/res/values/strings_th.arb
+index 6de6854ca8..13a3d9674a 100644
+--- a/res/values/strings_th.arb
++++ b/res/values/strings_th.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "เมล็ดพันธุ์",
+   "seedtype_alert_content": "การแบ่งปันเมล็ดกับกระเป๋าเงินอื่น ๆ เป็นไปได้เฉพาะกับ bip39 seedtype",
+   "seedtype_alert_title": "การแจ้งเตือน seedtype",
+-  "seedtype_legacy": "มรดก (25 คำ)",
+-  "seedtype_polyseed": "โพลีส (16 คำ)",
+-  "seedtype_wownero": "wownero (14 คำ)",
+   "select_backup_file": "เลือกไฟล์สำรอง",
+   "select_buy_provider_notice": "เลือกผู้ให้บริการซื้อด้านบน คุณสามารถข้ามหน้าจอนี้ได้โดยการตั้งค่าผู้ให้บริการซื้อเริ่มต้นในการตั้งค่าแอป",
+   "select_destination": "โปรดเลือกปลายทางสำหรับไฟล์สำรอง",
+@@ -1027,4 +1024,4 @@
+   "you_will_receive_estimated_amount": "คุณจะได้รับ(โดยประมาณ )",
+   "you_will_send": "แปลงจาก",
+   "yy": "ปี"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_tl.arb b/res/values/strings_tl.arb
+index 319286fbd0..cf2a15aca0 100644
+--- a/res/values/strings_tl.arb
++++ b/res/values/strings_tl.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "Seed type",
+   "seedtype_alert_content": "Ang pagbabahagi ng mga buto sa iba pang mga pitaka ay posible lamang sa bip39 seedtype.",
+   "seedtype_alert_title": "Alerto ng Seedtype",
+-  "seedtype_legacy": "Legacy (25 na salita)",
+-  "seedtype_polyseed": "Polyseed (16 na salita)",
+-  "seedtype_wownero": "Wownero (14 na salita)",
+   "select_backup_file": "Piliin ang backup na file",
+   "select_buy_provider_notice": "Pumili ng provider ng pagbili sa itaas. Maaari mong laktawan ang screen na ito sa pamamagitan ng pagtatakda ng iyong default na provider ng pagbili sa mga setting ng app.",
+   "select_destination": "Mangyaring piliin ang patutunguhan para sa backup na file.",
+@@ -1027,4 +1024,4 @@
+   "you_will_receive_estimated_amount": "Makakatanggap ka ng(tinantyang)",
+   "you_will_send": "I-convert mula sa",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_tr.arb b/res/values/strings_tr.arb
+index 852e7b1d2e..848a4b8a67 100644
+--- a/res/values/strings_tr.arb
++++ b/res/values/strings_tr.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "Tohum",
+   "seedtype_alert_content": "Tohumları diğer cüzdanlarla paylaşmak sadece BIP39 tohumu ile mümkündür.",
+   "seedtype_alert_title": "SeedType uyarısı",
+-  "seedtype_legacy": "Miras (25 kelime)",
+-  "seedtype_polyseed": "Polyseed (16 kelime)",
+-  "seedtype_wownero": "Wownero (14 kelime)",
+   "select_backup_file": "Yedek dosyası seç",
+   "select_buy_provider_notice": "Yukarıda bir satın alma sağlayıcısı seçin. App ayarlarında varsayılan satın alma sağlayıcınızı ayarlayarak bu ekranı atlayabilirsiniz.",
+   "select_destination": "Lütfen yedekleme dosyası için hedef seçin.",
+@@ -1027,4 +1024,4 @@
+   "you_will_receive_estimated_amount": "(Tahmini ) alacaksınız",
+   "you_will_send": "Biçiminden dönüştür:",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_uk.arb b/res/values/strings_uk.arb
+index 5afc448156..eef5bcdad4 100644
+--- a/res/values/strings_uk.arb
++++ b/res/values/strings_uk.arb
+@@ -684,9 +684,6 @@
+   "seedtype": "Насіннєвий тип",
+   "seedtype_alert_content": "Спільний доступ до інших гаманців можливе лише за допомогою BIP39 Seedtype.",
+   "seedtype_alert_title": "Попередження насінника",
+-  "seedtype_legacy": "Спадщина (25 слів)",
+-  "seedtype_polyseed": "Полісей (16 слів)",
+-  "seedtype_wownero": "Влонеро (14 слів)",
+   "select_backup_file": "Виберіть файл резервної копії",
+   "select_buy_provider_notice": "Виберіть постачальника купівлі вище. Ви можете пропустити цей екран, встановивши свого постачальника купівлі за замовчуванням у налаштуваннях додатків.",
+   "select_destination": "Виберіть місце призначення для файлу резервної копії.",
+@@ -1028,4 +1025,4 @@
+   "you_will_receive_estimated_amount": "Ви отримаєте(оцінюється )",
+   "you_will_send": "Конвертувати з",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_ur.arb b/res/values/strings_ur.arb
+index 675747d207..ddcc0a6964 100644
+--- a/res/values/strings_ur.arb
++++ b/res/values/strings_ur.arb
+@@ -685,9 +685,6 @@
+   "seedtype": "سیڈ ٹائپ",
+   "seedtype_alert_content": "دوسرے بٹوے کے ساتھ بیجوں کا اشتراک صرف BIP39 بیج ٹائپ کے ساتھ ہی ممکن ہے۔",
+   "seedtype_alert_title": "سیڈ ٹائپ الرٹ",
+-  "seedtype_legacy": "میراث (25 الفاظ)",
+-  "seedtype_polyseed": "پالیسیڈ (16 الفاظ)",
+-  "seedtype_wownero": "واونرو (14 الفاظ)",
+   "select_backup_file": "بیک اپ فائل کو منتخب کریں۔",
+   "select_buy_provider_notice": "اوپر خریدنے والا خریدنے والا منتخب کریں۔ آپ ایپ کی ترتیبات میں اپنے پہلے سے طے شدہ خریدنے والے کو ترتیب دے کر اس اسکرین کو چھوڑ سکتے ہیں۔",
+   "select_destination": "۔ﮟﯾﺮﮐ ﺏﺎﺨﺘﻧﺍ ﺎﮐ ﻝﺰﻨﻣ ﮯﯿﻟ ﮯﮐ ﻞﺋﺎﻓ ﭖﺍ ﮏﯿﺑ ﻡﺮﮐ ﮦﺍﺮﺑ",
+@@ -1029,4 +1026,4 @@
+   "you_will_receive_estimated_amount": "آپ(تخمینہ ) وصول کریں گے",
+   "you_will_send": "سے تبدیل کریں۔",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_vi.arb b/res/values/strings_vi.arb
+index 76bdaae34d..9abf12e33e 100644
+--- a/res/values/strings_vi.arb
++++ b/res/values/strings_vi.arb
+@@ -681,9 +681,6 @@
+   "seedtype": "Loại hạt giống",
+   "seedtype_alert_content": "Chia sẻ hạt giống với ví khác chỉ có thể với BIP39 SeedType.",
+   "seedtype_alert_title": "Cảnh báo hạt giống",
+-  "seedtype_legacy": "Di sản (25 từ)",
+-  "seedtype_polyseed": "Polyseed (16 từ)",
+-  "seedtype_wownero": "Wownero (14 từ)",
+   "select_backup_file": "Chọn tệp sao lưu",
+   "select_buy_provider_notice": "Chọn nhà cung cấp mua ở trên. Bạn có thể bỏ qua màn hình này bằng cách thiết lập nhà cung cấp mua mặc định trong cài đặt ứng dụng.",
+   "select_destination": "Vui lòng chọn đích cho tệp sao lưu.",
+@@ -1024,4 +1021,4 @@
+   "you_will_receive_estimated_amount": "Bạn sẽ nhận được(ước tính )",
+   "you_will_send": "Chuyển đổi từ",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_yo.arb b/res/values/strings_yo.arb
+index b43c6cef46..dc836bb178 100644
+--- a/res/values/strings_yo.arb
++++ b/res/values/strings_yo.arb
+@@ -684,9 +684,6 @@
+   "seedtype": "Irugbin-seetypu",
+   "seedtype_alert_content": "Pinpin awọn irugbin pẹlu awọn gedo miiran ṣee ṣe pẹlu Bip39 irugbin.",
+   "seedtype_alert_title": "Ṣajọpọ Seeytype",
+-  "seedtype_legacy": "Legacy (awọn ọrọ 25)",
+-  "seedtype_polyseed": "Polyseed (awọn ọrọ 16)",
+-  "seedtype_wownero": "Wowero (awọn ọrọ 14)",
+   "select_backup_file": "Select backup file",
+   "select_buy_provider_notice": "Yan olupese Ra loke. O le skii iboju yii nipa ṣiṣeto olupese rẹ ni awọn eto App.",
+   "select_destination": "Jọwọ yan ibi ti o nlo fun faili afẹyinti.",
+@@ -1028,4 +1025,4 @@
+   "you_will_receive_estimated_amount": "Iwọ yoo gba ( excimated )",
+   "you_will_send": "Ṣe pàṣípààrọ̀ láti",
+   "yy": "Ọd"
+-}
+\ No newline at end of file
++}
+diff --git a/res/values/strings_zh.arb b/res/values/strings_zh.arb
+index a83d355708..15fee3ed93 100644
+--- a/res/values/strings_zh.arb
++++ b/res/values/strings_zh.arb
+@@ -683,9 +683,6 @@
+   "seedtype": "籽粒",
+   "seedtype_alert_content": "只有BIP39籽粒可以与其他钱包共享种子。",
+   "seedtype_alert_title": "籽粒警报",
+-  "seedtype_legacy": "遗产（25个单词）",
+-  "seedtype_polyseed": "多种物品（16个单词）",
+-  "seedtype_wownero": "沃恩罗（14个单词）",
+   "select_backup_file": "选择备份文件",
+   "select_buy_provider_notice": "在上面选择买入提供商。您可以通过在应用程序设置中设置默认的购买提供商来跳过此屏幕。",
+   "select_destination": "请选择备份文件的目的地。",
+@@ -1027,4 +1024,4 @@
+   "you_will_receive_estimated_amount": "您将收到(估计的)",
+   "you_will_send": "转换自",
+   "yy": "YY"
+-}
+\ No newline at end of file
++}
+diff --git a/tool/configure.dart b/tool/configure.dart
+index 0c514de174..4711373b79 100644
+--- a/tool/configure.dart
++++ b/tool/configure.dart
+@@ -406,7 +406,7 @@ abstract class Monero {
+     required int height});
+   WalletCredentials createMoneroRestoreWalletFromSeedCredentials({required String name, required String password, required String passphrase, required int height, required String mnemonic});
+   WalletCredentials createMoneroRestoreWalletFromHardwareCredentials({required String name, required String password, required int height, required ledger.LedgerConnection ledgerConnection});
+-  WalletCredentials createMoneroNewWalletCredentials({required String name, required String language, required bool isPolyseed, required String? passphrase, String? password});
++WalletCredentials createMoneroNewWalletCredentials({required String name, required String language, required int seedType, required String? passphrase, String? password, String? mnemonic});
+   Map<String, String> getKeys(Object wallet);
+   int? getRestoreHeight(Object wallet);
+   Object createMoneroTransactionCreationCredentials({required List<Output> outputs, required TransactionPriority priority});

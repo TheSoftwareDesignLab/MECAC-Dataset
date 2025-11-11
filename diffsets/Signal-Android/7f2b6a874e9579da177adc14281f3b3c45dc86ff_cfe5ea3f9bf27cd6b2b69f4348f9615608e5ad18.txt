@@ -1,0 +1,1001 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/DonateToSignalFragment.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/DonateToSignalFragment.kt
+index 6788171d696..0257caa7669 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/DonateToSignalFragment.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/DonateToSignalFragment.kt
+@@ -320,6 +320,8 @@ class DonateToSignalFragment :
+     val message = if (state.donateToSignalType == DonateToSignalType.ONE_TIME) {
+       if (state.oneTimeDonationState.isOneTimeDonationLongRunning) {
+         R.string.DonateToSignalFragment__bank_transfers_usually_take_1_business_day_to_process_onetime
++      } else if (state.oneTimeDonationState.isNonVerifiedIdeal) {
++        R.string.DonateToSignalFragment__your_ideal_payment_is_still_processing
+       } else {
+         R.string.DonateToSignalFragment__your_payment_is_still_being_processed_onetime
+       }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/DonateToSignalState.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/DonateToSignalState.kt
+index ecfb39b4f2b..130a5d2060f 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/DonateToSignalState.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/DonateToSignalState.kt
+@@ -4,6 +4,7 @@ import org.signal.core.util.money.FiatMoney
+ import org.thoughtcrime.securesms.badges.models.Badge
+ import org.thoughtcrime.securesms.components.settings.app.subscription.InAppDonations
+ import org.thoughtcrime.securesms.components.settings.app.subscription.boost.Boost
++import org.thoughtcrime.securesms.database.model.databaseprotos.PendingOneTimeDonation
+ import org.thoughtcrime.securesms.database.model.isLongRunning
+ import org.thoughtcrime.securesms.database.model.isPending
+ import org.thoughtcrime.securesms.keyvalue.SignalStore
+@@ -94,10 +95,13 @@ data class DonateToSignalState(
+     val isCustomAmountFocused: Boolean = false,
+     val donationStage: DonationStage = DonationStage.INIT,
+     val selectableCurrencyCodes: List<String> = emptyList(),
+-    val isOneTimeDonationPending: Boolean = SignalStore.donationsValues().getPendingOneTimeDonation().isPending(),
+-    val isOneTimeDonationLongRunning: Boolean = SignalStore.donationsValues().getPendingOneTimeDonation().isLongRunning(),
++    private val pendingOneTimeDonation: PendingOneTimeDonation? = null,
+     private val minimumDonationAmounts: Map<Currency, FiatMoney> = emptyMap()
+   ) {
++    val isOneTimeDonationPending: Boolean = pendingOneTimeDonation.isPending()
++    val isOneTimeDonationLongRunning: Boolean = pendingOneTimeDonation.isLongRunning()
++    val isNonVerifiedIdeal = pendingOneTimeDonation?.pendingVerification == true
++
+     val minimumDonationAmountOfSelectedCurrency: FiatMoney = minimumDonationAmounts[selectedCurrency] ?: FiatMoney(BigDecimal.ZERO, selectedCurrency)
+     private val isCustomAmountTooSmall: Boolean = if (isCustomAmountFocused) customAmount.amount < minimumDonationAmountOfSelectedCurrency.amount else false
+     private val isCustomAmountZero: Boolean = customAmount.amount == BigDecimal.ZERO
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/DonateToSignalViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/DonateToSignalViewModel.kt
+index f6bcd692e01..4be31f66772 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/DonateToSignalViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/DonateToSignalViewModel.kt
+@@ -13,14 +13,16 @@ import org.signal.core.util.StringUtil
+ import org.signal.core.util.logging.Log
+ import org.signal.core.util.money.FiatMoney
+ import org.signal.core.util.money.PlatformCurrencyUtil
++import org.signal.core.util.orNull
+ import org.thoughtcrime.securesms.components.settings.app.subscription.MonthlyDonationRepository
+ import org.thoughtcrime.securesms.components.settings.app.subscription.OneTimeDonationRepository
+ import org.thoughtcrime.securesms.components.settings.app.subscription.boost.Boost
+ import org.thoughtcrime.securesms.components.settings.app.subscription.donate.gateway.GatewayRequest
++import org.thoughtcrime.securesms.components.settings.app.subscription.manage.DonationRedemptionJobStatus
+ import org.thoughtcrime.securesms.components.settings.app.subscription.manage.DonationRedemptionJobWatcher
++import org.thoughtcrime.securesms.database.model.databaseprotos.PendingOneTimeDonation
+ import org.thoughtcrime.securesms.database.model.isExpired
+ import org.thoughtcrime.securesms.dependencies.ApplicationDependencies
+-import org.thoughtcrime.securesms.jobmanager.JobTracker
+ import org.thoughtcrime.securesms.keyvalue.SignalStore
+ import org.thoughtcrime.securesms.recipients.Recipient
+ import org.thoughtcrime.securesms.subscription.LevelUpdate
+@@ -34,6 +36,7 @@ import java.math.BigDecimal
+ import java.text.DecimalFormat
+ import java.text.DecimalFormatSymbols
+ import java.util.Currency
++import java.util.Optional
+ 
+ /**
+  * Contains the logic to manage the UI of the unified donations screen.
+@@ -208,24 +211,31 @@ class DonateToSignalViewModel(
+   }
+ 
+   private fun initializeOneTimeDonationState(oneTimeDonationRepository: OneTimeDonationRepository) {
+-    val isOneTimeDonationInProgress: Observable<Boolean> = DonationRedemptionJobWatcher.watchOneTimeRedemption().map {
+-      it.map { jobState ->
+-        when (jobState) {
+-          JobTracker.JobState.PENDING -> true
+-          JobTracker.JobState.RUNNING -> true
+-          else -> false
+-        }
+-      }.orElse(false)
++    val oneTimeDonationFromJob: Observable<Optional<PendingOneTimeDonation>> = DonationRedemptionJobWatcher.watchOneTimeRedemption().map {
++      when (it) {
++        is DonationRedemptionJobStatus.PendingExternalVerification -> Optional.ofNullable(it.pendingOneTimeDonation)
++
++        DonationRedemptionJobStatus.PendingReceiptRedemption,
++        DonationRedemptionJobStatus.PendingReceiptRequest,
++        DonationRedemptionJobStatus.FailedSubscription,
++        DonationRedemptionJobStatus.None -> Optional.empty()
++      }
+     }.distinctUntilChanged()
+ 
+-    val isOneTimeDonationPending: Observable<Boolean> = SignalStore.donationsValues().observablePendingOneTimeDonation
+-      .map { pending -> pending.filter { !it.isExpired }.isPresent }
++    val oneTimeDonationFromStore: Observable<Optional<PendingOneTimeDonation>> = SignalStore.donationsValues().observablePendingOneTimeDonation
++      .map { pending -> pending.filter { !it.isExpired } }
+       .distinctUntilChanged()
+ 
+     oneTimeDonationDisposables += Observable
+-      .combineLatest(isOneTimeDonationInProgress, isOneTimeDonationPending) { a, b -> a || b }
+-      .subscribe { hasPendingOneTimeDonation ->
+-        store.update { it.copy(oneTimeDonationState = it.oneTimeDonationState.copy(isOneTimeDonationPending = hasPendingOneTimeDonation)) }
++      .combineLatest(oneTimeDonationFromJob, oneTimeDonationFromStore) { job, store ->
++        if (store.isPresent) {
++          store
++        } else {
++          job
++        }
++      }
++      .subscribe { pendingOneTimeDonation: Optional<PendingOneTimeDonation> ->
++        store.update { it.copy(oneTimeDonationState = it.oneTimeDonationState.copy(pendingOneTimeDonation = pendingOneTimeDonation.orNull())) }
+       }
+ 
+     oneTimeDonationDisposables += oneTimeDonationRepository.getBoostBadge().subscribeBy(
+@@ -296,13 +306,14 @@ class DonateToSignalViewModel(
+ 
+   private fun monitorLevelUpdateProcessing() {
+     val isTransactionJobInProgress: Observable<Boolean> = DonationRedemptionJobWatcher.watchSubscriptionRedemption().map {
+-      it.map { jobState ->
+-        when (jobState) {
+-          JobTracker.JobState.PENDING -> true
+-          JobTracker.JobState.RUNNING -> true
+-          else -> false
+-        }
+-      }.orElse(false)
++      when (it) {
++        is DonationRedemptionJobStatus.PendingExternalVerification,
++        DonationRedemptionJobStatus.PendingReceiptRedemption,
++        DonationRedemptionJobStatus.PendingReceiptRequest -> true
++
++        DonationRedemptionJobStatus.FailedSubscription,
++        DonationRedemptionJobStatus.None -> false
++      }
+     }
+ 
+     monthlyDonationDisposables += Observable
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/gateway/GatewaySelectorBottomSheet.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/gateway/GatewaySelectorBottomSheet.kt
+index cb3b9425cf2..1bd2aa1c1f8 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/gateway/GatewaySelectorBottomSheet.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/gateway/GatewaySelectorBottomSheet.kt
+@@ -65,22 +65,24 @@ class GatewaySelectorBottomSheet : DSLSettingsBottomSheetFragment() {
+ 
+       presentTitleAndSubtitle(requireContext(), args.request)
+ 
+-      space(66.dp)
++      space(16.dp)
+ 
+       if (state.loading) {
++        space(16.dp)
+         customPref(IndeterminateLoadingCircle)
+         space(16.dp)
+         return@configure
+       }
+ 
+       state.gatewayOrderStrategy.orderedGateways.forEachIndexed { index, gateway ->
+-        val isFirst = index == 0
++        space(16.dp)
++
+         when (gateway) {
+-          GatewayResponse.Gateway.GOOGLE_PAY -> renderGooglePayButton(state, isFirst)
+-          GatewayResponse.Gateway.PAYPAL -> renderPayPalButton(state, isFirst)
+-          GatewayResponse.Gateway.CREDIT_CARD -> renderCreditCardButton(state, isFirst)
+-          GatewayResponse.Gateway.SEPA_DEBIT -> renderSEPADebitButton(state, isFirst)
+-          GatewayResponse.Gateway.IDEAL -> renderIDEALButton(state, isFirst)
++          GatewayResponse.Gateway.GOOGLE_PAY -> renderGooglePayButton(state)
++          GatewayResponse.Gateway.PAYPAL -> renderPayPalButton(state)
++          GatewayResponse.Gateway.CREDIT_CARD -> renderCreditCardButton(state)
++          GatewayResponse.Gateway.SEPA_DEBIT -> renderSEPADebitButton(state)
++          GatewayResponse.Gateway.IDEAL -> renderIDEALButton(state)
+         }
+       }
+ 
+@@ -88,12 +90,8 @@ class GatewaySelectorBottomSheet : DSLSettingsBottomSheetFragment() {
+     }
+   }
+ 
+-  private fun DSLConfiguration.renderGooglePayButton(state: GatewaySelectorState, isFirstButton: Boolean) {
++  private fun DSLConfiguration.renderGooglePayButton(state: GatewaySelectorState) {
+     if (state.isGooglePayAvailable) {
+-      if (!isFirstButton) {
+-        space(8.dp)
+-      }
+-
+       customPref(
+         GooglePayButton.Model(
+           isEnabled = true,
+@@ -107,12 +105,8 @@ class GatewaySelectorBottomSheet : DSLSettingsBottomSheetFragment() {
+     }
+   }
+ 
+-  private fun DSLConfiguration.renderPayPalButton(state: GatewaySelectorState, isFirstButton: Boolean) {
++  private fun DSLConfiguration.renderPayPalButton(state: GatewaySelectorState) {
+     if (state.isPayPalAvailable) {
+-      if (!isFirstButton) {
+-        space(8.dp)
+-      }
+-
+       customPref(
+         PayPalButton.Model(
+           onClick = {
+@@ -126,12 +120,8 @@ class GatewaySelectorBottomSheet : DSLSettingsBottomSheetFragment() {
+     }
+   }
+ 
+-  private fun DSLConfiguration.renderCreditCardButton(state: GatewaySelectorState, isFirstButton: Boolean) {
++  private fun DSLConfiguration.renderCreditCardButton(state: GatewaySelectorState) {
+     if (state.isCreditCardAvailable) {
+-      if (!isFirstButton) {
+-        space(8.dp)
+-      }
+-
+       primaryButton(
+         text = DSLSettingsText.from(R.string.GatewaySelectorBottomSheet__credit_or_debit_card),
+         icon = DSLSettingsIcon.from(R.drawable.credit_card, R.color.signal_colorOnCustom),
+@@ -144,12 +134,8 @@ class GatewaySelectorBottomSheet : DSLSettingsBottomSheetFragment() {
+     }
+   }
+ 
+-  private fun DSLConfiguration.renderSEPADebitButton(state: GatewaySelectorState, isFirstButton: Boolean) {
++  private fun DSLConfiguration.renderSEPADebitButton(state: GatewaySelectorState) {
+     if (state.isSEPADebitAvailable) {
+-      if (!isFirstButton) {
+-        space(8.dp)
+-      }
+-
+       tonalButton(
+         text = DSLSettingsText.from(R.string.GatewaySelectorBottomSheet__bank_transfer),
+         icon = DSLSettingsIcon.from(R.drawable.bank_transfer),
+@@ -162,12 +148,8 @@ class GatewaySelectorBottomSheet : DSLSettingsBottomSheetFragment() {
+     }
+   }
+ 
+-  private fun DSLConfiguration.renderIDEALButton(state: GatewaySelectorState, isFirstButton: Boolean) {
++  private fun DSLConfiguration.renderIDEALButton(state: GatewaySelectorState) {
+     if (state.isIDEALAvailable) {
+-      if (!isFirstButton) {
+-        space(8.dp)
+-      }
+-
+       tonalButton(
+         text = DSLSettingsText.from(R.string.GatewaySelectorBottomSheet__ideal),
+         icon = DSLSettingsIcon.from(R.drawable.logo_ideal, NO_TINT),
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/stripe/Stripe3DSDialogFragment.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/stripe/Stripe3DSDialogFragment.kt
+index 35fb89bfd01..2ba2da9fce3 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/stripe/Stripe3DSDialogFragment.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/stripe/Stripe3DSDialogFragment.kt
+@@ -5,23 +5,29 @@ import android.content.DialogInterface
+ import android.content.Intent
+ import android.graphics.Bitmap
+ import android.os.Bundle
++import android.view.Gravity
+ import android.view.View
++import android.view.ViewGroup
+ import android.view.WindowManager
+ import android.webkit.WebResourceRequest
+ import android.webkit.WebSettings
+ import android.webkit.WebView
+ import android.webkit.WebViewClient
++import android.widget.FrameLayout
+ import androidx.activity.ComponentDialog
+ import androidx.core.os.bundleOf
+ import androidx.fragment.app.DialogFragment
+ import androidx.fragment.app.setFragmentResult
+ import androidx.navigation.fragment.navArgs
++import com.google.android.material.button.MaterialButton
++import org.signal.donations.PaymentSourceType
+ import org.signal.donations.StripeIntentAccessor
+ import org.thoughtcrime.securesms.R
+ import org.thoughtcrime.securesms.components.ViewBinderDelegate
+ import org.thoughtcrime.securesms.components.settings.app.subscription.donate.DonationWebViewOnBackPressedCallback
+ import org.thoughtcrime.securesms.databinding.DonationWebviewFragmentBinding
+ import org.thoughtcrime.securesms.keyvalue.SignalStore
++import org.thoughtcrime.securesms.util.FeatureFlags
+ import org.thoughtcrime.securesms.util.visible
+ 
+ /**
+@@ -49,7 +55,7 @@ class Stripe3DSDialogFragment : DialogFragment(R.layout.donation_webview_fragmen
+     setStyle(STYLE_NO_FRAME, R.style.Signal_DayNight_Dialog_FullScreen)
+   }
+ 
+-  @SuppressLint("SetJavaScriptEnabled")
++  @SuppressLint("SetJavaScriptEnabled", "SetTextI18n")
+   override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+     dialog!!.window!!.setFlags(
+       WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+@@ -69,6 +75,19 @@ class Stripe3DSDialogFragment : DialogFragment(R.layout.donation_webview_fragmen
+         binding.webView
+       )
+     )
++
++    if (FeatureFlags.internalUser() && args.stripe3DSData.paymentSourceType == PaymentSourceType.Stripe.IDEAL) {
++      val openApp = MaterialButton(requireContext()).apply {
++        text = "Open App"
++        layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
++          gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
++        }
++        setOnClickListener {
++          handleLaunchExternal(Intent(Intent.ACTION_VIEW, args.uri))
++        }
++      }
++      binding.root.addView(openApp)
++    }
+   }
+ 
+   override fun onDismiss(dialog: DialogInterface) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/transfer/details/BankTransferDetailsFragment.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/transfer/details/BankTransferDetailsFragment.kt
+index 9112b89b65a..c7116619408 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/transfer/details/BankTransferDetailsFragment.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/transfer/details/BankTransferDetailsFragment.kt
+@@ -274,6 +274,7 @@ private fun BankTransferDetailsContent(
+             modifier = Modifier
+               .fillMaxWidth()
+               .padding(top = 12.dp)
++              .defaultMinSize(minHeight = 78.dp)
+               .onFocusChanged { onIBANFocusChanged(it.hasFocus) }
+               .focusRequester(focusRequester)
+           )
+@@ -293,9 +294,11 @@ private fun BankTransferDetailsContent(
+             keyboardActions = KeyboardActions(
+               onNext = { focusManager.moveFocus(FocusDirection.Down) }
+             ),
++            supportingText = {},
+             modifier = Modifier
+               .fillMaxWidth()
+-              .padding(bottom = 16.dp)
++              .padding(top = 16.dp)
++              .defaultMinSize(minHeight = 78.dp)
+           )
+         }
+ 
+@@ -313,16 +316,20 @@ private fun BankTransferDetailsContent(
+             keyboardActions = KeyboardActions(
+               onDone = { onDonateClick() }
+             ),
++            supportingText = {},
+             modifier = Modifier
+               .fillMaxWidth()
+-              .padding(bottom = 16.dp)
++              .padding(top = 16.dp)
++              .defaultMinSize(minHeight = 78.dp)
+           )
+         }
+ 
+         item {
+           Box(
+             contentAlignment = Center,
+-            modifier = Modifier.fillMaxWidth()
++            modifier = Modifier
++              .fillMaxWidth()
++              .padding(top = 8.dp)
+           ) {
+             TextButton(
+               onClick = { setDisplayFindAccountInfoSheet(true) }
+@@ -338,7 +345,7 @@ private fun BankTransferDetailsContent(
+         onClick = onDonateClick,
+         modifier = Modifier
+           .defaultMinSize(minWidth = 220.dp)
+-          .padding(bottom = 16.dp)
++          .padding(vertical = 16.dp)
+       ) {
+         Text(text = donateLabel)
+       }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/transfer/mandate/BankTransferMandateFragment.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/transfer/mandate/BankTransferMandateFragment.kt
+index 41445a73701..dc00436c58a 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/transfer/mandate/BankTransferMandateFragment.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/donate/transfer/mandate/BankTransferMandateFragment.kt
+@@ -38,6 +38,7 @@ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.ui.Alignment.Companion.CenterHorizontally
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.ColorFilter
+ import androidx.compose.ui.graphics.vector.ImageVector
+ import androidx.compose.ui.graphics.vector.rememberVectorPainter
+ import androidx.compose.ui.layout.ContentScale
+@@ -45,6 +46,7 @@ import androidx.compose.ui.res.dimensionResource
+ import androidx.compose.ui.res.painterResource
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.res.vectorResource
++import androidx.compose.ui.text.style.TextAlign
+ import androidx.compose.ui.tooling.preview.Preview
+ import androidx.compose.ui.unit.dp
+ import androidx.navigation.fragment.findNavController
+@@ -192,14 +194,16 @@ fun BankTransferScreen(
+         item {
+           Image(
+             painter = painterResource(id = R.drawable.bank_transfer),
+-            contentScale = ContentScale.Inside,
++            contentScale = ContentScale.FillBounds,
+             contentDescription = null,
++            colorFilter = ColorFilter.tint(MaterialTheme.colorScheme.onSurface),
+             modifier = Modifier
+               .size(72.dp)
+               .background(
+                 SignalTheme.colors.colorSurface2,
+                 CircleShape
+               )
++              .padding(18.dp)
+           )
+         }
+ 
+@@ -221,7 +225,8 @@ fun BankTransferScreen(
+               onLearnMoreClick()
+             },
+             style = MaterialTheme.typography.bodyLarge.copy(
+-              color = MaterialTheme.colorScheme.onSurfaceVariant
++              color = MaterialTheme.colorScheme.onSurfaceVariant,
++              textAlign = TextAlign.Center
+             ),
+             modifier = Modifier
+               .padding(bottom = 12.dp)
+@@ -262,7 +267,7 @@ fun BankTransferScreen(
+               .padding(top = 16.dp, bottom = 16.dp)
+               .defaultMinSize(minWidth = 220.dp)
+           ) {
+-            Text(text = if (listState.canScrollForward) stringResource(id = R.string.BankTransferMandateFragment__read_more) else stringResource(id = R.string.BankTransferMandateFragment__continue))
++            Text(text = if (listState.canScrollForward) stringResource(id = R.string.BankTransferMandateFragment__read_more) else stringResource(id = R.string.BankTransferMandateFragment__agree))
+           }
+         }
+       }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/DonationRedemptionJobStatus.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/DonationRedemptionJobStatus.kt
+new file mode 100644
+index 00000000000..f12f67c05cf
+--- /dev/null
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/DonationRedemptionJobStatus.kt
+@@ -0,0 +1,45 @@
++/*
++ * Copyright 2023 Signal Messenger, LLC
++ * SPDX-License-Identifier: AGPL-3.0-only
++ */
++
++package org.thoughtcrime.securesms.components.settings.app.subscription.manage
++
++import org.thoughtcrime.securesms.database.model.databaseprotos.PendingOneTimeDonation
++
++/**
++ * Represent the status of a donation as represented in the job system.
++ */
++sealed interface DonationRedemptionJobStatus {
++  /**
++   * No pending/running jobs for a donation type.
++   */
++  object None : DonationRedemptionJobStatus
++
++  /**
++   * Donation is pending external user verification (e.g., iDEAL).
++   *
++   * For one-time, pending donation data is provided via the job data as it is not in the store yet.
++   */
++  class PendingExternalVerification(val pendingOneTimeDonation: PendingOneTimeDonation? = null) : DonationRedemptionJobStatus
++
++  /**
++   * Donation is at the receipt request status.
++   *
++   * For one-time donations, pending donation data available via the store.
++   */
++  object PendingReceiptRequest : DonationRedemptionJobStatus
++
++  /**
++   * Donation is at the receipt redemption status.
++   *
++   * For one-time donations, pending donation data available via the store.
++   */
++  object PendingReceiptRedemption : DonationRedemptionJobStatus
++
++  /**
++   * Representation of a failed subscription job chain derived from no pending/running jobs and
++   * a failure state in the store.
++   */
++  object FailedSubscription : DonationRedemptionJobStatus
++}
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/DonationRedemptionJobWatcher.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/DonationRedemptionJobWatcher.kt
+index cc1c180b7af..fc5a351c2a8 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/DonationRedemptionJobWatcher.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/DonationRedemptionJobWatcher.kt
+@@ -1,14 +1,14 @@
+ package org.thoughtcrime.securesms.components.settings.app.subscription.manage
+ 
+ import io.reactivex.rxjava3.core.Observable
++import org.thoughtcrime.securesms.components.settings.app.subscription.DonationSerializationHelper
+ import org.thoughtcrime.securesms.dependencies.ApplicationDependencies
+-import org.thoughtcrime.securesms.jobmanager.JobTracker
++import org.thoughtcrime.securesms.jobmanager.persistence.JobSpec
+ import org.thoughtcrime.securesms.jobs.BoostReceiptRequestResponseJob
+ import org.thoughtcrime.securesms.jobs.DonationReceiptRedemptionJob
+ import org.thoughtcrime.securesms.jobs.ExternalLaunchDonationJob
+ import org.thoughtcrime.securesms.jobs.SubscriptionReceiptRequestResponseJob
+ import org.thoughtcrime.securesms.keyvalue.SignalStore
+-import java.util.Optional
+ import java.util.concurrent.TimeUnit
+ 
+ /**
+@@ -21,22 +21,23 @@ object DonationRedemptionJobWatcher {
+     ONE_TIME
+   }
+ 
+-  fun watchSubscriptionRedemption(): Observable<Optional<JobTracker.JobState>> = watch(RedemptionType.SUBSCRIPTION)
++  fun watchSubscriptionRedemption(): Observable<DonationRedemptionJobStatus> = watch(RedemptionType.SUBSCRIPTION)
+ 
+-  fun watchOneTimeRedemption(): Observable<Optional<JobTracker.JobState>> = watch(RedemptionType.ONE_TIME)
++  fun watchOneTimeRedemption(): Observable<DonationRedemptionJobStatus> = watch(RedemptionType.ONE_TIME)
+ 
+-  private fun watch(redemptionType: RedemptionType): Observable<Optional<JobTracker.JobState>> = Observable.interval(0, 5, TimeUnit.SECONDS).map {
++  private fun watch(redemptionType: RedemptionType): Observable<DonationRedemptionJobStatus> = Observable.interval(0, 5, TimeUnit.SECONDS).map {
+     val queue = when (redemptionType) {
+       RedemptionType.SUBSCRIPTION -> DonationReceiptRedemptionJob.SUBSCRIPTION_QUEUE
+       RedemptionType.ONE_TIME -> DonationReceiptRedemptionJob.ONE_TIME_QUEUE
+     }
+ 
+-    val externalLaunchJobState: JobTracker.JobState? = ApplicationDependencies.getJobManager().getFirstMatchingJobState {
+-      it.factoryKey == ExternalLaunchDonationJob.KEY && it.parameters.queue?.startsWith(queue) == true
+-    }
++    val donationJobSpecs = ApplicationDependencies
++      .getJobManager()
++      .find { it.queueKey?.startsWith(queue) == true }
++      .sortedBy { it.createTime }
+ 
+-    val redemptionJobState: JobTracker.JobState? = ApplicationDependencies.getJobManager().getFirstMatchingJobState {
+-      it.factoryKey == DonationReceiptRedemptionJob.KEY && it.parameters.queue?.startsWith(queue) == true
++    val externalLaunchJobSpec: JobSpec? = donationJobSpecs.firstOrNull {
++      it.factoryKey == ExternalLaunchDonationJob.KEY
+     }
+ 
+     val receiptRequestJobKey = when (redemptionType) {
+@@ -44,16 +45,48 @@ object DonationRedemptionJobWatcher {
+       RedemptionType.ONE_TIME -> BoostReceiptRequestResponseJob.KEY
+     }
+ 
+-    val receiptJobState: JobTracker.JobState? = ApplicationDependencies.getJobManager().getFirstMatchingJobState {
+-      it.factoryKey == receiptRequestJobKey && it.parameters.queue?.startsWith(queue) == true
++    val receiptJobSpec: JobSpec? = donationJobSpecs.firstOrNull {
++      it.factoryKey == receiptRequestJobKey
++    }
++
++    val redemptionJobSpec: JobSpec? = donationJobSpecs.firstOrNull {
++      it.factoryKey == DonationReceiptRedemptionJob.KEY
+     }
+ 
+-    val jobState: JobTracker.JobState? = externalLaunchJobState ?: redemptionJobState ?: receiptJobState
++    val jobSpec: JobSpec? = externalLaunchJobSpec ?: redemptionJobSpec ?: receiptJobSpec
+ 
+-    if (redemptionType == RedemptionType.SUBSCRIPTION && jobState == null && SignalStore.donationsValues().getSubscriptionRedemptionFailed()) {
+-      Optional.of(JobTracker.JobState.FAILURE)
++    if (redemptionType == RedemptionType.SUBSCRIPTION && jobSpec == null && SignalStore.donationsValues().getSubscriptionRedemptionFailed()) {
++      DonationRedemptionJobStatus.FailedSubscription
+     } else {
+-      Optional.ofNullable(jobState)
++      jobSpec?.toDonationRedemptionStatus() ?: DonationRedemptionJobStatus.None
+     }
+   }.distinctUntilChanged()
++
++  private fun JobSpec.toDonationRedemptionStatus(): DonationRedemptionJobStatus {
++    return when (factoryKey) {
++      ExternalLaunchDonationJob.KEY -> {
++        val stripe3DSData = ExternalLaunchDonationJob.Factory.parseSerializedData(serializedData!!)
++        DonationRedemptionJobStatus.PendingExternalVerification(
++          pendingOneTimeDonation = DonationSerializationHelper.createPendingOneTimeDonationProto(
++            badge = stripe3DSData.gatewayRequest.badge,
++            paymentSourceType = stripe3DSData.paymentSourceType,
++            amount = stripe3DSData.gatewayRequest.fiat
++          ).copy(
++            timestamp = createTime,
++            pendingVerification = true,
++            checkedVerification = runAttempt > 0
++          )
++        )
++      }
++
++      SubscriptionReceiptRequestResponseJob.KEY,
++      BoostReceiptRequestResponseJob.KEY -> DonationRedemptionJobStatus.PendingReceiptRequest
++
++      DonationReceiptRedemptionJob.KEY -> DonationRedemptionJobStatus.PendingReceiptRedemption
++
++      else -> {
++        DonationRedemptionJobStatus.None
++      }
++    }
++  }
+ }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/ManageDonationsFragment.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/ManageDonationsFragment.kt
+index bff30c285f3..0aff041fa8d 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/ManageDonationsFragment.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/ManageDonationsFragment.kt
+@@ -20,6 +20,7 @@ import org.thoughtcrime.securesms.components.settings.DSLSettingsFragment
+ import org.thoughtcrime.securesms.components.settings.DSLSettingsIcon
+ import org.thoughtcrime.securesms.components.settings.DSLSettingsText
+ import org.thoughtcrime.securesms.components.settings.app.AppSettingsActivity
++import org.thoughtcrime.securesms.components.settings.app.subscription.DonationSerializationHelper.toFiatMoney
+ import org.thoughtcrime.securesms.components.settings.app.subscription.MonthlyDonationRepository
+ import org.thoughtcrime.securesms.components.settings.app.subscription.completed.TerminalDonationDelegate
+ import org.thoughtcrime.securesms.components.settings.app.subscription.donate.DonateToSignalType
+@@ -27,6 +28,7 @@ import org.thoughtcrime.securesms.components.settings.app.subscription.models.Ne
+ import org.thoughtcrime.securesms.components.settings.configure
+ import org.thoughtcrime.securesms.components.settings.models.IndeterminateLoadingCircle
+ import org.thoughtcrime.securesms.database.model.databaseprotos.DonationErrorValue
++import org.thoughtcrime.securesms.database.model.databaseprotos.PendingOneTimeDonation
+ import org.thoughtcrime.securesms.dependencies.ApplicationDependencies
+ import org.thoughtcrime.securesms.help.HelpFragment
+ import org.thoughtcrime.securesms.keyvalue.SignalStore
+@@ -51,6 +53,10 @@ class ManageDonationsFragment :
+   ),
+   ExpiredGiftSheet.Callback {
+ 
++  companion object {
++    private val alertedIdealDonations = mutableSetOf<Long>()
++  }
++
+   private val supportTechSummary: CharSequence by lazy {
+     SpannableStringBuilder(SpanUtil.color(ContextCompat.getColor(requireContext(), R.color.signal_colorOnSurfaceVariant), requireContext().getString(R.string.DonateToSignalFragment__private_messaging)))
+       .append(" ")
+@@ -92,6 +98,21 @@ class ManageDonationsFragment :
+ 
+     viewModel.state.observe(viewLifecycleOwner) { state ->
+       adapter.submitList(getConfiguration(state).toMappingModelList())
++
++      if (state.pendingOneTimeDonation?.pendingVerification == true &&
++        state.pendingOneTimeDonation.checkedVerification &&
++        !alertedIdealDonations.contains(state.pendingOneTimeDonation.timestamp)
++      ) {
++        alertedIdealDonations += state.pendingOneTimeDonation.timestamp
++
++        val amount = FiatMoneyUtil.format(resources, state.pendingOneTimeDonation.amount!!.toFiatMoney(), FiatMoneyUtil.formatOptions().trimZerosAfterDecimal())
++
++        MaterialAlertDialogBuilder(requireContext())
++          .setTitle(R.string.ManageDonationsFragment__couldnt_confirm_donation)
++          .setMessage(getString(R.string.ManageDonationsFragment__your_one_time_s_donation_couldnt_be_confirmed, amount))
++          .setPositiveButton(android.R.string.ok, null)
++          .show()
++      }
+     }
+   }
+ 
+@@ -149,7 +170,7 @@ class ManageDonationsFragment :
+           } else {
+             customPref(IndeterminateLoadingCircle)
+           }
+-        } else if (state.hasOneTimeBadge) {
++        } else if (state.hasOneTimeBadge || state.pendingOneTimeDonation != null) {
+           presentActiveOneTimeDonorSettings(state)
+         } else {
+           presentNotADonorSettings(state.hasReceipts)
+@@ -186,7 +207,7 @@ class ManageDonationsFragment :
+             displayPendingDialog(it)
+           },
+           onErrorClick = {
+-            displayPendingOneTimeDonationErrorDialog(it)
++            displayPendingOneTimeDonationErrorDialog(it, pendingOneTimeDonation.paymentMethodType == PendingOneTimeDonation.PaymentMethodType.IDEAL)
+           }
+         )
+       )
+@@ -344,7 +365,7 @@ class ManageDonationsFragment :
+       .show()
+   }
+ 
+-  private fun displayPendingOneTimeDonationErrorDialog(error: DonationErrorValue) {
++  private fun displayPendingOneTimeDonationErrorDialog(error: DonationErrorValue, isIdeal: Boolean) {
+     when (error.type) {
+       DonationErrorValue.Type.REDEMPTION -> {
+         MaterialAlertDialogBuilder(requireContext())
+@@ -363,9 +384,15 @@ class ManageDonationsFragment :
+           .show()
+       }
+       else -> {
++        val message = if (isIdeal) {
++          R.string.DonationsErrors__your_ideal_couldnt_be_processed
++        } else {
++          R.string.DonationsErrors__try_another_payment_method
++        }
++
+         MaterialAlertDialogBuilder(requireContext())
+           .setTitle(R.string.DonationsErrors__error_processing_payment)
+-          .setMessage(R.string.DonationsErrors__try_another_payment_method)
++          .setMessage(message)
+           .setNegativeButton(R.string.DonationsErrors__learn_more) { _, _ ->
+             CommunicationActions.openBrowserLink(requireContext(), getString(R.string.donate_url))
+           }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/ManageDonationsViewModel.kt b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/ManageDonationsViewModel.kt
+index 3d7c4b89bef..c282e41fb30 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/ManageDonationsViewModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/settings/app/subscription/manage/ManageDonationsViewModel.kt
+@@ -14,13 +14,13 @@ import org.signal.core.util.logging.Log
+ import org.signal.core.util.orNull
+ import org.thoughtcrime.securesms.components.settings.app.subscription.MonthlyDonationRepository
+ import org.thoughtcrime.securesms.database.SignalDatabase
+-import org.thoughtcrime.securesms.jobmanager.JobTracker
+ import org.thoughtcrime.securesms.keyvalue.SignalStore
+ import org.thoughtcrime.securesms.recipients.Recipient
+ import org.thoughtcrime.securesms.subscription.LevelUpdate
+ import org.thoughtcrime.securesms.util.InternetConnectionObserver
+ import org.thoughtcrime.securesms.util.livedata.Store
+ import org.whispersystems.signalservice.api.subscriptions.ActiveSubscription
++import java.util.Optional
+ 
+ class ManageDonationsViewModel(
+   private val subscriptionsRepository: MonthlyDonationRepository
+@@ -76,16 +76,26 @@ class ManageDonationsViewModel(
+       store.update { it.copy(hasReceipts = hasReceipts) }
+     }
+ 
+-    disposables += DonationRedemptionJobWatcher.watchSubscriptionRedemption().subscribeBy { jobStateOptional ->
++    disposables += DonationRedemptionJobWatcher.watchSubscriptionRedemption().subscribeBy { redemptionStatus ->
+       store.update { manageDonationsState ->
+         manageDonationsState.copy(
+-          subscriptionRedemptionState = jobStateOptional.map(this::mapJobStateToRedemptionState).orElse(ManageDonationsState.RedemptionState.NONE)
++          subscriptionRedemptionState = mapStatusToRedemptionState(redemptionStatus)
+         )
+       }
+     }
+ 
+-    disposables += SignalStore.donationsValues()
+-      .observablePendingOneTimeDonation
++    disposables += Observable.combineLatest(
++      SignalStore.donationsValues().observablePendingOneTimeDonation,
++      DonationRedemptionJobWatcher.watchOneTimeRedemption()
++    ) { pendingFromStore, pendingFromJob ->
++      if (pendingFromStore.isPresent) {
++        pendingFromStore
++      } else if (pendingFromJob is DonationRedemptionJobStatus.PendingExternalVerification) {
++        Optional.ofNullable(pendingFromJob.pendingOneTimeDonation)
++      } else {
++        Optional.empty()
++      }
++    }
+       .distinctUntilChanged()
+       .subscribeBy { pending ->
+         store.update { it.copy(pendingOneTimeDonation = pending.orNull()) }
+@@ -122,13 +132,14 @@ class ManageDonationsViewModel(
+     )
+   }
+ 
+-  private fun mapJobStateToRedemptionState(jobState: JobTracker.JobState): ManageDonationsState.RedemptionState {
+-    return when (jobState) {
+-      JobTracker.JobState.PENDING -> ManageDonationsState.RedemptionState.IN_PROGRESS
+-      JobTracker.JobState.RUNNING -> ManageDonationsState.RedemptionState.IN_PROGRESS
+-      JobTracker.JobState.SUCCESS -> ManageDonationsState.RedemptionState.NONE
+-      JobTracker.JobState.FAILURE -> ManageDonationsState.RedemptionState.FAILED
+-      JobTracker.JobState.IGNORED -> ManageDonationsState.RedemptionState.NONE
++  private fun mapStatusToRedemptionState(status: DonationRedemptionJobStatus): ManageDonationsState.RedemptionState {
++    return when (status) {
++      DonationRedemptionJobStatus.FailedSubscription -> ManageDonationsState.RedemptionState.FAILED
++      DonationRedemptionJobStatus.None -> ManageDonationsState.RedemptionState.NONE
++
++      is DonationRedemptionJobStatus.PendingExternalVerification,
++      DonationRedemptionJobStatus.PendingReceiptRedemption,
++      DonationRedemptionJobStatus.PendingReceiptRequest -> ManageDonationsState.RedemptionState.IN_PROGRESS
+     }
+   }
+ 
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/compose/ComposeBottomSheetDialogFragment.kt b/app/src/main/java/org/thoughtcrime/securesms/compose/ComposeBottomSheetDialogFragment.kt
+index 168091aff0a..123e78c4d6e 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/compose/ComposeBottomSheetDialogFragment.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/compose/ComposeBottomSheetDialogFragment.kt
+@@ -25,7 +25,7 @@ abstract class ComposeBottomSheetDialogFragment : FixedRoundedCornerBottomSheetD
+         SignalTheme(
+           isDarkMode = isDarkTheme()
+         ) {
+-          Surface(shape = RoundedCornerShape(18.dp, 18.dp)) {
++          Surface(shape = RoundedCornerShape(18.dp, 18.dp), color = SignalTheme.colors.colorSurface1) {
+             SheetContent()
+           }
+         }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/BoostReceiptRequestResponseJob.java b/app/src/main/java/org/thoughtcrime/securesms/jobs/BoostReceiptRequestResponseJob.java
+index 754f238ce80..555ee4bedc7 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/BoostReceiptRequestResponseJob.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/BoostReceiptRequestResponseJob.java
+@@ -237,22 +237,12 @@ protected void onRun() throws Exception {
+                                                               receiptCredentialPresentation.serialize())
+                                              .putBlobAsString(DonationReceiptRedemptionJob.INPUT_TERMINAL_DONATION, terminalDonation.encode())
+                                              .serialize());
+-
+-      enqueueDonationComplete();
+     } else {
+       Log.w(TAG, "Encountered a retryable exception: " + response.getStatus(), response.getExecutionError().orElse(null), true);
+       throw new RetryableException();
+     }
+   }
+ 
+-  private void enqueueDonationComplete() {
+-    if (donationErrorSource != DonationErrorSource.GIFT) {
+-      return;
+-    }
+-
+-    SignalStore.donationsValues().setPendingOneTimeDonation(null);
+-  }
+-
+   /**
+    * Sets the pending one-time donation error according to the status code.
+    */
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/jobs/ExternalLaunchDonationJob.kt b/app/src/main/java/org/thoughtcrime/securesms/jobs/ExternalLaunchDonationJob.kt
+index f5aec0d14e8..83b05e8e536 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/jobs/ExternalLaunchDonationJob.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/jobs/ExternalLaunchDonationJob.kt
+@@ -15,6 +15,9 @@ import org.thoughtcrime.securesms.components.settings.app.subscription.DonationS
+ import org.thoughtcrime.securesms.components.settings.app.subscription.MonthlyDonationRepository
+ import org.thoughtcrime.securesms.components.settings.app.subscription.donate.DonateToSignalType
+ import org.thoughtcrime.securesms.components.settings.app.subscription.donate.stripe.Stripe3DSData
++import org.thoughtcrime.securesms.components.settings.app.subscription.errors.DonationError
++import org.thoughtcrime.securesms.components.settings.app.subscription.errors.DonationError.Companion.toDonationErrorValue
++import org.thoughtcrime.securesms.components.settings.app.subscription.errors.DonationErrorSource
+ import org.thoughtcrime.securesms.database.SignalDatabase
+ import org.thoughtcrime.securesms.database.model.DonationReceiptRecord
+ import org.thoughtcrime.securesms.database.model.databaseprotos.DonationErrorValue
+@@ -40,6 +43,8 @@ class ExternalLaunchDonationJob private constructor(
+   parameters: Parameters
+ ) : BaseJob(parameters), StripeApi.PaymentIntentFetcher, StripeApi.SetupIntentHelper {
+ 
++  private var donationError: DonationError? = null
++
+   companion object {
+     const val KEY = "ExternalLaunchDonationJob"
+ 
+@@ -96,6 +101,15 @@ class ExternalLaunchDonationJob private constructor(
+ 
+       jobChain.after(checkJob).enqueue()
+     }
++
++    private fun createDonationError(stripe3DSData: Stripe3DSData, throwable: Throwable): DonationError {
++      val source = when (stripe3DSData.gatewayRequest.donateToSignalType) {
++        DonateToSignalType.ONE_TIME -> DonationErrorSource.ONE_TIME
++        DonateToSignalType.MONTHLY -> DonationErrorSource.MONTHLY
++        DonateToSignalType.GIFT -> DonationErrorSource.GIFT
++      }
++      return DonationError.PaymentSetupError.GenericError(source, throwable)
++    }
+   }
+ 
+   private val stripeApi = StripeApi(Environment.Donations.STRIPE_CONFIGURATION, this, this, ApplicationDependencies.getOkHttpClient())
+@@ -106,7 +120,19 @@ class ExternalLaunchDonationJob private constructor(
+ 
+   override fun getFactoryKey(): String = KEY
+ 
+-  override fun onFailure() = Unit
++  override fun onFailure() {
++    if (donationError != null) {
++      SignalStore.donationsValues().setPendingOneTimeDonation(
++        DonationSerializationHelper.createPendingOneTimeDonationProto(
++          stripe3DSData.gatewayRequest.badge,
++          stripe3DSData.paymentSourceType,
++          stripe3DSData.gatewayRequest.fiat
++        ).copy(
++          error = donationError?.toDonationErrorValue()
++        )
++      )
++    }
++  }
+ 
+   override fun onRun() {
+     when (stripe3DSData.stripeIntentAccessor.objectType) {
+@@ -207,11 +233,18 @@ class ExternalLaunchDonationJob private constructor(
+ 
+       StripeIntentStatus.CANCELED -> {
+         Log.i(TAG, "Stripe Intent is cancelled, we cannot proceed.", true)
+-        throw Exception("User cancelled payment.")
++        donationError = createDonationError(stripe3DSData, Exception("User cancelled payment."))
++        throw donationError!!
++      }
++
++      StripeIntentStatus.REQUIRES_PAYMENT_METHOD -> {
++        Log.i(TAG, "Stripe Intent payment failed, we cannot proceed.", true)
++        donationError = createDonationError(stripe3DSData, Exception("payment failed"))
++        throw donationError!!
+       }
+ 
+       else -> {
+-        Log.i(TAG, "Stripe Intent is still processing, retry later.", true)
++        Log.i(TAG, "Stripe Intent is still processing, retry later. $stripeIntentStatus", true)
+         throw RetryException()
+       }
+     }
+@@ -260,10 +293,16 @@ class ExternalLaunchDonationJob private constructor(
+         error("Unexpected null value for serialized data")
+       }
+ 
+-      val stripe3DSData = Stripe3DSData.fromProtoBytes(serializedData, -1L)
++      val stripe3DSData = parseSerializedData(serializedData)
+ 
+       return ExternalLaunchDonationJob(stripe3DSData, parameters)
+     }
++
++    companion object {
++      fun parseSerializedData(serializedData: ByteArray): Stripe3DSData {
++        return Stripe3DSData.fromProtoBytes(serializedData, -1L)
++      }
++    }
+   }
+ 
+   override fun fetchPaymentIntent(price: FiatMoney, level: Long, sourceType: PaymentSourceType.Stripe): Single<StripeIntentAccessor> {
+diff --git a/app/src/main/protowire/Database.proto b/app/src/main/protowire/Database.proto
+index e2b2bffcb3e..ced45932904 100644
+--- a/app/src/main/protowire/Database.proto
++++ b/app/src/main/protowire/Database.proto
+@@ -306,11 +306,13 @@ message PendingOneTimeDonation {
+         IDEAL      = 3;
+     }
+ 
+-             PaymentMethodType  paymentMethodType = 1;
+-             FiatValue          amount            = 2;
+-             BadgeList.Badge    badge             = 3;
+-             int64              timestamp         = 4;
+-    optional DonationErrorValue error             = 5;
++             PaymentMethodType  paymentMethodType   = 1;
++             FiatValue          amount              = 2;
++             BadgeList.Badge    badge               = 3;
++             int64              timestamp           = 4;
++    optional DonationErrorValue error               = 5;
++             bool               pendingVerification = 6;
++             bool               checkedVerification = 7;
+ }
+ 
+ /**
+diff --git a/app/src/main/res/layout/dsl_button_primary.xml b/app/src/main/res/layout/dsl_button_primary.xml
+index b10d735e27d..3d4b176f155 100644
+--- a/app/src/main/res/layout/dsl_button_primary.xml
++++ b/app/src/main/res/layout/dsl_button_primary.xml
+@@ -11,7 +11,7 @@
+     android:insetTop="2dp"
+     android:insetBottom="2dp"
+     app:iconGravity="textStart"
+-    app:iconSize="32dp"
++    app:iconSize="24dp"
+     app:iconTint="@null"
+     tools:icon="@drawable/credit_card"
+     tools:text="Primary button"
+diff --git a/app/src/main/res/layout/dsl_button_tonal.xml b/app/src/main/res/layout/dsl_button_tonal.xml
+index a269c6ea935..345e6468a7f 100644
+--- a/app/src/main/res/layout/dsl_button_tonal.xml
++++ b/app/src/main/res/layout/dsl_button_tonal.xml
+@@ -11,7 +11,7 @@
+     android:insetTop="2dp"
+     android:insetBottom="2dp"
+     app:iconGravity="textStart"
+-    app:iconSize="32dp"
++    app:iconSize="24dp"
+     app:iconTint="@null"
+     tools:icon="@drawable/bank_transfer"
+     tools:text="Tonal button"
+diff --git a/app/src/main/res/layout/paypal_button.xml b/app/src/main/res/layout/paypal_button.xml
+index b54c4a8eace..2fffa16dbf1 100644
+--- a/app/src/main/res/layout/paypal_button.xml
++++ b/app/src/main/res/layout/paypal_button.xml
+@@ -18,7 +18,5 @@
+         app:iconGravity="textStart"
+         app:iconPadding="0dp"
+         app:iconTint="@null"
+-        app:backgroundTint="#EEEEEE"
+-        app:strokeColor="@color/paypal_outline"
+-        app:strokeWidth="1.5dp" />
++        app:backgroundTint="#f6c757" />
+ </FrameLayout>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index cec4b9da66c..0942a0b26c4 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -4764,6 +4764,10 @@
+     <string name="ManageDonationsFragment__other_ways_to_give">Other ways to give</string>
+     <!-- Preference label to launch badge gifting -->
+     <string name="ManageDonationsFragment__donate_for_a_friend">Donate for a Friend</string>
++    <!-- Dialog title shown when a donation requires verifying/confirmation outside of the app and the user hasn't done that yet -->
++    <string name="ManageDonationsFragment__couldnt_confirm_donation">Couldn\'t confirm donation</string>
++    <!-- Dialog message shown when a donation requires verifying/confirmation outside of the app and the user hasn't done that yet -->
++    <string name="ManageDonationsFragment__your_one_time_s_donation_couldnt_be_confirmed">Your one-time %1$s donation couldn\'t be confirmed. Check your banking app to approve your iDEAL payment.</string>
+ 
+     <string name="Boost__enter_custom_amount">Enter Custom Amount</string>
+     <!-- Error label when the amount is smaller than what we can accept -->
+@@ -4863,6 +4867,8 @@
+     <string name="DonationsErrors__this_user_cant_receive_donations_until">This user can\'t receive donations until they upgrade Signal.</string>
+     <!-- Displayed as a dialog message when the user\'s profile could not be fetched, likely due to lack of internet -->
+     <string name="DonationsErrors__your_donation_could_not_be_sent">Your donation could not be sent because of a network error. Check your connection and try again.</string>
++    <!-- Displayed as a dialog message when the user encounters an error during an iDEAL donation -->
++    <string name="DonationsErrors__your_ideal_couldnt_be_processed">Your iDEAL donation couldn\'t be processed. Try another payment method or contact your bank for more information.</string>
+ 
+     <!-- Gift message view title -->
+     <string name="GiftMessageView__donation_on_behalf_of_s">Donation on behalf of %1$s</string>
+@@ -5843,6 +5849,8 @@
+     <string name="DonateToSignalFragment__your_payment_is_still_being_processed_monthly">Your payment is still being processed. This can take a few minutes depending on your connection. Please wait until this payment completes before updating your subscription.</string>
+     <!-- Dialog body when a user tries to donate while they already have a pending one time donation. -->
+     <string name="DonateToSignalFragment__your_payment_is_still_being_processed_onetime">Your payment is still being processed. This can take a few minutes depending on your connection. Please wait until this payment completes before making another donation.</string>
++    <!-- Dialog body when a user opens the manage donations main screen and they have a pending iDEAL donation -->
++    <string name="DonateToSignalFragment__your_ideal_payment_is_still_processing">Your iDEAL payment is still processing. Check your banking app to approve your payment before making another donation.</string>
+ 
+     <!-- Donation pill toggle monthly text -->
+     <string name="DonationPillToggle__monthly">Monthly</string>
+@@ -5910,7 +5918,7 @@
+     <!-- Subtitle learn more of screen displaying bank transfer mandate -->
+     <string name="BankTransferMandateFragment__learn_more">Learn more</string>
+     <!-- Button label to continue with transfer -->
+-    <string name="BankTransferMandateFragment__continue">Continue</string>
++    <string name="BankTransferMandateFragment__agree">Agree</string>
+     <!-- Button label to read more of the bank mandate that is currently off screen -->
+     <string name="BankTransferMandateFragment__read_more">Read more</string>
+     <!-- Text displayed when mandate load fails -->
+@@ -5918,7 +5926,7 @@
+ 
+     <!-- BankTransferDetailsFragment -->
+     <!-- Subtext explaining how email is used. Placeholder is \'Learn more\' -->
+-    <string name="BankTransferDetailsFragment__enter_your_bank_details">Enter your bank details and email address. Your email is used by Stripe to send you updates about your donation. %1$s</string>
++    <string name="BankTransferDetailsFragment__enter_your_bank_details">Enter your bank details and email. Stripe uses this email to send you updates about your donation. %1$s</string>
+     <!-- Subtext learn more link text -->
+     <string name="BankTransferDetailsFragment__learn_more">Learn more</string>
+     <!-- Text field label for name on bank account -->

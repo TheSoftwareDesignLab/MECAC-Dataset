@@ -1,0 +1,264 @@
+diff --git a/Signal/src/AppDelegate.m b/Signal/src/AppDelegate.m
+index b2dc9f04220..a9672ca2ffc 100644
+--- a/Signal/src/AppDelegate.m
++++ b/Signal/src/AppDelegate.m
+@@ -887,8 +887,8 @@ - (BOOL)application:(UIApplication *)application
+                 return;
+             }
+ 
+-            SignalServiceAddress *_Nullable address = [self addressForIntentHandle:handle];
+-            if (!address.isValid) {
++            TSThread *_Nullable thread = [self threadForIntentHandle:handle];
++            if (!thread) {
+                 OWSLogWarn(@"ignoring attempt to initiate video call to unknown user.");
+                 return;
+             }
+@@ -903,8 +903,7 @@ - (BOOL)application:(UIApplication *)application
+             //   to that user - unless there already is another call in progress.
+             SignalCall *_Nullable currentCall = AppEnvironment.shared.callService.currentCall;
+             if (currentCall != nil) {
+-                if (currentCall.isIndividualCall &&
+-                    [address isEqualToAddress:currentCall.individualCall.remoteAddress]) {
++                if (currentCall.isIndividualCall && [thread.uniqueId isEqual:currentCall.thread.uniqueId]) {
+                     OWSLogWarn(@"trying to upgrade ongoing call to video.");
+                     [AppEnvironment.shared.callService.individualCallService handleCallKitStartVideo];
+                     return;
+@@ -914,7 +913,6 @@ - (BOOL)application:(UIApplication *)application
+                 }
+             }
+ 
+-            TSContactThread *thread = [TSContactThread getOrCreateThreadWithContactAddress:address];
+             OutboundIndividualCallInitiator *outboundIndividualCallInitiator
+                 = AppEnvironment.shared.outboundIndividualCallInitiator;
+             OWSAssertDebug(outboundIndividualCallInitiator);
+@@ -944,8 +942,8 @@ - (BOOL)application:(UIApplication *)application
+                 return;
+             }
+ 
+-            SignalServiceAddress *_Nullable address = [self addressForIntentHandle:handle];
+-            if (!address.isValid) {
++            TSThread *_Nullable thread = [self threadForIntentHandle:handle];
++            if (!thread) {
+                 OWSLogWarn(@"ignoring attempt to initiate audio call to unknown user.");
+                 return;
+             }
+@@ -955,7 +953,6 @@ - (BOOL)application:(UIApplication *)application
+                 return;
+             }
+ 
+-            TSContactThread *thread = [TSContactThread getOrCreateThreadWithContactAddress:address];
+             OutboundIndividualCallInitiator *outboundIndividualCallInitiator
+                 = AppEnvironment.shared.outboundIndividualCallInitiator;
+             OWSAssertDebug(outboundIndividualCallInitiator);
+@@ -991,8 +988,8 @@ - (BOOL)application:(UIApplication *)application
+                     return;
+                 }
+ 
+-                SignalServiceAddress *_Nullable address = [self addressForIntentHandle:handle];
+-                if (!address.isValid) {
++                TSThread *_Nullable thread = [self threadForIntentHandle:handle];
++                if (!thread) {
+                     OWSLogWarn(@"ignoring attempt to initiate call to unknown user.");
+                     return;
+                 }
+@@ -1002,7 +999,6 @@ - (BOOL)application:(UIApplication *)application
+                     return;
+                 }
+ 
+-                TSContactThread *thread = [TSContactThread getOrCreateThreadWithContactAddress:address];
+                 OutboundIndividualCallInitiator *outboundIndividualCallInitiator
+                     = AppEnvironment.shared.outboundIndividualCallInitiator;
+                 OWSAssertDebug(outboundIndividualCallInitiator);
+@@ -1026,23 +1022,19 @@ - (BOOL)application:(UIApplication *)application
+     return NO;
+ }
+ 
+-- (nullable SignalServiceAddress *)addressForIntentHandle:(NSString *)handle
++- (nullable TSThread *)threadForIntentHandle:(NSString *)handle
+ {
+     OWSAssertDebug(handle.length > 0);
+ 
+     if ([handle hasPrefix:CallKitCallManager.kAnonymousCallHandlePrefix]) {
+-        SignalServiceAddress *_Nullable address = [CallKitIdStore addressForCallKitId:handle];
+-        if (!address.isValid) {
+-            OWSLogWarn(@"ignoring attempt to initiate audio call to unknown anonymous signal user.");
+-            return nil;
+-        }
+-        return address;
++        return [CallKitIdStore threadForCallKitId:handle];
+     }
+ 
+     for (PhoneNumber *phoneNumber in
+         [PhoneNumber tryParsePhoneNumbersFromUserSpecifiedText:handle
+                                               clientPhoneNumber:[TSAccountManager localNumber]]) {
+-        return [[SignalServiceAddress alloc] initWithPhoneNumber:phoneNumber.toE164];
++        SignalServiceAddress *address = [[SignalServiceAddress alloc] initWithPhoneNumber:phoneNumber.toE164];
++        return [TSContactThread getOrCreateThreadWithContactAddress:address];
+     }
+     return nil;
+ }
+diff --git a/Signal/src/Calls/Individual/OutboundIndividualCallInitiator.swift b/Signal/src/Calls/Individual/OutboundIndividualCallInitiator.swift
+index e5e35a813c6..ad87f06dcff 100644
+--- a/Signal/src/Calls/Individual/OutboundIndividualCallInitiator.swift
++++ b/Signal/src/Calls/Individual/OutboundIndividualCallInitiator.swift
+@@ -24,7 +24,7 @@ public class OutboundIndividualCallInitiator: NSObject {
+      */
+     @discardableResult
+     @objc
+-    public func initiateCall(thread: TSContactThread, isVideo: Bool) -> Bool {
++    public func initiateCall(thread: TSThread, isVideo: Bool) -> Bool {
+         guard tsAccountManager.isOnboarded() else {
+             Logger.warn("aborting due to user not being onboarded.")
+             OWSActionSheets.showActionSheet(title: NSLocalizedString("YOU_MUST_COMPLETE_ONBOARDING_BEFORE_PROCEEDING",
+@@ -40,6 +40,10 @@ public class OutboundIndividualCallInitiator: NSObject {
+             owsFailDebug("could not identify frontmostViewController")
+             return false
+         }
++        guard let thread = thread as? TSContactThread else {
++            owsFailDebug("cannot initiate call to group thread")
++            return false
++        }
+ 
+         let showedAlert = SafetyNumberConfirmationSheet.presentIfNecessary(
+             address: thread.contactAddress,
+diff --git a/Signal/src/Calls/UserInterface/CallKit/CallKitCallManager.swift b/Signal/src/Calls/UserInterface/CallKit/CallKitCallManager.swift
+index c49260df16a..a9dd7fec3a2 100644
+--- a/Signal/src/Calls/UserInterface/CallKit/CallKitCallManager.swift
++++ b/Signal/src/Calls/UserInterface/CallKit/CallKitCallManager.swift
+@@ -50,7 +50,7 @@ final class CallKitCallManager: NSObject {
+         } else {
+             let callKitId = CallKitCallManager.kAnonymousCallHandlePrefix + call.localId.uuidString
+             handle = CXHandle(type: .generic, value: callKitId)
+-            CallKitIdStore.setAddress(call.individualCall.remoteAddress, forCallKitId: callKitId)
++            CallKitIdStore.setThread(call.thread, forCallKitId: callKitId)
+         }
+ 
+         let startCallAction = CXStartCallAction(call: call.localId, handle: handle)
+diff --git a/Signal/src/Calls/UserInterface/CallKit/CallKitCallUIAdaptee.swift b/Signal/src/Calls/UserInterface/CallKit/CallKitCallUIAdaptee.swift
+index 6cba98f9c58..5964f300bf0 100644
+--- a/Signal/src/Calls/UserInterface/CallKit/CallKitCallUIAdaptee.swift
++++ b/Signal/src/Calls/UserInterface/CallKit/CallKitCallUIAdaptee.swift
+@@ -154,7 +154,7 @@ final class CallKitCallUIAdaptee: NSObject, CallUIAdaptee, CXProviderDelegate {
+         } else {
+             let callKitId = CallKitCallManager.kAnonymousCallHandlePrefix + call.localId.uuidString
+             update.remoteHandle = CXHandle(type: .generic, value: callKitId)
+-            CallKitIdStore.setAddress(call.individualCall.remoteAddress, forCallKitId: callKitId)
++            CallKitIdStore.setThread(call.thread, forCallKitId: callKitId)
+             update.localizedCallerName = NSLocalizedString("CALLKIT_ANONYMOUS_CONTACT_NAME", comment: "The generic name used for calls if CallKit privacy is enabled")
+         }
+ 
+diff --git a/SignalServiceKit/src/Storage/AxolotlStore/CallKitIdStore.h b/SignalServiceKit/src/Storage/AxolotlStore/CallKitIdStore.h
+index f5477afebce..194887fedee 100644
+--- a/SignalServiceKit/src/Storage/AxolotlStore/CallKitIdStore.h
++++ b/SignalServiceKit/src/Storage/AxolotlStore/CallKitIdStore.h
+@@ -1,27 +1,15 @@
+ //
+-//  Copyright (c) 2019 Open Whisper Systems. All rights reserved.
++//  Copyright (c) 2022 Open Whisper Systems. All rights reserved.
+ //
+ 
+ NS_ASSUME_NONNULL_BEGIN
+ 
+-@class SDSKeyValueStore;
+-@class SignalServiceAddress;
++@class TSThread;
+ 
+ @interface CallKitIdStore : NSObject
+ 
+-+ (SDSKeyValueStore *)phoneNumberStore;
+-+ (SDSKeyValueStore *)uuidStore;
+-
+-// phoneNumber is an e164 formatted phone number.
+-//
+-// callKitId is expected to have CallKitCallManager.kAnonymousCallHandlePrefix.
+-+ (void)setAddress:(SignalServiceAddress *)address forCallKitId:(NSString *)callKitId;
+-
+-// returns an e164 formatted phone number or nil if no
+-// record can be found.
+-//
+-// callKitId is expected to have CallKitCallManager.kAnonymousCallHandlePrefix.
+-+ (SignalServiceAddress *)addressForCallKitId:(NSString *)callKitId;
+++ (void)setThread:(TSThread *)thread forCallKitId:(NSString *)callKitId;
+++ (nullable TSThread *)threadForCallKitId:(NSString *)callKitId;
+ 
+ @end
+ 
+diff --git a/SignalServiceKit/src/Storage/AxolotlStore/CallKitIdStore.m b/SignalServiceKit/src/Storage/AxolotlStore/CallKitIdStore.m
+index e7519503238..7600111b31f 100644
+--- a/SignalServiceKit/src/Storage/AxolotlStore/CallKitIdStore.m
++++ b/SignalServiceKit/src/Storage/AxolotlStore/CallKitIdStore.m
+@@ -1,5 +1,5 @@
+ //
+-//  Copyright (c) 2021 Open Whisper Systems. All rights reserved.
++//  Copyright (c) 2022 Open Whisper Systems. All rights reserved.
+ //
+ 
+ #import "CallKitIdStore.h"
+@@ -21,42 +21,48 @@ + (SDSKeyValueStore *)uuidStore
+ 
+ #pragma mark -
+ 
+-+ (void)setAddress:(SignalServiceAddress *)address forCallKitId:(NSString *)callKitId
+++ (void)setThread:(TSThread *)thread forCallKitId:(NSString *)callKitId
+ {
+-    OWSAssertDebug(address.isValid);
+     OWSAssertDebug(callKitId.length > 0);
++    OWSAssertDebug([thread isKindOfClass:[TSContactThread class]]);
+ 
+     DatabaseStorageWrite(self.databaseStorage, ^(SDSAnyWriteTransaction *transaction) {
+-        if (address.phoneNumber) {
+-            [self.phoneNumberStore setString:address.phoneNumber key:callKitId transaction:transaction];
+-        } else {
++        SignalServiceAddress *address = [(TSContactThread *)thread contactAddress];
++        NSString *uuidString = address.uuidString;
++        if (uuidString) {
++            [self.uuidStore setString:uuidString key:callKitId transaction:transaction];
+             [self.phoneNumberStore removeValueForKey:callKitId transaction:transaction];
+-        }
+-
+-        if (address.uuidString) {
+-            [self.uuidStore setString:address.uuidString key:callKitId transaction:transaction];
+         } else {
++            OWSFailDebug(@"making a call to an address with no UUID: %@", address.phoneNumber);
++            [self.phoneNumberStore setString:address.phoneNumber key:callKitId transaction:transaction];
+             [self.uuidStore removeValueForKey:callKitId transaction:transaction];
+         }
+     });
+ }
+ 
+-+ (SignalServiceAddress *)addressForCallKitId:(NSString *)callKitId
+++ (nullable TSThread *)threadForCallKitId:(NSString *)callKitId
+ {
+     OWSAssertDebug(callKitId.length > 0);
+ 
+-    __block NSString *_Nullable phoneNumber;
+-    __block NSString *_Nullable uuidString;
++    __block TSThread *_Nullable result;
+     [self.databaseStorage readWithBlock:^(SDSAnyReadTransaction *transaction) {
+-        phoneNumber = [self.phoneNumberStore getString:callKitId transaction:transaction];
+-        uuidString = [self.uuidStore getString:callKitId transaction:transaction];
+-    }];
++        // Check for an ACI first, then phone numbers.
++        NSString *_Nullable uuidString = [self.uuidStore getString:callKitId transaction:transaction];
++        if (uuidString) {
++            SignalServiceAddress *address = [[SignalServiceAddress alloc] initWithUuidString:uuidString];
++            result = [TSContactThread getThreadWithContactAddress:address transaction:transaction];
++            return;
++        }
+ 
+-    if (!phoneNumber && !uuidString) {
+-        return nil;
+-    }
++        NSString *_Nullable phoneNumber = [self.phoneNumberStore getString:callKitId transaction:transaction];
++        if (phoneNumber) {
++            SignalServiceAddress *address = [[SignalServiceAddress alloc] initWithPhoneNumber:phoneNumber];
++            result = [TSContactThread getThreadWithContactAddress:address transaction:transaction];
++            return;
++        }
++    }];
+ 
+-    return [[SignalServiceAddress alloc] initWithUuidString:uuidString phoneNumber:phoneNumber];
++    return result;
+ }
+ 
+ @end

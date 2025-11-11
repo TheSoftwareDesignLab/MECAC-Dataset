@@ -1,0 +1,464 @@
+diff --git a/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/Nimbus.kt b/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/Nimbus.kt
+index d1f055bb57c2..4a730c05fe36 100644
+--- a/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/Nimbus.kt
++++ b/android-components/components/service/nimbus/src/main/java/mozilla/components/service/nimbus/Nimbus.kt
+@@ -15,11 +15,14 @@ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.asCoroutineDispatcher
+ import kotlinx.coroutines.launch
+ import mozilla.components.service.glean.Glean
+-import mozilla.components.support.base.log.Log
++import mozilla.components.support.base.log.logger.Logger
++import mozilla.components.support.base.observer.Observable
++import mozilla.components.support.base.observer.ObserverRegistry
+ import mozilla.components.support.locale.getLocaleTag
+ import org.mozilla.experiments.nimbus.AppContext
+ import org.mozilla.experiments.nimbus.AvailableRandomizationUnits
+ import org.mozilla.experiments.nimbus.EnrolledExperiment
++import org.mozilla.experiments.nimbus.ErrorException
+ import org.mozilla.experiments.nimbus.NimbusClient
+ import org.mozilla.experiments.nimbus.NimbusClientInterface
+ import org.mozilla.experiments.nimbus.RemoteSettingsConfig
+@@ -27,10 +30,15 @@ import java.io.File
+ import java.util.Locale
+ import java.util.concurrent.Executors
+ 
++private const val LOG_TAG = "service/Nimbus"
++private const val EXPERIMENT_BUCKET_NAME = "main"
++private const val EXPERIMENT_COLLECTION_NAME = "nimbus-mobile-experiments"
++private const val NIMBUS_DATA_DIR: String = "nimbus_data"
++
+ /**
+  * This is the main experiments API, which is exposed through the global [Nimbus] object.
+  */
+-interface NimbusApi {
++interface NimbusApi : Observable<NimbusApi.Observer> {
+     /**
+      * Get the list of currently enrolled experiments
+      *
+@@ -48,7 +56,8 @@ interface NimbusApi {
+     fun getExperimentBranch(experimentId: String): String?
+ 
+     /**
+-     * Refreshes the experiments from the endpoint
++     * Refreshes the experiments from the endpoint. Should be called at least once after
++     * initialization
+      */
+     fun updateExperiments()
+ 
+@@ -63,12 +72,24 @@ interface NimbusApi {
+      * Control the opt out for all experiments at once. This is likely a user action.
+      */
+     var globalUserParticipation: Boolean
+-}
+ 
+-private const val LOG_TAG = "service/Nimbus"
+-private const val EXPERIMENT_BUCKET_NAME = "main"
+-private const val EXPERIMENT_COLLECTION_NAME = "nimbus-mobile-experiments"
+-private const val NIMBUS_DATA_DIR: String = "nimbus_data"
++    /**
++     * Interface to be implemented by classes that want to observe experiment updates
++     */
++    interface Observer {
++        /**
++         * Event to indicate that the experiments have been fetched from the endpoint
++         */
++        fun onExperimentsFetched()
++
++        /**
++         * Event to indicate that the experiment enrollments have been applied. Multiple calls to
++         * get the active experiments will return the same value so this has limited usefulness for
++         * most feature developers
++         */
++        fun onUpdatesApplied(updated: List<EnrolledExperiment>)
++    }
++}
+ 
+ /**
+  * This class allows client apps to configure Nimbus to point to your own server.
+@@ -84,16 +105,17 @@ data class NimbusServerSettings(
+  */
+ class Nimbus(
+     context: Context,
+-    server: NimbusServerSettings?
+-) : NimbusApi {
++    server: NimbusServerSettings?,
++    private val delegate: Observable<NimbusApi.Observer> = ObserverRegistry()
++) : NimbusApi, Observable<NimbusApi.Observer> by delegate {
++
+     // Using a single threaded executor here to enforce synchronization where needed.
+     private val scope: CoroutineScope =
+         CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
+ 
+-    private val nimbus: NimbusClientInterface
+-    private var onExperimentUpdated: ((List<EnrolledExperiment>) -> Unit)? = null
+-
+-    private var isInitialized = false
++    private var nimbus: NimbusClientInterface
++    private var dataDir: File
++    private val logger = Logger(LOG_TAG)
+ 
+     override var globalUserParticipation: Boolean
+         get() = nimbus.getGlobalUserParticipation()
+@@ -106,6 +128,8 @@ class Nimbus(
+             "uniffi.component.nimbus.libraryOverride",
+             System.getProperty("mozilla.appservices.megazord.library", "megazord")
+         )
++        // Build a File object to represent the data directory for Nimbus data
++        dataDir = File(context.applicationInfo.dataDir, NIMBUS_DATA_DIR)
+ 
+         // Build Nimbus AppContext object to pass into initialize
+         val experimentContext = buildExperimentContext(context)
+@@ -140,55 +164,37 @@ class Nimbus(
+         )
+     }
+ 
+-    /**
+-     * Initialize the Nimbus SDK library.
+-     *
+-     * This should only be initialized once by the application.
+-     *
+-     * @param onExperimentUpdated callback that will be executed when the list of experiments has
+-     * been updated from the experiments endpoint and evaluated by the Nimbus-SDK. This is meant to
+-     * be used for consuming applications to perform any actions as a result of enrollment in an
+-     * experiment so that the application is not required to await the network request. The
+-     * callback will be supplied with the list of active experiments (if any) for which the client
+-     * is enrolled.
+-     */
+-    fun initialize(
+-        onExperimentUpdated: ((activeExperiments: List<EnrolledExperiment>) -> Unit)? = null
+-    ) {
+-        this.onExperimentUpdated = onExperimentUpdated
+-
+-        // Do initialization off of the main thread
+-        scope.launch {
+-            nimbus.updateExperiments()
+-
+-            // Get experiments
+-            val activeExperiments = nimbus.getActiveExperiments()
+-
+-            // Record enrollments in telemetry
+-            recordExperimentTelemetry(activeExperiments)
+-
+-            isInitialized = true
+-
+-            // Invoke the callback with the list of active experiments for the consuming app to
+-            // process.
+-            onExperimentUpdated?.invoke(activeExperiments)
+-        }
+-    }
+-
+     override fun getActiveExperiments(): List<EnrolledExperiment> =
+-        if (isInitialized) { nimbus.getActiveExperiments() } else { emptyList() }
++        nimbus.getActiveExperiments()
+ 
+     override fun getExperimentBranch(experimentId: String): String? =
+-        if (isInitialized) { nimbus.getExperimentBranch(experimentId) } else { null }
++        nimbus.getExperimentBranch(experimentId)
+ 
+     override fun updateExperiments() {
+-        if (!isInitialized) return
+-        nimbus.updateExperiments()
+-        onExperimentUpdated?.invoke(nimbus.getActiveExperiments())
++        scope.launch {
++            try {
++                nimbus.updateExperiments()
++
++                // Get the experiments to record in telemetry
++                nimbus.getActiveExperiments().let {
++                    if (it.any()) {
++                        recordExperimentTelemetry(it)
++                        // The current plan is to have the nimbus-sdk updateExperiments() function
++                        // return a diff of the experiments that have been received, at which point we
++                        // can emit the appropriate telemetry events and notify observers of just the
++                        // diff
++                        notifyObservers { onUpdatesApplied(it) }
++                    }
++                }
++            } catch (e: ErrorException.RequestError) {
++                logger.info("Error fetching experiments from endpoint: $e")
++            } catch (e: ErrorException.InvalidExperimentResponse) {
++                logger.info("Invalid experiment response: $e")
++            }
++        }
+     }
+ 
+     override fun optOut(experimentId: String) {
+-        if (!isInitialized) return
+         nimbus.optOut(experimentId)
+     }
+ 
+@@ -196,7 +202,6 @@ class Nimbus(
+     // force an experiment/branch enrollment.
+     @VisibleForTesting(otherwise = VisibleForTesting.NONE)
+     internal fun optInWithBranch(experiment: String, branch: String) {
+-        if (!isInitialized) return
+         nimbus.optInWithBranch(experiment, branch)
+     }
+ 
+@@ -217,24 +222,20 @@ class Nimbus(
+                 context.packageName, 0
+             )
+         } catch (e: PackageManager.NameNotFoundException) {
+-            Log.log(Log.Priority.ERROR,
+-                LOG_TAG,
+-                message = "Could not retrieve package info for appBuild and appVersion"
+-            )
+             null
+         }
+ 
+         return AppContext(
+-                appId = context.packageName,
+-                androidSdkVersion = Build.VERSION.SDK_INT.toString(),
+-                appBuild = packageInfo?.let { PackageInfoCompat.getLongVersionCode(it).toString() },
+-                appVersion = packageInfo?.versionName,
+-                architecture = Build.SUPPORTED_ABIS[0],
+-                debugTag = null,
+-                deviceManufacturer = Build.MANUFACTURER,
+-                deviceModel = Build.MODEL,
+-                locale = Locale.getDefault().getLocaleTag(),
+-                os = "Android",
+-                osVersion = Build.VERSION.RELEASE)
++            appId = context.packageName,
++            androidSdkVersion = Build.VERSION.SDK_INT.toString(),
++            appBuild = packageInfo?.let { PackageInfoCompat.getLongVersionCode(it).toString() },
++            appVersion = packageInfo?.versionName,
++            architecture = Build.SUPPORTED_ABIS[0],
++            debugTag = null,
++            deviceManufacturer = Build.MANUFACTURER,
++            deviceModel = Build.MODEL,
++            locale = Locale.getDefault().getLocaleTag(),
++            os = "Android",
++            osVersion = Build.VERSION.RELEASE)
+     }
+ }
+diff --git a/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/NimbusTest.kt b/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/NimbusTest.kt
+index ffb7822370f9..d5654e4aa406 100644
+--- a/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/NimbusTest.kt
++++ b/android-components/components/service/nimbus/src/test/java/mozilla/components/service/nimbus/NimbusTest.kt
+@@ -5,6 +5,7 @@
+ package mozilla.components.service.nimbus
+ 
+ import android.content.Context
++import android.net.Uri
+ import androidx.test.core.app.ApplicationProvider
+ import androidx.test.ext.junit.runners.AndroidJUnit4
+ import mozilla.components.concept.fetch.Client
+@@ -28,6 +29,8 @@ class NimbusTest {
+     private val context: Context
+         get() = ApplicationProvider.getApplicationContext()
+ 
++    private val nimbus = Nimbus(context, NimbusServerSettings(Uri.parse("https://example.com")))
++
+     @get:Rule
+     val gleanRule = GleanTestRule(context)
+ 
+@@ -53,10 +56,16 @@ class NimbusTest {
+             userFacingDescription = "A test experiment for testing experiments",
+             userFacingName = "Test Experiment"))
+ 
+-        val nimbus = Nimbus(context, null)
+         nimbus.recordExperimentTelemetry(experiments = enrolledExperiments)
+         assertTrue(Glean.testIsExperimentActive("test-experiment"))
+         val experimentData = Glean.testGetExperimentData("test-experiment")
+         assertEquals("test-branch", experimentData.branch)
+     }
++
++    @Test
++    fun `buildExperimentContext returns a valid context`() {
++        val expContext = nimbus.buildExperimentContext(context)
++        assertEquals("mozilla.components.service.nimbus.test", expContext.appId)
++        // If we could control more of the context here we might be able to better test it
++    }
+ }
+diff --git a/android-components/samples/glean/src/main/java/org/mozilla/samples/glean/ExperimentUpdateReceiver.kt b/android-components/samples/glean/src/main/java/org/mozilla/samples/glean/ExperimentUpdateReceiver.kt
+deleted file mode 100644
+index a2476d6deff4..000000000000
+--- a/android-components/samples/glean/src/main/java/org/mozilla/samples/glean/ExperimentUpdateReceiver.kt
++++ /dev/null
+@@ -1,45 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-package org.mozilla.samples.glean
+-
+-import android.content.BroadcastReceiver
+-import android.content.Context
+-import android.content.Intent
+-
+-/**
+- * Creates a [BroadcastReceiver] interface through which the MainActivity can receive notifications
+- * when the experiments are updated.  This is not relevant to the Glean SDK and is only important
+- * to the experiments library.
+- */
+-class ExperimentUpdateReceiver : BroadcastReceiver {
+-
+-    private var listener: ExperimentUpdateListener
+-
+-    /**
+-     * Secondary constructor which allows the listener to be passed in
+-     *
+-     * @param listener: The listener to notify when the experiment is updated.
+-     */
+-    constructor(listener: ExperimentUpdateListener) : super() {
+-        this.listener = listener
+-    }
+-
+-    /**
+-     * When the broadcast notification is received, calls the `onExperimentUpdated` on the listener
+-     */
+-    override fun onReceive(context: Context?, intent: Intent?) {
+-        listener.onExperimentsUpdated()
+-    }
+-
+-    /**
+-     * Public interface for the listener to implement
+-     */
+-    interface ExperimentUpdateListener {
+-        /**
+-         * Callback function that will be invoked when the experiments are updated.
+-         */
+-        fun onExperimentsUpdated()
+-    }
+-}
+diff --git a/android-components/samples/glean/src/main/java/org/mozilla/samples/glean/GleanApplication.kt b/android-components/samples/glean/src/main/java/org/mozilla/samples/glean/GleanApplication.kt
+index f2295ee793b1..a55ef6555a54 100644
+--- a/android-components/samples/glean/src/main/java/org/mozilla/samples/glean/GleanApplication.kt
++++ b/android-components/samples/glean/src/main/java/org/mozilla/samples/glean/GleanApplication.kt
+@@ -5,7 +5,6 @@
+ package org.mozilla.samples.glean
+ 
+ import android.app.Application
+-import android.content.Intent
+ import android.net.Uri
+ import mozilla.components.lib.fetch.httpurlconnection.HttpURLConnectionClient
+ import mozilla.components.service.glean.Glean
+@@ -58,9 +57,8 @@ class GleanApplication : Application() {
+     }
+ 
+     /**
+-     * Initialize the Nimbus experiments library and pass in the callback that will generate a
+-     * broadcast Intent to signal the application that experiments have been updated. This is
+-     * only relevant to the Nimbus library, aside from recording the experiment in Glean.
++     * Initialize the Nimbus experiments library. This is only relevant to the Nimbus library, aside
++     * from recording the experiment in Glean.
+      */
+     private fun initNimbus() {
+         RustLog.enable()
+@@ -69,11 +67,7 @@ class GleanApplication : Application() {
+         nimbus = Nimbus(this,
+             NimbusServerSettings(url)
+         ).also { nimbus ->
+-            nimbus.initialize {
+-                val intent = Intent()
+-                intent.action = "org.mozilla.samples.glean.experiments.updated"
+-                sendBroadcast(intent)
+-            }
++            nimbus.updateExperiments()
+         }
+     }
+ }
+diff --git a/android-components/samples/glean/src/main/java/org/mozilla/samples/glean/MainActivity.kt b/android-components/samples/glean/src/main/java/org/mozilla/samples/glean/MainActivity.kt
+index 3fe6329b1ea5..b22dedc503e1 100644
+--- a/android-components/samples/glean/src/main/java/org/mozilla/samples/glean/MainActivity.kt
++++ b/android-components/samples/glean/src/main/java/org/mozilla/samples/glean/MainActivity.kt
+@@ -4,11 +4,11 @@
+ 
+ package org.mozilla.samples.glean
+ 
+-import android.content.IntentFilter
+ import android.graphics.Color
+ import android.os.Bundle
+ import androidx.appcompat.app.AppCompatActivity
+ import kotlinx.android.synthetic.main.activity_main.*
++import mozilla.components.service.nimbus.NimbusApi
+ import org.mozilla.experiments.nimbus.EnrolledExperiment
+ import org.mozilla.samples.glean.GleanMetrics.BrowserEngagement
+ import org.mozilla.samples.glean.GleanMetrics.Test
+@@ -17,12 +17,7 @@ import org.mozilla.samples.glean.library.SamplesGleanLibrary
+ /**
+  * Main Activity of the glean-sample-app
+  */
+-open class MainActivity : AppCompatActivity(), ExperimentUpdateReceiver.ExperimentUpdateListener {
+-
+-    // This BroadcastReceiver and list are not relevant to the Glean SDK, but is relevant to the
+-    // Nimbus experiments library.
+-    private var experimentUpdateReceiver: ExperimentUpdateReceiver? = null
+-    private var activeExperiments: List<EnrolledExperiment> = listOf()
++open class MainActivity : AppCompatActivity(), NimbusApi.Observer {
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+@@ -60,16 +55,10 @@ open class MainActivity : AppCompatActivity(), ExperimentUpdateReceiver.Experime
+         SamplesGleanLibrary.recordMetric()
+         SamplesGleanLibrary.recordExperiment()
+ 
+-        // The following is not relevant to the Glean SDK, but to the Nimbus experiments library.
+-        // Set up the ExperimentUpdateReceiver to receive experiment updated Intents.
++        // The following is not relevant to the Glean SDK, but to the Nimbus experiments library
+         setupNimbusExperiments()
+     }
+ 
+-    override fun onDestroy() {
+-        super.onDestroy()
+-        unregisterReceiver(experimentUpdateReceiver)
+-    }
+-
+     /** Begin Nimbus component specific functions */
+ 
+     /**
+@@ -77,29 +66,28 @@ open class MainActivity : AppCompatActivity(), ExperimentUpdateReceiver.Experime
+      * button. This is not relevant to the Glean SDK, but to the Nimbus experiments library.
+      */
+     private fun setupNimbusExperiments() {
+-        experimentUpdateReceiver = ExperimentUpdateReceiver(this)
+-        val filter = IntentFilter()
+-        filter.addAction("org.mozilla.samples.glean.experiments.updated")
+-        registerReceiver(experimentUpdateReceiver, filter)
+-
+-        // Handle logic for the "test-color" experiment on click.
++        // Attach the click listener for the experiments button to the updateExperiments function
+         buttonCheckExperiments.setOnClickListener {
+-            onExperimentsUpdated()
++            GleanApplication.nimbus.updateExperiments()
+         }
++        // Register the main activity as a Nimbus observer
++        GleanApplication.nimbus.register(this)
++    }
++
++    /**
++     * Event to indicate that the experiments have been fetched from the endpoint
++     */
++    override fun onExperimentsFetched() {
++        println("Experiments fetched")
+     }
+ 
+     /**
+-     * This function will be called by the ExperimentUpdateListener interface when the experiments
+-     * are updated. This is not relevant to the Glean SDK, but to the Nimbus experiments library.
++     * Event to indicate that the experiment enrollments have been applied. Developers normally
++     * shouldn't care to observe this and rather rely on `onExperimentsFetched` and `withExperiment`
+      */
+-    override fun onExperimentsUpdated() {
+-        textViewExperimentStatus.setBackgroundColor(Color.WHITE)
+-        textViewExperimentStatus.text = getString(R.string.experiment_not_active)
+-
+-        val nimbus = GleanApplication.nimbus
+-        activeExperiments = nimbus.getActiveExperiments()
+-        if (activeExperiments.any { it.slug == "test-color" }) {
+-            val color = when (nimbus.getExperimentBranch("test-color")) {
++    override fun onUpdatesApplied(updated: List<EnrolledExperiment>) {
++        GleanApplication.nimbus.getExperimentBranch("test-color")?.let { branch ->
++            val color = when (branch) {
+                 "blue" -> Color.BLUE
+                 "red" -> Color.RED
+                 "control" -> Color.DKGRAY
+@@ -111,7 +99,7 @@ open class MainActivity : AppCompatActivity(), ExperimentUpdateReceiver.Experime
+                 textViewExperimentStatus.setBackgroundColor(color)
+                 textViewExperimentStatus.text = getString(
+                     R.string.experiment_active_branch,
+-                    "Experiment Branch: ${nimbus.getExperimentBranch("test-color")}")
++                    "Experiment Branch: $branch")
+             }
+         }
+     }

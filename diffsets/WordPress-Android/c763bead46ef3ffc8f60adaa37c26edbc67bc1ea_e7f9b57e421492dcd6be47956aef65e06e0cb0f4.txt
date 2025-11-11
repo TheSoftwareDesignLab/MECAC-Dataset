@@ -1,0 +1,333 @@
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/reader/ReaderFragment.kt b/WordPress/src/main/java/org/wordpress/android/ui/reader/ReaderFragment.kt
+index e692f05a4288..474ef518d722 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/reader/ReaderFragment.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/reader/ReaderFragment.kt
+@@ -14,6 +14,7 @@ import androidx.compose.ui.platform.ViewCompositionStrategy
+ import androidx.core.view.isVisible
+ import androidx.fragment.app.Fragment
+ import androidx.lifecycle.ViewModelProvider
++import androidx.lifecycle.ViewModelStoreOwner
+ import androidx.recyclerview.widget.RecyclerView
+ import dagger.hilt.android.AndroidEntryPoint
+ import org.greenrobot.eventbus.EventBus
+@@ -47,7 +48,7 @@ import org.wordpress.android.ui.reader.subfilter.ActionType.OpenSuggestedTagsPag
+ import org.wordpress.android.ui.reader.subfilter.BottomSheetUiState
+ import org.wordpress.android.ui.reader.subfilter.BottomSheetUiState.BottomSheetVisible
+ import org.wordpress.android.ui.reader.subfilter.SubFilterViewModel
+-import org.wordpress.android.ui.reader.subfilter.SubFilterViewModelOwner
++import org.wordpress.android.ui.reader.subfilter.SubFilterViewModelProvider
+ import org.wordpress.android.ui.reader.subfilter.SubfilterCategory
+ import org.wordpress.android.ui.reader.subfilter.SubfilterListItem
+ import org.wordpress.android.ui.reader.viewmodels.ReaderViewModel
+@@ -71,7 +72,7 @@ import javax.inject.Inject
+ 
+ @AndroidEntryPoint
+ class ReaderFragment : Fragment(R.layout.reader_fragment_layout), ScrollableViewInitializedListener,
+-    OnScrollToTopListener, SubFilterViewModelOwner {
++    OnScrollToTopListener, SubFilterViewModelProvider {
+     @Inject
+     lateinit var viewModelFactory: ViewModelProvider.Factory
+ 
+@@ -415,6 +416,20 @@ class ReaderFragment : Fragment(R.layout.reader_fragment_layout), ScrollableView
+         }
+     }
+ 
++    /**
++     * The owner of the SubFilterViewModel should be the current feed Fragment, so it can be properly cleared when the
++     * feed is changed, since it will be properly tied to the expected feed Fragment lifecycle instead of the
++     * [ReaderFragment] lifecycle.
++     *
++     * This method exists mainly for readability purposes and to avoid passing the Fragment as a parameter.
++     *
++     * Note: it can cause a crash if the current feed Fragment is not available for any reason, which should never
++     * happen since the calling methods are always called by the feed Fragment or their children.
++     */
++    private fun getSubFilterViewModelOwner(): ViewModelStoreOwner {
++        return getCurrentFeedFragment() as ViewModelStoreOwner
++    }
++
+     private fun getSubFilterViewModel(): SubFilterViewModel? {
+         val selectedTag = (viewModel.uiState.value as? ContentUiState)?.selectedReaderTag ?: return null
+         return getSubFilterViewModelForTag(selectedTag)
+@@ -425,38 +440,20 @@ class ReaderFragment : Fragment(R.layout.reader_fragment_layout), ScrollableView
+      * should only be used for getting a ViewModel that's already been started.
+      */
+     override fun getSubFilterViewModelForKey(key: String): SubFilterViewModel {
+-        return ViewModelProvider(this, viewModelFactory)[key, SubFilterViewModel::class.java]
++        return ViewModelProvider(getSubFilterViewModelOwner(), viewModelFactory)[key, SubFilterViewModel::class.java]
+     }
+ 
+     override fun getSubFilterViewModelForTag(tag: ReaderTag, savedInstanceState: Bundle?): SubFilterViewModel {
+-        // TODO thomashortadev now that this Fragment owns the SubFilterViewModel, it lives longer than the context
+-        //  that uses it (selected feed), so we need to make sure it's properly cleared when the feed is changed.
+-        //  OR maybe we can set the owner to be the current feed Fragment but have this ReaderFragment manage the
+-        //  retrieval and initialization of the SubFilterViewModel. 🤔
+-
+-        return ViewModelProvider(this, viewModelFactory)[
++        return ViewModelProvider(getSubFilterViewModelOwner(), viewModelFactory)[
+             SubFilterViewModel.getViewModelKeyForTag(tag),
+             SubFilterViewModel::class.java
+         ].also {
+             it.initSubFilterViewModel(tag, savedInstanceState)
+-
+-            if (tag.isFilterable) {
+-                it.updateTagsAndSites()
+-            } else {
+-                viewModel.hideTopBarFilterGroup(tag)
+-            }
+         }
+     }
+ 
+     private fun SubFilterViewModel.initSubFilterViewModel(startedTag: ReaderTag, savedInstanceState: Bundle?) {
+-        if (isStarted) return
+-
+-        val wpMainActivityViewModel = ViewModelProvider(
+-            requireActivity(),
+-            viewModelFactory
+-        )[WPMainActivityViewModel::class.java]
+-
+-        val viewModelKey = SubFilterViewModel.getViewModelKeyForTag(startedTag)
++        setupSubFilterBottomSheetObservers(startedTag)
+ 
+         currentSubFilter.observe(
+             viewLifecycleOwner
+@@ -465,6 +462,44 @@ class ReaderFragment : Fragment(R.layout.reader_fragment_layout), ScrollableView
+             viewModel.onSubFilterItemSelected(subfilterListItem)
+         }
+ 
++
++        updateTagsAndSites.observe(
++            viewLifecycleOwner
++        ) { event: Event<EnumSet<UpdateTask>> ->
++            event.applyIfNotHandled {
++                if (NetworkUtils.isNetworkAvailable(activity)) {
++                    ReaderUpdateServiceStarter.startService(activity, this)
++                }
++            }
++        }
++
++        if (startedTag.isFilterable) {
++            subFilters.observe(
++                viewLifecycleOwner
++            ) { subFilters: List<SubfilterListItem> ->
++                viewModel.showTopBarFilterGroup(
++                    startedTag,
++                    subFilters
++                )
++            }
++
++            updateTagsAndSites()
++        } else {
++            viewModel.hideTopBarFilterGroup(startedTag)
++        }
++
++        // thomashortadev: not sure if always passing the same tags can cause problems
++        start(startedTag, startedTag, savedInstanceState)
++    }
++
++    private fun SubFilterViewModel.setupSubFilterBottomSheetObservers(startedTag: ReaderTag) {
++        val wpMainActivityViewModel = ViewModelProvider(
++            requireActivity(),
++            viewModelFactory
++        )[WPMainActivityViewModel::class.java]
++
++        val viewModelKey = SubFilterViewModel.getViewModelKeyForTag(startedTag)
++
+         bottomSheetUiState.observe(
+             viewLifecycleOwner
+         ) { event: Event<BottomSheetUiState> ->
+@@ -514,30 +549,6 @@ class ReaderFragment : Fragment(R.layout.reader_fragment_layout), ScrollableView
+                 }
+             }
+         }
+-
+-        updateTagsAndSites.observe(
+-            viewLifecycleOwner
+-        ) { event: Event<EnumSet<UpdateTask>> ->
+-            event.applyIfNotHandled {
+-                if (NetworkUtils.isNetworkAvailable(activity)) {
+-                    ReaderUpdateServiceStarter.startService(activity, this)
+-                }
+-            }
+-        }
+-
+-        if (startedTag.isFilterable) {
+-            subFilters.observe(
+-                viewLifecycleOwner
+-            ) { subFilters: List<SubfilterListItem> ->
+-                viewModel.showTopBarFilterGroup(
+-                    startedTag,
+-                    subFilters
+-                )
+-            }
+-        }
+-
+-        // TODO thomashortadev not sure if always passing the same tags can cause problems
+-        start(startedTag, startedTag, savedInstanceState)
+     }
+ 
+     companion object {
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/reader/ReaderPostListFragment.java b/WordPress/src/main/java/org/wordpress/android/ui/reader/ReaderPostListFragment.java
+index cf8c0d4f0de1..822a2aa2f2be 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/reader/ReaderPostListFragment.java
++++ b/WordPress/src/main/java/org/wordpress/android/ui/reader/ReaderPostListFragment.java
+@@ -110,7 +110,7 @@
+ import org.wordpress.android.ui.reader.services.update.ReaderUpdateServiceStarter;
+ import org.wordpress.android.ui.reader.services.update.TagUpdateClientUtilsProvider;
+ import org.wordpress.android.ui.reader.subfilter.SubFilterViewModel;
+-import org.wordpress.android.ui.reader.subfilter.SubFilterViewModelOwner;
++import org.wordpress.android.ui.reader.subfilter.SubFilterViewModelProvider;
+ import org.wordpress.android.ui.reader.subfilter.SubfilterListItem.Site;
+ import org.wordpress.android.ui.reader.subfilter.SubfilterListItem.SiteAll;
+ import org.wordpress.android.ui.reader.tracker.ReaderTracker;
+@@ -601,7 +601,7 @@ private void addWebViewCachingFragment(Long blogId, Long postId) {
+     }
+ 
+     private void initSubFilterViewModel(@Nullable Bundle savedInstanceState) {
+-        mSubFilterViewModel = SubFilterViewModelOwner.
++        mSubFilterViewModel = SubFilterViewModelProvider.
+                 getSubFilterViewModelForTag(this, mTagFragmentStartedWith, savedInstanceState);
+ 
+         mSubFilterViewModel.getCurrentSubFilter().observe(getViewLifecycleOwner(), subfilterListItem -> {
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/reader/ReaderTagsFeedFragment.kt b/WordPress/src/main/java/org/wordpress/android/ui/reader/ReaderTagsFeedFragment.kt
+index 3e23b650e730..80897531c895 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/reader/ReaderTagsFeedFragment.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/reader/ReaderTagsFeedFragment.kt
+@@ -34,7 +34,7 @@ import org.wordpress.android.ui.ViewPagerFragment
+ import org.wordpress.android.ui.compose.theme.AppThemeWithoutBackground
+ import org.wordpress.android.ui.main.WPMainActivity
+ import org.wordpress.android.ui.reader.subfilter.SubFilterViewModel
+-import org.wordpress.android.ui.reader.subfilter.SubFilterViewModelOwner
++import org.wordpress.android.ui.reader.subfilter.SubFilterViewModelProvider
+ import org.wordpress.android.ui.reader.subfilter.SubfilterListItem
+ import org.wordpress.android.ui.reader.viewmodels.ReaderTagsFeedViewModel
+ import org.wordpress.android.ui.reader.viewmodels.ReaderViewModel
+@@ -88,7 +88,7 @@ class ReaderTagsFeedFragment : ViewPagerFragment(R.layout.reader_tag_feed_fragme
+     }
+ 
+     private fun initViewModels(savedInstanceState: Bundle?) {
+-        subFilterViewModel = SubFilterViewModelOwner.getSubFilterViewModelForTag(this, tagsFeedTag, savedInstanceState)
++        subFilterViewModel = SubFilterViewModelProvider.getSubFilterViewModelForTag(this, tagsFeedTag, savedInstanceState)
+ 
+         subFilterViewModel.subFilters.observe(viewLifecycleOwner) { subFilters ->
+             val tags = subFilters.filterIsInstance<SubfilterListItem.Tag>().map { it.tag }
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/reader/SubfilterBottomSheetFragment.kt b/WordPress/src/main/java/org/wordpress/android/ui/reader/SubfilterBottomSheetFragment.kt
+index d783046708de..262c6f2d119d 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/reader/SubfilterBottomSheetFragment.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/reader/SubfilterBottomSheetFragment.kt
+@@ -18,7 +18,7 @@ import org.wordpress.android.R
+ import org.wordpress.android.WordPress
+ import org.wordpress.android.ui.reader.subfilter.ActionType
+ import org.wordpress.android.ui.reader.subfilter.SubFilterViewModel
+-import org.wordpress.android.ui.reader.subfilter.SubFilterViewModelOwner
++import org.wordpress.android.ui.reader.subfilter.SubFilterViewModelProvider
+ import org.wordpress.android.ui.reader.subfilter.SubfilterCategory
+ import org.wordpress.android.ui.reader.subfilter.SubfilterCategory.SITES
+ import org.wordpress.android.ui.reader.subfilter.SubfilterCategory.TAGS
+@@ -75,7 +75,7 @@ class SubfilterBottomSheetFragment : BottomSheetDialogFragment() {
+             return
+         }
+ 
+-        viewModel = SubFilterViewModelOwner.getSubFilterViewModelForKey(this, subfilterVmKey)
++        viewModel = SubFilterViewModelProvider.getSubFilterViewModelForKey(this, subfilterVmKey)
+ 
+         // TODO remove the pager and support only one category
+         val pager = view.findViewById<ViewPager>(R.id.view_pager)
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/reader/subfilter/SubFilterViewModelOwner.kt b/WordPress/src/main/java/org/wordpress/android/ui/reader/subfilter/SubFilterViewModelProvider.kt
+similarity index 71%
+rename from WordPress/src/main/java/org/wordpress/android/ui/reader/subfilter/SubFilterViewModelOwner.kt
+rename to WordPress/src/main/java/org/wordpress/android/ui/reader/subfilter/SubFilterViewModelProvider.kt
+index 1745275b8085..33057daf33cd 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/reader/subfilter/SubFilterViewModelOwner.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/reader/subfilter/SubFilterViewModelProvider.kt
+@@ -4,15 +4,15 @@ import android.os.Bundle
+ import androidx.fragment.app.Fragment
+ import org.wordpress.android.models.ReaderTag
+ 
+-interface SubFilterViewModelOwner {
++interface SubFilterViewModelProvider {
+     fun getSubFilterViewModelForKey(key: String): SubFilterViewModel
+     fun getSubFilterViewModelForTag(tag: ReaderTag, savedInstanceState: Bundle? = null): SubFilterViewModel
+ 
+     companion object {
+         /**
+          * Helper function to get the [SubFilterViewModel] for a given [ReaderTag] from a [Fragment]. Note that the
+-         * [Fragment] must be a child or descendant of a Fragment that implements [SubFilterViewModelOwner], otherwise
+-         * this function will throw an [IllegalStateException].
++         * [Fragment] must be a child or descendant of a Fragment that implements [SubFilterViewModelProvider],
++         * otherwise this function will throw an [IllegalStateException].
+          *
+          * @param fragment the [Fragment] to get the [SubFilterViewModel] from
+          * @param tag the [ReaderTag] to get the [SubFilterViewModel] for
+@@ -27,25 +27,25 @@ interface SubFilterViewModelOwner {
+             savedInstanceState: Bundle? = null
+         ): SubFilterViewModel {
+             // traverse the parent fragment hierarchy to find the SubFilterViewModelOwner
+-            var possibleOwner: Fragment? = fragment
+-            while (possibleOwner != null) {
+-                if (possibleOwner is SubFilterViewModelOwner) {
+-                    return possibleOwner.getSubFilterViewModelForTag(tag, savedInstanceState)
++            var possibleProvider: Fragment? = fragment
++            while (possibleProvider != null) {
++                if (possibleProvider is SubFilterViewModelProvider) {
++                    return possibleProvider.getSubFilterViewModelForTag(tag, savedInstanceState)
+                 }
+-                possibleOwner = possibleOwner.parentFragment
++                possibleProvider = possibleProvider.parentFragment
+             }
+             error("Fragment must be a child or descendant of a Fragment that implements SubFilterViewModelOwner")
+         }
+ 
+         /**
+          * Helper function to get the [SubFilterViewModel] for a given key from a [Fragment]. Note that the [Fragment]
+-         * must be a child or descendant of a Fragment that implements [SubFilterViewModelOwner], otherwise this
++         * must be a child or descendant of a Fragment that implements [SubFilterViewModelProvider], otherwise this
+          * function will throw an [IllegalStateException].
+          *
+          * @param fragment the [Fragment] to get the [SubFilterViewModel] from
+          * @param key the key to get the [SubFilterViewModel] for
+          * @return the [SubFilterViewModel] for the given key, or null if the [Fragment] is not a child or descendant
+-         * of a Fragment that implements [SubFilterViewModelOwner]
++         * of a Fragment that implements [SubFilterViewModelProvider]
+          */
+         @JvmStatic
+         fun getSubFilterViewModelForKey(
+@@ -53,12 +53,12 @@ interface SubFilterViewModelOwner {
+             key: String,
+         ): SubFilterViewModel {
+             // traverse the parent fragment hierarchy to find the SubFilterViewModelOwner
+-            var possibleOwner: Fragment? = fragment
+-            while (possibleOwner != null) {
+-                if (possibleOwner is SubFilterViewModelOwner) {
+-                    return possibleOwner.getSubFilterViewModelForKey(key)
++            var possibleProvider: Fragment? = fragment
++            while (possibleProvider != null) {
++                if (possibleProvider is SubFilterViewModelProvider) {
++                    return possibleProvider.getSubFilterViewModelForKey(key)
+                 }
+-                possibleOwner = possibleOwner.parentFragment
++                possibleProvider = possibleProvider.parentFragment
+             }
+             error("Fragment must be a child or descendant of a Fragment that implements SubFilterViewModelOwner")
+         }
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/reader/subfilter/SubfilterPageFragment.kt b/WordPress/src/main/java/org/wordpress/android/ui/reader/subfilter/SubfilterPageFragment.kt
+index c739f3253ef3..120886d85947 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/reader/subfilter/SubfilterPageFragment.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/reader/subfilter/SubfilterPageFragment.kt
+@@ -14,7 +14,6 @@ import androidx.fragment.app.Fragment
+ import androidx.fragment.app.FragmentManager
+ import androidx.fragment.app.FragmentPagerAdapter
+ import androidx.lifecycle.ViewModelProvider
+-import androidx.lifecycle.ViewModelStoreOwner
+ import androidx.recyclerview.widget.LinearLayoutManager
+ import androidx.recyclerview.widget.RecyclerView
+ import dagger.hilt.android.AndroidEntryPoint
+@@ -101,7 +100,7 @@ class SubfilterPageFragment : Fragment() {
+         primaryButton = emptyStateContainer.findViewById(R.id.action_button_primary)
+         secondaryButton = emptyStateContainer.findViewById(R.id.action_button_secondary)
+ 
+-        subFilterViewModel = SubFilterViewModelOwner.getSubFilterViewModelForKey(this, subfilterVmKey)
++        subFilterViewModel = SubFilterViewModelProvider.getSubFilterViewModelForKey(this, subfilterVmKey)
+ 
+         subFilterViewModel.subFilters.observe(viewLifecycleOwner) {
+             (recyclerView.adapter as? SubfilterListAdapter)?.let { adapter ->

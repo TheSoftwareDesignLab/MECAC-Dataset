@@ -1,0 +1,649 @@
+diff --git a/packages/smooth_app/lib/background/abstract_background_task.dart b/packages/smooth_app/lib/background/abstract_background_task.dart
+index 6d93cbc3a5dd..a497d0b0efb8 100644
+--- a/packages/smooth_app/lib/background/abstract_background_task.dart
++++ b/packages/smooth_app/lib/background/abstract_background_task.dart
+@@ -7,6 +7,7 @@ import 'package:smooth_app/background/background_task_details.dart';
+ import 'package:smooth_app/background/background_task_image.dart';
+ import 'package:smooth_app/background/background_task_manager.dart';
+ import 'package:smooth_app/background/background_task_refresh_later.dart';
++import 'package:smooth_app/background/background_task_unselect.dart';
+ import 'package:smooth_app/database/local_database.dart';
+ import 'package:smooth_app/generic_lib/duration_constants.dart';
+ import 'package:smooth_app/pages/product/common/product_refresher.dart';
+@@ -45,6 +46,7 @@ abstract class AbstractBackgroundTask {
+   static AbstractBackgroundTask? fromJson(final Map<String, dynamic> map) =>
+       BackgroundTaskDetails.fromJson(map) ??
+       BackgroundTaskImage.fromJson(map) ??
++      BackgroundTaskUnselect.fromJson(map) ??
+       BackgroundTaskRefreshLater.fromJson(map);
+ 
+   /// Executes the background task: upload, download, update locally.
+diff --git a/packages/smooth_app/lib/background/background_task_manager.dart b/packages/smooth_app/lib/background/background_task_manager.dart
+index b053849aa755..31ccf3d22951 100644
+--- a/packages/smooth_app/lib/background/background_task_manager.dart
++++ b/packages/smooth_app/lib/background/background_task_manager.dart
+@@ -221,7 +221,7 @@ class BackgroundTaskManager {
+     _debugPrint('get all tasks/0');
+     final List<AbstractBackgroundTask> result = <AbstractBackgroundTask>[];
+     final List<String> list = localDatabase.getAllTaskIds();
+-    final List<String> duplicateTaskIds = <String>[];
++    final List<String> removeTaskIds = <String>[];
+     if (list.isEmpty) {
+       return result;
+     }
+@@ -229,10 +229,12 @@ class BackgroundTaskManager {
+       final AbstractBackgroundTask? task = _get(taskId);
+       if (task == null) {
+         // unexpected, but let's remove that null task anyway.
+-        await _finishTask(taskId);
++        _debugPrint('get all tasks/unexpected/$taskId');
++        removeTaskIds.add(taskId);
+         continue;
+       }
+       if (!task.mayRunNow()) {
++        _debugPrint('get all tasks/maynotrun/$taskId');
+         // let's ignore this task: it's not supposed to be run now.
+         continue;
+       }
+@@ -248,7 +250,7 @@ class BackgroundTaskManager {
+           if (result[i].stamp == stamp) {
+             final String removeTaskId = result[i].uniqueId;
+             _debugPrint('duplicate stamp, task $removeTaskId being removed...');
+-            duplicateTaskIds.add(removeTaskId);
++            removeTaskIds.add(removeTaskId);
+             removeMe = i;
+             break;
+           }
+@@ -261,7 +263,7 @@ class BackgroundTaskManager {
+       }
+       result.add(task);
+     }
+-    for (final String taskId in duplicateTaskIds) {
++    for (final String taskId in removeTaskIds) {
+       await _finishTask(taskId);
+     }
+     _debugPrint('get all tasks returned (begin)');
+diff --git a/packages/smooth_app/lib/background/background_task_unselect.dart b/packages/smooth_app/lib/background/background_task_unselect.dart
+new file mode 100644
+index 000000000000..ec8716f4a904
+--- /dev/null
++++ b/packages/smooth_app/lib/background/background_task_unselect.dart
+@@ -0,0 +1,175 @@
++import 'dart:convert';
++
++import 'package:flutter/material.dart';
++import 'package:flutter_gen/gen_l10n/app_localizations.dart';
++import 'package:openfoodfacts/openfoodfacts.dart';
++import 'package:provider/provider.dart';
++import 'package:smooth_app/background/abstract_background_task.dart';
++import 'package:smooth_app/background/background_task_image.dart';
++import 'package:smooth_app/background/background_task_refresh_later.dart';
++import 'package:smooth_app/data_models/operation_type.dart';
++import 'package:smooth_app/database/local_database.dart';
++import 'package:smooth_app/query/product_query.dart';
++
++/// Background task about unselecting a product image.
++class BackgroundTaskUnselect extends AbstractBackgroundTask {
++  const BackgroundTaskUnselect._({
++    required super.processName,
++    required super.uniqueId,
++    required super.barcode,
++    required super.languageCode,
++    required super.user,
++    required super.country,
++    required super.stamp,
++    required this.imageField,
++  });
++
++  BackgroundTaskUnselect._fromJson(Map<String, dynamic> json)
++      : this._(
++          processName: json['processName'] as String,
++          uniqueId: json['uniqueId'] as String,
++          barcode: json['barcode'] as String,
++          languageCode: json['languageCode'] as String,
++          user: json['user'] as String,
++          country: json['country'] as String,
++          imageField: json['imageField'] as String,
++          stamp: json['stamp'] as String,
++        );
++
++  /// Task ID.
++  static const String _PROCESS_NAME = 'IMAGE_UNSELECT';
++
++  static const OperationType _operationType = OperationType.unselect;
++
++  final String imageField;
++
++  @override
++  Map<String, dynamic> toJson() => <String, dynamic>{
++        'processName': processName,
++        'uniqueId': uniqueId,
++        'barcode': barcode,
++        'languageCode': languageCode,
++        'user': user,
++        'country': country,
++        'imageField': imageField,
++        'stamp': stamp,
++      };
++
++  /// Returns the deserialized background task if possible, or null.
++  static AbstractBackgroundTask? fromJson(final Map<String, dynamic> map) {
++    try {
++      final AbstractBackgroundTask result =
++          BackgroundTaskUnselect._fromJson(map);
++      if (result.processName == _PROCESS_NAME) {
++        return result;
++      }
++    } catch (e) {
++      //
++    }
++    return null;
++  }
++
++  /// Adds the background task about unselecting a product image.
++  static Future<void> addTask(
++    final String barcode, {
++    required final ImageField imageField,
++    required final State<StatefulWidget> widget,
++  }) async {
++    final LocalDatabase localDatabase = widget.context.read<LocalDatabase>();
++    final String uniqueId = await _operationType.getNewKey(
++      localDatabase,
++      barcode,
++    );
++    final AbstractBackgroundTask task = _getNewTask(
++      barcode,
++      imageField,
++      uniqueId,
++    );
++    await task.addToManager(localDatabase, widget: widget);
++  }
++
++  @override
++  String? getSnackBarMessage(final AppLocalizations appLocalizations) =>
++      appLocalizations.product_task_background_schedule;
++
++  /// Returns a new background task about unselecting a product image.
++  static BackgroundTaskUnselect _getNewTask(
++    final String barcode,
++    final ImageField imageField,
++    final String uniqueId,
++  ) =>
++      BackgroundTaskUnselect._(
++        uniqueId: uniqueId,
++        barcode: barcode,
++        processName: _PROCESS_NAME,
++        imageField: imageField.offTag,
++        languageCode: ProductQuery.getLanguage().code,
++        user: jsonEncode(ProductQuery.getUser().toJson()),
++        country: ProductQuery.getCountry()!.offTag,
++        // same stamp as image upload
++        stamp: BackgroundTaskImage.getStamp(
++          barcode,
++          imageField.offTag,
++          ProductQuery.getLanguage().code,
++        ),
++      );
++
++  @override
++  Future<void> preExecute(final LocalDatabase localDatabase) async =>
++      localDatabase.upToDate.addChange(uniqueId, _getUnselectedProduct());
++
++  @override
++  Future<void> postExecute(
++    final LocalDatabase localDatabase,
++    final bool success,
++  ) async {
++    localDatabase.upToDate.terminate(uniqueId);
++    localDatabase.notifyListeners();
++    if (success) {
++      await BackgroundTaskRefreshLater.addTask(
++        barcode,
++        localDatabase: localDatabase,
++      );
++    }
++  }
++
++  /// Unselects the product image.
++  @override
++  Future<void> upload() async => OpenFoodAPIClient.unselectProductImage(
++        barcode: barcode,
++        imageField: ImageField.fromOffTag(imageField)!,
++        language: getLanguage(),
++        user: getUser(),
++      );
++
++  /// Returns a product with "unselected" image.
++  ///
++  /// The problem is that `null` may mean both
++  /// * "I don't change this value"
++  /// * "I change the value to null"
++  /// Here we put an empty string instead, to be understood as "force to null!".
++  Product _getUnselectedProduct() {
++    final Product result = Product(barcode: barcode);
++    switch (ImageField.fromOffTag(imageField)!) {
++      case ImageField.FRONT:
++        result.imageFrontUrl = '';
++        result.imageFrontSmallUrl = '';
++        break;
++      case ImageField.INGREDIENTS:
++        result.imageIngredientsUrl = '';
++        result.imageIngredientsSmallUrl = '';
++        break;
++      case ImageField.NUTRITION:
++        result.imageNutritionUrl = '';
++        result.imageNutritionSmallUrl = '';
++        break;
++      case ImageField.PACKAGING:
++        result.imagePackagingUrl = '';
++        result.imagePackagingSmallUrl = '';
++        break;
++      case ImageField.OTHER:
++      // We do nothing. Actually we're not supposed to unselect other images.
++    }
++    return result;
++  }
++}
+diff --git a/packages/smooth_app/lib/data_models/operation_type.dart b/packages/smooth_app/lib/data_models/operation_type.dart
+index 6c100c0c1a43..a45b13e596cf 100644
+--- a/packages/smooth_app/lib/data_models/operation_type.dart
++++ b/packages/smooth_app/lib/data_models/operation_type.dart
+@@ -1,3 +1,4 @@
++import 'package:flutter_gen/gen_l10n/app_localizations.dart';
+ import 'package:smooth_app/database/dao_int.dart';
+ import 'package:smooth_app/database/dao_transient_operation.dart';
+ import 'package:smooth_app/database/local_database.dart';
+@@ -12,6 +13,7 @@ import 'package:smooth_app/helpers/database_helper.dart';
+ /// * possibly, which barcode (not useful yet)
+ enum OperationType {
+   image('I'),
++  unselect('U'),
+   refreshLater('R'),
+   details('D');
+ 
+@@ -37,6 +39,19 @@ enum OperationType {
+   bool matches(final TransientOperation action) =>
+       action.key.startsWith('$header$_transientHeaderSeparator');
+ 
++  String getLabel(final AppLocalizations appLocalizations) {
++    switch (this) {
++      case OperationType.details:
++        return appLocalizations.background_task_operation_details;
++      case OperationType.image:
++        return appLocalizations.background_task_operation_image;
++      case OperationType.unselect:
++        return 'Unselect a product image';
++      case OperationType.refreshLater:
++        return 'Waiting 10 min before refreshing product to get all automatic edits';
++    }
++  }
++
+   static int getSequentialId(final TransientOperation operation) {
+     final List<String> keyItems =
+         operation.key.split(_transientHeaderSeparator);
+diff --git a/packages/smooth_app/lib/data_models/up_to_date_changes.dart b/packages/smooth_app/lib/data_models/up_to_date_changes.dart
+index 1606dec299dd..5cd72eb08a11 100644
+--- a/packages/smooth_app/lib/data_models/up_to_date_changes.dart
++++ b/packages/smooth_app/lib/data_models/up_to_date_changes.dart
+@@ -13,14 +13,13 @@ class UpToDateChanges {
+   /// For a barcode, map of the actions (pending and done).
+   final DaoTransientOperation _daoTransientProduct;
+ 
+-  OperationType get taskActionable => OperationType.details;
+-
+   /// Returns all the actions related to a barcode, sorted by id.
+   Iterable<TransientOperation> getSortedOperations(final String barcode) {
+     final List<TransientOperation> result = <TransientOperation>[];
+     for (final TransientOperation transientProduct
+         in _daoTransientProduct.getAll(barcode)) {
+-      if (taskActionable.matches(transientProduct)) {
++      if (OperationType.details.matches(transientProduct) ||
++          OperationType.unselect.matches(transientProduct)) {
+         result.add(transientProduct);
+       }
+     }
+@@ -57,7 +56,6 @@ class UpToDateChanges {
+   /// Currently limited to the fields modified by
+   /// * [BackgroundTaskDetails]
+   /// * [BackgroundTaskImage]
+-  // TODO(monsieurtanuki): refactor this "à la copyWith" or something like that
+   Product _overwrite(final Product initial, final Product change) {
+     if (change.productName != null) {
+       initial.productName = change.productName;
+@@ -118,29 +116,49 @@ class UpToDateChanges {
+     if (change.countriesTagsInLanguages != null) {
+       initial.countriesTagsInLanguages = change.countriesTagsInLanguages;
+     }
++
++    /// In some cases we want to force null; we do that with an empty String.
++    String? emptyMeansNull(final String value) => value.isEmpty ? null : value;
++
+     if (change.imageFrontUrl != null) {
+-      initial.imageFrontUrl = change.imageFrontUrl;
++      initial.imageFrontUrl = emptyMeansNull(
++        change.imageFrontUrl!,
++      );
+     }
+     if (change.imageFrontSmallUrl != null) {
+-      initial.imageFrontSmallUrl = change.imageFrontSmallUrl;
++      initial.imageFrontSmallUrl = emptyMeansNull(
++        change.imageFrontSmallUrl!,
++      );
+     }
+     if (change.imageIngredientsUrl != null) {
+-      initial.imageIngredientsUrl = change.imageIngredientsUrl;
++      initial.imageIngredientsUrl = emptyMeansNull(
++        change.imageIngredientsUrl!,
++      );
+     }
+     if (change.imageIngredientsSmallUrl != null) {
+-      initial.imageIngredientsSmallUrl = change.imageIngredientsSmallUrl;
++      initial.imageIngredientsSmallUrl = emptyMeansNull(
++        change.imageIngredientsSmallUrl!,
++      );
+     }
+     if (change.imageNutritionUrl != null) {
+-      initial.imageNutritionUrl = change.imageNutritionUrl;
++      initial.imageNutritionUrl = emptyMeansNull(
++        change.imageNutritionUrl!,
++      );
+     }
+     if (change.imageNutritionSmallUrl != null) {
+-      initial.imageNutritionSmallUrl = change.imageNutritionSmallUrl;
++      initial.imageNutritionSmallUrl = emptyMeansNull(
++        change.imageNutritionSmallUrl!,
++      );
+     }
+     if (change.imagePackagingUrl != null) {
+-      initial.imagePackagingUrl = change.imagePackagingUrl;
++      initial.imagePackagingUrl = emptyMeansNull(
++        change.imagePackagingUrl!,
++      );
+     }
+     if (change.imagePackagingSmallUrl != null) {
+-      initial.imagePackagingSmallUrl = change.imagePackagingSmallUrl;
++      initial.imagePackagingSmallUrl = emptyMeansNull(
++        change.imagePackagingSmallUrl!,
++      );
+     }
+     if (change.website != null) {
+       initial.website = change.website;
+diff --git a/packages/smooth_app/lib/l10n/app_en.arb b/packages/smooth_app/lib/l10n/app_en.arb
+index 6e66a3cc889c..cd3600c3e11d 100644
+--- a/packages/smooth_app/lib/l10n/app_en.arb
++++ b/packages/smooth_app/lib/l10n/app_en.arb
+@@ -1522,6 +1522,10 @@
+     "@edit_photo_button_label": {
+         "description": "Edit photo button label"
+     },
++    "edit_photo_unselect_button_label": "Unselect photo",
++    "@edit_photo_unselect_button_label": {
++        "description": "Edit 'unselect photo' button label"
++    },
+     "category_picker_screen_title": "Categories",
+     "@category_picker_screen_title": {
+         "description": "Categories picker screen title"
+diff --git a/packages/smooth_app/lib/pages/offline_tasks_page.dart b/packages/smooth_app/lib/pages/offline_tasks_page.dart
+index 83550f405c8c..fd105acbdec4 100644
+--- a/packages/smooth_app/lib/pages/offline_tasks_page.dart
++++ b/packages/smooth_app/lib/pages/offline_tasks_page.dart
+@@ -63,10 +63,9 @@ class _OfflineTaskState extends State<OfflineTaskPage> {
+                   },
+                   title: Text(
+                     '${OperationType.getBarcode(taskId)}'
+-                    ' (${_getOperationLabel(
+-                      OperationType.getOperationType(taskId),
+-                      appLocalizations,
+-                    )})',
++                    ' (${OperationType.getOperationType(taskId)?.getLabel(
++                          appLocalizations,
++                        ) ?? appLocalizations.background_task_operation_unknown})',
+                   ),
+                   subtitle: Text(_getMessage(status, appLocalizations)),
+                   trailing: const Icon(Icons.clear),
+@@ -76,22 +75,6 @@ class _OfflineTaskState extends State<OfflineTaskPage> {
+     );
+   }
+ 
+-  String _getOperationLabel(
+-    final OperationType? type,
+-    final AppLocalizations appLocalizations,
+-  ) {
+-    switch (type) {
+-      case null:
+-        return appLocalizations.background_task_operation_unknown;
+-      case OperationType.details:
+-        return appLocalizations.background_task_operation_details;
+-      case OperationType.image:
+-        return appLocalizations.background_task_operation_image;
+-      case OperationType.refreshLater:
+-        return 'Waiting 10 min before refreshing product to get all automatic edits';
+-    }
+-  }
+-
+   String _getMessage(
+     final String? status,
+     final AppLocalizations appLocalizations,
+diff --git a/packages/smooth_app/lib/pages/product/edit_image_button.dart b/packages/smooth_app/lib/pages/product/edit_image_button.dart
+new file mode 100644
+index 000000000000..0132be9d4375
+--- /dev/null
++++ b/packages/smooth_app/lib/pages/product/edit_image_button.dart
+@@ -0,0 +1,30 @@
++import 'package:flutter/material.dart';
++import 'package:smooth_app/generic_lib/design_constants.dart';
++
++/// Standard text button for the "edit image" pages.
++class EditImageButton extends StatelessWidget {
++  const EditImageButton({
++    required this.iconData,
++    required this.label,
++    required this.onPressed,
++  });
++
++  final IconData iconData;
++  final String label;
++  final VoidCallback onPressed;
++
++  @override
++  Widget build(BuildContext context) => OutlinedButton.icon(
++        icon: Icon(iconData),
++        style: ButtonStyle(
++          backgroundColor: MaterialStateProperty.all(
++            Theme.of(context).colorScheme.background,
++          ),
++          shape: MaterialStateProperty.all(
++            const RoundedRectangleBorder(borderRadius: ROUNDED_BORDER_RADIUS),
++          ),
++        ),
++        onPressed: onPressed,
++        label: Text(label),
++      );
++}
+diff --git a/packages/smooth_app/lib/pages/product/product_image_viewer.dart b/packages/smooth_app/lib/pages/product/product_image_viewer.dart
+index 7b51ef4715c9..c2207ffd7b0b 100644
+--- a/packages/smooth_app/lib/pages/product/product_image_viewer.dart
++++ b/packages/smooth_app/lib/pages/product/product_image_viewer.dart
+@@ -7,15 +7,18 @@ import 'package:openfoodfacts/openfoodfacts.dart';
+ import 'package:path_provider/path_provider.dart';
+ import 'package:photo_view/photo_view.dart';
+ import 'package:provider/provider.dart';
++import 'package:smooth_app/background/background_task_unselect.dart';
+ import 'package:smooth_app/data_models/product_image_data.dart';
+ import 'package:smooth_app/database/dao_int.dart';
+ import 'package:smooth_app/database/local_database.dart';
+ import 'package:smooth_app/database/transient_file.dart';
++import 'package:smooth_app/generic_lib/design_constants.dart';
+ import 'package:smooth_app/generic_lib/loading_dialog.dart';
+ import 'package:smooth_app/generic_lib/widgets/picture_not_found.dart';
+ import 'package:smooth_app/helpers/database_helper.dart';
+ import 'package:smooth_app/helpers/product_cards_helper.dart';
+ import 'package:smooth_app/pages/image_crop_page.dart';
++import 'package:smooth_app/pages/product/edit_image_button.dart';
+ import 'package:smooth_app/tmp_crop_image/new_crop_page.dart';
+ import 'package:smooth_app/widgets/smooth_scaffold.dart';
+ 
+@@ -68,37 +71,68 @@ class _ProductImageViewerState extends State<ProductImageViewer> {
+     return SmoothScaffold(
+       extendBodyBehindAppBar: true,
+       backgroundColor: Colors.black,
+-      floatingActionButton: FloatingActionButton.extended(
+-        label: Text(
+-          imageProvider == null
+-              ? appLocalizations.add
+-              : appLocalizations.edit_photo_button_label,
+-        ),
+-        icon: Icon(
+-          imageProvider == null ? Icons.add : Icons.edit,
+-        ),
+-        backgroundColor: Theme.of(context).colorScheme.primary,
+-        onPressed: () async => _editImage(),
+-      ),
+       body: Column(
+-        mainAxisAlignment: MainAxisAlignment.center,
++        mainAxisAlignment: MainAxisAlignment.spaceBetween,
++        crossAxisAlignment: CrossAxisAlignment.center,
+         children: <Widget>[
+-          ConstrainedBox(
+-            constraints: BoxConstraints.tight(
+-              Size(double.infinity, MediaQuery.of(context).size.height / 2),
+-            ),
+-            child: imageProvider == null
+-                ? const PictureNotFound()
+-                : PhotoView(
+-                    minScale: 0.2,
+-                    imageProvider: imageProvider,
+-                    heroAttributes: PhotoViewHeroAttributes(
+-                      tag: imageProvider,
+-                    ),
+-                    backgroundDecoration: const BoxDecoration(
+-                      color: Colors.black,
++          Expanded(
++            child: Padding(
++              padding: const EdgeInsets.all(MINIMUM_TOUCH_SIZE / 2),
++              child: imageProvider == null
++                  ? const SizedBox.expand(child: PictureNotFound())
++                  : PhotoView(
++                      minScale: 0.2,
++                      imageProvider: imageProvider,
++                      heroAttributes: PhotoViewHeroAttributes(
++                        tag: imageProvider,
++                      ),
++                      backgroundDecoration: const BoxDecoration(
++                        color: Colors.black,
++                      ),
+                     ),
++            ),
++          ),
++          Row(
++            mainAxisAlignment: MainAxisAlignment.spaceBetween,
++            crossAxisAlignment: CrossAxisAlignment.center,
++            mainAxisSize: MainAxisSize.max,
++            children: <Widget>[
++              Expanded(
++                child: Padding(
++                  padding: const EdgeInsets.symmetric(horizontal: SMALL_SPACE),
++                  child: (imageProvider == null)
++                      ? Container()
++                      : EditImageButton(
++                          iconData: Icons.do_disturb_on,
++                          label:
++                              appLocalizations.edit_photo_unselect_button_label,
++                          onPressed: () async {
++                            final NavigatorState navigatorState =
++                                Navigator.of(context);
++                            await BackgroundTaskUnselect.addTask(
++                              _barcode,
++                              imageField: widget.imageField,
++                              widget: this,
++                            );
++                            _localDatabase.notifyListeners();
++                            navigatorState.pop();
++                          },
++                        ),
++                ),
++              ),
++              Expanded(
++                child: Padding(
++                  padding: const EdgeInsets.symmetric(horizontal: SMALL_SPACE),
++                  child: EditImageButton(
++                    iconData: imageProvider == null ? Icons.add : Icons.edit,
++                    label: imageProvider == null
++                        ? appLocalizations.add
++                        : appLocalizations.edit_photo_button_label,
++                    onPressed: () async => _editImage(),
+                   ),
++                ),
++              ),
++            ],
+           ),
+         ],
+       ),
+@@ -134,7 +168,7 @@ class _ProductImageViewerState extends State<ProductImageViewer> {
+         return;
+       }
+ 
+-      final DaoInt daoInt = DaoInt(context.read<LocalDatabase>());
++      final DaoInt daoInt = DaoInt(_localDatabase);
+       imageFile = await LoadingDialog.run<File?>(
+         context: context,
+         future: _downloadImageFile(daoInt, imageUrl),
+diff --git a/packages/smooth_app/lib/tmp_crop_image/new_crop_page.dart b/packages/smooth_app/lib/tmp_crop_image/new_crop_page.dart
+index 55e726f412e4..ccf715bd5d5c 100644
+--- a/packages/smooth_app/lib/tmp_crop_image/new_crop_page.dart
++++ b/packages/smooth_app/lib/tmp_crop_image/new_crop_page.dart
+@@ -19,6 +19,7 @@ import 'package:smooth_app/generic_lib/loading_dialog.dart';
+ import 'package:smooth_app/helpers/database_helper.dart';
+ import 'package:smooth_app/helpers/product_cards_helper.dart';
+ import 'package:smooth_app/pages/image_crop_page.dart';
++import 'package:smooth_app/pages/product/edit_image_button.dart';
+ import 'package:smooth_app/pages/product/may_exit_page_helper.dart';
+ import 'package:smooth_app/tmp_crop_image/rotated_crop_controller.dart';
+ import 'package:smooth_app/tmp_crop_image/rotated_crop_image.dart';
+@@ -145,12 +146,12 @@ class _CropPageState extends State<CropPage> {
+                     spacing: MEDIUM_SPACE,
+                     alignment: WrapAlignment.center,
+                     children: <Widget>[
+-                      _OutlinedButton(
++                      EditImageButton(
+                         iconData: Icons.camera_alt,
+                         label: appLocalizations.capture,
+                         onPressed: () async => _capture(),
+                       ),
+-                      _OutlinedButton(
++                      EditImageButton(
+                         iconData: Icons.check,
+                         label: appLocalizations.confirm_button_label,
+                         onPressed: () async => _mayExitPage(saving: true),
+@@ -352,31 +353,3 @@ class _IconButton extends StatelessWidget {
+         child: Icon(iconData),
+       );
+ }
+-
+-/// Standard text button for this page.
+-class _OutlinedButton extends StatelessWidget {
+-  const _OutlinedButton({
+-    required this.iconData,
+-    required this.label,
+-    required this.onPressed,
+-  });
+-
+-  final IconData iconData;
+-  final String label;
+-  final VoidCallback onPressed;
+-
+-  @override
+-  Widget build(BuildContext context) => OutlinedButton.icon(
+-        icon: Icon(iconData),
+-        style: ButtonStyle(
+-          backgroundColor: MaterialStateProperty.all(
+-            Theme.of(context).colorScheme.background,
+-          ),
+-          shape: MaterialStateProperty.all(
+-            const RoundedRectangleBorder(borderRadius: ROUNDED_BORDER_RADIUS),
+-          ),
+-        ),
+-        onPressed: onPressed,
+-        label: Text(label),
+-      );
+-}

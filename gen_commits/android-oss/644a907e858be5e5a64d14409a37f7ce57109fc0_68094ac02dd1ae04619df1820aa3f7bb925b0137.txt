@@ -1,0 +1,490 @@
+diff --git a/app/src/main/java/com/kickstarter/libs/utils/extensions/ContextExt.kt b/app/src/main/java/com/kickstarter/libs/utils/extensions/ContextExt.kt
+index 84578667f8..8b2998e36d 100644
+--- a/app/src/main/java/com/kickstarter/libs/utils/extensions/ContextExt.kt
++++ b/app/src/main/java/com/kickstarter/libs/utils/extensions/ContextExt.kt
+@@ -1,6 +1,7 @@
+ @file:JvmName("ContextExt")
+ package com.kickstarter.libs.utils.extensions
+ 
++import android.app.AlertDialog
+ import android.app.Application
+ import android.content.Context
+ import com.kickstarter.KSApplication
+@@ -18,3 +19,41 @@ fun Context.registerActivityLifecycleCallbacks(callbacks: Application.ActivityLi
+         this.registerActivityLifecycleCallbacks(callbacks)
+     }
+ }
++
++fun Context.showAlertDialog(
++    title: String? = "",
++    message: String? = "",
++    positiveActionTitle: String? = null,
++    negativeActionTitle: String? = null,
++    isCancelable: Boolean = true,
++    positiveAction: (() -> Unit)? = null,
++    negativeAction: (() -> Unit)? = null
++) {
++
++    // setup the alert builder
++    val builder = AlertDialog.Builder(this).apply {
++        setTitle(title)
++        setMessage(message)
++
++        // add a button
++        positiveActionTitle?.let {
++            setPositiveButton(positiveActionTitle) { dialog, _ ->
++                dialog.dismiss()
++                positiveAction?.invoke()
++            }
++        }
++
++        negativeActionTitle?.let {
++            setNegativeButton(negativeActionTitle) { dialog, _ ->
++                dialog.dismiss()
++                negativeAction?.invoke()
++            }
++        }
++
++        setCancelable(isCancelable)
++    }
++
++    // create and show the alert dialog
++    val dialog: AlertDialog = builder.create()
++    dialog.show()
++}
+diff --git a/app/src/main/java/com/kickstarter/ui/activities/CommentsActivity.kt b/app/src/main/java/com/kickstarter/ui/activities/CommentsActivity.kt
+index 5804f20e7e..9830430dd9 100644
+--- a/app/src/main/java/com/kickstarter/ui/activities/CommentsActivity.kt
++++ b/app/src/main/java/com/kickstarter/ui/activities/CommentsActivity.kt
+@@ -14,6 +14,7 @@ import com.kickstarter.libs.qualifiers.RequiresActivityViewModel
+ import com.kickstarter.libs.utils.ApplicationUtils
+ import com.kickstarter.libs.utils.TransitionUtils
+ import com.kickstarter.libs.utils.UrlUtils
++import com.kickstarter.libs.utils.extensions.showAlertDialog
+ import com.kickstarter.libs.utils.extensions.toVisibility
+ import com.kickstarter.models.Comment
+ import com.kickstarter.ui.IntentKey
+@@ -44,7 +45,9 @@ class CommentsActivity :
+         setContentView(view)
+         binding.commentsRecyclerView.adapter = adapter
+ 
+-        binding.backButton.setOnClickListener { viewModel.inputs.backPressed() }
++        binding.backButton.setOnClickListener {
++            viewModel.inputs.checkIfThereAnyPendingComments(true)
++        }
+ 
+         setupPagination()
+ 
+@@ -130,6 +133,47 @@ class CommentsActivity :
+             .subscribe {
+                 ApplicationUtils.openUrlExternally(this, UrlUtils.appendPath(environment().webEndpoint(), COMMENT_KICKSTARTER_GUIDELINES))
+             }
++
++        viewModel.outputs.hasPendingComments()
++            .compose(bindToLifecycle())
++            .observeOn(AndroidSchedulers.mainThread())
++            .subscribe {
++                if (it.first) {
++                    handleBackAction(it.second)
++                } else {
++                    executeActions(it.second)
++                }
++            }
++    }
++
++    private fun handleBackAction(isBackAction: Boolean) {
++        this.showAlertDialog(
++            getString(R.string.Your_comment_wasnt_posted),
++            getString(R.string.You_will_lose_the_comment),
++            getString(R.string.cancel),
++            getString(R.string.leave_page),
++            false,
++            positiveAction = {
++                if (!isBackAction) {
++                    binding.commentsSwipeRefreshLayout.isRefreshing = false
++                }
++            },
++            negativeAction = {
++                executeActions(isBackAction)
++            }
++        )
++    }
++
++    fun executeActions(isBackAction: Boolean) {
++        if (!isBackAction) {
++            viewModel.inputs.refresh()
++        } else {
++            viewModel.inputs.backPressed()
++        }
++    }
++
++    override fun back() {
++        viewModel.inputs.checkIfThereAnyPendingComments(true)
+     }
+ 
+     private fun closeCommentsActivity() {
+@@ -142,7 +186,10 @@ class CommentsActivity :
+         recyclerViewPaginator = RecyclerViewPaginator(binding.commentsRecyclerView, { viewModel.inputs.nextPage() }, viewModel.outputs.isFetchingComments())
+ 
+         swipeRefresher = SwipeRefresher(
+-            this, binding.commentsSwipeRefreshLayout, { viewModel.inputs.refresh() }
++            this, binding.commentsSwipeRefreshLayout,
++            {
++                viewModel.inputs.checkIfThereAnyPendingComments(false)
++            }
+         ) { viewModel.outputs.isFetchingComments() }
+ 
+         viewModel.outputs.isFetchingComments()
+@@ -205,6 +252,7 @@ class CommentsActivity :
+     }
+ 
+     override fun onCommentPostedFailed(comment: Comment) {
++        viewModel.inputs.refreshCommentCardInCaseFailedPosted(comment)
+     }
+ 
+     override fun onCommentRepliesClicked(comment: Comment) {
+diff --git a/app/src/main/java/com/kickstarter/viewmodels/CommentsViewModel.kt b/app/src/main/java/com/kickstarter/viewmodels/CommentsViewModel.kt
+index aec9f02822..924e01588e 100644
+--- a/app/src/main/java/com/kickstarter/viewmodels/CommentsViewModel.kt
++++ b/app/src/main/java/com/kickstarter/viewmodels/CommentsViewModel.kt
+@@ -9,12 +9,14 @@ import com.kickstarter.libs.Environment
+ import com.kickstarter.libs.loadmore.ApolloPaginate
+ import com.kickstarter.libs.rx.transformers.Transformers
+ import com.kickstarter.libs.rx.transformers.Transformers.combineLatestPair
++import com.kickstarter.libs.rx.transformers.Transformers.takePairWhen
+ import com.kickstarter.libs.utils.ProjectUtils
+ import com.kickstarter.models.Comment
+ import com.kickstarter.models.Project
+ import com.kickstarter.models.Update
+ import com.kickstarter.models.User
+ import com.kickstarter.models.extensions.updateCommentAfterSuccessfulPost
++import com.kickstarter.models.extensions.updateCommentFailedToPost
+ import com.kickstarter.services.ApiClientType
+ import com.kickstarter.services.ApolloClientType
+ import com.kickstarter.services.apiresponses.commentresponse.CommentEnvelope
+@@ -37,9 +39,11 @@ interface CommentsViewModel {
+         fun insertNewCommentToList(comment: String, createdAt: DateTime)
+         fun onReplyClicked(comment: Comment, openKeyboard: Boolean)
+         fun onShowGuideLinesLinkClicked()
++        fun checkIfThereAnyPendingComments(isBackAction: Boolean)
+ 
+         /** Will be called with the successful response when calling the `postComment` Mutation **/
+         fun refreshComment(comment: Comment)
++        fun refreshCommentCardInCaseFailedPosted(comment: Comment)
+     }
+ 
+     interface Outputs {
+@@ -56,6 +60,7 @@ interface CommentsViewModel {
+         fun paginateCommentsError(): Observable<Throwable>
+         fun pullToRefreshError(): Observable<Throwable>
+         fun startThreadActivity(): Observable<Pair<CommentCardData, Boolean>>
++        fun hasPendingComments(): Observable<Pair<Boolean, Boolean>>
+ 
+         /** Emits a boolean indicating whether comments are being fetched from the API.  */
+         fun isFetchingComments(): Observable<Boolean>
+@@ -76,6 +81,8 @@ interface CommentsViewModel {
+         private val nextPage = PublishSubject.create<Void>()
+         private val onShowGuideLinesLinkClicked = PublishSubject.create<Void>()
+         private val onReplyClicked = PublishSubject.create<Pair<Comment, Boolean>>()
++        private val checkIfThereAnyPendingComments = PublishSubject.create<Boolean>()
++        private val failedCommentCardToRefresh = PublishSubject.create<Comment>()
+ 
+         private val closeCommentsPage = BehaviorSubject.create<Void>()
+         private val currentUserAvatar = BehaviorSubject.create<String?>()
+@@ -93,6 +100,7 @@ interface CommentsViewModel {
+         private val displayPaginationError = BehaviorSubject.create<Boolean>()
+         private val commentToRefresh = PublishSubject.create<Comment>()
+         private val startThreadActivity = BehaviorSubject.create<Pair<CommentCardData, Boolean>>()
++        private val hasPendingComments = BehaviorSubject.create<Pair<Boolean, Boolean>>()
+ 
+         // - Error observables to handle the 3 different use cases
+         private val internalError = BehaviorSubject.create<Throwable>()
+@@ -220,6 +228,21 @@ interface CommentsViewModel {
+                     this.displayPaginationError.onNext(true)
+                 }
+ 
++            this.commentsList
++                .compose(takePairWhen(checkIfThereAnyPendingComments))
++                .compose(bindToLifecycle())
++                .subscribe { pair ->
++                    this.hasPendingComments.onNext(
++                        Pair(
++                            pair.first.any {
++                                it.commentCardState == CommentCardStatus.TRYING_TO_POST.commentCardStatus ||
++                                    it.commentCardState == CommentCardStatus.FAILED_TO_SEND_COMMENT.commentCardStatus
++                            },
++                            pair.second
++                        )
++                    )
++                }
++
+             this.backPressed
+                 .compose(bindToLifecycle())
+                 .subscribe { this.closeCommentsPage.onNext(it) }
+@@ -241,10 +264,10 @@ interface CommentsViewModel {
+                 }
+ 
+             // - Update internal mutable list with the latest state after successful response
+-            this.commentToRefresh
+-                .compose(combineLatestPair(this.commentsList))
++            this.commentsList
++                .compose(takePairWhen(this.commentToRefresh))
+                 .map {
+-                    it.first.updateCommentAfterSuccessfulPost(it.second)
++                    it.second.updateCommentAfterSuccessfulPost(it.first)
+                 }
+                 .distinctUntilChanged()
+                 .compose(bindToLifecycle())
+@@ -259,6 +282,17 @@ interface CommentsViewModel {
+                 .subscribe {
+                     this.outputCommentList.onNext(it)
+                 }
++            // - Update internal mutable list with the latest state after failed response
++            this.commentsList
++                .compose(takePairWhen(this.failedCommentCardToRefresh))
++                .map {
++                    it.second.updateCommentFailedToPost(it.first)
++                }
++                .distinctUntilChanged()
++                .compose(bindToLifecycle())
++                .subscribe {
++                    this.commentsList.onNext(it)
++                }
+         }
+ 
+         private fun loadCommentListFromProjectOrUpdate(projectOrUpdate: Observable<Pair<Project, Update?>>) {
+@@ -396,7 +430,9 @@ interface CommentsViewModel {
+         override fun onShowGuideLinesLinkClicked() = onShowGuideLinesLinkClicked.onNext(null)
+         override fun refreshComment(comment: Comment) = this.commentToRefresh.onNext(comment)
+         override fun onReplyClicked(comment: Comment, openKeyboard: Boolean) = onReplyClicked.onNext(Pair(comment, openKeyboard))
+-
++        override fun checkIfThereAnyPendingComments(isBackAction: Boolean) = checkIfThereAnyPendingComments.onNext(isBackAction)
++        override fun refreshCommentCardInCaseFailedPosted(comment: Comment) =
++            this.failedCommentCardToRefresh.onNext(comment)
+         // - Outputs
+         override fun closeCommentsPage(): Observable<Void> = closeCommentsPage
+         override fun currentUserAvatar(): Observable<String?> = currentUserAvatar
+@@ -415,5 +451,7 @@ interface CommentsViewModel {
+ 
+         override fun startThreadActivity(): Observable<Pair<CommentCardData, Boolean>> = this.startThreadActivity
+         override fun isFetchingComments(): Observable<Boolean> = this.isFetchingComments
++
++        override fun hasPendingComments(): Observable<Pair<Boolean, Boolean>> = this.hasPendingComments
+     }
+ }
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 468fbd4596..2d57b06e68 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -78,4 +78,10 @@
+   <string name="email_verification_interstitial" formatted="false">Email Verification Interstitial</string>
+ 
+   <string name="estimated_delivery_data" formatted="false">%{title} %{estimated_delivery_data}</string>
++
++  <!-- Replies Screen -->
++  <string name="Your_comment_wasnt_posted">Your comment wasn\'t posted</string>
++  <string name="You_will_lose_the_comment">You\'ll lose the comment if you leave this page.</string>
++  <string name="cancel">Cancel</string>
++  <string name="leave_page">Leave page</string>
+ </resources>
+diff --git a/app/src/test/java/com/kickstarter/viewmodels/CommentsViewModelTest.kt b/app/src/test/java/com/kickstarter/viewmodels/CommentsViewModelTest.kt
+index 6410effce7..c5d67c8021 100644
+--- a/app/src/test/java/com/kickstarter/viewmodels/CommentsViewModelTest.kt
++++ b/app/src/test/java/com/kickstarter/viewmodels/CommentsViewModelTest.kt
+@@ -38,6 +38,7 @@ class CommentsViewModelTest : KSRobolectricTestCase() {
+     private val shouldShowPaginatedCell = TestSubscriber.create<Boolean>()
+     private val openCommentGuideLines = TestSubscriber<Void>()
+     private val startThreadActivity = BehaviorSubject.create<Pair<CommentCardData, Boolean>>()
++    private val hasPendingComments = TestSubscriber<Pair<Boolean, Boolean>>()
+ 
+     @Test
+     fun testCommentsViewModel_whenUserLoggedInAndBacking_shouldShowEnabledComposer() {
+@@ -520,4 +521,188 @@ class CommentsViewModelTest : KSRobolectricTestCase() {
+             assertTrue(newList[2].commentCardState == commentCardData2.commentCardState)
+         }
+     }
++
++    @Test
++    fun testComments_PullToRefreshWithPendingComment() {
++        val currentUser = UserFactory.user()
++            .toBuilder()
++            .id(1)
++            .build()
++
++        val comment1 = CommentFactory.commentToPostWithUser(currentUser).toBuilder().id(1).body("comment1").build()
++        val comment2 = CommentFactory.commentToPostWithUser(currentUser).toBuilder().id(2).body("comment2").build()
++        val newPostedComment = CommentFactory.commentToPostWithUser(currentUser).toBuilder().id(3).body("comment3").build()
++
++        val commentEnvelope = CommentEnvelopeFactory.commentsEnvelope().toBuilder()
++            .comments(listOf(comment1, comment2))
++            .build()
++
++        val testScheduler = TestScheduler()
++        val env = environment().toBuilder().apolloClient(object : MockApolloClient() {
++            override fun getProjectComments(slug: String, cursor: String?, limit: Int): Observable<CommentEnvelope> {
++                return Observable.just(commentEnvelope)
++            }
++        })
++            .currentUser(MockCurrentUser(currentUser))
++            .scheduler(testScheduler)
++            .build()
++
++        val commentCardData1 = CommentCardData.builder()
++            .comment(comment1)
++            .commentCardState(CommentCardStatus.COMMENT_FOR_LOGIN_BACKED_USERS.commentCardStatus)
++            .build()
++        val commentCardData2 = CommentCardData.builder()
++            .comment(comment2)
++            .commentCardState(CommentCardStatus.COMMENT_FOR_LOGIN_BACKED_USERS.commentCardStatus)
++            .build()
++        val commentCardData3 = CommentCardData.builder()
++            .comment(newPostedComment)
++            .commentCardState(CommentCardStatus.TRYING_TO_POST.commentCardStatus)
++            .build()
++        val commentCardData3Updated = CommentCardData.builder()
++            .comment(newPostedComment)
++            .commentCardState(CommentCardStatus.COMMENT_FOR_LOGIN_BACKED_USERS.commentCardStatus)
++            .build()
++
++        val vm = CommentsViewModel.ViewModel(env)
++        vm.intent(Intent().putExtra(IntentKey.PROJECT, ProjectFactory.project()))
++        vm.outputs.commentsList().subscribe(commentsList)
++        vm.outputs.hasPendingComments().subscribe(hasPendingComments)
++
++        commentsList.assertValueCount(1)
++        vm.outputs.commentsList().take(0).subscribe {
++            val newList = it
++            assertTrue(newList.size == 2)
++            assertTrue(newList[0].comment?.body() == commentCardData1.comment?.body())
++            assertTrue(newList[0].commentCardState == commentCardData1.commentCardState)
++
++            assertTrue(newList[1].comment?.body() == commentCardData2.comment?.body())
++            assertTrue(newList[1].commentCardState == commentCardData2.commentCardState)
++        }
++
++        vm.inputs.checkIfThereAnyPendingComments(false)
++
++        this.hasPendingComments.assertValue(Pair(false, false))
++        // - New posted comment with status "TRYING_TO_POST"
++        vm.inputs.insertNewCommentToList(newPostedComment.body(), DateTime.now())
++        testScheduler.advanceTimeBy(2, TimeUnit.SECONDS)
++        commentsList.assertValueCount(2)
++        vm.outputs.commentsList().take(1).subscribe {
++            val newList = it
++            assertTrue(newList.size == 3)
++            assertTrue(newList[0].comment?.body() == commentCardData3.comment?.body())
++            assertTrue(newList[0].commentCardState == commentCardData3.commentCardState)
++
++            assertTrue(newList[1].comment?.body() == commentCardData1.comment?.body())
++            assertTrue(newList[1].commentCardState == commentCardData1.commentCardState)
++
++            assertTrue(newList[2].comment?.body() == commentCardData2.comment?.body())
++            assertTrue(newList[2].commentCardState == commentCardData2.commentCardState)
++        }
++
++        vm.inputs.checkIfThereAnyPendingComments(false)
++        testScheduler.advanceTimeBy(2, TimeUnit.SECONDS)
++        this.hasPendingComments.assertValues(Pair(false, false), Pair(true, false))
++
++        // - Check the status of the newly posted comment
++        vm.inputs.refreshComment(newPostedComment)
++        testScheduler.advanceTimeBy(2, TimeUnit.SECONDS)
++
++        // - Check Pull to refresh
++        vm.inputs.checkIfThereAnyPendingComments(false)
++        testScheduler.advanceTimeBy(2, TimeUnit.SECONDS)
++        this.hasPendingComments.assertValues(Pair(false, false), Pair(true, false), Pair(false, false))
++    }
++
++    @Test
++    fun testComments_BackWithPendingComment() {
++        val currentUser = UserFactory.user()
++            .toBuilder()
++            .id(1)
++            .build()
++
++        val comment1 = CommentFactory.commentToPostWithUser(currentUser).toBuilder().id(1).body("comment1").build()
++        val comment2 = CommentFactory.commentToPostWithUser(currentUser).toBuilder().id(2).body("comment2").build()
++        val newPostedComment = CommentFactory.commentToPostWithUser(currentUser).toBuilder().id(3).body("comment3").build()
++
++        val commentEnvelope = CommentEnvelopeFactory.commentsEnvelope().toBuilder()
++            .comments(listOf(comment1, comment2))
++            .build()
++
++        val testScheduler = TestScheduler()
++        val env = environment().toBuilder().apolloClient(object : MockApolloClient() {
++            override fun getProjectComments(slug: String, cursor: String?, limit: Int): Observable<CommentEnvelope> {
++                return Observable.just(commentEnvelope)
++            }
++        })
++            .currentUser(MockCurrentUser(currentUser))
++            .scheduler(testScheduler)
++            .build()
++
++        val commentCardData1 = CommentCardData.builder()
++            .comment(comment1)
++            .commentCardState(CommentCardStatus.COMMENT_FOR_LOGIN_BACKED_USERS.commentCardStatus)
++            .build()
++        val commentCardData2 = CommentCardData.builder()
++            .comment(comment2)
++            .commentCardState(CommentCardStatus.COMMENT_FOR_LOGIN_BACKED_USERS.commentCardStatus)
++            .build()
++        val commentCardData3 = CommentCardData.builder()
++            .comment(newPostedComment)
++            .commentCardState(CommentCardStatus.TRYING_TO_POST.commentCardStatus)
++            .build()
++        val commentCardData3Updated = CommentCardData.builder()
++            .comment(newPostedComment)
++            .commentCardState(CommentCardStatus.COMMENT_FOR_LOGIN_BACKED_USERS.commentCardStatus)
++            .build()
++
++        val vm = CommentsViewModel.ViewModel(env)
++        vm.intent(Intent().putExtra(IntentKey.PROJECT, ProjectFactory.project()))
++        vm.outputs.commentsList().subscribe(commentsList)
++        vm.outputs.hasPendingComments().subscribe(hasPendingComments)
++
++        commentsList.assertValueCount(1)
++        vm.outputs.commentsList().take(0).subscribe {
++            val newList = it
++            assertTrue(newList.size == 2)
++            assertTrue(newList[0].comment?.body() == commentCardData1.comment?.body())
++            assertTrue(newList[0].commentCardState == commentCardData1.commentCardState)
++
++            assertTrue(newList[1].comment?.body() == commentCardData2.comment?.body())
++            assertTrue(newList[1].commentCardState == commentCardData2.commentCardState)
++        }
++
++        vm.inputs.checkIfThereAnyPendingComments(true)
++
++        this.hasPendingComments.assertValue(Pair(false, true))
++        // - New posted comment with status "TRYING_TO_POST"
++        vm.inputs.insertNewCommentToList(newPostedComment.body(), DateTime.now())
++        testScheduler.advanceTimeBy(2, TimeUnit.SECONDS)
++        commentsList.assertValueCount(2)
++        vm.outputs.commentsList().take(1).subscribe {
++            val newList = it
++            assertTrue(newList.size == 3)
++            assertTrue(newList[0].comment?.body() == commentCardData3.comment?.body())
++            assertTrue(newList[0].commentCardState == commentCardData3.commentCardState)
++
++            assertTrue(newList[1].comment?.body() == commentCardData1.comment?.body())
++            assertTrue(newList[1].commentCardState == commentCardData1.commentCardState)
++
++            assertTrue(newList[2].comment?.body() == commentCardData2.comment?.body())
++            assertTrue(newList[2].commentCardState == commentCardData2.commentCardState)
++        }
++
++        vm.inputs.checkIfThereAnyPendingComments(true)
++        testScheduler.advanceTimeBy(2, TimeUnit.SECONDS)
++        this.hasPendingComments.assertValues(Pair(false, true), Pair(true, true))
++
++        // - Check the status of the newly posted comment
++        vm.inputs.refreshComment(newPostedComment)
++        testScheduler.advanceTimeBy(2, TimeUnit.SECONDS)
++
++        // - Check Pull to refresh
++        vm.inputs.checkIfThereAnyPendingComments(true)
++        testScheduler.advanceTimeBy(2, TimeUnit.SECONDS)
++        this.hasPendingComments.assertValues(Pair(false, true), Pair(true, true), Pair(false, true))
++    }
+ }

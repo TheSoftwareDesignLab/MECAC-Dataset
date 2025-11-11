@@ -1,0 +1,556 @@
+diff --git a/assets/images/broadcast_image.png b/assets/images/broadcast_image.png
+new file mode 100644
+index 0000000000..fed57f3293
+Binary files /dev/null and b/assets/images/broadcast_image.png differ
+diff --git a/lib/src/model/broadcast/broadcast_providers.dart b/lib/src/model/broadcast/broadcast_providers.dart
+index a4e9243a5b..2f33523288 100644
+--- a/lib/src/model/broadcast/broadcast_providers.dart
++++ b/lib/src/model/broadcast/broadcast_providers.dart
+@@ -3,6 +3,7 @@ import 'package:lichess_mobile/src/model/broadcast/broadcast.dart';
+ import 'package:lichess_mobile/src/model/broadcast/broadcast_repository.dart';
+ import 'package:lichess_mobile/src/model/common/id.dart';
+ import 'package:lichess_mobile/src/network/http.dart';
++import 'package:lichess_mobile/src/utils/image.dart';
+ import 'package:riverpod_annotation/riverpod_annotation.dart';
+ 
+ part 'broadcast_providers.g.dart';
+@@ -53,3 +54,16 @@ Future<BroadcastTournament> broadcastTournament(
+         BroadcastRepository(client).getTournament(broadcastTournamentId),
+   );
+ }
++
++@Riverpod(keepAlive: true)
++BroadcastImageWorkerFactory broadcastImageWorkerFactory(Ref ref) {
++  return const BroadcastImageWorkerFactory();
++}
++
++class BroadcastImageWorkerFactory {
++  const BroadcastImageWorkerFactory();
++
++  Future<ImageColorWorker> spawn() async {
++    return ImageColorWorker.spawn();
++  }
++}
+diff --git a/lib/src/utils/image.dart b/lib/src/utils/image.dart
+new file mode 100644
+index 0000000000..24b2cdf77d
+--- /dev/null
++++ b/lib/src/utils/image.dart
+@@ -0,0 +1,137 @@
++import 'dart:async';
++import 'dart:isolate';
++import 'package:http/http.dart' as http;
++import 'package:image/image.dart' as img;
++
++import 'package:material_color_utilities/material_color_utilities.dart';
++
++/// A worker that calculates the `primaryContainer` color of a remote image.
++///
++/// The worker is created by calling [ImageColorWorker.spawn], and the computation
++/// is run in a separate isolate.
++class ImageColorWorker {
++  final SendPort _commands;
++  final ReceivePort _responses;
++  final Map<int, Completer<(int, int)?>> _activeRequests = {};
++  int _idCounter = 0;
++  bool _closed = false;
++
++  bool get closed => _closed;
++
++  Future<(int, int)?> getImageColors(String url) async {
++    if (_closed) throw StateError('Closed');
++    final completer = Completer<(int, int)?>.sync();
++    final id = _idCounter++;
++    _activeRequests[id] = completer;
++    _commands.send((id, url));
++    return await completer.future;
++  }
++
++  static Future<ImageColorWorker> spawn() async {
++    final initPort = RawReceivePort();
++    final connection = Completer<(ReceivePort, SendPort)>.sync();
++    initPort.handler = (dynamic initialMessage) {
++      final commandPort = initialMessage as SendPort;
++      connection.complete(
++        (
++          ReceivePort.fromRawReceivePort(initPort),
++          commandPort,
++        ),
++      );
++    };
++
++    try {
++      await Isolate.spawn(_startRemoteIsolate, initPort.sendPort);
++    } on Object {
++      initPort.close();
++      rethrow;
++    }
++
++    final (ReceivePort receivePort, SendPort sendPort) =
++        await connection.future;
++
++    return ImageColorWorker._(receivePort, sendPort);
++  }
++
++  ImageColorWorker._(this._responses, this._commands) {
++    _responses.listen(_handleResponsesFromIsolate);
++  }
++
++  void _handleResponsesFromIsolate(dynamic message) {
++    final (int id, Object response) = message as (int, Object);
++    final completer = _activeRequests.remove(id)!;
++
++    if (response is RemoteError) {
++      completer.completeError(response);
++    } else {
++      completer.complete(response as (int, int));
++    }
++
++    if (_closed && _activeRequests.isEmpty) _responses.close();
++  }
++
++  static void _handleCommandsToIsolate(
++    ReceivePort receivePort,
++    SendPort sendPort,
++  ) {
++    receivePort.listen((message) async {
++      if (message == 'shutdown') {
++        receivePort.close();
++        return;
++      }
++      final (int id, String url) = message as (int, String);
++      try {
++        final bytes = await http.readBytes(Uri.parse(url));
++        final image = img.decodeImage(bytes);
++        final resized = img.copyResize(image!, width: 112);
++        final QuantizerResult quantizerResult =
++            await QuantizerCelebi().quantize(
++          resized.buffer.asUint32List(),
++          128,
++          returnInputPixelToClusterPixel: true,
++        );
++        final Map<int, int> colorToCount = quantizerResult.colorToCount.map(
++          (int key, int value) =>
++              MapEntry<int, int>(_getArgbFromAbgr(key), value),
++        );
++        // Score colors for color scheme suitability.
++        final List<int> scoredResults = Score.score(colorToCount, desired: 1);
++        final Hct sourceColor = Hct.fromInt(scoredResults.first);
++        final scheme = SchemeFidelity(
++          sourceColorHct: sourceColor,
++          isDark: false,
++          contrastLevel: 0.0,
++        );
++        final colors = (scheme.primaryContainer, scheme.onPrimaryContainer);
++        sendPort.send((id, colors));
++      } catch (e) {
++        sendPort.send((id, RemoteError(e.toString(), '')));
++      }
++    });
++  }
++
++  static void _startRemoteIsolate(SendPort sendPort) {
++    final receivePort = ReceivePort();
++    sendPort.send(receivePort.sendPort);
++    _handleCommandsToIsolate(receivePort, sendPort);
++  }
++
++  void close() {
++    if (!_closed) {
++      _closed = true;
++      _commands.send('shutdown');
++      if (_activeRequests.isEmpty) _responses.close();
++    }
++  }
++}
++
++// Converts AABBGGRR color int to AARRGGBB format.
++int _getArgbFromAbgr(int abgr) {
++  const int exceptRMask = 0xFF00FFFF;
++  const int onlyRMask = ~exceptRMask;
++  const int exceptBMask = 0xFFFFFF00;
++  const int onlyBMask = ~exceptBMask;
++  final int r = (abgr & onlyRMask) >> 16;
++  final int b = abgr & onlyBMask;
++  return (abgr & exceptRMask & exceptBMask) | (b << 16) | r;
++}
+diff --git a/lib/src/view/broadcast/broadcast_list_screen.dart b/lib/src/view/broadcast/broadcast_list_screen.dart
+index 6415c80d83..8a912847f9 100644
+--- a/lib/src/view/broadcast/broadcast_list_screen.dart
++++ b/lib/src/view/broadcast/broadcast_list_screen.dart
+@@ -7,13 +7,13 @@ import 'package:intl/intl.dart';
+ import 'package:lichess_mobile/src/model/broadcast/broadcast.dart';
+ import 'package:lichess_mobile/src/model/broadcast/broadcast_providers.dart';
+ import 'package:lichess_mobile/src/model/common/id.dart';
++import 'package:lichess_mobile/src/styles/lichess_colors.dart';
+ import 'package:lichess_mobile/src/styles/styles.dart';
+-import 'package:lichess_mobile/src/styles/transparent_image.dart';
++import 'package:lichess_mobile/src/utils/image.dart';
+ import 'package:lichess_mobile/src/utils/l10n_context.dart';
+ import 'package:lichess_mobile/src/utils/navigation.dart';
+ import 'package:lichess_mobile/src/utils/screen.dart';
+ import 'package:lichess_mobile/src/view/broadcast/broadcast_round_screen.dart';
+-import 'package:lichess_mobile/src/view/broadcast/default_broadcast_image.dart';
+ import 'package:lichess_mobile/src/widgets/buttons.dart';
+ import 'package:lichess_mobile/src/widgets/platform_scaffold.dart';
+ import 'package:lichess_mobile/src/widgets/shimmer.dart';
+@@ -45,20 +45,32 @@ class _Body extends ConsumerStatefulWidget {
+ 
+ class _BodyState extends ConsumerState<_Body> {
+   final ScrollController _scrollController = ScrollController();
++  ImageColorWorker? _worker;
+ 
+   @override
+   void initState() {
+     super.initState();
+     _scrollController.addListener(_scrollListener);
++    _initWorker();
+   }
+ 
+   @override
+   void dispose() {
+     _scrollController.removeListener(_scrollListener);
+     _scrollController.dispose();
++    _worker?.close();
+     super.dispose();
+   }
+ 
++  Future<void> _initWorker() async {
++    final worker = await ref.read(broadcastImageWorkerFactoryProvider).spawn();
++    if (mounted) {
++      setState(() {
++        _worker = worker;
++      });
++    }
++  }
++
+   void _scrollListener() {
+     if (_scrollController.position.pixels >=
+         _scrollController.position.maxScrollExtent - 300) {
+@@ -74,7 +86,7 @@ class _BodyState extends ConsumerState<_Body> {
+   Widget build(BuildContext context) {
+     final broadcasts = ref.watch(broadcastsPaginatorProvider);
+ 
+-    if (!broadcasts.hasValue && broadcasts.isLoading) {
++    if (_worker == null || (!broadcasts.hasValue && broadcasts.isLoading)) {
+       return const Center(
+         child: CircularProgressIndicator.adaptive(),
+       );
+@@ -105,8 +117,10 @@ class _BodyState extends ConsumerState<_Body> {
+                 crossAxisSpacing: 10,
+                 mainAxisSpacing: 10,
+               ),
+-              itemBuilder: (context, index) =>
+-                  BroadcastGridItem(broadcast: broadcasts.value!.active[index]),
++              itemBuilder: (context, index) => BroadcastGridItem(
++                broadcast: broadcasts.value!.active[index],
++                worker: _worker!,
++              ),
+               itemCount: broadcasts.value!.active.length,
+             ),
+           ),
+@@ -128,6 +142,7 @@ class _BodyState extends ConsumerState<_Body> {
+                 mainAxisSpacing: 10,
+               ),
+               itemBuilder: (context, index) => BroadcastGridItem(
++                worker: _worker!,
+                 broadcast: broadcasts.value!.upcoming[index],
+               ),
+               itemCount: broadcasts.value!.upcoming.length,
+@@ -150,15 +165,18 @@ class _BodyState extends ConsumerState<_Body> {
+                 crossAxisSpacing: 10,
+                 mainAxisSpacing: 10,
+               ),
+-              itemBuilder: (context, index) => (broadcasts.isLoading &&
+-                      index >= itemsCount - loadingItems)
+-                  ? Shimmer(
+-                      child: ShimmerLoading(
+-                        isLoading: true,
+-                        child: BroadcastGridItem.loading(),
+-                      ),
+-                    )
+-                  : BroadcastGridItem(broadcast: broadcasts.value!.past[index]),
++              itemBuilder: (context, index) =>
++                  (broadcasts.isLoading && index >= itemsCount - loadingItems)
++                      ? Shimmer(
++                          child: ShimmerLoading(
++                            isLoading: true,
++                            child: BroadcastGridItem.loading(_worker!),
++                          ),
++                        )
++                      : BroadcastGridItem(
++                          worker: _worker!,
++                          broadcast: broadcasts.value!.past[index],
++                        ),
+               itemCount: itemsCount,
+             ),
+           ),
+@@ -169,11 +187,16 @@ class _BodyState extends ConsumerState<_Body> {
+ }
+ 
+ class BroadcastGridItem extends StatefulWidget {
+-  final Broadcast broadcast;
++  const BroadcastGridItem({
++    required this.broadcast,
++    required this.worker,
++    super.key,
++  });
+ 
+-  const BroadcastGridItem({required this.broadcast});
++  final Broadcast broadcast;
++  final ImageColorWorker worker;
+ 
+-  BroadcastGridItem.loading()
++  BroadcastGridItem.loading(this.worker)
+       : broadcast = Broadcast(
+           tour: const BroadcastTournamentData(
+             id: BroadcastTournamentId(''),
+@@ -203,48 +226,71 @@ class BroadcastGridItem extends StatefulWidget {
+   State<BroadcastGridItem> createState() => _BroadcastGridItemState();
+ }
+ 
++typedef _CardColors = ({
++  Color primaryContainer,
++  Color onPrimaryContainer,
++});
++final Map<ImageProvider, _CardColors> _colorsCache = {
++  kDefaultBroadcastImage: (
++    primaryContainer: LichessColors.brag,
++    onPrimaryContainer: const Color(0xFF000000),
++  ),
++};
++
++const kDefaultBroadcastImage = AssetImage('assets/images/broadcast_image.png');
++
+ class _BroadcastGridItemState extends State<BroadcastGridItem> {
+-  ColorScheme? _colorScheme;
++  _CardColors? _cardColors;
++
++  String? get imageUrl => widget.broadcast.tour.imageUrl;
++
++  ImageProvider get image =>
++      imageUrl != null ? NetworkImage(imageUrl!) : kDefaultBroadcastImage;
+ 
+   @override
+   void didChangeDependencies() {
+     super.didChangeDependencies();
+-    if (widget.broadcast.tour.imageUrl != null) {
+-      _fetchColorScheme(widget.broadcast.tour.imageUrl!);
++    final cachedColors = _colorsCache[image];
++    if (cachedColors != null) {
++      _cardColors = cachedColors;
++    } else {
++      if (imageUrl != null) {
++        _fetchImageAndColors(image as NetworkImage);
++      }
+     }
+   }
+ 
+-  Future<void> _fetchColorScheme(String url) async {
++  Future<void> _fetchImageAndColors(NetworkImage provider) async {
+     if (!mounted) return;
+ 
+     if (Scrollable.recommendDeferredLoadingForContext(context)) {
+       SchedulerBinding.instance.scheduleFrameCallback((_) {
+-        scheduleMicrotask(() => _fetchColorScheme(url));
++        scheduleMicrotask(() => _fetchImageAndColors(provider));
+       });
+-    } else {
+-      try {
+-        final colorScheme = await ColorScheme.fromImageProvider(
+-          provider: NetworkImage(url),
+-          dynamicSchemeVariant: DynamicSchemeVariant.fidelity,
++    } else if (widget.worker.closed == false) {
++      final response = await widget.worker.getImageColors(provider.url);
++      if (response != null) {
++        final (primaryContainer, onPrimaryContainer) = response;
++        final cardColors = (
++          primaryContainer: Color(primaryContainer),
++          onPrimaryContainer: Color(onPrimaryContainer),
+         );
++        _colorsCache[provider] = cardColors;
+         if (mounted) {
+           setState(() {
+-            _colorScheme = colorScheme;
++            _cardColors = cardColors;
+           });
+         }
+-      } catch (_) {
+-        // ignore
+       }
+     }
+   }
+ 
+   @override
+   Widget build(BuildContext context) {
+-    final backgroundColor =
+-        _colorScheme?.primaryContainer ?? Colors.transparent;
+-    final titleColor = _colorScheme?.onPrimaryContainer;
++    final backgroundColor = _cardColors?.primaryContainer ?? Colors.transparent;
++    final titleColor = _cardColors?.onPrimaryContainer;
+     final subTitleColor =
+-        _colorScheme?.onPrimaryContainer.withValues(alpha: 0.7) ??
++        _cardColors?.onPrimaryContainer.withValues(alpha: 0.7) ??
+             textShade(context, 0.7);
+ 
+     return AdaptiveInkWell(
+@@ -267,6 +313,15 @@ class _BroadcastGridItemState extends State<BroadcastGridItem> {
+               ? null
+               : kElevationToShadow[1],
+         ),
++        foregroundDecoration: BoxDecoration(
++          border: (widget.broadcast.isLive)
++              ? Border.all(
++                  color: LichessColors.red.withValues(alpha: 0.7),
++                  width: 3,
++                )
++              : null,
++          borderRadius: BorderRadius.circular(20),
++        ),
+         child: Column(
+           mainAxisAlignment: MainAxisAlignment.start,
+           crossAxisAlignment: CrossAxisAlignment.start,
+@@ -285,17 +340,15 @@ class _BroadcastGridItemState extends State<BroadcastGridItem> {
+                   tileMode: TileMode.clamp,
+                 ).createShader(bounds);
+               },
+-              child: widget.broadcast.tour.imageUrl != null
+-                  ? AspectRatio(
+-                      aspectRatio: 2.0,
+-                      child: FadeInImage.memoryNetwork(
+-                        placeholder: transparentImage,
+-                        image: widget.broadcast.tour.imageUrl!,
+-                        imageErrorBuilder: (context, error, stackTrace) =>
+-                            const DefaultBroadcastImage(aspectRatio: 2.0),
+-                      ),
+-                    )
+-                  : const DefaultBroadcastImage(aspectRatio: 2.0),
++              child: AspectRatio(
++                aspectRatio: 2.0,
++                child: FadeInImage(
++                  placeholder: kDefaultBroadcastImage,
++                  image: image,
++                  imageErrorBuilder: (context, error, stackTrace) =>
++                      const Image(image: kDefaultBroadcastImage),
++                ),
++              ),
+             ),
+             if (widget.broadcast.round.startsAt != null ||
+                 widget.broadcast.isLive)
+diff --git a/pubspec.lock b/pubspec.lock
+index a10b8cbcbb..2de7ca885d 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -804,7 +804,7 @@ packages:
+     source: hosted
+     version: "0.1.0"
+   image:
+-    dependency: transitive
++    dependency: "direct main"
+     description:
+       name: image
+       sha256: f31d52537dc417fdcde36088fdf11d191026fd5e4fae742491ebd40e5a8bea7d
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 827462f30f..90f4e62475 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -52,6 +52,7 @@ dependencies:
+   flutter_svg: ^2.0.10+1
+   freezed_annotation: ^2.2.0
+   http: ^1.1.0
++  image: ^4.3.0
+   intl: ^0.19.0
+   json_annotation: ^4.7.0
+   linkify: ^5.0.0
+diff --git a/test/view/broadcast/broadcasts_list_screen_test.dart b/test/view/broadcast/broadcasts_list_screen_test.dart
+index a570b58071..b68ed3f660 100644
+--- a/test/view/broadcast/broadcasts_list_screen_test.dart
++++ b/test/view/broadcast/broadcasts_list_screen_test.dart
+@@ -1,12 +1,35 @@
++import 'package:flutter/material.dart';
+ import 'package:flutter_test/flutter_test.dart';
+ import 'package:http/testing.dart';
++import 'package:lichess_mobile/src/model/broadcast/broadcast_providers.dart';
+ import 'package:lichess_mobile/src/network/http.dart';
++import 'package:lichess_mobile/src/utils/image.dart';
+ import 'package:lichess_mobile/src/view/broadcast/broadcast_list_screen.dart';
+ import 'package:network_image_mock/network_image_mock.dart';
+ 
+ import '../../test_helpers.dart';
+ import '../../test_provider_scope.dart';
+ 
++class FakeImageColorWorker implements ImageColorWorker {
++  @override
++  void close() {}
++
++  @override
++  bool get closed => false;
++
++  @override
++  Future<(int, int)?> getImageColors(String url) {
++    return Future.value(null);
++  }
++}
++
++class FakeBroadcastImageWorkerFactory implements BroadcastImageWorkerFactory {
++  @override
++  Future<ImageColorWorker> spawn() {
++    return Future.value(FakeImageColorWorker());
++  }
++}
++
+ final client = MockClient((request) {
+   if (request.url.path == '/api/broadcast/top') {
+     return mockResponse(
+@@ -31,19 +54,20 @@ void main() {
+             overrides: [
+               lichessClientProvider
+                   .overrideWith((ref) => LichessClient(client, ref)),
++              broadcastImageWorkerFactoryProvider.overrideWith(
++                (ref) => FakeBroadcastImageWorkerFactory(),
++              ),
+             ],
+           );
+ 
+           await tester.pumpWidget(app);
+ 
++          expect(find.byType(CircularProgressIndicator), findsOneWidget);
++
+           // wait for broadcast tournaments to load
+           await tester.pump(const Duration(milliseconds: 100));
+ 
+           expect(find.byType(BroadcastGridItem), findsAtLeast(1));
+-
+-          // ColorScheme.fromImageProvider creates a Timer of 5s which is not automatically
+-          // disposed
+-          await tester.pump(const Duration(seconds: 10));
+         });
+       },
+     );
+@@ -59,21 +83,22 @@ void main() {
+             overrides: [
+               lichessClientProvider
+                   .overrideWith((ref) => LichessClient(client, ref)),
++              broadcastImageWorkerFactoryProvider.overrideWith(
++                (ref) => FakeBroadcastImageWorkerFactory(),
++              ),
+             ],
+           );
+ 
+           await tester.pumpWidget(app);
+ 
++          expect(find.byType(CircularProgressIndicator), findsOneWidget);
++
+           // wait for broadcast tournaments to load
+           await tester.pump(const Duration(milliseconds: 100));
+ 
+           await tester.scrollUntilVisible(find.text('Past broadcasts'), 200.0);
+ 
+           await tester.pumpAndSettle();
+-
+-          // ColorScheme.fromImageProvider creates a Timer of 5s which is not automatically
+-          // disposed
+-          await tester.pump(const Duration(seconds: 10));
+         });
+       },
+     );

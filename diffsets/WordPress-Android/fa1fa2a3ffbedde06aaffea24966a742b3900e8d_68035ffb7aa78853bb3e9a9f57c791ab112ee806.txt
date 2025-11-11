@@ -1,0 +1,467 @@
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/ActivityLauncher.java b/WordPress/src/main/java/org/wordpress/android/ui/ActivityLauncher.java
+index aa4c4b43128b..613f160fe761 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/ActivityLauncher.java
++++ b/WordPress/src/main/java/org/wordpress/android/ui/ActivityLauncher.java
+@@ -149,6 +149,7 @@
+ import static org.wordpress.android.analytics.AnalyticsTracker.Stat.STATS_ACCESS_ERROR;
+ import static org.wordpress.android.imageeditor.preview.PreviewImageFragment.ARG_EDIT_IMAGE_DATA;
+ import static org.wordpress.android.login.LoginMode.JETPACK_LOGIN_ONLY;
++import static org.wordpress.android.login.LoginMode.JETPACK_REST_CONNECT;
+ import static org.wordpress.android.login.LoginMode.WPCOM_LOGIN_ONLY;
+ import static org.wordpress.android.push.NotificationsProcessingService.ARG_NOTIFICATION_TYPE;
+ import static org.wordpress.android.ui.WPWebViewActivity.ENCODING_UTF8;
+@@ -1415,6 +1416,20 @@ public static void showSignInForResultWpComOnly(Activity activity) {
+         activity.startActivityForResult(intent, RequestCodes.ADD_ACCOUNT);
+     }
+ 
++    /**
++     * Sign in to WordPress.com from the Jetpack REST connection flow.
++     * This method is specifically for the Jetpack connection process where
++     * we need to authenticate with WordPress.com to establish the connection
++     * and return immediately to the connection flow.
++     *
++     * @param activity The activity requesting the sign-in
++     */
++    public static void showWpComSignInForRestConnect(@NonNull Activity activity) {
++        Intent intent = new Intent(activity, LoginActivity.class);
++        JETPACK_REST_CONNECT.putInto(intent);
++        activity.startActivityForResult(intent, RequestCodes.ADD_ACCOUNT);
++    }
++
+     public static void showSignInForResultJetpackOnly(Activity activity) {
+         Intent intent = new Intent(activity, LoginActivity.class);
+         intent.setFlags(
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/accounts/LoginActivity.java b/WordPress/src/main/java/org/wordpress/android/ui/accounts/LoginActivity.java
+index 91863591b42e..7e36ac495b8b 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/accounts/LoginActivity.java
++++ b/WordPress/src/main/java/org/wordpress/android/ui/accounts/LoginActivity.java
+@@ -194,6 +194,7 @@ protected void onCreate(@Nullable Bundle savedInstanceState) {
+                     loginFromPrologue();
+                     break;
+                 case WPCOM_LOGIN_ONLY:
++                case JETPACK_REST_CONNECT:
+                     mUnifiedLoginTracker.setSource(Source.ADD_WORDPRESS_COM_ACCOUNT);
+                     mIsSignupFromLoginEnabled = mBuildConfigWrapper.isSignupEnabled();
+                     checkSmartLockPasswordAndStartLogin();
+@@ -357,6 +358,12 @@ private void loggedInAndFinish(ArrayList<Integer> oldSitesIds, boolean doLoginUp
+             case JETPACK_STATS:
+                 ActivityLauncher.showLoginEpilogueForResult(this, oldSitesIds, true);
+                 break;
++            case JETPACK_REST_CONNECT:
++                // for the Jetpack REST connection we want to return to the caller activity instead of
++                // showing the login epilogue
++                setResult(Activity.RESULT_OK);
++                finish();
++                break;
+             case WPCOM_LOGIN_DEEPLINK:
+             case WPCOM_REAUTHENTICATE:
+                 ActivityLauncher.showLoginEpilogueForResult(this, oldSitesIds, false);
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/jetpackrestconnection/JetpackRestConnectionActivity.kt b/WordPress/src/main/java/org/wordpress/android/ui/jetpackrestconnection/JetpackRestConnectionActivity.kt
+index 07877482bfa8..3082614f6919 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/jetpackrestconnection/JetpackRestConnectionActivity.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/jetpackrestconnection/JetpackRestConnectionActivity.kt
+@@ -11,13 +11,24 @@ import dagger.hilt.android.AndroidEntryPoint
+ import kotlinx.coroutines.flow.filterNotNull
+ import kotlinx.coroutines.launch
+ import org.wordpress.android.R
++import org.wordpress.android.fluxc.store.AccountStore
++import org.wordpress.android.ui.ActivityLauncher
++import org.wordpress.android.ui.ActivityNavigator
++import org.wordpress.android.ui.RequestCodes
+ import org.wordpress.android.ui.main.BaseAppCompatActivity
+ import org.wordpress.android.util.extensions.setContent
++import javax.inject.Inject
+ 
+ @AndroidEntryPoint
+ class JetpackRestConnectionActivity : BaseAppCompatActivity() {
+     private val viewModel: JetpackRestConnectionViewModel by viewModels()
+ 
++    @Inject
++    lateinit var activityNavigator: ActivityNavigator
++
++    @Inject
++    lateinit var accountStore: AccountStore
++
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         setContent {
+@@ -34,13 +45,34 @@ class JetpackRestConnectionActivity : BaseAppCompatActivity() {
+         lifecycleScope.launch {
+             viewModel.uiEvent.filterNotNull().collect { event ->
+                 when (event) {
+-                    JetpackRestConnectionViewModel.UiEvent.Close -> finish()
+-                    JetpackRestConnectionViewModel.UiEvent.ShowCancelConfirmation -> showCancelConfirmationDialog()
++                    JetpackRestConnectionViewModel.UiEvent.StartWPComLogin ->
++                        startWPComLogin()
++
++                    JetpackRestConnectionViewModel.UiEvent.Close ->
++                        finish()
++
++                    JetpackRestConnectionViewModel.UiEvent.ShowCancelConfirmation ->
++                        showCancelConfirmationDialog()
+                 }
+             }
+         }
+     }
+ 
++    private fun startWPComLogin() {
++        ActivityLauncher.showWpComSignInForRestConnect(this)
++    }
++
++    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
++        super.onActivityResult(requestCode, resultCode, data)
++
++        // User returned from WordPress.com login - note the resultCode will always be RESULT_OK but
++        // we check it here in case that ever changes
++        if (requestCode == RequestCodes.ADD_ACCOUNT) {
++            val loginSuccessful = resultCode == RESULT_OK && (accountStore.accessToken?.isNotEmpty() == true)
++            viewModel.onWPComLoginCompleted(success = loginSuccessful)
++        }
++    }
++
+     private fun showCancelConfirmationDialog() {
+         MaterialAlertDialogBuilder(this)
+             .setTitle(R.string.jetpack_rest_connection_cancel_title)
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/jetpackrestconnection/JetpackRestConnectionScreen.kt b/WordPress/src/main/java/org/wordpress/android/ui/jetpackrestconnection/JetpackRestConnectionScreen.kt
+index bf48308df2ea..c04aecb42bac 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/jetpackrestconnection/JetpackRestConnectionScreen.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/jetpackrestconnection/JetpackRestConnectionScreen.kt
+@@ -249,30 +249,29 @@ private fun ConnectionStepContent(
+ 
+         Spacer(modifier = Modifier.height(4.dp))
+ 
+-        Text(
+-            text = getStatusText(status),
+-            style = MaterialTheme.typography.bodyMedium,
+-            color = style.statusColor
+-        )
+-
+         if (errorType != null && status == ConnectionStatus.Failed) {
+-            Spacer(modifier = Modifier.height(4.dp))
+             Text(
+                 text = getErrorText(LocalContext.current, errorType),
+                 style = MaterialTheme.typography.bodySmall,
+                 color = MaterialTheme.colorScheme.error
+             )
++        } else {
++            Text(
++                text = getStatusText(status),
++                style = MaterialTheme.typography.bodyMedium,
++                color = style.statusColor
++            )
+         }
+     }
+ }
+ 
+ private fun getErrorText(context: Context, errorType: ErrorType): String {
+     @StringRes val messageRes = when (errorType) {
+-        is ErrorType.JetpackAlreadyInstalled -> R.string.jetpack_rest_connection_error_jetpack_already_installed
++        ErrorType.FailedToLoginWpCom -> R.string.jetpack_rest_connection_error_login_wpcom
++        ErrorType.FailedToConnectWpCom -> R.string.jetpack_rest_connection_error_connect_wpcom
+         is ErrorType.Timeout -> R.string.jetpack_rest_connection_error_timeout
+         is ErrorType.Offline -> R.string.jetpack_rest_connection_error_offline
+         is ErrorType.Unknown -> R.string.jetpack_rest_connection_error_unknown
+-        is ErrorType.FailedToConnectWpCom -> R.string.jetpack_rest_connection_error_wpcom
+     }
+     val baseMessage = context.getString(messageRes)
+     return errorType.message?.let { "$baseMessage: $it" } ?: baseMessage
+@@ -422,7 +421,7 @@ private fun JetpackRestConnectionScreenPreview() {
+                 ConnectionStep.ConnectSite to StepState(ConnectionStatus.InProgress),
+                 ConnectionStep.ConnectWpCom to StepState(
+                     ConnectionStatus.Failed,
+-                    ErrorType.FailedToConnectWpCom()
++                    ErrorType.FailedToConnectWpCom
+                 ),
+                 ConnectionStep.Finalize to StepState(ConnectionStatus.NotStarted)
+             )
+@@ -439,5 +438,7 @@ private fun JetpackRestConnectionScreenPreview() {
+     )
+ }
+ 
+-@ColorRes private val IN_PROGRESS_BACKGROUND_COLOR = R.color.yellow_10 // Light yellow
+-@ColorRes private val IN_PROGRESS_FOREGROUND_COLOR = R.color.yellow_90 // Dark brown for readability on the above
++@ColorRes
++private val IN_PROGRESS_BACKGROUND_COLOR = R.color.yellow_10 // Light yellow
++@ColorRes
++private val IN_PROGRESS_FOREGROUND_COLOR = R.color.yellow_90 // Dark brown for readability on the above
+diff --git a/WordPress/src/main/java/org/wordpress/android/ui/jetpackrestconnection/JetpackRestConnectionViewModel.kt b/WordPress/src/main/java/org/wordpress/android/ui/jetpackrestconnection/JetpackRestConnectionViewModel.kt
+index d110e1fea94c..56ff8458c85d 100644
+--- a/WordPress/src/main/java/org/wordpress/android/ui/jetpackrestconnection/JetpackRestConnectionViewModel.kt
++++ b/WordPress/src/main/java/org/wordpress/android/ui/jetpackrestconnection/JetpackRestConnectionViewModel.kt
+@@ -3,12 +3,12 @@ package org.wordpress.android.ui.jetpackrestconnection
+ import dagger.hilt.android.lifecycle.HiltViewModel
+ import kotlinx.coroutines.CoroutineDispatcher
+ import kotlinx.coroutines.Job
+-import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.TimeoutCancellationException
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.withContext
+ import kotlinx.coroutines.withTimeout
+ import org.wordpress.android.fluxc.model.SiteModel
+-import org.wordpress.android.fluxc.store.AccountStore
+ import org.wordpress.android.fluxc.utils.AppLogWrapper
+ import org.wordpress.android.modules.BG_THREAD
+ import org.wordpress.android.modules.UI_THREAD
+@@ -16,9 +16,6 @@ import org.wordpress.android.ui.mysite.SelectedSiteRepository
+ import org.wordpress.android.util.AppLog
+ import org.wordpress.android.util.VersionUtils.checkMinimalVersion
+ import org.wordpress.android.viewmodel.ScopedViewModel
+-import kotlinx.coroutines.delay
+-import uniffi.wp_api.JetpackConnectionClient
+-import uniffi.wp_api.WpAuthentication
+ import javax.inject.Inject
+ import javax.inject.Named
+ 
+@@ -27,7 +24,6 @@ class JetpackRestConnectionViewModel @Inject constructor(
+     @Named(UI_THREAD) mainDispatcher: CoroutineDispatcher,
+     @Named(BG_THREAD) private val bgDispatcher: CoroutineDispatcher,
+     private val selectedSiteRepository: SelectedSiteRepository,
+-    private val accountStore: AccountStore,
+     private val appLogWrapper: AppLogWrapper,
+ ) : ScopedViewModel(mainDispatcher) {
+     private val _currentStep = MutableStateFlow<ConnectionStep?>(null)
+@@ -49,8 +45,7 @@ class JetpackRestConnectionViewModel @Inject constructor(
+ 
+     private var job: Job? = null
+ 
+-    // TODO Inject or initialize this properly when the actual implementation is ready
+-    private var jetpackConnectionClient: JetpackConnectionClient? = null
++    private var isWaitingForWPComLogin = false
+ 
+     private fun startConnectionJob(fromStep: ConnectionStep? = null) {
+         val stepInfo = fromStep?.let { " from step: $it" } ?: ""
+@@ -81,7 +76,7 @@ class JetpackRestConnectionViewModel @Inject constructor(
+         ConnectionStep.Finalize -> null
+     }
+ 
+-    private suspend fun startNextStep() {
++    private fun startNextStep() {
+         // Mark current step as completed if exists
+         currentStep.value?.let {
+             if (_stepStates.value[it]?.status == ConnectionStatus.InProgress) {
+@@ -95,15 +90,20 @@ class JetpackRestConnectionViewModel @Inject constructor(
+         }
+     }
+ 
+-    private suspend fun startStep(step: ConnectionStep) {
++    private fun startStep(step: ConnectionStep) {
+         appLogWrapper.d(AppLog.T.API, "$TAG: Starting step: $step")
+         _currentStep.value = step
+         updateStepStatus(step, ConnectionStatus.InProgress)
+-        // TODO executeStepWithErrorHandling(nextStep)
+-
+-        // TODO this is just to test the UI
+-        delay(STEP_DELAY_MS)
+-        updateStepStatus(step, ConnectionStatus.Completed)
++        if (step == ConnectionStep.LoginWpCom) {
++            loginWpCom()
++        } else {
++            launch {
++                executeStepWithErrorHandling(step)
++                // TODO this is just to test the UI
++                delay(STEP_DELAY_MS)
++                updateStepStatus(step, ConnectionStatus.Completed)
++            }
++        }
+     }
+ 
+     private fun updateStepStatus(
+@@ -122,15 +122,15 @@ class JetpackRestConnectionViewModel @Inject constructor(
+                 _currentStep.value = null
+                 _buttonType.value = ButtonType.Retry
+             }
++
+             ConnectionStatus.Completed -> {
+                 if (step == ConnectionStep.Finalize) {
+                     onJobCompleted()
+                 } else {
+-                    launch {
+-                        startNextStep()
+-                    }
++                    startNextStep()
+                 }
+             }
++
+             else -> {}
+         }
+     }
+@@ -210,74 +210,83 @@ class JetpackRestConnectionViewModel @Inject constructor(
+                     executeNetworkRequest(step)
+                 }
+             }
+-            updateStepStatus(step, ConnectionStatus.Completed)
+         } catch (e: Exception) {
+             appLogWrapper.e(AppLog.T.API, "$TAG: Error in step $step: ${e.message}")
+             val errorType = when (e) {
+                 is TimeoutCancellationException -> ErrorType.Timeout(e.message)
+                 else -> ErrorType.Unknown(e.message)
+             }
+-            updateStepStatus(step, ConnectionStatus.Failed, errorType)
++            updateStepStatus(
++                step = step,
++                status = ConnectionStatus.Failed,
++                error = errorType,
++            )
+         }
+     }
+ 
+-    private suspend fun executeNetworkRequest(step: ConnectionStep) {
++    private fun executeNetworkRequest(step: ConnectionStep) {
+         when (step) {
+             ConnectionStep.LoginWpCom -> {
+-                // TODO
++                // noop - this is handled separately since it doesn't use a coroutine
+             }
+ 
+             ConnectionStep.InstallJetpack -> {
+-                val site = getSite()
+-                if (site.isJetpackInstalled) {
+-                    appLogWrapper.d(AppLog.T.API, "$TAG: Jetpack already installed")
+-                    updateStepStatus(
+-                        step = step,
+-                        status = ConnectionStatus.Failed,
+-                        error = ErrorType.JetpackAlreadyInstalled()
+-                    )
+-                } else {
+-                    installJetpackPlugin()
+-                }
++                appLogWrapper.d(AppLog.T.API, "$TAG: Installing Jetpack")
++                // TODO
+             }
+ 
+             ConnectionStep.ConnectSite -> {
+                 appLogWrapper.d(AppLog.T.API, "$TAG: Connecting site")
+-                jetpackConnectionClient?.connectSite(
+-                    from = getSiteId().toString()
+-                ) ?: error("JetpackConnectionClient not initialized")
++                // TODO
+             }
+ 
+             ConnectionStep.ConnectWpCom -> {
+-                val token = accountStore.accessToken
+-                    ?: error("No access token available")
+-
+                 appLogWrapper.d(AppLog.T.API, "$TAG: Connecting WordPress.com user")
+-                jetpackConnectionClient?.connectUser(
+-                    wpComAuthentication = WpAuthentication.Bearer(token = token),
+-                    from = getSiteId().toString()
+-                ) ?: error("JetpackConnectionClient not initialized")
++                // TODO
+             }
+ 
+             ConnectionStep.Finalize -> {
+                 appLogWrapper.d(AppLog.T.API, "$TAG: Finalizing connection")
++                // TODO
+             }
+         }
+     }
+ 
+-    private suspend fun installJetpackPlugin() {
+-        appLogWrapper.d(AppLog.T.API, "$TAG: Installing Jetpack plugin")
+-        // TODO Implement actual plugin installation API call when ready
+-        // val params = PluginCreateParams(
+-        //     slug = PluginWpOrgDirectorySlug("jetpack"),
+-        //     status = PluginStatus.ACTIVE,
+-        // )
+-        // For now, simulate network delay
+-        delay(STEP_DELAY_MS)
++    private fun loginWpCom() {
++        appLogWrapper.d(AppLog.T.API, "$TAG: Starting WordPress.com login")
++        // TODO skip if the account store token already exists, but for now don't do this to make testing easier
++        isWaitingForWPComLogin = true
++        _uiEvent.value = UiEvent.StartWPComLogin
+     }
+ 
+-    private fun getSiteId() = getSite().siteId
++    /**
++     * Called by the activity when WordPress.com login flow completes
++     */
++    fun onWPComLoginCompleted(success: Boolean) {
++        if (!isWaitingForWPComLogin) {
++            appLogWrapper.w(AppLog.T.API, "$TAG: WordPress.com login completed, but not waiting for it")
++            return
++        }
++
++        isWaitingForWPComLogin = false
++        launch {
++            if (success) {
++                // Login successful
++                appLogWrapper.d(AppLog.T.API, "$TAG: WordPress.com login successful")
++                updateStepStatus(ConnectionStep.LoginWpCom, ConnectionStatus.Completed)
++            } else {
++                // Login failed or was cancelled
++                appLogWrapper.e(AppLog.T.API, "$TAG: WordPress.com login failed or cancelled")
++                updateStepStatus(
++                    ConnectionStep.LoginWpCom,
++                    ConnectionStatus.Failed,
++                    ErrorType.FailedToLoginWpCom
++                )
++            }
++        }
++    }
+ 
++    @Suppress("Unused", "UnusedPrivateMember")
+     private fun getSite() = selectedSiteRepository.getSelectedSite()
+         ?: error("No site is currently selected in SelectedSiteRepository")
+ 
+@@ -297,13 +306,14 @@ class JetpackRestConnectionViewModel @Inject constructor(
+     }
+ 
+     sealed class UiEvent {
++        data object StartWPComLogin : UiEvent()
+         data object Close : UiEvent()
+         data object ShowCancelConfirmation : UiEvent()
+     }
+ 
+     sealed class ErrorType(open val message: String? = null) {
+-        data class JetpackAlreadyInstalled(override val message: String? = null) : ErrorType(message)
+-        data class FailedToConnectWpCom(override val message: String? = null) : ErrorType(message)
++        data object FailedToLoginWpCom : ErrorType()
++        data object FailedToConnectWpCom : ErrorType()
+         data class Timeout(override val message: String? = null) : ErrorType(message)
+         data class Offline(override val message: String? = null) : ErrorType(message)
+         data class Unknown(override val message: String? = null) : ErrorType(message)
+@@ -329,9 +339,9 @@ class JetpackRestConnectionViewModel @Inject constructor(
+          */
+         fun canInitiateJetpackRestConnection(site: SiteModel): Boolean {
+             return site.isUsingSelfHostedRestApi
+-                && !site.wpApiRestUrl.isNullOrEmpty()
+-                && !site.isJetpackConnected
+-                && (!site.isJetpackInstalled || checkMinimalVersion(site.jetpackVersion, LIMIT_VERSION))
++                    && !site.wpApiRestUrl.isNullOrEmpty()
++                    && !site.isJetpackConnected
++                    && (!site.isJetpackInstalled || checkMinimalVersion(site.jetpackVersion, LIMIT_VERSION))
+         }
+ 
+         private val initialStepStates = mapOf(
+diff --git a/WordPress/src/main/res/values/strings.xml b/WordPress/src/main/res/values/strings.xml
+index 7da68312b389..3e5ba381575f 100644
+--- a/WordPress/src/main/res/values/strings.xml
++++ b/WordPress/src/main/res/values/strings.xml
+@@ -1021,11 +1021,11 @@
+     <string name="jetpack_rest_connection_status_failed">Failed</string>
+     <string name="jetpack_rest_connection_cancel_title">Cancel Jetpack Setup?</string>
+     <string name="jetpack_rest_connection_cancel_message">The Jetpack connection process is in progress. Are you sure you want to cancel?</string>
+-    <string name="jetpack_rest_connection_error_jetpack_already_installed">Jetpack is already installed</string>
+     <string name="jetpack_rest_connection_error_timeout">Timed out</string>
+     <string name="jetpack_rest_connection_error_unknown" translatable="false">@string/error_generic</string>
+     <string name="jetpack_rest_connection_error_offline" translatable="false">@string/no_network_title</string>
+-    <string name="jetpack_rest_connection_error_wpcom">Unable to connect to WordPress.com</string>
++    <string name="jetpack_rest_connection_error_login_wpcom">Unable to log into WordPress.com</string>
++    <string name="jetpack_rest_connection_error_connect_wpcom">Unable to connect to WordPress.com</string>
+ 
+     <!-- Stats refresh -->
+     <string name="stats_no_data_yet">No data yet</string>
+diff --git a/libs/login/src/main/java/org/wordpress/android/login/LoginMode.java b/libs/login/src/main/java/org/wordpress/android/login/LoginMode.java
+index b715b9a6bafe..7be20419fd88 100644
+--- a/libs/login/src/main/java/org/wordpress/android/login/LoginMode.java
++++ b/libs/login/src/main/java/org/wordpress/android/login/LoginMode.java
+@@ -9,6 +9,7 @@ public enum LoginMode {
+     WPCOM_LOGIN_ONLY,
+     JETPACK_LOGIN_ONLY,
+     JETPACK_STATS,
++    JETPACK_REST_CONNECT,
+     WPCOM_LOGIN_DEEPLINK,
+     WPCOM_REAUTHENTICATE,
+     SHARE_INTENT,

@@ -1,0 +1,2529 @@
+diff --git a/android/app/build.gradle b/android/app/build.gradle
+index b65c541087..67f34cc67f 100644
+--- a/android/app/build.gradle
++++ b/android/app/build.gradle
+@@ -37,7 +37,7 @@ if (appPropertiesFile.exists()) {
+ }
+ 
+ android {
+-    compileSdkVersion 34
++    compileSdkVersion 35
+     buildToolsVersion "34.0.0"
+ 
+     lintOptions {
+@@ -81,6 +81,9 @@ android {
+ 
+             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
++       debug {
++            signingConfig signingConfigs.release
++       }
+    }
+ 
+     ndkVersion "27.0.12077973"
+diff --git a/cw_core/lib/set_app_secure_native.dart b/cw_core/lib/set_app_secure_native.dart
+index 84096e2d61..16faa56c11 100644
+--- a/cw_core/lib/set_app_secure_native.dart
++++ b/cw_core/lib/set_app_secure_native.dart
+@@ -1,9 +1,9 @@
+ import 'package:flutter/services.dart';
+ 
+-void setIsAppSecureNative(bool isAppSecure) {
++Future<void> setIsAppSecureNative(bool isAppSecure) async {
+   try {
+     final utils = const MethodChannel('com.cake_wallet/native_utils');
+ 
+-    utils.invokeMethod<Uint8List>('setIsAppSecure', {'isAppSecure': isAppSecure});
++    await utils.invokeMethod<Uint8List>('setIsAppSecure', {'isAppSecure': isAppSecure});
+   } catch (_) {}
+ }
+diff --git a/cw_core/lib/wallet_base.dart b/cw_core/lib/wallet_base.dart
+index 42bd66da03..e15dca89b9 100644
+--- a/cw_core/lib/wallet_base.dart
++++ b/cw_core/lib/wallet_base.dart
+@@ -67,6 +67,12 @@ abstract class WalletBase<BalanceType extends Balance, HistoryType extends Trans
+   // there is a default definition here because only coins with a pow node (nano based) need to override this
+   Future<void> connectToPowNode({required Node node}) async {}
+ 
++  // startBackgroundSync is used to start sync in the background, without doing any
++  // extra things in the background.
++  // startSync is used as a fallback.
++  Future<void> startBackgroundSync() => startSync();
++  Future<void> stopBackgroundSync(String password) => stopSync();
++
+   Future<void> startSync();
+ 
+   Future<void> stopSync() async {}
+diff --git a/cw_monero/lib/api/account_list.dart b/cw_monero/lib/api/account_list.dart
+index e3bb25c973..0e55ce15cb 100644
+--- a/cw_monero/lib/api/account_list.dart
++++ b/cw_monero/lib/api/account_list.dart
+@@ -37,7 +37,8 @@ List<monero.SubaddressAccountRow> getAllAccount() {
+   int size = monero.SubaddressAccount_getAll_size(subaddressAccount!);
+   if (size == 0) {
+     monero.Wallet_addSubaddressAccount(wptr!);
+-    return getAllAccount();
++    monero.Wallet_status(wptr!);
++    return [];
+   }
+   return List.generate(size, (index) {
+     return monero.SubaddressAccount_getAll_byIndex(subaddressAccount!, index: index);
+diff --git a/cw_monero/lib/api/wallet.dart b/cw_monero/lib/api/wallet.dart
+index b9f3d21ecb..755887652c 100644
+--- a/cw_monero/lib/api/wallet.dart
++++ b/cw_monero/lib/api/wallet.dart
+@@ -2,6 +2,7 @@ import 'dart:async';
+ import 'dart:ffi';
+ import 'dart:isolate';
+ 
++import 'package:cw_core/root_dir.dart';
+ import 'package:cw_core/utils/print_verbose.dart';
+ import 'package:cw_monero/api/account_list.dart';
+ import 'package:cw_monero/api/exceptions/setup_wallet_exception.dart';
+@@ -108,9 +109,13 @@ Map<int, Map<int, Map<int, String>>> addressCache = {};
+ 
+ String getAddress({int accountIndex = 0, int addressIndex = 0}) {
+   // printV("getaddress: ${accountIndex}/${addressIndex}: ${monero.Wallet_numSubaddresses(wptr!, accountIndex: accountIndex)}: ${monero.Wallet_address(wptr!, accountIndex: accountIndex, addressIndex: addressIndex)}");
+-  while (monero.Wallet_numSubaddresses(wptr!, accountIndex: accountIndex)-1 < addressIndex) {
+-    printV("adding subaddress");
+-    monero.Wallet_addSubaddress(wptr!, accountIndex: accountIndex);
++  // this could be a while loop, but I'm in favor of making it if to not cause freezes
++  if (monero.Wallet_numSubaddresses(wptr!, accountIndex: accountIndex)-1 < addressIndex) {
++    if (monero.Wallet_numSubaddressAccounts(wptr!) < accountIndex) {
++      monero.Wallet_addSubaddressAccount(wptr!);
++    } else {
++      monero.Wallet_addSubaddress(wptr!, accountIndex: accountIndex);
++    }
+   }
+   addressCache[wptr!.address] ??= {};
+   addressCache[wptr!.address]![accountIndex] ??= {};
+@@ -149,6 +154,7 @@ Future<bool> setupNodeSync(
+ }
+ ''');
+   final addr = wptr!.address;
++  printV("init: start");
+   await Isolate.run(() {
+     monero.Wallet_init(Pointer.fromAddress(addr),
+         daemonAddress: address,
+@@ -157,6 +163,7 @@ Future<bool> setupNodeSync(
+         daemonUsername: login ?? '',
+         daemonPassword: password ?? '');
+   });
++  printV("init: end");
+ 
+   final status = monero.Wallet_status(wptr!);
+ 
+@@ -168,7 +175,7 @@ Future<bool> setupNodeSync(
+     }
+   }
+ 
+-  if (kDebugMode && debugMonero) {
++  if (true) {
+     monero.Wallet_init3(
+       wptr!, argv0: '',
+       defaultLogBaseName: 'moneroc',
+@@ -243,7 +250,9 @@ class SyncListener {
+   SyncListener(this.onNewBlock, this.onNewTransaction)
+       : _cachedBlockchainHeight = 0,
+         _lastKnownBlockHeight = 0,
+-        _initialSyncHeight = 0;
++        _initialSyncHeight = 0 {
++          _start();
++        }
+ 
+   void Function(int, int, double) onNewBlock;
+   void Function() onNewTransaction;
+@@ -261,7 +270,7 @@ class SyncListener {
+     return _cachedBlockchainHeight;
+   }
+ 
+-  void start() {
++  void _start() {
+     _cachedBlockchainHeight = 0;
+     _lastKnownBlockHeight = 0;
+     _initialSyncHeight = 0;
+@@ -282,7 +291,7 @@ class SyncListener {
+       }
+ 
+       final bchHeight = await getNodeHeightOrUpdate(syncHeight);
+-
++      // printV("syncHeight: $syncHeight, _lastKnownBlockHeight: $_lastKnownBlockHeight, bchHeight: $bchHeight");
+       if (_lastKnownBlockHeight == syncHeight) {
+         return;
+       }
+@@ -379,4 +388,4 @@ String signMessage(String message, {String address = ""}) {
+ 
+ bool verifyMessage(String message, String address, String signature) {
+   return monero.Wallet_verifySignedMessage(wptr!, message: message, address: address, signature: signature);
+-}
++}
+\ No newline at end of file
+diff --git a/cw_monero/lib/api/wallet_manager.dart b/cw_monero/lib/api/wallet_manager.dart
+index 7cadadbb91..bfebe42471 100644
+--- a/cw_monero/lib/api/wallet_manager.dart
++++ b/cw_monero/lib/api/wallet_manager.dart
+@@ -11,6 +11,7 @@ import 'package:cw_monero/api/exceptions/wallet_restore_from_seed_exception.dart
+ import 'package:cw_monero/api/transaction_history.dart';
+ import 'package:cw_monero/api/wallet.dart';
+ import 'package:cw_monero/ledger.dart';
++import 'package:flutter/foundation.dart';
+ import 'package:monero/monero.dart' as monero;
+ 
+ class MoneroCException implements Exception {
+@@ -50,7 +51,13 @@ final monero.WalletManager wmPtr = Pointer.fromAddress((() {
+     // codebase, so it will be easier to debug what happens. At least easier
+     // than plugging gdb in. Especially on windows/android.
+     monero.printStarts = false;
++    if (kDebugMode && debugMonero) {
++      monero.WalletManagerFactory_setLogLevel(4);
++    }
+     _wmPtr ??= monero.WalletManagerFactory_getWalletManager();
++    if (kDebugMode && debugMonero) {
++      monero.WalletManagerFactory_setLogLevel(4);
++    }
+     printV("ptr: $_wmPtr");
+   } catch (e) {
+     printV(e);
+@@ -77,10 +84,17 @@ void createWalletSync(
+   final newWptr = monero.WalletManager_createWallet(wmPtr,
+       path: path, password: password, language: language, networkType: 0);
+ 
+-  final status = monero.Wallet_status(newWptr);
++  int status = monero.Wallet_status(newWptr);
++  if (status != 0) {
++    throw WalletCreationException(message: monero.Wallet_errorString(newWptr));
++  }
++
++  monero.Wallet_setupBackgroundSync(newWptr, backgroundSyncType: 2, walletPassword: password, backgroundCachePassword: '');
++  status = monero.Wallet_status(newWptr);
+   if (status != 0) {
+     throw WalletCreationException(message: monero.Wallet_errorString(newWptr));
+   }
++
+   wptr = newWptr;
+   monero.Wallet_setCacheAttribute(wptr!, key: "cakewallet.passphrase", value: passphrase);
+   monero.Wallet_store(wptr!, path: path);
+@@ -166,12 +180,19 @@ void restoreWalletFromKeysSync(
+           nettype: 0,
+         );
+ 
+-  final status = monero.Wallet_status(newWptr);
++  int status = monero.Wallet_status(newWptr);
+   if (status != 0) {
+     throw WalletRestoreFromKeysException(
+         message: monero.Wallet_errorString(newWptr));
+   }
+ 
++  
++  monero.Wallet_setupBackgroundSync(newWptr, backgroundSyncType: 2, walletPassword: password, backgroundCachePassword: '');
++  status = monero.Wallet_status(newWptr);
++  if (status != 0) {
++    throw WalletCreationException(message: monero.Wallet_errorString(newWptr));
++  }
++
+   // CW-712 - Try to restore deterministic wallet first, if the view key doesn't
+   // match the view key provided
+   if (spendKey != "") {
+@@ -190,11 +211,17 @@ void restoreWalletFromKeysSync(
+         spendKeyString: spendKey,
+         nettype: 0,
+       );
+-      final status = monero.Wallet_status(newWptr);
++      int status = monero.Wallet_status(newWptr);
+       if (status != 0) {
+         throw WalletRestoreFromKeysException(
+             message: monero.Wallet_errorString(newWptr));
+       }
++        
++      monero.Wallet_setupBackgroundSync(newWptr, backgroundSyncType: 2, walletPassword: password, backgroundCachePassword: '');
++      status = monero.Wallet_status(newWptr);
++      if (status != 0) {
++        throw WalletCreationException(message: monero.Wallet_errorString(newWptr));
++      }
+     }
+   }
+ 
+@@ -227,7 +254,7 @@ void restoreWalletFromPolyseedWithOffset(
+     kdfRounds: 1,
+   );
+ 
+-  final status = monero.Wallet_status(newWptr);
++  int status = monero.Wallet_status(newWptr);
+ 
+   if (status != 0) {
+     final err = monero.Wallet_errorString(newWptr);
+@@ -240,6 +267,12 @@ void restoreWalletFromPolyseedWithOffset(
+   monero.Wallet_setCacheAttribute(wptr!, key: "cakewallet.seed", value: seed);
+   monero.Wallet_setCacheAttribute(wptr!, key: "cakewallet.passphrase", value: seedOffset);
+   monero.Wallet_store(wptr!);
++    
++  monero.Wallet_setupBackgroundSync(newWptr, backgroundSyncType: 2, walletPassword: password, backgroundCachePassword: '');
++  status = monero.Wallet_status(newWptr);
++  if (status != 0) {
++    throw WalletCreationException(message: monero.Wallet_errorString(newWptr));
++  }
+   storeSync();
+ 
+   openedWalletsByPath[path] = wptr!;
+@@ -277,7 +310,7 @@ void restoreWalletFromSpendKeySync(
+     restoreHeight: restoreHeight,
+   );
+ 
+-  final status = monero.Wallet_status(newWptr);
++  int status = monero.Wallet_status(newWptr);
+ 
+   if (status != 0) {
+     final err = monero.Wallet_errorString(newWptr);
+@@ -290,6 +323,12 @@ void restoreWalletFromSpendKeySync(
+   monero.Wallet_setCacheAttribute(wptr!, key: "cakewallet.seed", value: seed);
+ 
+   storeSync();
++  
++  monero.Wallet_setupBackgroundSync(newWptr, backgroundSyncType: 2, walletPassword: password, backgroundCachePassword: '');
++  status = monero.Wallet_status(newWptr);
++  if (status != 0) {
++    throw WalletCreationException(message: monero.Wallet_errorString(newWptr));
++  }
+ 
+   openedWalletsByPath[path] = wptr!;
+   _lastOpenedWallet = path;
+@@ -321,6 +360,14 @@ Future<void> restoreWalletFromHardwareWallet(
+     final error = monero.Wallet_errorString(newWptr);
+     throw WalletRestoreFromSeedException(message: error);
+   }
++
++  // TODO: Check with upstream if we can use background sync here
++  // monero.Wallet_setupBackgroundSync(newWptr, backgroundSyncType: 2, walletPassword: password, backgroundCachePassword: '');
++  // status = monero.Wallet_status(newWptr);
++  // if (status != 0) {
++  //   throw WalletCreationException(message: monero.Wallet_errorString(newWptr));
++  // }
++
+   wptr = newWptr;
+   _lastOpenedWallet = path;
+   openedWalletsByPath[path] = wptr!;
+@@ -384,7 +431,14 @@ Future<void> loadWallet(
+ 
+     final newWptr = Pointer<Void>.fromAddress(newWptrAddr);
+ 
+-    final status = monero.Wallet_status(newWptr);
++    int status = monero.Wallet_status(newWptr);
++    if (status != 0) {
++      final err = monero.Wallet_errorString(newWptr);
++      printV("loadWallet:"+err);
++      throw WalletOpeningException(message: err);
++    }
++    monero.Wallet_setupBackgroundSync(newWptr, backgroundSyncType: 2, walletPassword: password, backgroundCachePassword: '');
++    status = monero.Wallet_status(newWptr);
+     if (status != 0) {
+       final err = monero.Wallet_errorString(newWptr);
+       printV("loadWallet:"+err);
+diff --git a/cw_monero/lib/monero_wallet.dart b/cw_monero/lib/monero_wallet.dart
+index ebad95f8e3..db4d30ee88 100644
+--- a/cw_monero/lib/monero_wallet.dart
++++ b/cw_monero/lib/monero_wallet.dart
+@@ -218,7 +218,7 @@ abstract class MoneroWalletBase extends WalletBase<MoneroBalance,
+           // FIXME: hardcoded value
+           socksProxyAddress: node.socksProxyAddress);
+ 
+-      monero_wallet.setTrustedDaemon(node.trusted);
++      await monero_wallet.setTrustedDaemon(node.trusted);
+       syncStatus = ConnectedSyncStatus();
+     } catch (e) {
+       syncStatus = FailedSyncStatus();
+@@ -226,6 +226,57 @@ abstract class MoneroWalletBase extends WalletBase<MoneroBalance,
+     }
+   }
+ 
++  @override
++  Future<void> startBackgroundSync() async {
++    if (isBackgroundSyncRunning) {
++      printV("Background sync already running");
++      return;
++    }
++    isBackgroundSyncRunning = true;
++    int status = monero.Wallet_status(wptr!);
++    if (status != 0) {
++      final err = monero.Wallet_errorString(wptr!);
++      throw Exception("unable to setup background sync: $err");
++    }
++    await save();
++
++    monero.Wallet_startBackgroundSync(wptr!);
++    status = monero.Wallet_status(wptr!);
++    if (status != 0) {
++      final err = monero.Wallet_errorString(wptr!);
++      throw Exception("unable to start background sync: $err");
++    }
++    await save();
++    await init();
++    await startSync();
++  }
++
++  bool isBackgroundSyncRunning = false;
++
++  @action
++  @override
++  Future<void> stopSync() async {
++    if (isBackgroundSyncRunning) {
++      printV("Stopping background sync");
++      await save();
++      monero.Wallet_stopBackgroundSync(wptr!, '');
++      await save();
++      isBackgroundSyncRunning = false;
++    }
++  }
++
++  @action
++  @override
++  Future<void> stopBackgroundSync(String password) async {
++    if (isBackgroundSyncRunning) {
++      printV("Stopping background sync");
++      await save();
++      monero.Wallet_stopBackgroundSync(wptr!, password);
++      await save();
++      isBackgroundSyncRunning = false;
++    }
++  }
++
+   @override
+   Future<void> startSync() async {
+     try {
+@@ -250,7 +301,6 @@ abstract class MoneroWalletBase extends WalletBase<MoneroBalance,
+       syncStatus = AttemptingSyncStatus();
+       monero_wallet.startRefresh();
+       _setListeners();
+-      _listener?.start();
+     } catch (e) {
+       syncStatus = FailedSyncStatus();
+       printV(e);
+@@ -782,6 +832,7 @@ abstract class MoneroWalletBase extends WalletBase<MoneroBalance,
+   }
+ 
+   void _onNewBlock(int height, int blocksLeft, double ptc) async {
++    printV("onNewBlock: $height, $blocksLeft, $ptc");
+     try {
+       if (walletInfo.isRecovery) {
+         await _askForUpdateTransactionHistory();
+diff --git a/cw_wownero/lib/api/wallet_manager.dart b/cw_wownero/lib/api/wallet_manager.dart
+index 8d745ef8eb..060ebd4d0e 100644
+--- a/cw_wownero/lib/api/wallet_manager.dart
++++ b/cw_wownero/lib/api/wallet_manager.dart
+@@ -349,6 +349,7 @@ void loadWallet(
+     txhistory = null;
+     final newWptr = wownero.WalletManager_openWallet(wmPtr,
+         path: path, password: password);
++
+     _lastOpenedWallet = path;
+     final status = wownero.Wallet_status(newWptr);
+     if (status != 0) {
+diff --git a/ios/Podfile.lock b/ios/Podfile.lock
+index f621ab9b21..8e9852f302 100644
+--- a/ios/Podfile.lock
++++ b/ios/Podfile.lock
+@@ -3,38 +3,9 @@ PODS:
+     - Flutter
+     - ReachabilitySwift
+   - CryptoSwift (1.8.3)
+-  - cw_haven (0.0.1):
+-    - cw_haven/Boost (= 0.0.1)
+-    - cw_haven/Haven (= 0.0.1)
+-    - cw_haven/OpenSSL (= 0.0.1)
+-    - cw_haven/Sodium (= 0.0.1)
+-    - cw_shared_external
+-    - Flutter
+-  - cw_haven/Boost (0.0.1):
+-    - cw_shared_external
+-    - Flutter
+-  - cw_haven/Haven (0.0.1):
+-    - cw_shared_external
+-    - Flutter
+-  - cw_haven/OpenSSL (0.0.1):
+-    - cw_shared_external
+-    - Flutter
+-  - cw_haven/Sodium (0.0.1):
+-    - cw_shared_external
+-    - Flutter
+-  - cw_mweb (0.0.1):
+-    - Flutter
+   - cw_decred (0.0.1):
+-  - cw_shared_external (0.0.1):
+-    - cw_shared_external/Boost (= 0.0.1)
+-    - cw_shared_external/OpenSSL (= 0.0.1)
+-    - cw_shared_external/Sodium (= 0.0.1)
+-    - Flutter
+-  - cw_shared_external/Boost (0.0.1):
+-    - Flutter
+-  - cw_shared_external/OpenSSL (0.0.1):
+     - Flutter
+-  - cw_shared_external/Sodium (0.0.1):
++  - cw_mweb (0.0.1):
+     - Flutter
+   - device_display_brightness (0.0.1):
+     - Flutter
+@@ -131,16 +102,12 @@ PODS:
+     - Flutter
+   - wakelock_plus (0.0.1):
+     - Flutter
+-  - workmanager (0.0.1):
+-    - Flutter
+ 
+ DEPENDENCIES:
+   - connectivity_plus (from `.symlinks/plugins/connectivity_plus/ios`)
+   - CryptoSwift
+-  - cw_haven (from `.symlinks/plugins/cw_haven/ios`)
+-  - cw_mweb (from `.symlinks/plugins/cw_mweb/ios`)
+-  - cw_shared_external (from `.symlinks/plugins/cw_shared_external/ios`)
+   - cw_decred (from `.symlinks/plugins/cw_decred/ios`)
++  - cw_mweb (from `.symlinks/plugins/cw_mweb/ios`)
+   - device_display_brightness (from `.symlinks/plugins/device_display_brightness/ios`)
+   - device_info_plus (from `.symlinks/plugins/device_info_plus/ios`)
+   - devicelocale (from `.symlinks/plugins/devicelocale/ios`)
+@@ -165,7 +132,6 @@ DEPENDENCIES:
+   - universal_ble (from `.symlinks/plugins/universal_ble/darwin`)
+   - url_launcher_ios (from `.symlinks/plugins/url_launcher_ios/ios`)
+   - wakelock_plus (from `.symlinks/plugins/wakelock_plus/ios`)
+-  - workmanager (from `.symlinks/plugins/workmanager/ios`)
+ 
+ SPEC REPOS:
+   https://github.com/CocoaPods/Specs.git:
+@@ -181,14 +147,10 @@ SPEC REPOS:
+ EXTERNAL SOURCES:
+   connectivity_plus:
+     :path: ".symlinks/plugins/connectivity_plus/ios"
+-  cw_haven:
+-    :path: ".symlinks/plugins/cw_haven/ios"
+-  cw_mweb:
+-    :path: ".symlinks/plugins/cw_mweb/ios"
+-  cw_shared_external:
+-    :path: ".symlinks/plugins/cw_shared_external/ios"
+   cw_decred:
+     :path: ".symlinks/plugins/cw_decred/ios"
++  cw_mweb:
++    :path: ".symlinks/plugins/cw_mweb/ios"
+   device_display_brightness:
+     :path: ".symlinks/plugins/device_display_brightness/ios"
+   device_info_plus:
+@@ -237,48 +199,43 @@ EXTERNAL SOURCES:
+     :path: ".symlinks/plugins/url_launcher_ios/ios"
+   wakelock_plus:
+     :path: ".symlinks/plugins/wakelock_plus/ios"
+-  workmanager:
+-    :path: ".symlinks/plugins/workmanager/ios"
+ 
+ SPEC CHECKSUMS:
+-  connectivity_plus: bf0076dd84a130856aa636df1c71ccaff908fa1d
++  connectivity_plus: 481668c94744c30c53b8895afb39159d1e619bdf
+   CryptoSwift: 967f37cea5a3294d9cce358f78861652155be483
+-  cw_haven: b3e54e1fbe7b8e6fda57a93206bc38f8e89b898a
+-  cw_mweb: 22cd01dfb8ad2d39b15332006f22046aaa8352a3
+-  cw_shared_external: 2972d872b8917603478117c9957dfca611845a92
+-  cw_decred: 9c0e1df74745b51a1289ec5e91fb9e24b68fa14a
+-  device_display_brightness: 1510e72c567a1f6ce6ffe393dcd9afd1426034f7
+-  device_info_plus: c6fb39579d0f423935b0c9ce7ee2f44b71b9fce6
+-  devicelocale: 35ba84dc7f45f527c3001535d8c8d104edd5d926
++  cw_decred: a02cf30175a46971c1e2fa22c48407534541edc6
++  cw_mweb: 3aea2fb35b2bd04d8b2d21b83216f3b8fb768d85
++  device_display_brightness: 04374ebd653619292c1d996f00f42877ea19f17f
++  device_info_plus: 335f3ce08d2e174b9fdc3db3db0f4e3b1f66bd89
++  devicelocale: bd64aa714485a8afdaded0892c1e7d5b7f680cf8
+   DKImagePickerController: 946cec48c7873164274ecc4624d19e3da4c1ef3c
+   DKPhotoGallery: b3834fecb755ee09a593d7c9e389d8b5d6deed60
+-  fast_scanner: 44c00940355a51258cd6c2085734193cd23d95bc
+-  file_picker: 15fd9539e4eb735dc54bae8c0534a7a9511a03de
++  fast_scanner: 2cb1ad3e69e645e9980fb4961396ce5804caa3e3
++  file_picker: 07c75322ede1d47ec9bb4ac82b27c94d3598251a
+   Flutter: e0871f40cf51350855a761d2e70bf5af5b9b5de7
+-  flutter_inappwebview_ios: 6f63631e2c62a7c350263b13fa5427aedefe81d4
+-  flutter_local_authentication: 1172a4dd88f6306dadce067454e2c4caf07977bb
+-  flutter_mailer: 2ef5a67087bc8c6c4cefd04a178bf1ae2c94cd83
+-  flutter_secure_storage: 23fc622d89d073675f2eaa109381aefbcf5a49be
+-  fluttertoast: e9a18c7be5413da53898f660530c56f35edfba9c
+-  in_app_review: a31b5257259646ea78e0e35fc914979b0031d011
+-  integration_test: 252f60fa39af5e17c3aa9899d35d908a0721b573
++  flutter_inappwebview_ios: b89ba3482b96fb25e00c967aae065701b66e9b99
++  flutter_local_authentication: 989278c681612f1ee0e36019e149137f114b9d7f
++  flutter_mailer: 3a8cd4f36c960fb04528d5471097270c19fec1c4
++  flutter_secure_storage: 2c2ff13db9e0a5647389bff88b0ecac56e3f3418
++  fluttertoast: 76fea30fcf04176325f6864c87306927bd7d2038
++  in_app_review: 5596fe56fab799e8edb3561c03d053363ab13457
++  integration_test: 4a889634ef21a45d28d50d622cf412dc6d9f586e
+   OrderedSet: e539b66b644ff081c73a262d24ad552a69be3a94
+-  package_info_plus: c0502532a26c7662a62a356cebe2692ec5fe4ec4
+-  path_provider_foundation: 2b6b4c569c0fb62ec74538f866245ac84301af46
+-  permission_handler_apple: e76247795d700c14ea09e3a2d8855d41ee80a2e6
++  package_info_plus: af8e2ca6888548050f16fa2f1938db7b5a5df499
++  path_provider_foundation: 080d55be775b7414fd5a5ef3ac137b97b097e564
++  permission_handler_apple: 3787117e48f80715ff04a3830ca039283d6a4f29
+   ReachabilitySwift: 32793e867593cfc1177f5d16491e3a197d2fccda
+   SDWebImage: 8a6b7b160b4d710e2a22b6900e25301075c34cb3
+-  sensitive_clipboard: d4866e5d176581536c27bb1618642ee83adca986
+-  share_plus: 8b6f8b3447e494cca5317c8c3073de39b3600d1f
+-  shared_preferences_foundation: fcdcbc04712aee1108ac7fda236f363274528f78
+-  sp_scanner: eaa617fa827396b967116b7f1f43549ca62e9a12
++  sensitive_clipboard: 161e9abc3d56b3131309d8a321eb4690a803c16b
++  share_plus: 50da8cb520a8f0f65671c6c6a99b3617ed10a58a
++  shared_preferences_foundation: 9e1978ff2562383bd5676f64ec4e9aa8fa06a6f7
++  sp_scanner: b1bc9321690980bdb44bba7ec85d5543e716d1b5
+   SwiftyGif: 706c60cf65fa2bc5ee0313beece843c8eb8194d4
+   Toast: 1f5ea13423a1e6674c4abdac5be53587ae481c4e
+-  uni_links: d97da20c7701486ba192624d99bffaaffcfc298a
+-  universal_ble: cf52a7b3fd2e7c14d6d7262e9fdadb72ab6b88a6
+-  url_launcher_ios: 5334b05cef931de560670eeae103fd3e431ac3fe
+-  wakelock_plus: 373cfe59b235a6dd5837d0fb88791d2f13a90d56
+-  workmanager: 0afdcf5628bbde6924c21af7836fed07b42e30e6
++  uni_links: ed8c961e47ed9ce42b6d91e1de8049e38a4b3152
++  universal_ble: ff19787898040d721109c6324472e5dd4bc86adc
++  url_launcher_ios: 694010445543906933d732453a59da0a173ae33d
++  wakelock_plus: 04623e3f525556020ebd4034310f20fe7fda8b49
+ 
+ PODFILE CHECKSUM: e448f662d4c41f0c0b1ccbb78afd57dbf895a597
+ 
+diff --git a/ios/Runner/AppDelegate.swift b/ios/Runner/AppDelegate.swift
+index 0a4db4ddd3..853372825a 100644
+--- a/ios/Runner/AppDelegate.swift
++++ b/ios/Runner/AppDelegate.swift
+@@ -1,6 +1,5 @@
+ import UIKit
+ import Flutter
+-import workmanager
+ 
+ @main
+ @objc class AppDelegate: FlutterAppDelegate {    
+@@ -12,15 +11,6 @@ import workmanager
+           UNUserNotificationCenter.current().delegate = self as? UNUserNotificationCenterDelegate
+         }
+ 
+-        WorkmanagerPlugin.setPluginRegistrantCallback { registry in
+-            // Registry in this case is the FlutterEngine that is created in Workmanager's
+-            // performFetchWithCompletionHandler or BGAppRefreshTask.
+-            // This will make other plugins available during a background operation.
+-            GeneratedPluginRegistrant.register(with: registry)
+-        }
+-
+-        WorkmanagerPlugin.registerTask(withIdentifier: "com.fotolockr.cakewallet.monero_sync_task")
+-
+         makeSecure()
+         
+         let controller : FlutterViewController = window?.rootViewController as! FlutterViewController
+diff --git a/lib/core/background_sync.dart b/lib/core/background_sync.dart
+new file mode 100644
+index 0000000000..0098b62b68
+--- /dev/null
++++ b/lib/core/background_sync.dart
+@@ -0,0 +1,107 @@
++import 'dart:async';
++import 'dart:math';
++
++import 'package:cake_wallet/core/key_service.dart';
++import 'package:cake_wallet/core/wallet_loading_service.dart';
++import 'package:cake_wallet/di.dart';
++import 'package:cake_wallet/store/settings_store.dart';
++import 'package:cake_wallet/view_model/wallet_list/wallet_list_item.dart';
++import 'package:cake_wallet/view_model/wallet_list/wallet_list_view_model.dart';
++import 'package:cw_core/sync_status.dart';
++import 'package:cw_core/utils/print_verbose.dart';
++import 'package:cw_core/wallet_type.dart';
++import 'package:flutter/foundation.dart';
++import 'package:http/http.dart' as http;
++
++class BackgroundSync {
++  Future<void> sync() async {
++    printV("Background sync started");
++    await _syncMonero();
++    printV("Background sync completed");
++  }
++
++  Future<void> _syncMonero() async {
++    final walletLoadingService = getIt.get<WalletLoadingService>();
++    final walletListViewModel = getIt.get<WalletListViewModel>();
++    final settingsStore = getIt.get<SettingsStore>();
++
++
++    final List<WalletListItem> moneroWallets = walletListViewModel.wallets
++        .where((element) => !element.isHardware)
++        .where((element) => [WalletType.monero].contains(element.type))
++        .toList();
++    for (int i = 0; i < moneroWallets.length; i++) {
++      final wallet = await walletLoadingService.load(moneroWallets[i].type, moneroWallets[i].name);
++      int syncedTicks = 0;
++      final keyService = getIt.get<KeyService>();
++      
++      int stuckTicks = 0;
++
++      inner:
++      while (true) {
++        await Future.delayed(const Duration(seconds: 1));
++        final syncStatus = wallet.syncStatus;
++        final progress = syncStatus.progress();
++        if (syncStatus is ConnectedSyncStatus || syncStatus is AttemptingSyncStatus || syncStatus is NotConnectedSyncStatus) {
++          stuckTicks++;
++          if (stuckTicks > 30) {
++            printV("${wallet.name} STUCK SYNCING");
++            break inner;
++          }
++        } else {
++          stuckTicks = 0;
++        }
++        if (syncStatus is NotConnectedSyncStatus) {
++          printV("${wallet.name} NOT CONNECTED");
++          final node = settingsStore.getCurrentNode(wallet.type);
++          await wallet.connectToNode(node: node);
++          await wallet.startBackgroundSync();
++          printV("STARTED SYNC");
++          continue inner;
++        }
++
++        if (progress > 0.999 || syncStatus is SyncedSyncStatus) {
++          syncedTicks++;
++          if (syncedTicks > 5) {
++            syncedTicks = 0;
++            printV("WALLET $i SYNCED");
++            try {
++              await wallet.stopBackgroundSync((await keyService.getWalletPassword(walletName: wallet.name)));
++            } catch (e) {
++              printV("error stopping sync: $e");
++            }
++            break inner;
++          }
++        } else {
++          syncedTicks = 0;
++        }
++        if (kDebugMode) {
++          if (syncStatus is SyncingSyncStatus) {
++            final blocksLeft = syncStatus.blocksLeft;
++            printV("$blocksLeft Blocks Left");
++          } else if (syncStatus is SyncedSyncStatus) {
++            printV("Synced");
++          } else if (syncStatus is SyncedTipSyncStatus) {
++            printV("Scanned Tip: ${syncStatus.tip}");
++          } else if (syncStatus is NotConnectedSyncStatus) {
++            printV("Still Not Connected");
++          } else if (syncStatus is AttemptingSyncStatus) {
++            printV("Attempting Sync");
++          } else if (syncStatus is StartingScanSyncStatus) {
++            printV("Starting Scan");
++          } else if (syncStatus is SyncronizingSyncStatus) {
++            printV("Syncronizing");
++          } else if (syncStatus is FailedSyncStatus) {
++            printV("Failed Sync");
++          } else if (syncStatus is ConnectingSyncStatus) {
++            printV("Connecting");
++          } else {
++            printV("Unknown Sync Status ${syncStatus.runtimeType}");
++          }
++        }
++      }
++      await wallet.stopBackgroundSync(await keyService.getWalletPassword(walletName: wallet.name));
++      await wallet.close(shouldCleanup: true);
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/lib/di.dart b/lib/di.dart
+index 8d9b045df1..8fb60fa29b 100644
+--- a/lib/di.dart
++++ b/lib/di.dart
+@@ -26,7 +26,6 @@ import 'package:cake_wallet/core/wallet_connect/web3wallet_service.dart';
+ import 'package:cake_wallet/core/wallet_creation_service.dart';
+ import 'package:cake_wallet/core/wallet_loading_service.dart';
+ import 'package:cake_wallet/core/yat_service.dart';
+-import 'package:cake_wallet/entities/background_tasks.dart';
+ import 'package:cake_wallet/entities/biometric_auth.dart';
+ import 'package:cake_wallet/entities/contact.dart';
+ import 'package:cake_wallet/entities/contact_record.dart';
+@@ -34,6 +33,9 @@ import 'package:cake_wallet/entities/exchange_api_mode.dart';
+ import 'package:cake_wallet/entities/hardware_wallet/require_hardware_wallet_connection.dart';
+ import 'package:cake_wallet/entities/parse_address_from_domain.dart';
+ import 'package:cake_wallet/exchange/provider/trocador_exchange_provider.dart';
++import 'package:cake_wallet/src/screens/dev/monero_background_sync.dart';
++import 'package:cake_wallet/src/screens/settings/background_sync_page.dart';
++import 'package:cake_wallet/view_model/dev/monero_background_sync.dart';
+ import 'package:cake_wallet/view_model/link_view_model.dart';
+ import 'package:cake_wallet/tron/tron.dart';
+ import 'package:cake_wallet/src/screens/transaction_details/rbf_details_page.dart';
+@@ -309,9 +311,6 @@ Future<void> setup({
+     getIt.registerSingletonAsync<SharedPreferences>(() => SharedPreferences.getInstance());
+     getIt.registerSingleton<SecureStorage>(secureStorage);
+   }
+-  if (!_isSetupFinished) {
+-    getIt.registerFactory(() => BackgroundTasks());
+-  }
+ 
+   final isBitcoinBuyEnabled = (secrets.wyreSecretKey.isNotEmpty) &&
+       (secrets.wyreApiKey.isNotEmpty) &&
+@@ -909,6 +908,8 @@ Future<void> setup({
+ 
+   getIt.registerFactory<SeedSettingsViewModel>(() => SeedSettingsViewModel(getIt.get<AppStore>(), getIt.get<SeedSettingsStore>()));
+ 
++  getIt.registerFactory(() => DevMoneroBackgroundSync(getIt.get<AppStore>().wallet!));
++
+   getIt.registerFactoryParam<WalletSeedPage, bool, void>((bool isWalletCreated, _) =>
+       WalletSeedPage(getIt.get<WalletSeedViewModel>(), isNewWalletCreated: isWalletCreated));
+ 
+@@ -1068,6 +1069,8 @@ Future<void> setup({
+   getIt.registerFactory(
+       () => ExchangeTradeExternalSendPage(exchangeTradeViewModel: getIt.get<ExchangeTradeViewModel>()));
+ 
++  getIt.registerFactory(() => BackgroundSyncPage(getIt.get<DashboardViewModel>()));
++
+   getIt.registerFactory(() => ExchangeTemplatePage(getIt.get<ExchangeViewModel>()));
+ 
+   getIt.registerFactoryParam<WalletService, WalletType, void>((WalletType param1, __) {
+@@ -1443,7 +1446,8 @@ Future<void> setup({
+ 
+   getIt.registerFactory(() => SignViewModel(getIt.get<AppStore>().wallet!));
+ 
+-    getIt.registerFactory(() => SeedVerificationPage(getIt.get<WalletSeedViewModel>()));
++  getIt.registerFactory(() => SeedVerificationPage(getIt.get<WalletSeedViewModel>()));
+ 
++  getIt.registerFactory(() => DevMoneroBackgroundSyncPage(getIt.get<DevMoneroBackgroundSync>()));
+   _isSetupFinished = true;
+ }
+diff --git a/lib/entities/background_tasks.dart b/lib/entities/background_tasks.dart
+deleted file mode 100644
+index 60e4c86cd6..0000000000
+--- a/lib/entities/background_tasks.dart
++++ /dev/null
+@@ -1,166 +0,0 @@
+-import 'dart:io';
+-
+-import 'package:cake_wallet/core/wallet_loading_service.dart';
+-import 'package:cake_wallet/entities/preferences_key.dart';
+-import 'package:cake_wallet/store/settings_store.dart';
+-import 'package:cake_wallet/utils/device_info.dart';
+-import 'package:cake_wallet/utils/feature_flag.dart';
+-import 'package:cake_wallet/view_model/settings/sync_mode.dart';
+-import 'package:cake_wallet/view_model/wallet_list/wallet_list_item.dart';
+-import 'package:cake_wallet/view_model/wallet_list/wallet_list_view_model.dart';
+-import 'package:cw_core/utils/print_verbose.dart';
+-import 'package:cw_core/wallet_base.dart';
+-import 'package:cw_core/wallet_type.dart';
+-import 'package:flutter/foundation.dart';
+-import 'package:shared_preferences/shared_preferences.dart';
+-import 'package:workmanager/workmanager.dart';
+-import 'package:cake_wallet/main.dart';
+-import 'package:cake_wallet/di.dart';
+-
+-const moneroSyncTaskKey = "com.fotolockr.cakewallet.monero_sync_task";
+-
+-@pragma('vm:entry-point')
+-void callbackDispatcher() {
+-  Workmanager().executeTask((task, inputData) async {
+-    try {
+-      switch (task) {
+-        case moneroSyncTaskKey:
+-
+-          /// The work manager runs on a separate isolate from the main flutter isolate.
+-          /// thus we initialize app configs first; hive, getIt, etc...
+-          await initializeAppConfigs();
+-
+-          final walletLoadingService = getIt.get<WalletLoadingService>();
+-
+-          final typeRaw = getIt.get<SharedPreferences>().getInt(PreferencesKey.currentWalletType);
+-
+-          WalletBase? wallet;
+-
+-          if (inputData!['sync_all'] as bool) {
+-            /// get all Monero wallets of the user and sync them
+-            final List<WalletListItem> moneroWallets = getIt
+-                .get<WalletListViewModel>()
+-                .wallets
+-                .where((element) => [WalletType.monero, WalletType.wownero].contains(element.type))
+-                .toList();
+-
+-            for (int i = 0; i < moneroWallets.length; i++) {
+-              wallet =
+-                  await walletLoadingService.load(moneroWallets[i].type, moneroWallets[i].name);
+-              final node = getIt.get<SettingsStore>().getCurrentNode(moneroWallets[i].type);
+-              await wallet.connectToNode(node: node);
+-              await wallet.startSync();
+-            }
+-          } else {
+-            /// if the user chose to sync only active wallet
+-            /// if the current wallet is monero; sync it only
+-            if (typeRaw == WalletType.monero.index || typeRaw == WalletType.wownero.index) {
+-              final name =
+-                  getIt.get<SharedPreferences>().getString(PreferencesKey.currentWalletName);
+-
+-              wallet = await walletLoadingService.load(WalletType.values[typeRaw!], name!);
+-              final node = getIt.get<SettingsStore>().getCurrentNode(WalletType.values[typeRaw]);
+-
+-              await wallet.connectToNode(node: node);
+-              await wallet.startSync();
+-            }
+-          }
+-
+-          if (wallet?.syncStatus.progress() == null) {
+-            return Future.error("No Monero/Wownero wallet found");
+-          }
+-
+-          for (int i = 0;; i++) {
+-            await Future<void>.delayed(const Duration(seconds: 1));
+-            if (wallet?.syncStatus.progress() == 1.0) {
+-              break;
+-            }
+-            if (i > 600) {
+-              return Future.error("Synchronization Timed out");
+-            }
+-          }
+-          break;
+-      }
+-
+-      return Future.value(true);
+-    } catch (error, stackTrace) {
+-      printV(error);
+-      printV(stackTrace);
+-      return Future.error(error);
+-    }
+-  });
+-}
+-
+-class BackgroundTasks {
+-  void registerSyncTask({bool changeExisting = false}) async {
+-    try {
+-      bool hasMonero = getIt
+-          .get<WalletListViewModel>()
+-          .wallets
+-          .any((element) => element.type == WalletType.monero);
+-
+-      /// if its not android nor ios, or the user has no monero wallets; exit
+-      if (!DeviceInfo.instance.isMobile || !hasMonero) {
+-        return;
+-      }
+-
+-      final settingsStore = getIt.get<SettingsStore>();
+-
+-      final SyncMode syncMode = settingsStore.currentSyncMode;
+-      final bool syncAll = settingsStore.currentSyncAll;
+-
+-      if (syncMode.type == SyncType.disabled || !FeatureFlag.isBackgroundSyncEnabled) {
+-        cancelSyncTask();
+-        return;
+-      }
+-
+-      await Workmanager().initialize(
+-        callbackDispatcher,
+-        isInDebugMode: kDebugMode,
+-      );
+-
+-      final inputData = <String, dynamic>{"sync_all": syncAll};
+-      final constraints = Constraints(
+-        networkType:
+-            syncMode.type == SyncType.unobtrusive ? NetworkType.unmetered : NetworkType.connected,
+-        requiresBatteryNotLow: syncMode.type == SyncType.unobtrusive,
+-        requiresCharging: syncMode.type == SyncType.unobtrusive,
+-        requiresDeviceIdle: syncMode.type == SyncType.unobtrusive,
+-      );
+-
+-      if (Platform.isIOS) {
+-        await Workmanager().registerOneOffTask(
+-          moneroSyncTaskKey,
+-          moneroSyncTaskKey,
+-          initialDelay: syncMode.frequency,
+-          existingWorkPolicy: ExistingWorkPolicy.replace,
+-          inputData: inputData,
+-          constraints: constraints,
+-        );
+-        return;
+-      }
+-
+-      await Workmanager().registerPeriodicTask(
+-        moneroSyncTaskKey,
+-        moneroSyncTaskKey,
+-        initialDelay: syncMode.frequency,
+-        frequency: syncMode.frequency,
+-        existingWorkPolicy: changeExisting ? ExistingWorkPolicy.replace : ExistingWorkPolicy.keep,
+-        inputData: inputData,
+-        constraints: constraints,
+-      );
+-    } catch (error, stackTrace) {
+-      printV(error);
+-      printV(stackTrace);
+-    }
+-  }
+-
+-  void cancelSyncTask() {
+-    try {
+-      Workmanager().cancelByUniqueName(moneroSyncTaskKey);
+-    } catch (error, stackTrace) {
+-      printV(error);
+-      printV(stackTrace);
+-    }
+-  }
+-}
+diff --git a/lib/entities/load_current_wallet.dart b/lib/entities/load_current_wallet.dart
+index e67b599973..a421168d07 100644
+--- a/lib/entities/load_current_wallet.dart
++++ b/lib/entities/load_current_wallet.dart
+@@ -1,7 +1,6 @@
+ import 'package:cake_wallet/di.dart';
+ import 'package:shared_preferences/shared_preferences.dart';
+ import 'package:cake_wallet/store/app_store.dart';
+-import 'package:cake_wallet/entities/background_tasks.dart';
+ import 'package:cake_wallet/entities/preferences_key.dart';
+ import 'package:cw_core/wallet_type.dart';
+ import 'package:cake_wallet/core/wallet_loading_service.dart';
+@@ -26,6 +25,4 @@ Future<void> loadCurrentWallet({String? password}) async {
+     name,
+     password: password);
+   await appStore.changeCurrentWallet(wallet);
+-
+-  getIt.get<BackgroundTasks>().registerSyncTask();
+ }
+diff --git a/lib/main.dart b/lib/main.dart
+index 2bf0f269de..7e5f24b607 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -1,9 +1,11 @@
+ import 'dart:async';
+ import 'dart:io';
++import 'dart:ui';
+ import 'package:cake_wallet/anonpay/anonpay_invoice_info.dart';
+ import 'package:cake_wallet/app_scroll_behavior.dart';
+ import 'package:cake_wallet/buy/order.dart';
+ import 'package:cake_wallet/core/auth_service.dart';
++import 'package:cake_wallet/core/background_sync.dart';
+ import 'package:cake_wallet/di.dart';
+ import 'package:cake_wallet/entities/contact.dart';
+ import 'package:cake_wallet/entities/default_settings_migration.dart';
+@@ -34,11 +36,13 @@ import 'package:cw_core/hive_type_ids.dart';
+ import 'package:cw_core/mweb_utxo.dart';
+ import 'package:cw_core/node.dart';
+ import 'package:cw_core/unspent_coins_info.dart';
++import 'package:cw_core/utils/print_verbose.dart';
+ import 'package:cw_core/wallet_info.dart';
+ import 'package:cw_core/wallet_type.dart';
+ import 'package:flutter/foundation.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter/services.dart';
++import 'package:flutter_daemon/flutter_daemon.dart';
+ import 'package:flutter_mobx/flutter_mobx.dart';
+ import 'package:hive/hive.dart';
+ import 'package:cw_core/root_dir.dart';
+@@ -68,6 +72,7 @@ Future<void> runAppWithZone({Key? topLevelKey}) async {
+ 
+       return true;
+     };
++    await FlutterDaemon().unmarkBackgroundSync();
+     await initializeAppAtRoot();
+ 
+     if (kDebugMode) {
+@@ -100,7 +105,7 @@ Future<void> initializeAppAtRoot({bool reInitializing = false}) async {
+   await initializeAppConfigs();
+ }
+ 
+-Future<void> initializeAppConfigs() async {
++Future<void> initializeAppConfigs({bool loadWallet = true}) async {
+   setRootDirFromEnv();
+   final appDir = await getAppDir();
+   CakeHive.init(appDir.path);
+@@ -200,6 +205,7 @@ Future<void> initializeAppConfigs() async {
+       encryptionKey: havenSeedStoreBoxKey);
+ 
+   await initialSetup(
++    loadWallet: loadWallet,
+     sharedPreferences: await SharedPreferences.getInstance(),
+     nodes: nodes,
+     powNodes: powNodes,
+@@ -220,7 +226,8 @@ Future<void> initializeAppConfigs() async {
+ }
+ 
+ Future<void> initialSetup(
+-    {required SharedPreferences sharedPreferences,
++    {required bool loadWallet,
++    required SharedPreferences sharedPreferences,
+     required Box<Node> nodes,
+     required Box<Node> powNodes,
+     required Box<WalletInfo> walletInfoSource,
+@@ -262,7 +269,7 @@ Future<void> initialSetup(
+     navigatorKey: navigatorKey,
+     secureStorage: secureStorage,
+   );
+-  await bootstrap(navigatorKey);
++  await bootstrap(navigatorKey, loadWallet: loadWallet);
+ }
+ 
+ class App extends StatefulWidget {
+@@ -390,3 +397,34 @@ class TopLevelErrorWidget extends StatelessWidget {
+     );
+   }
+ }
++
++@pragma('vm:entry-point')
++Future<void> backgroundSync() async {
++  bool shouldUnmark = false;
++  try {
++    printV("Background sync triggered");
++    printV("- WidgetsFlutterBinding.ensureInitialized()");
++    WidgetsFlutterBinding.ensureInitialized();
++    printV("- DartPluginRegistrant.ensureInitialized()");
++    DartPluginRegistrant.ensureInitialized();
++    printV("- FlutterDaemon.markBackgroundSync()");
++    final val = await FlutterDaemon().markBackgroundSync();
++    if (val) {
++      printV("Background sync already in progress");
++      return;
++    }
++    shouldUnmark = true;
++    printV("Starting background sync");
++    final backgroundSync = BackgroundSync();
++    await initializeAppConfigs(loadWallet: false);
++    await backgroundSync.sync();
++    printV("Background sync completed");
++  } finally {
++    if (shouldUnmark) {
++      printV("Unmarking background sync");
++      await FlutterDaemon().unmarkBackgroundSync();
++    } else {
++      printV("Not unmarking background sync");
++    }
++  }
++}
+diff --git a/lib/reactions/bootstrap.dart b/lib/reactions/bootstrap.dart
+index bf045c0ddf..e767433aa2 100644
+--- a/lib/reactions/bootstrap.dart
++++ b/lib/reactions/bootstrap.dart
+@@ -15,7 +15,7 @@ import 'package:cake_wallet/store/settings_store.dart';
+ import 'package:cake_wallet/store/authentication_store.dart';
+ import 'package:cake_wallet/store/dashboard/fiat_conversion_store.dart';
+ 
+-Future<void> bootstrap(GlobalKey<NavigatorState> navigatorKey) async {
++Future<void> bootstrap(GlobalKey<NavigatorState> navigatorKey, {required bool loadWallet}) async {
+   final appStore = getIt.get<AppStore>();
+   final authenticationStore = getIt.get<AuthenticationStore>();
+   final settingsStore = getIt.get<SettingsStore>();
+@@ -27,7 +27,9 @@ Future<void> bootstrap(GlobalKey<NavigatorState> navigatorKey) async {
+     authenticationStore.installed();
+   }
+ 
+-  startAuthenticationStateChange(authenticationStore, navigatorKey);
++  if (loadWallet) {
++    startAuthenticationStateChange(authenticationStore, navigatorKey);
++  }
+   startCurrentWalletChangeReaction(appStore, settingsStore, fiatConversionStore);
+   startCurrentFiatChangeReaction(appStore, settingsStore, fiatConversionStore);
+   startCurrentFiatApiModeChangeReaction(appStore, settingsStore, fiatConversionStore);
+diff --git a/lib/router.dart b/lib/router.dart
+index 54cbb1531a..35177c0ebd 100644
+--- a/lib/router.dart
++++ b/lib/router.dart
+@@ -36,6 +36,7 @@ import 'package:cake_wallet/src/screens/dashboard/pages/address_page.dart';
+ import 'package:cake_wallet/src/screens/dashboard/pages/nft_details_page.dart';
+ import 'package:cake_wallet/src/screens/dashboard/pages/transactions_page.dart';
+ import 'package:cake_wallet/src/screens/dashboard/sign_page.dart';
++import 'package:cake_wallet/src/screens/dev/monero_background_sync.dart';
+ import 'package:cake_wallet/src/screens/disclaimer/disclaimer_page.dart';
+ import 'package:cake_wallet/src/screens/exchange/exchange_page.dart';
+ import 'package:cake_wallet/src/screens/exchange/exchange_template_page.dart';
+@@ -73,6 +74,7 @@ import 'package:cake_wallet/src/screens/seed/wallet_seed_page.dart';
+ import 'package:cake_wallet/src/screens/send/send_page.dart';
+ import 'package:cake_wallet/src/screens/send/send_template_page.dart';
+ import 'package:cake_wallet/src/screens/send/transaction_success_info_page.dart';
++import 'package:cake_wallet/src/screens/settings/background_sync_page.dart';
+ import 'package:cake_wallet/src/screens/settings/connection_sync_page.dart';
+ import 'package:cake_wallet/src/screens/settings/desktop_settings/desktop_settings_page.dart';
+ import 'package:cake_wallet/src/screens/settings/display_settings_page.dart';
+@@ -824,6 +826,14 @@ Route<dynamic> createRoute(RouteSettings settings) {
+     case Routes.exchangeTradeExternalSendPage:
+       return MaterialPageRoute<void>(builder: (_) => getIt.get<ExchangeTradeExternalSendPage>(),);
+ 
++    case Routes.backgroundSync:
++      return CupertinoPageRoute<void>(
++          fullscreenDialog: true, builder: (_) => getIt.get<BackgroundSyncPage>());
++    case Routes.devMoneroBackgroundSync:
++      return MaterialPageRoute<void>(
++        builder: (_) => getIt.get<DevMoneroBackgroundSyncPage>(),
++      );
++
+     default:
+       return MaterialPageRoute<void>(
+           builder: (_) => Scaffold(
+diff --git a/lib/routes.dart b/lib/routes.dart
+index e2b4fdb341..be5e9f05db 100644
+--- a/lib/routes.dart
++++ b/lib/routes.dart
+@@ -110,6 +110,8 @@ class Routes {
+   static const nftDetailsPage = '/nft_details_page';
+   static const importNFTPage = '/import_nft_page';
+   static const torPage = '/tor_page';
++  static const backgroundSync = '/background_sync';
++  static const devMoneroBackgroundSync = '/dev/monero_background_sync';
+ 
+   static const signPage = '/sign_page';
+   static const connectDevices = '/device/connect';
+diff --git a/lib/src/screens/dev/monero_background_sync.dart b/lib/src/screens/dev/monero_background_sync.dart
+new file mode 100644
+index 0000000000..8927b33cf8
+--- /dev/null
++++ b/lib/src/screens/dev/monero_background_sync.dart
+@@ -0,0 +1,112 @@
++import 'package:cake_wallet/src/screens/base_page.dart';
++import 'package:cake_wallet/src/widgets/primary_button.dart';
++import 'package:cake_wallet/view_model/dev/monero_background_sync.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_mobx/flutter_mobx.dart';
++
++class DevMoneroBackgroundSyncPage extends BasePage {
++  final DevMoneroBackgroundSync viewModel;
++
++  DevMoneroBackgroundSyncPage(this.viewModel);
++
++  @override
++  String? get title => "[dev] xmr background sync";
++
++  Widget _buildSingleCell(String title, String value) {
++    return Container(
++      decoration: BoxDecoration(
++        border: Border.all(color: Colors.grey),
++        borderRadius: BorderRadius.circular(8),
++      ),
++      padding: const EdgeInsets.all(8),
++      child: Column(
++        mainAxisAlignment: MainAxisAlignment.center,
++        children: [
++          Text(title, style: TextStyle(fontWeight: FontWeight.bold)),
++          Text(value, maxLines: 1, overflow: TextOverflow.ellipsis),
++        ],
++      ),
++    );
++  }
++
++  @override
++  Widget body(BuildContext context) {
++    return Observer(
++      builder: (_) {
++        return GridView.count(
++          padding: const EdgeInsets.all(16),
++          crossAxisCount: 2,
++          childAspectRatio: 25/9,
++          crossAxisSpacing: 16,
++          mainAxisSpacing: 16,
++          children: [
++            _buildSingleCell('Height (local)', viewModel.localBlockHeight ?? ''),
++            _buildSingleCell('Height (node)', viewModel.nodeBlockHeight ?? ''),
++            _buildSingleCell('Time', viewModel.tick.toString()),
++            _buildSingleCell('Background Sync', viewModel.isBackgroundSyncing ? 'Enabled' : 'Disabled'),
++            _buildSingleCell('Public View Key', viewModel.publicViewKey ?? ''),
++            _buildSingleCell('Private View Key', viewModel.privateViewKey ?? ''),
++            _buildSingleCell('Public Spend Key', viewModel.publicSpendKey ?? ''),
++            _buildSingleCell('Private Spend Key', viewModel.privateSpendKey ?? ''),
++            _buildSingleCell('Primary Address', viewModel.primaryAddress ?? ''),
++            _buildSingleCell('Passphrase', viewModel.passphrase ?? ''),
++            _buildSingleCell('Seed', viewModel.seed ?? ''),
++            _buildSingleCell('Seed Legacy', viewModel.seedLegacy ?? ''),
++            _enableBackgroundSyncButton(),
++            _disableBackgroundSyncButton(),
++            _refreshButton(),
++            _manualRescanButton(),
++          ],
++        );
++      },
++    );
++  }
++
++  PrimaryButton _enableBackgroundSyncButton() {
++    return PrimaryButton(
++      text: "Enable background sync",
++      color: Colors.purple,
++      textColor: Colors.white,
++      onPressed: () {
++        viewModel.startBackgroundSync();
++      },
++    );
++  }
++
++  PrimaryButton _disableBackgroundSyncButton() {
++    return PrimaryButton(
++      text: "Disable background sync",
++      color: Colors.purple,
++      textColor: Colors.white,
++      onPressed: () {
++        viewModel.stopBackgroundSync();
++      },
++    );
++  }
++
++  PrimaryButton _refreshButton() {
++    return PrimaryButton(
++      text: viewModel.refreshTimer == null ? "Enable refresh" : "Disable refresh",
++      color: Colors.purple,
++      textColor: Colors.white,
++      onPressed: () {
++        if (viewModel.refreshTimer == null) {
++          viewModel.startRefreshTimer();
++        } else {
++          viewModel.stopRefreshTimer();
++        }
++      },
++    );
++  }
++
++  PrimaryButton _manualRescanButton() {
++    return PrimaryButton(
++      text: "Manual rescan",
++      color: Colors.purple,
++      textColor: Colors.white,
++      onPressed: () {
++        viewModel.manualRescan();
++      },
++    );
++  }
++}
+diff --git a/lib/src/screens/settings/background_sync_page.dart b/lib/src/screens/settings/background_sync_page.dart
+new file mode 100644
+index 0000000000..f9589297d4
+--- /dev/null
++++ b/lib/src/screens/settings/background_sync_page.dart
+@@ -0,0 +1,91 @@
++import 'dart:async';
++import 'dart:io';
++
++import 'package:cake_wallet/generated/i18n.dart';
++import 'package:cake_wallet/src/screens/base_page.dart';
++import 'package:cake_wallet/src/screens/settings/widgets/settings_picker_cell.dart';
++import 'package:cake_wallet/src/screens/settings/widgets/settings_switcher_cell.dart';
++import 'package:cake_wallet/src/widgets/alert_with_no_action.dart.dart';
++import 'package:cake_wallet/src/widgets/alert_with_one_action.dart';
++import 'package:cake_wallet/utils/show_pop_up.dart';
++import 'package:cake_wallet/view_model/dashboard/dashboard_view_model.dart';
++import 'package:cake_wallet/view_model/settings/sync_mode.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_mobx/flutter_mobx.dart';
++
++class BackgroundSyncPage extends BasePage {
++  BackgroundSyncPage(this.dashboardViewModel);
++
++  @override
++  String get title => S.current.background_sync;
++
++  final DashboardViewModel dashboardViewModel;
++
++  @override
++  Widget body(BuildContext context) {
++    return Container(
++      padding: EdgeInsets.only(top: 10),
++      child: Column(
++        mainAxisSize: MainAxisSize.min,
++        children: [
++          if (dashboardViewModel.hasBatteryOptimization)
++            Observer(builder: (context) {
++              return SettingsSwitcherCell(
++                title: S.current.unrestricted_background_service,
++                value: !dashboardViewModel.batteryOptimizationEnabled,
++                onValueChange: (_, bool value) {
++                  dashboardViewModel.disableBatteryOptimization();
++                },
++              );
++            }),
++          Observer(builder: (context) {
++            return SettingsSwitcherCell(
++              title: S.current.background_sync,
++              value: dashboardViewModel.backgroundSyncEnabled,
++              onValueChange: (dashboardViewModel.batteryOptimizationEnabled && dashboardViewModel.hasBatteryOptimization) ? (_, bool value) {
++                unawaited(showPopUp(context: context, builder: (context) => AlertWithOneAction(
++                  alertTitle: S.current.background_sync,
++                  alertContent: S.current.unrestricted_background_service_notice,
++                  buttonText: S.current.ok,
++                  buttonAction: () => Navigator.of(context).pop(),
++                )));
++              } : (_, bool value) {
++                if (value) {
++                  dashboardViewModel.enableBackgroundSync();
++                } else {
++                  dashboardViewModel.disableBackgroundSync();
++                }
++              },
++            );
++          }),
++          Observer(builder: (context) {
++            return SettingsPickerCell<SyncMode>(
++                title: S.current.background_sync_mode,
++                items: SyncMode.all,
++                displayItem: (SyncMode syncMode) => syncMode.name,
++                selectedItem: dashboardViewModel.settingsStore.currentSyncMode,
++                onItemSelected: (dashboardViewModel.batteryOptimizationEnabled && dashboardViewModel.hasBatteryOptimization) ? null : (syncMode) async {
++                  dashboardViewModel.setSyncMode(syncMode);
++                });
++          }),
++          
++          // Observer(builder: (context) {
++          //   return SettingsSwitcherCell(
++          //     title: S.current.background_sync_on_battery,
++          //     value: dashboardViewModel.backgroundSyncOnBattery,
++          //     onValueChange: (_, bool value) =>
++          //         dashboardViewModel.setBackgroundSyncOnBattery(value),
++          //   );
++          // }),
++          // Observer(builder: (context) {
++          //   return SettingsSwitcherCell(
++          //     title: S.current.background_sync_on_data,
++          //     value: dashboardViewModel.backgroundSyncOnData,
++          //     onValueChange: (_, bool value) => dashboardViewModel.setBackgroundSyncOnData(value),
++          //   );
++          // }),
++        ],
++      ),
++    );
++  }
++}
+diff --git a/lib/src/screens/settings/connection_sync_page.dart b/lib/src/screens/settings/connection_sync_page.dart
+index c4d85a3a5b..739e01c55c 100644
+--- a/lib/src/screens/settings/connection_sync_page.dart
++++ b/lib/src/screens/settings/connection_sync_page.dart
+@@ -44,56 +44,17 @@ class ConnectionSyncPage extends BasePage {
+                   : S.current.rescan,
+               handler: (context) => Navigator.of(context).pushNamed(Routes.rescan),
+             ),
+-            if (DeviceInfo.instance.isMobile && FeatureFlag.isBackgroundSyncEnabled) ...[
+-              Observer(builder: (context) {
+-                return SettingsPickerCell<SyncMode>(
+-                    title: S.current.background_sync_mode,
+-                    items: SyncMode.all,
+-                    displayItem: (SyncMode syncMode) => syncMode.name,
+-                    selectedItem: dashboardViewModel.syncMode,
+-                    onItemSelected: (syncMode) async {
+-                      dashboardViewModel.setSyncMode(syncMode);
+-
+-                      if (Platform.isIOS) return;
+-
+-                      if (syncMode.type != SyncType.disabled) {
+-                        final isDisabled = await isBatteryOptimizationDisabled();
+-
+-                        if (isDisabled) return;
+-
+-                        await showPopUp<void>(
+-                          context: context,
+-                          builder: (BuildContext dialogContext) {
+-                            return AlertWithTwoActions(
+-                              alertTitle: S.current.disableBatteryOptimization,
+-                              alertContent: S.current.disableBatteryOptimizationDescription,
+-                              leftButtonText: S.of(context).cancel,
+-                              rightButtonText: S.of(context).ok,
+-                              actionLeftButton: () => Navigator.of(dialogContext).pop(),
+-                              actionRightButton: () async {
+-                                await requestDisableBatteryOptimization();
+-
+-                                Navigator.of(dialogContext).pop();
+-                              },
+-                            );
+-                          },
+-                        );
+-                      }
+-                    });
+-              }),
+-              Observer(builder: (context) {
+-                return SettingsSwitcherCell(
+-                  title: S.current.sync_all_wallets,
+-                  value: dashboardViewModel.syncAll,
+-                  onValueChange: (_, bool value) => dashboardViewModel.setSyncAll(value),
+-                );
+-              }),
+-            ],
+           ],
+           SettingsCellWithArrow(
+             title: S.current.manage_nodes,
+             handler: (context) => Navigator.of(context).pushNamed(Routes.manageNodes),
+           ),
++          if (dashboardViewModel.hasBackgroundSync && Platform.isAndroid && FeatureFlag.isBackgroundSyncEnabled) ...[
++            SettingsCellWithArrow(
++              title: S.current.background_sync,
++              handler: (context) => Navigator.of(context).pushNamed(Routes.backgroundSync),
++            ),
++          ],
+           Observer(
+             builder: (context) {
+               if (!dashboardViewModel.hasPowNodes) return const SizedBox();
+diff --git a/lib/src/screens/settings/other_settings_page.dart b/lib/src/screens/settings/other_settings_page.dart
+index 8e0a259589..ca1c1b2cb4 100644
+--- a/lib/src/screens/settings/other_settings_page.dart
++++ b/lib/src/screens/settings/other_settings_page.dart
+@@ -10,6 +10,7 @@ import 'package:cake_wallet/src/screens/settings/widgets/settings_switcher_cell.
+ import 'package:cake_wallet/src/screens/settings/widgets/settings_version_cell.dart';
+ import 'package:cake_wallet/view_model/settings/other_settings_view_model.dart';
+ import 'package:cw_core/wallet_type.dart';
++import 'package:flutter/foundation.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_mobx/flutter_mobx.dart';
+ 
+@@ -63,6 +64,12 @@ class OtherSettingsPage extends BasePage {
+                 handler: (BuildContext context) =>
+                     Navigator.of(context).pushNamed(Routes.readDisclaimer),
+               ),
++              if (kDebugMode && _otherSettingsViewModel.walletType == WalletType.monero) 
++                SettingsCellWithArrow(
++                  title: '[dev] monero background sync',
++                  handler: (BuildContext context) =>
++                      Navigator.of(context).pushNamed(Routes.devMoneroBackgroundSync),
++                ),
+               Spacer(),
+               SettingsVersionCell(
+                   title: S.of(context).version(_otherSettingsViewModel.currentVersion)),
+diff --git a/lib/store/settings_store.dart b/lib/store/settings_store.dart
+index d435508061..5f6b415b9a 100644
+--- a/lib/store/settings_store.dart
++++ b/lib/store/settings_store.dart
+@@ -1,3 +1,4 @@
++import 'dart:async';
+ import 'dart:convert';
+ import 'dart:io';
+ 
+@@ -8,7 +9,6 @@ import 'package:cake_wallet/core/secure_storage.dart';
+ import 'package:cake_wallet/di.dart';
+ import 'package:cake_wallet/entities/action_list_display_mode.dart';
+ import 'package:cake_wallet/entities/auto_generate_subaddress_status.dart';
+-import 'package:cake_wallet/entities/background_tasks.dart';
+ import 'package:cake_wallet/entities/balance_display_mode.dart';
+ import 'package:cake_wallet/entities/cake_2fa_preset_options.dart';
+ import 'package:cake_wallet/entities/country.dart';
+@@ -46,6 +46,7 @@ import 'package:cw_core/utils/print_verbose.dart';
+ import 'package:cw_core/wallet_type.dart';
+ import 'package:device_info_plus/device_info_plus.dart';
+ import 'package:flutter/material.dart';
++import 'package:flutter_daemon/flutter_daemon.dart';
+ import 'package:hive/hive.dart';
+ import 'package:mobx/mobx.dart';
+ import 'package:shared_preferences/shared_preferences.dart';
+@@ -57,7 +58,6 @@ class SettingsStore = SettingsStoreBase with _$SettingsStore;
+ abstract class SettingsStoreBase with Store {
+   SettingsStoreBase(
+       {required SecureStorage secureStorage,
+-      required BackgroundTasks backgroundTasks,
+       required SharedPreferences sharedPreferences,
+       required bool initialShouldShowMarketPlaceInDashboard,
+       required bool initialShowAddressBookPopupEnabled,
+@@ -146,7 +146,6 @@ abstract class SettingsStoreBase with Store {
+         powNodes = ObservableMap<WalletType, Node>.of(powNodes),
+         _secureStorage = secureStorage,
+         _sharedPreferences = sharedPreferences,
+-        _backgroundTasks = backgroundTasks,
+         fiatCurrency = initialFiatCurrency,
+         balanceDisplayMode = initialBalanceDisplayMode,
+         shouldSaveRecipientAddress = initialSaveRecipientAddress,
+@@ -303,11 +302,11 @@ abstract class SettingsStoreBase with Store {
+             PreferencesKey.shouldSaveRecipientAddressKey, shouldSaveRecipientAddress));
+ 
+     if (DeviceInfo.instance.isMobile) {
+-      setIsAppSecureNative(isAppSecure);
++      unawaited(setIsAppSecureNative(isAppSecure));
+ 
+       reaction((_) => isAppSecure, (bool isAppSecure) {
+         sharedPreferences.setBool(PreferencesKey.isAppSecureKey, isAppSecure);
+-        setIsAppSecureNative(isAppSecure);
++        unawaited(setIsAppSecureNative(isAppSecure));
+       });
+     }
+ 
+@@ -402,14 +401,11 @@ abstract class SettingsStoreBase with Store {
+ 
+     reaction((_) => currentSyncMode, (SyncMode syncMode) {
+       sharedPreferences.setInt(PreferencesKey.syncModeKey, syncMode.type.index);
+-
+-      _backgroundTasks.registerSyncTask(changeExisting: true);
++      FlutterDaemon().startBackgroundSync(syncMode.frequency.inMinutes);
+     });
+ 
+     reaction((_) => currentSyncAll, (bool syncAll) {
+       sharedPreferences.setBool(PreferencesKey.syncAllKey, syncAll);
+-
+-      _backgroundTasks.registerSyncTask(changeExisting: true);
+     });
+ 
+     reaction(
+@@ -807,6 +803,7 @@ abstract class SettingsStoreBase with Store {
+ 
+   @observable
+   bool lookupsWellKnown;
++
+   @observable
+   SyncMode currentSyncMode;
+ 
+@@ -843,7 +840,6 @@ abstract class SettingsStoreBase with Store {
+ 
+   final SecureStorage _secureStorage;
+   final SharedPreferences _sharedPreferences;
+-  final BackgroundTasks _backgroundTasks;
+ 
+   ObservableMap<WalletType, Node> nodes;
+   ObservableMap<WalletType, Node> powNodes;
+@@ -885,7 +881,6 @@ abstract class SettingsStoreBase with Store {
+       ThemeBase? initialTheme}) async {
+     final sharedPreferences = await getIt.getAsync<SharedPreferences>();
+     final secureStorage = await getIt.get<SecureStorage>();
+-    final backgroundTasks = getIt.get<BackgroundTasks>();
+     final currentFiatCurrency = FiatCurrency.deserialize(
+         raw: sharedPreferences.getString(PreferencesKey.currentFiatCurrencyKey)!);
+     final savedCakePayCountryRaw = sharedPreferences.getString(PreferencesKey.currentCakePayCountry);
+@@ -1157,7 +1152,7 @@ abstract class SettingsStoreBase with Store {
+     }
+ 
+     final savedSyncMode = SyncMode.all.firstWhere((element) {
+-      return element.type.index == (sharedPreferences.getInt(PreferencesKey.syncModeKey) ?? 0);
++      return element.type.index == (sharedPreferences.getInt(PreferencesKey.syncModeKey) ?? 2); // default to 2 - daily sync
+     });
+     final savedSyncAll = sharedPreferences.getBool(PreferencesKey.syncAllKey) ?? true;
+ 
+@@ -1339,7 +1334,6 @@ abstract class SettingsStoreBase with Store {
+           shouldRequireTOTP2FAForAllSecurityAndBackupSettings,
+       initialEthereumTransactionPriority: ethereumTransactionPriority,
+       initialPolygonTransactionPriority: polygonTransactionPriority,
+-      backgroundTasks: backgroundTasks,
+       initialSyncMode: savedSyncMode,
+       initialSyncAll: savedSyncAll,
+       shouldShowYatPopup: shouldShowYatPopup,
+diff --git a/lib/utils/feature_flag.dart b/lib/utils/feature_flag.dart
+index 593e0f216d..6e829d4745 100644
+--- a/lib/utils/feature_flag.dart
++++ b/lib/utils/feature_flag.dart
+@@ -4,6 +4,6 @@ class FeatureFlag {
+   static const bool isCakePayEnabled = false;
+   static const bool isExolixEnabled = true;
+   static const bool isInAppTorEnabled = false;
+-  static const bool isBackgroundSyncEnabled = false;
++  static const bool isBackgroundSyncEnabled = true;
+   static const int verificationWordsCount = kDebugMode ? 0 : 2;
+ }
+\ No newline at end of file
+diff --git a/lib/view_model/dashboard/dashboard_view_model.dart b/lib/view_model/dashboard/dashboard_view_model.dart
+index a4408a9359..29ccedef26 100644
+--- a/lib/view_model/dashboard/dashboard_view_model.dart
++++ b/lib/view_model/dashboard/dashboard_view_model.dart
+@@ -4,6 +4,7 @@ import 'dart:io' show Platform;
+ 
+ import 'package:cake_wallet/.secrets.g.dart' as secrets;
+ import 'package:cake_wallet/bitcoin/bitcoin.dart';
++import 'package:cake_wallet/core/background_sync.dart';
+ import 'package:cake_wallet/core/key_service.dart';
+ import 'package:cake_wallet/entities/auto_generate_subaddress_status.dart';
+ import 'package:cake_wallet/entities/balance_display_mode.dart';
+@@ -40,12 +41,14 @@ import 'package:cw_core/sync_status.dart';
+ import 'package:cw_core/transaction_history.dart';
+ import 'package:cw_core/transaction_info.dart';
+ import 'package:cw_core/utils/file.dart';
++import 'package:cw_core/utils/print_verbose.dart';
+ import 'package:cw_core/wallet_base.dart';
+ import 'package:cw_core/wallet_info.dart';
+ import 'package:cw_core/wallet_type.dart';
+ import 'package:eth_sig_util/util/utils.dart';
+ import 'package:flutter/foundation.dart';
+ import 'package:flutter/services.dart';
++import 'package:flutter_daemon/flutter_daemon.dart';
+ import 'package:http/http.dart' as http;
+ import 'package:mobx/mobx.dart';
+ import 'package:shared_preferences/shared_preferences.dart';
+@@ -175,6 +178,8 @@ abstract class DashboardViewModelBase with Store {
+     isShowFirstYatIntroduction = false;
+     isShowSecondYatIntroduction = false;
+     isShowThirdYatIntroduction = false;
++    unawaited(isBackgroundSyncEnabled());
++    unawaited(isBatteryOptimizationEnabled());
+ 
+     final _wallet = wallet;
+ 
+@@ -406,6 +411,11 @@ abstract class DashboardViewModelBase with Store {
+   @computed
+   bool get hasRescan => wallet.hasRescan;
+ 
++  @computed
++  bool get hasBackgroundSync => [
++        WalletType.monero,
++      ].contains(wallet.type);
++
+   @computed
+   bool get isMoneroViewOnly {
+     if (wallet.type != WalletType.monero) return false;
+@@ -492,6 +502,69 @@ abstract class DashboardViewModelBase with Store {
+   @observable
+   late bool showDecredInfoCard;
+ 
++  @observable
++  bool backgroundSyncEnabled = false;
++
++  @action
++  Future<bool> isBackgroundSyncEnabled() async {
++    if (!Platform.isAndroid) {
++      return false;
++    }
++    final resp = await FlutterDaemon().getBackgroundSyncStatus();
++    backgroundSyncEnabled = resp;
++    return resp;
++  }
++
++  bool get hasBatteryOptimization => Platform.isAndroid;
++
++  @observable
++  bool batteryOptimizationEnabled = false;
++
++  @action
++  Future<bool> isBatteryOptimizationEnabled() async {
++    if (!hasBatteryOptimization) {
++      return false;
++    }
++    final resp = await FlutterDaemon().isBatteryOptimizationDisabled();
++    batteryOptimizationEnabled = !resp;
++    if (batteryOptimizationEnabled && await isBackgroundSyncEnabled()) {
++      // If the battery optimization is enabled, we need to disable the background sync
++      await disableBackgroundSync();
++    }
++    return resp;
++  }
++
++  @action
++  Future<void> disableBatteryOptimization() async {
++    final resp = await FlutterDaemon().requestDisableBatteryOptimization();
++    unawaited((() async {
++      // android doesn't return if the permission was granted, so we need to poll it,
++      // minute should be enough for the fallback method (opening settings and changing the permission)
++      for (var i = 0; i < 4 * 60; i++) {
++        await Future.delayed(Duration(milliseconds: 250));
++        await isBatteryOptimizationEnabled();
++      }
++    })());
++  }
++
++  @action
++  Future<void> enableBackgroundSync() async {
++    if (hasBatteryOptimization && batteryOptimizationEnabled) {
++      disableBackgroundSync();
++      return;
++    }
++    final resp = await FlutterDaemon().startBackgroundSync(settingsStore.currentSyncMode.frequency.inMinutes);
++    printV("Background sync enabled: $resp");
++    backgroundSyncEnabled = true;
++  }
++
++  @action
++  Future<void> disableBackgroundSync() async {
++    final resp = await FlutterDaemon().stopBackgroundSync();
++    printV("Background sync disabled: $resp");
++    backgroundSyncEnabled = false;
++  }
++
+   @computed
+   bool get hasEnabledMwebBefore => settingsStore.hasEnabledMwebBefore;
+ 
+@@ -797,11 +870,11 @@ abstract class DashboardViewModelBase with Store {
+     }
+   }
+ 
+-  @computed
+-  SyncMode get syncMode => settingsStore.currentSyncMode;
+-
+   @action
+-  void setSyncMode(SyncMode syncMode) => settingsStore.currentSyncMode = syncMode;
++  Future<void> setSyncMode(SyncMode syncMode) async {
++    settingsStore.currentSyncMode = syncMode;
++    await enableBackgroundSync();
++  }
+ 
+   @computed
+   bool get syncAll => settingsStore.currentSyncAll;
+diff --git a/lib/view_model/dev/monero_background_sync.dart b/lib/view_model/dev/monero_background_sync.dart
+new file mode 100644
+index 0000000000..3eb4292b15
+--- /dev/null
++++ b/lib/view_model/dev/monero_background_sync.dart
+@@ -0,0 +1,106 @@
++import 'dart:async';
++
++import 'package:cake_wallet/core/key_service.dart';
++import 'package:cake_wallet/di.dart';
++import 'package:cake_wallet/monero/monero.dart';
++import 'package:cw_monero/monero_wallet.dart';
++import 'package:mobx/mobx.dart';
++import 'package:cw_core/wallet_base.dart';
++
++part 'monero_background_sync.g.dart';
++
++class DevMoneroBackgroundSync = DevMoneroBackgroundSyncBase with _$DevMoneroBackgroundSync;
++
++abstract class DevMoneroBackgroundSyncBase with Store {
++  DevMoneroBackgroundSyncBase(WalletBase wallet) : wallet = wallet;
++
++  final WalletBase wallet;
++
++  @observable
++  Timer? refreshTimer;
++
++  @observable
++  String? localBlockHeight;
++
++  @observable
++  String? nodeBlockHeight;
++
++  @observable
++  String? primaryAddress;
++
++  @observable
++  String? publicViewKey;
++
++  @observable
++  String? privateViewKey;
++
++  @observable
++  String? publicSpendKey;
++
++  @observable
++  String? privateSpendKey;
++
++  @observable
++  String? passphrase;
++
++  @observable
++  String? seed;
++
++  @observable
++  String? seedLegacy;
++
++  @observable
++  int tick = -1;
++
++  @observable
++  bool isBackgroundSyncing = false;
++
++  Future<void> _setValues() async {
++    final w = (wallet as MoneroWallet);
++    localBlockHeight = (await monero!.getCurrentHeight()).toString();
++    nodeBlockHeight = (await w.getNodeHeight()).toString();
++    final keys = w.keys;
++    primaryAddress = keys.primaryAddress;
++    publicViewKey = keys.publicViewKey;
++    privateViewKey = keys.privateViewKey;
++    publicSpendKey = keys.publicSpendKey;
++    privateSpendKey = keys.privateSpendKey;
++    passphrase = keys.passphrase;
++    seed = w.seed;
++    seedLegacy = w.seedLegacy("English");
++    tick = refreshTimer?.tick ?? -1;
++    isBackgroundSyncing = w.isBackgroundSyncRunning;
++  }
++
++  @action
++  Future<void> manualRescan() async {
++    final w = (wallet as MoneroWallet);
++    await wallet.rescan(height: await w.getNodeHeight() - 10000);
++  }
++
++  @action
++  void startRefreshTimer() {
++    refreshTimer = Timer.periodic(Duration(seconds: 1), (timer) async {
++      await _setValues();
++    });
++  }
++
++  @action
++  void stopRefreshTimer() {
++    refreshTimer?.cancel();
++    refreshTimer = null;
++  }
++
++  @action
++  void startBackgroundSync() {
++    final w = (wallet as MoneroWallet);
++    w.startBackgroundSync();
++  }
++
++  @action
++  Future<void> stopBackgroundSync() async {
++    final w = (wallet as MoneroWallet);
++    final keyService = getIt.get<KeyService>();
++    await w.stopBackgroundSync(await keyService.getWalletPassword(walletName: wallet.name));
++  }
++}
+diff --git a/lib/view_model/settings/sync_mode.dart b/lib/view_model/settings/sync_mode.dart
+index ac3ac87179..86046a8391 100644
+--- a/lib/view_model/settings/sync_mode.dart
++++ b/lib/view_model/settings/sync_mode.dart
+@@ -1,4 +1,4 @@
+-enum SyncType { disabled, unobtrusive, aggressive }
++enum SyncType { aggresive, hourly, daily }
+ 
+ class SyncMode {
+   SyncMode(this.name, this.type, this.frequency);
+@@ -8,8 +8,10 @@ class SyncMode {
+   final Duration frequency;
+ 
+   static final all = [
+-    SyncMode("Disabled", SyncType.disabled, Duration.zero),
+-    SyncMode("Unobtrusive", SyncType.unobtrusive, Duration(hours: 12)),
+-    SyncMode("Aggressive", SyncType.aggressive, Duration(hours: 3)),
++    // **Technically** we could call aggressive option "15 minutes" but OS may "not feel like it",
++    // so instead we will call it aggressive so user knows that it will be as frequent as possible.
++    SyncMode("Aggressive", SyncType.aggresive, Duration(minutes: 15)),
++    SyncMode("Hourly", SyncType.hourly, Duration(hours: 1)),
++    SyncMode("Daily", SyncType.daily, Duration(hours: 18)), // yes this is straight up lie.
+   ];
+ }
+diff --git a/lib/view_model/wallet_creation_vm.dart b/lib/view_model/wallet_creation_vm.dart
+index f423622f67..07a9aefd08 100644
+--- a/lib/view_model/wallet_creation_vm.dart
++++ b/lib/view_model/wallet_creation_vm.dart
+@@ -2,7 +2,6 @@ import 'package:cake_wallet/bitcoin/bitcoin.dart';
+ import 'package:cake_wallet/core/execution_state.dart';
+ import 'package:cake_wallet/core/wallet_creation_service.dart';
+ import 'package:cake_wallet/di.dart';
+-import 'package:cake_wallet/entities/background_tasks.dart';
+ import 'package:cake_wallet/entities/generate_name.dart';
+ import 'package:cake_wallet/entities/hash_wallet_identifier.dart';
+ import 'package:cake_wallet/generated/i18n.dart';
+@@ -113,7 +112,6 @@ abstract class WalletCreationVMBase with Store {
+       walletInfo.address = wallet.walletAddresses.address;
+       await _walletInfoSource.add(walletInfo);
+       await _appStore.changeCurrentWallet(wallet);
+-      getIt.get<BackgroundTasks>().registerSyncTask();
+       _appStore.authenticationStore.allowedCreate();
+       state = ExecutedSuccessfullyState();
+     } catch (e, s) {
+diff --git a/lib/view_model/wallet_groups_display_view_model.dart b/lib/view_model/wallet_groups_display_view_model.dart
+index 09d6d656cf..056d713aab 100644
+--- a/lib/view_model/wallet_groups_display_view_model.dart
++++ b/lib/view_model/wallet_groups_display_view_model.dart
+@@ -158,6 +158,7 @@ abstract class WalletGroupsDisplayViewModelBase with Store {
+       isCurrent: info.name == _appStore.wallet?.name && info.type == _appStore.wallet?.type,
+       isEnabled: availableWalletTypes.contains(info.type),
+       isTestnet: info.network?.toLowerCase().contains('testnet') ?? false,
++      isHardware: info.isHardwareWallet,
+     );
+   }
+ }
+diff --git a/lib/view_model/wallet_list/wallet_list_item.dart b/lib/view_model/wallet_list/wallet_list_item.dart
+index 24b1a3bd00..8f8c58ea9f 100644
+--- a/lib/view_model/wallet_list/wallet_list_item.dart
++++ b/lib/view_model/wallet_list/wallet_list_item.dart
+@@ -5,6 +5,7 @@ class WalletListItem {
+     required this.name,
+     required this.type,
+     required this.key,
++    required this.isHardware,
+     this.isCurrent = false,
+     this.isEnabled = true,
+     this.isTestnet = false,
+@@ -16,4 +17,5 @@ class WalletListItem {
+   final dynamic key;
+   final bool isEnabled;
+   final bool isTestnet;
++  final bool isHardware;
+ }
+diff --git a/lib/view_model/wallet_list/wallet_list_view_model.dart b/lib/view_model/wallet_list/wallet_list_view_model.dart
+index 407dce55ac..8c36f84122 100644
+--- a/lib/view_model/wallet_list/wallet_list_view_model.dart
++++ b/lib/view_model/wallet_list/wallet_list_view_model.dart
+@@ -265,6 +265,7 @@ abstract class WalletListViewModelBase with Store {
+           info.type == _appStore.wallet?.type,
+       isEnabled: availableWalletTypes.contains(info.type),
+       isTestnet: info.network?.toLowerCase().contains('testnet') ?? false,
++      isHardware: info.isHardwareWallet,
+     );
+   }
+ }
+diff --git a/pubspec_base.yaml b/pubspec_base.yaml
+index ca49f2842a..8bf2de2741 100644
+--- a/pubspec_base.yaml
++++ b/pubspec_base.yaml
+@@ -68,7 +68,6 @@ dependencies:
+    git:
+      url: https://github.com/MrCyjaneK/device_display_brightness.git
+      ref: 4cac18c446ce686f3d75b1565badbd7da439bbd9
+-  workmanager: ^0.5.2
+   wakelock_plus: ^1.2.5
+   flutter_mailer:       
+     git:
+@@ -119,6 +118,10 @@ dependencies:
+     git:
+       url: https://github.com/cake-tech/blockchain_utils
+       ref: cake-update-v2
++  flutter_daemon:
++    git:
++      url: https://github.com/MrCyjaneK/flutter_daemon
++      ref: 5c369e0e69e6f459357b9802bc694a221397298a
+ 
+ dev_dependencies:
+   flutter_test:
+diff --git a/res/values/strings_ar.arb b/res/values/strings_ar.arb
+index 60a0c2b786..64089065d5 100644
+--- a/res/values/strings_ar.arb
++++ b/res/values/strings_ar.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "متوسط مدخرات",
+   "awaitDAppProcessing": ".ﺔﺠﻟﺎﻌﻤﻟﺍ ﻦﻣ dApp ﻲﻬﺘﻨﻳ ﻰﺘﺣ ﺭﺎﻈﺘﻧﻻ﻿ﺍ ﻰﺟﺮﻳ",
+   "awaiting_payment_confirmation": "في انتظار تأكيد الدفع",
++  "background_sync": "مزامنة الخلفية",
+   "background_sync_mode": "وضع مزامنة الخلفية",
+   "backup": "نسخ الاحتياطي",
+   "backup_file": "ملف النسخ الاحتياطي",
+@@ -922,6 +923,8 @@
+   "understand": "لقد فهمت",
+   "unlock": "الغاء القفل",
+   "unmatched_currencies": "عملة محفظتك الحالية لا تتطابق مع عملة QR الممسوحة ضوئيًا",
++  "unrestricted_background_service": "خدمة خلفية غير مقيدة",
++  "unrestricted_background_service_notice": "من أجل تمكين مزامنة الخلفية ، تحتاج إلى تمكين خدمة الخلفية غير المقيدة",
+   "unspent_change": "يتغير",
+   "unspent_coins_details_title": "تفاصيل العملات الغير المنفقة",
+   "unspent_coins_title": "العملات الغير المنفقة",
+diff --git a/res/values/strings_bg.arb b/res/values/strings_bg.arb
+index 146fa8efd6..24b6e2640a 100644
+--- a/res/values/strings_bg.arb
++++ b/res/values/strings_bg.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Средни спестявания",
+   "awaitDAppProcessing": "Моля, изчакайте dApp да завърши обработката.",
+   "awaiting_payment_confirmation": "Чака се потвърждение на плащането",
++  "background_sync": "Фон Синхх",
+   "background_sync_mode": "Режим на синхронизиране на фона",
+   "backup": "Резервно копие",
+   "backup_file": "Резервно копие",
+@@ -922,6 +923,8 @@
+   "understand": "Разбирам",
+   "unlock": "Отключване",
+   "unmatched_currencies": "Валутата на този портфейл не съвпада с тази от сканирания QR код",
++  "unrestricted_background_service": "Неограничена фонова услуга",
++  "unrestricted_background_service_notice": "За да активирате синхронизирането на фона, трябва да активирате неограничена фонова услуга",
+   "unspent_change": "Промяна",
+   "unspent_coins_details_title": "Подробности за неизползваните монети",
+   "unspent_coins_title": "Неизползвани монети",
+diff --git a/res/values/strings_cs.arb b/res/values/strings_cs.arb
+index 2c770069b9..9dbc99d5cd 100644
+--- a/res/values/strings_cs.arb
++++ b/res/values/strings_cs.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Prům. ušetřeno",
+   "awaitDAppProcessing": "Počkejte, až dApp dokončí zpracování.",
+   "awaiting_payment_confirmation": "Čeká se na potvrzení platby",
++  "background_sync": "Synchronizace pozadí",
+   "background_sync_mode": "Režim synchronizace pozadí",
+   "backup": "Záloha",
+   "backup_file": "Soubor se zálohou",
+@@ -922,6 +923,8 @@
+   "understand": "Rozumím",
+   "unlock": "Odemknout",
+   "unmatched_currencies": "Měna vaší současné peněženky neodpovídá té v naskenovaném QR kódu",
++  "unrestricted_background_service": "Neomezená služba na pozadí",
++  "unrestricted_background_service_notice": "Chcete -li povolit synchronizaci pozadí, musíte povolit neomezenou službu na pozadí",
+   "unspent_change": "Změna",
+   "unspent_coins_details_title": "Podrobnosti o neutracených mincích",
+   "unspent_coins_title": "Neutracené mince",
+diff --git a/res/values/strings_de.arb b/res/values/strings_de.arb
+index d7071061b2..54303caf39 100644
+--- a/res/values/strings_de.arb
++++ b/res/values/strings_de.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Durchschn. Einsparungen",
+   "awaitDAppProcessing": "Bitte warten Sie, bis die dApp die Verarbeitung abgeschlossen hat.",
+   "awaiting_payment_confirmation": "Warten auf Zahlungsbestätigung",
++  "background_sync": "Hintergrundsynchronisation",
+   "background_sync_mode": "Hintergrundsynchronisierungsmodus",
+   "backup": "Sicherung",
+   "backup_file": "Sicherungsdatei",
+@@ -924,6 +925,8 @@
+   "understand": "Ich verstehe",
+   "unlock": "Freischalten",
+   "unmatched_currencies": "Die Währung Ihres aktuellen Wallets stimmt nicht mit der des gescannten QR überein",
++  "unrestricted_background_service": "Uneingeschränkter Hintergrunddienst",
++  "unrestricted_background_service_notice": "Um die Hintergrundsynchronisierung zu ermöglichen, müssen Sie einen uneingeschränkten Hintergrundservice aktivieren",
+   "unspent_change": "Wechselgeld",
+   "unspent_coins_details_title": "Details zu nicht ausgegebenen Coins",
+   "unspent_coins_title": "Nicht ausgegebene Coins",
+diff --git a/res/values/strings_en.arb b/res/values/strings_en.arb
+index 68e730b27a..85103162de 100644
+--- a/res/values/strings_en.arb
++++ b/res/values/strings_en.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Avg. Savings",
+   "awaitDAppProcessing": "Kindly wait for the dApp to finish processing.",
+   "awaiting_payment_confirmation": "Awaiting Payment Confirmation",
++  "background_sync": "Background sync",
+   "background_sync_mode": "Background sync mode",
+   "backup": "Backup",
+   "backup_file": "Backup file",
+@@ -923,6 +924,8 @@
+   "understand": "I understand",
+   "unlock": "Unlock",
+   "unmatched_currencies": "Your current wallet's currency does not match that of the scanned QR",
++  "unrestricted_background_service": "Unrestricted background service",
++  "unrestricted_background_service_notice": "In order to enable background sync you need to enable unrestricted background service",
+   "unspent_change": "Change",
+   "unspent_coins_details_title": "Unspent coins details",
+   "unspent_coins_title": "Unspent coins",
+diff --git a/res/values/strings_es.arb b/res/values/strings_es.arb
+index 3d45ab3a08..cd63e5a3d1 100644
+--- a/res/values/strings_es.arb
++++ b/res/values/strings_es.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Ahorro promedio",
+   "awaitDAppProcessing": "Espere a que la dApp termine de procesarse.",
+   "awaiting_payment_confirmation": "Esperando confirmación de pago",
++  "background_sync": "Sincronización de fondo",
+   "background_sync_mode": "Modo de sincronización en segundo plano",
+   "backup": "Apoyo",
+   "backup_file": "Archivo de respaldo",
+@@ -923,6 +924,8 @@
+   "understand": "Entiendo",
+   "unlock": "desbloquear",
+   "unmatched_currencies": "La moneda de tu billetera actual no coincide con la del QR escaneado",
++  "unrestricted_background_service": "Servicio de antecedentes sin restricciones",
++  "unrestricted_background_service_notice": "Para habilitar la sincronización de antecedentes, debe habilitar el servicio de fondo sin restricciones",
+   "unspent_change": "Cambiar",
+   "unspent_coins_details_title": "Detalles de monedas no gastadas",
+   "unspent_coins_title": "Monedas no gastadas",
+diff --git a/res/values/strings_fr.arb b/res/values/strings_fr.arb
+index a6433da9dc..309319277e 100644
+--- a/res/values/strings_fr.arb
++++ b/res/values/strings_fr.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Économies moy.",
+   "awaitDAppProcessing": "Veuillez attendre que l'application décentralisée (dApp) termine le traitement.",
+   "awaiting_payment_confirmation": "En attente de confirmation de paiement",
++  "background_sync": "Synchronisation de fond",
+   "background_sync_mode": "Mode de synchronisation en arrière-plan",
+   "backup": "Sauvegarde",
+   "backup_file": "Fichier de sauvegarde",
+@@ -922,6 +923,8 @@
+   "understand": "J'ai compris",
+   "unlock": "Ouvrir",
+   "unmatched_currencies": "La devise de votre portefeuille (wallet) actuel ne correspond pas à celle du QR code scanné",
++  "unrestricted_background_service": "Service de fond sans restriction",
++  "unrestricted_background_service_notice": "Afin d'activer la synchronisation des antécédents, vous devez activer le service de fond sans restriction",
+   "unspent_change": "Monnaie",
+   "unspent_coins_details_title": "Détails des pièces (coins) non dépensées",
+   "unspent_coins_title": "Pièces (coins) non dépensées",
+diff --git a/res/values/strings_ha.arb b/res/values/strings_ha.arb
+index deec1e470c..4ae70f8ddc 100644
+--- a/res/values/strings_ha.arb
++++ b/res/values/strings_ha.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Matsakaici Adana",
+   "awaitDAppProcessing": "Da fatan za a jira dApp ya gama aiki.",
+   "awaiting_payment_confirmation": "Ana jiran Tabbacin Biyan Kuɗi",
++  "background_sync": "Tunawa da Setc",
+   "background_sync_mode": "Yanayin Sync",
+   "backup": "Ajiyayyen",
+   "backup_file": "Ajiyayyen fayil",
+@@ -924,6 +925,8 @@
+   "understand": "na gane",
+   "unlock": "Buɗe",
+   "unmatched_currencies": "Nau'in walat ɗin ku na yanzu bai dace da na lambar QR da aka bincika ba",
++  "unrestricted_background_service": "Sabis na baya",
++  "unrestricted_background_service_notice": "Don ba da damar Sync na asali kuna buƙatar kunna sabis na baya da ba a santa ba",
+   "unspent_change": "Canza",
+   "unspent_coins_details_title": "Bayanan tsabar kudi da ba a kashe ba",
+   "unspent_coins_title": "Tsabar da ba a kashe ba",
+diff --git a/res/values/strings_hi.arb b/res/values/strings_hi.arb
+index 91bd94dacf..de15f45b60 100644
+--- a/res/values/strings_hi.arb
++++ b/res/values/strings_hi.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "औसत बचत",
+   "awaitDAppProcessing": "कृपया डीएपी की प्रोसेसिंग पूरी होने तक प्रतीक्षा करें।",
+   "awaiting_payment_confirmation": "भुगतान की पुष्टि की प्रतीक्षा में",
++  "background_sync": "पृष्ठभूमि सिंक",
+   "background_sync_mode": "बैकग्राउंड सिंक मोड",
+   "backup": "बैकअप",
+   "backup_file": "बैकअपफ़ाइल",
+@@ -924,6 +925,8 @@
+   "understand": "मुझे समझ",
+   "unlock": "अनलॉक",
+   "unmatched_currencies": "आपके वर्तमान वॉलेट की मुद्रा स्कैन किए गए क्यूआर से मेल नहीं खाती",
++  "unrestricted_background_service": "अप्रतिबंधित पृष्ठभूमि सेवा",
++  "unrestricted_background_service_notice": "पृष्ठभूमि सिंक को सक्षम करने के लिए आपको अप्रतिबंधित पृष्ठभूमि सेवा को सक्षम करने की आवश्यकता है",
+   "unspent_change": "परिवर्तन",
+   "unspent_coins_details_title": "अव्ययित सिक्कों का विवरण",
+   "unspent_coins_title": "खर्च न किए गए सिक्के",
+diff --git a/res/values/strings_hr.arb b/res/values/strings_hr.arb
+index c5e4cd54b2..48da3833a9 100644
+--- a/res/values/strings_hr.arb
++++ b/res/values/strings_hr.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Prosj. ušteda",
+   "awaitDAppProcessing": "Molimo pričekajte da dApp završi obradu.",
+   "awaiting_payment_confirmation": "Čeka se potvrda plaćanja",
++  "background_sync": "Sinkronizacija pozadine",
+   "background_sync_mode": "Sinkronizacija u pozadini",
+   "backup": "Sigurnosna kopija",
+   "backup_file": "Sigurnosna kopija datoteke",
+@@ -922,6 +923,8 @@
+   "understand": "Razumijem",
+   "unlock": "Otključati",
+   "unmatched_currencies": "Valuta vašeg trenutnog novčanika ne odgovara onoj na skeniranom QR-u",
++  "unrestricted_background_service": "Neograničena pozadinska usluga",
++  "unrestricted_background_service_notice": "Da biste omogućili sinkronizaciju pozadine, morate omogućiti neograničenu pozadinsku uslugu",
+   "unspent_change": "Promijeniti",
+   "unspent_coins_details_title": "Nepotrošeni detalji o novčićima",
+   "unspent_coins_title": "Nepotrošeni novčići",
+diff --git a/res/values/strings_hy.arb b/res/values/strings_hy.arb
+index d2e3071648..ee1c997b08 100644
+--- a/res/values/strings_hy.arb
++++ b/res/values/strings_hy.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Միջին խնայողություն",
+   "awaitDAppProcessing": "Խնդրեմ սպասեք, մինչև դիմումը կավարտի մշակումը։",
+   "awaiting_payment_confirmation": "Վճարման հաստատման սպասում",
++  "background_sync": "Ֆոնային համաժամեցում",
+   "background_sync_mode": "Հետին պլանի համաժամացման ռեժիմ",
+   "backup": "Կրկնօրինակ",
+   "backup_file": "Կրկնօրինակի ֆայլ",
+@@ -920,6 +921,8 @@
+   "understand": "Ես հասկանում եմ",
+   "unlock": "Բացել",
+   "unmatched_currencies": "Ձեր ընթացիկ դրամապանակի արժույթը չի համապատասխանում սկանավորված QR կոդի արժույթին",
++  "unrestricted_background_service": "Անսահմանափակ ֆոնային ծառայություն",
++  "unrestricted_background_service_notice": "Ֆոնային համաժամացման համար անհրաժեշտ է միացնել անսահմանափակ ֆոնային ծառայություն",
+   "unspent_change": "Մնացորդ",
+   "unspent_coins_details_title": "Չծախսված արժույթների մանրամասները",
+   "unspent_coins_title": "Չծախսված արժույթներ",
+diff --git a/res/values/strings_id.arb b/res/values/strings_id.arb
+index 19ffba89e3..f9a2311129 100644
+--- a/res/values/strings_id.arb
++++ b/res/values/strings_id.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Rata-rata Pembayaran",
+   "awaitDAppProcessing": "Mohon tunggu hingga dApp menyelesaikan pemrosesan.",
+   "awaiting_payment_confirmation": "Menunggu Konfirmasi Pembayaran",
++  "background_sync": "Sinkronisasi Latar Belakang",
+   "background_sync_mode": "Mode Sinkronisasi Latar Belakang",
+   "backup": "Cadangan",
+   "backup_file": "File cadangan",
+@@ -925,6 +926,8 @@
+   "understand": "Saya mengerti",
+   "unlock": "Membuka kunci",
+   "unmatched_currencies": "Mata uang dompet Anda saat ini tidak cocok dengan yang ditandai QR",
++  "unrestricted_background_service": "Layanan latar belakang tidak terbatas",
++  "unrestricted_background_service_notice": "Untuk mengaktifkan sinkronisasi latar belakang, Anda perlu mengaktifkan layanan latar belakang yang tidak dibatasi",
+   "unspent_change": "Mengubah",
+   "unspent_coins_details_title": "Rincian koin yang tidak terpakai",
+   "unspent_coins_title": "Koin yang tidak terpakai",
+diff --git a/res/values/strings_it.arb b/res/values/strings_it.arb
+index 721da624a4..25d02d9d08 100644
+--- a/res/values/strings_it.arb
++++ b/res/values/strings_it.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Risparmio medio",
+   "awaitDAppProcessing": "Attendi gentilmente che la dApp termini l'elaborazione.",
+   "awaiting_payment_confirmation": "In attesa di conferma del pagamento",
++  "background_sync": "Sincronizzazione in background",
+   "background_sync_mode": "Modalità di sincronizzazione in background",
+   "backup": "Backup",
+   "backup_file": "Backup file",
+@@ -923,6 +924,8 @@
+   "understand": "Capisco",
+   "unlock": "Sblocca",
+   "unmatched_currencies": "La valuta del tuo portafoglio attuale non corrisponde a quella del QR scansionato",
++  "unrestricted_background_service": "Servizio di background senza restrizioni",
++  "unrestricted_background_service_notice": "Per abilitare la sincronizzazione in background è necessario abilitare il servizio di background senza restrizioni",
+   "unspent_change": "Resto",
+   "unspent_coins_details_title": "Dettagli sulle monete non spese",
+   "unspent_coins_title": "Monete non spese",
+diff --git a/res/values/strings_ja.arb b/res/values/strings_ja.arb
+index 92130db7be..6a3a5da723 100644
+--- a/res/values/strings_ja.arb
++++ b/res/values/strings_ja.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "平均節約額",
+   "awaitDAppProcessing": "dAppの処理が完了するまでお待ちください。",
+   "awaiting_payment_confirmation": "支払い確認を待っています",
++  "background_sync": "背景同期",
+   "background_sync_mode": "バックグラウンド同期モード",
+   "backup": "バックアップ",
+   "backup_file": "バックアップファイル",
+@@ -923,6 +924,8 @@
+   "understand": "わかります",
+   "unlock": "ロックを解除します",
+   "unmatched_currencies": "現在のウォレットの通貨がスキャンされたQRの通貨と一致しません",
++  "unrestricted_background_service": "無制限のバックグラウンドサービス",
++  "unrestricted_background_service_notice": "バックグラウンドの同期を有​​効にするには、無制限のバックグラウンドサービスを有効にする必要があります",
+   "unspent_change": "変化",
+   "unspent_coins_details_title": "未使用のコインの詳細",
+   "unspent_coins_title": "未使用のコイン",
+diff --git a/res/values/strings_ko.arb b/res/values/strings_ko.arb
+index 3892448a6f..d16e18a533 100644
+--- a/res/values/strings_ko.arb
++++ b/res/values/strings_ko.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "평균 절감액",
+   "awaitDAppProcessing": "dApp이 처리를 마칠 때까지 기다려주세요.",
+   "awaiting_payment_confirmation": "결제 확인 대기 중",
++  "background_sync": "배경 동기화",
+   "background_sync_mode": "백그라운드 동기화 모드",
+   "backup": "지원",
+   "backup_file": "백업 파일",
+@@ -922,6 +923,8 @@
+   "understand": "이해 했어요",
+   "unlock": "터놓다",
+   "unmatched_currencies": "현재 지갑의 통화가 스캔한 QR의 통화와 일치하지 않습니다.",
++  "unrestricted_background_service": "무제한 배경 서비스",
++  "unrestricted_background_service_notice": "배경 동기화를 활성화하려면 무제한 배경 서비스를 활성화해야합니다.",
+   "unspent_change": "변화",
+   "unspent_coins_details_title": "사용하지 않은 동전 세부 정보",
+   "unspent_coins_title": "사용하지 않은 동전",
+diff --git a/res/values/strings_my.arb b/res/values/strings_my.arb
+index 2f7131aa93..d7ba8d7a68 100644
+--- a/res/values/strings_my.arb
++++ b/res/values/strings_my.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "ပျမ်းမျှ စုဆောင်းငွေ",
+   "awaitDAppProcessing": "ကျေးဇူးပြု၍ dApp ကို စီမံလုပ်ဆောင်ခြင်း အပြီးသတ်ရန် စောင့်ပါ။",
+   "awaiting_payment_confirmation": "ငွေပေးချေမှု အတည်ပြုချက်ကို စောင့်မျှော်နေပါသည်။",
++  "background_sync": "နောက်ခံထပ်တူပြုခြင်း",
+   "background_sync_mode": "နောက်ခံထပ်တူပြုခြင်း mode ကို",
+   "backup": "မိတ္တူ",
+   "backup_file": "အရန်ဖိုင်",
+@@ -922,6 +923,8 @@
+   "understand": "ကျွန်တော်နားလည်ပါတယ်",
+   "unlock": "သော့ဖွင့်",
+   "unmatched_currencies": "သင့်လက်ရှိပိုက်ဆံအိတ်၏ငွေကြေးသည် စကင်ဖတ်ထားသော QR နှင့် မကိုက်ညီပါ။",
++  "unrestricted_background_service": "အကန့်အသတ်မရှိနောက်ခံဝန်ဆောင်မှု",
++  "unrestricted_background_service_notice": "နောက်ခံထပ်တူပြုခြင်းကို Enable လုပ်ရန်သင်ကန့်သတ်ထားသောနောက်ခံဝန်ဆောင်မှုကိုဖွင့်ရန်လိုအပ်သည်",
+   "unspent_change": "ပေြာင်းလဲခြင်း",
+   "unspent_coins_details_title": "အသုံးမဝင်သော အကြွေစေ့အသေးစိတ်များ",
+   "unspent_coins_title": "အသုံးမဝင်သော အကြွေစေ့များ",
+diff --git a/res/values/strings_nl.arb b/res/values/strings_nl.arb
+index 9d998fcc57..55e588f62b 100644
+--- a/res/values/strings_nl.arb
++++ b/res/values/strings_nl.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Gem. besparingen",
+   "awaitDAppProcessing": "Wacht tot de dApp klaar is met verwerken.",
+   "awaiting_payment_confirmation": "In afwachting van betalingsbevestiging",
++  "background_sync": "Achtergrondsynchronisatie",
+   "background_sync_mode": "Achtergrondsynchronisatiemodus",
+   "backup": "Back-up",
+   "backup_file": "Backup bestand",
+@@ -922,6 +923,8 @@
+   "understand": "Ik begrijp het",
+   "unlock": "Ontgrendelen",
+   "unmatched_currencies": "De valuta van uw huidige portemonnee komt niet overeen met die van de gescande QR",
++  "unrestricted_background_service": "Onbeperkte achtergrondservice",
++  "unrestricted_background_service_notice": "Om achtergrondsynchronisatie in te schakelen, moet u onbeperkte achtergrondservice inschakelen",
+   "unspent_change": "Wijziging",
+   "unspent_coins_details_title": "Details van niet-uitgegeven munten",
+   "unspent_coins_title": "Ongebruikte munten",
+diff --git a/res/values/strings_pl.arb b/res/values/strings_pl.arb
+index 52ee64a5b2..cb4f099827 100644
+--- a/res/values/strings_pl.arb
++++ b/res/values/strings_pl.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Śr. oszczędności",
+   "awaitDAppProcessing": "Poczekaj, aż dApp zakończy przetwarzanie.",
+   "awaiting_payment_confirmation": "Oczekiwanie na potwierdzenie płatności",
++  "background_sync": "Synchronizacja tła",
+   "background_sync_mode": "Tryb synchronizacji w tle",
+   "backup": "Kopia zapasowa",
+   "backup_file": "Plik kopii zapasowej",
+@@ -922,6 +923,8 @@
+   "understand": "Rozumiem",
+   "unlock": "Odblokować",
+   "unmatched_currencies": "Waluta Twojego obecnego portfela nie zgadza się z waluctą zeskanowanego kodu QR",
++  "unrestricted_background_service": "Nieograniczona usługa w tle",
++  "unrestricted_background_service_notice": "Aby włączyć synchronizację tła, musisz włączyć nieograniczoną usługę w tle",
+   "unspent_change": "Zmiana",
+   "unspent_coins_details_title": "Szczegóły niewydanych monet",
+   "unspent_coins_title": "Niewydane monety",
+diff --git a/res/values/strings_pt.arb b/res/values/strings_pt.arb
+index 453dae4db4..2fb3bac5fa 100644
+--- a/res/values/strings_pt.arb
++++ b/res/values/strings_pt.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Poupança média",
+   "awaitDAppProcessing": "Aguarde até que o dApp termine o processamento.",
+   "awaiting_payment_confirmation": "Aguardando confirmação de pagamento",
++  "background_sync": "Sincronização de fundo",
+   "background_sync_mode": "Modo de sincronização em segundo plano",
+   "backup": "Cópia de segurança",
+   "backup_file": "Arquivo de backup",
+@@ -924,6 +925,8 @@
+   "understand": "Entendo",
+   "unlock": "Desbloquear",
+   "unmatched_currencies": "A moeda da sua carteira atual não corresponde à do QR digitalizado",
++  "unrestricted_background_service": "Serviço de fundo irrestrito",
++  "unrestricted_background_service_notice": "Para ativar a sincronização de fundo, você precisa ativar o serviço de fundo irrestrito",
+   "unspent_change": "Troco",
+   "unspent_coins_details_title": "Detalhes de moedas não gastas",
+   "unspent_coins_title": "Moedas não gastas",
+diff --git a/res/values/strings_ru.arb b/res/values/strings_ru.arb
+index 4decec0641..4173ad6d53 100644
+--- a/res/values/strings_ru.arb
++++ b/res/values/strings_ru.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Средняя экономия",
+   "awaitDAppProcessing": "Пожалуйста, подождите, пока dApp завершит обработку.",
+   "awaiting_payment_confirmation": "Ожидается подтверждения платежа",
++  "background_sync": "Фоновая синхронизация",
+   "background_sync_mode": "Режим фоновой синхронизации",
+   "backup": "Резервная копия",
+   "backup_file": "Файл резервной копии",
+@@ -923,6 +924,8 @@
+   "understand": "Понятно",
+   "unlock": "Разблокировать",
+   "unmatched_currencies": "Валюта вашего текущего кошелька не соответствует валюте отсканированного QR-кода.",
++  "unrestricted_background_service": "Неограниченная фоновая служба",
++  "unrestricted_background_service_notice": "Чтобы включить фона синхронизации, необходимо включить неограниченную фоновую службу",
+   "unspent_change": "Изменять",
+   "unspent_coins_details_title": "Сведения о неизрасходованных монетах",
+   "unspent_coins_title": "Неизрасходованные монеты",
+diff --git a/res/values/strings_th.arb b/res/values/strings_th.arb
+index f718a9c76f..acd70c554c 100644
+--- a/res/values/strings_th.arb
++++ b/res/values/strings_th.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "ประหยัดเฉลี่ย",
+   "awaitDAppProcessing": "โปรดรอให้ dApp ประมวลผลเสร็จสิ้น",
+   "awaiting_payment_confirmation": "รอการยืนยันการชำระเงิน",
++  "background_sync": "การซิงค์พื้นหลัง",
+   "background_sync_mode": "โหมดซิงค์พื้นหลัง",
+   "backup": "สำรองข้อมูล",
+   "backup_file": "ไฟล์สำรองข้อมูล",
+@@ -922,6 +923,8 @@
+   "understand": "ฉันเข้าใจ",
+   "unlock": "ปลดล็อค",
+   "unmatched_currencies": "สกุลเงินของกระเป๋าปัจจุบันของคุณไม่ตรงกับของ QR ที่สแกน",
++  "unrestricted_background_service": "บริการพื้นหลังที่ไม่ จำกัด",
++  "unrestricted_background_service_notice": "ในการเปิดใช้งานการซิงค์พื้นหลังคุณต้องเปิดใช้งานบริการพื้นหลังที่ไม่ จำกัด",
+   "unspent_change": "เปลี่ยน",
+   "unspent_coins_details_title": "รายละเอียดเหรียญที่ไม่ได้ใช้",
+   "unspent_coins_title": "เหรียญที่ไม่ได้ใช้",
+diff --git a/res/values/strings_tl.arb b/res/values/strings_tl.arb
+index 90ae8f9a81..a378ff3ea5 100644
+--- a/res/values/strings_tl.arb
++++ b/res/values/strings_tl.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Avg. Matitipid",
+   "awaitDAppProcessing": "Pakihintay na matapos ang pagproseso ng dApp.",
+   "awaiting_payment_confirmation": "Nanghihintay ng Kumpirmasyon sa Pagbabayad",
++  "background_sync": "Pag -sync ng background",
+   "background_sync_mode": "Background sync mode",
+   "backup": "Backup",
+   "backup_file": "Backup na file",
+@@ -922,6 +923,8 @@
+   "understand": "Naiitindihan ko",
+   "unlock": "I-unlock",
+   "unmatched_currencies": "Hindi tumutugma ang pera ng iyong kasalukuyang wallet sa na-scan na QR",
++  "unrestricted_background_service": "Hindi pinigilan na serbisyo sa background",
++  "unrestricted_background_service_notice": "Upang paganahin ang pag -sync ng background kailangan mong paganahin ang hindi pinigilan na serbisyo sa background",
+   "unspent_change": "Sukli",
+   "unspent_coins_details_title": "Mga detalye ng mga hindi nagastos na barya",
+   "unspent_coins_title": "Mga hindi nagamit na barya",
+diff --git a/res/values/strings_tr.arb b/res/values/strings_tr.arb
+index bbcd5e575a..8011401dc5 100644
+--- a/res/values/strings_tr.arb
++++ b/res/values/strings_tr.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Ortalama Tasarruf",
+   "awaitDAppProcessing": "Lütfen dApp'in işlemeyi bitirmesini bekleyin.",
+   "awaiting_payment_confirmation": "Ödemenin onaylanması bekleniyor",
++  "background_sync": "Arka plan senkronizasyonu",
+   "background_sync_mode": "Arka Plan Senkronizasyon Modu",
+   "backup": "Yedek",
+   "backup_file": "Yedek dosyası",
+@@ -922,6 +923,8 @@
+   "understand": "Anladım",
+   "unlock": "Kilidini aç",
+   "unmatched_currencies": "Mevcut cüzdanınızın para birimi taranan QR ile eşleşmiyor",
++  "unrestricted_background_service": "Sınırsız arka plan hizmeti",
++  "unrestricted_background_service_notice": "Arka plan senkronizasyonunu etkinleştirmek için sınırsız arka plan hizmetini etkinleştirmeniz gerekir",
+   "unspent_change": "Değiştirmek",
+   "unspent_coins_details_title": "Harcanmamış koin detayları",
+   "unspent_coins_title": "Harcanmamış koinler",
+diff --git a/res/values/strings_uk.arb b/res/values/strings_uk.arb
+index 77ae06a226..8227d581f9 100644
+--- a/res/values/strings_uk.arb
++++ b/res/values/strings_uk.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Середня економія",
+   "awaitDAppProcessing": "Зачекайте, доки dApp завершить обробку.",
+   "awaiting_payment_confirmation": "Очікується підтвердження платежу",
++  "background_sync": "Фонове синхронізація",
+   "background_sync_mode": "Фоновий режим синхронізації",
+   "backup": "Резервна копія",
+   "backup_file": "Файл резервної копії",
+@@ -923,6 +924,8 @@
+   "understand": "Зрозуміло",
+   "unlock": "Розблокувати",
+   "unmatched_currencies": "Валюта вашого гаманця не збігається з валютою сканованого QR-коду",
++  "unrestricted_background_service": "Необмежена фонова послуга",
++  "unrestricted_background_service_notice": "Для того, щоб увімкнути фонову синхронізацію, вам потрібно ввімкнути необмежену фонову послугу",
+   "unspent_change": "Зміна",
+   "unspent_coins_details_title": "Відомості про невитрачені монети",
+   "unspent_coins_title": "Невитрачені монети",
+diff --git a/res/values/strings_ur.arb b/res/values/strings_ur.arb
+index fea91580b6..307340a213 100644
+--- a/res/values/strings_ur.arb
++++ b/res/values/strings_ur.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "اوسط بچت",
+   "awaitDAppProcessing": "۔ﮟﯾﺮﮐ ﺭﺎﻈﺘﻧﺍ ﺎﮐ ﮯﻧﻮﮨ ﻞﻤﮑﻣ ﮓﻨﺴﯿﺳﻭﺮﭘ ﮯﮐ dApp ﻡﺮﮐ ﮦﺍﺮﺑ",
+   "awaiting_payment_confirmation": "ادائیگی کی تصدیق کے منتظر",
++  "background_sync": "پس منظر کی ہم آہنگی",
+   "background_sync_mode": "پس منظر کی مطابقت پذیری کا موڈ",
+   "backup": "بیک اپ",
+   "backup_file": "بیک اپ فائل",
+@@ -924,6 +925,8 @@
+   "understand": "میں سمجھتا ہوں۔",
+   "unlock": "غیر مقفل",
+   "unmatched_currencies": "آپ کے پرس کی موجودہ کرنسی اسکین شدہ QR سے مماثل نہیں ہے۔",
++  "unrestricted_background_service": "غیر محدود پس منظر کی خدمت",
++  "unrestricted_background_service_notice": "پس منظر کی مطابقت پذیری کو قابل بنانے کے ل you آپ کو غیر محدود پس منظر کی خدمت کو فعال کرنے کی ضرورت ہے",
+   "unspent_change": "تبدیل کریں",
+   "unspent_coins_details_title": "غیر خرچ شدہ سککوں کی تفصیلات",
+   "unspent_coins_title": "غیر خرچ شدہ سکے ۔",
+diff --git a/res/values/strings_vi.arb b/res/values/strings_vi.arb
+index 776131f5fc..c2935e9a05 100644
+--- a/res/values/strings_vi.arb
++++ b/res/values/strings_vi.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Tiết kiệm trung bình",
+   "awaitDAppProcessing": "Vui lòng đợi ứng dụng phi tập trung hoàn thành xử lý.",
+   "awaiting_payment_confirmation": "Đang chờ xác nhận thanh toán",
++  "background_sync": "Đồng bộ nền",
+   "background_sync_mode": "Chế độ đồng bộ nền",
+   "backup": "Sao lưu",
+   "backup_file": "Tập tin sao lưu",
+@@ -919,6 +920,8 @@
+   "understand": "Tôi hiểu",
+   "unlock": "Mở khóa",
+   "unmatched_currencies": "Tiền tệ của ví hiện tại của bạn không khớp với QR đã quét",
++  "unrestricted_background_service": "Dịch vụ nền không giới hạn",
++  "unrestricted_background_service_notice": "Để cho phép đồng bộ hóa nền, bạn cần bật dịch vụ nền không giới hạn",
+   "unspent_change": "Tiền thối",
+   "unspent_coins_details_title": "Chi tiết các đồng tiền chưa chi tiêu",
+   "unspent_coins_title": "Các đồng tiền chưa chi tiêu",
+diff --git a/res/values/strings_yo.arb b/res/values/strings_yo.arb
+index cbe7c8ffd5..b97fbb7571 100644
+--- a/res/values/strings_yo.arb
++++ b/res/values/strings_yo.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "Ìpamọ́ l’óòrèkóòrè",
+   "awaitDAppProcessing": "Fi inurere duro fun dApp lati pari sisẹ.",
+   "awaiting_payment_confirmation": "À ń dúró de ìjẹ́rìísí àránṣẹ́",
++  "background_sync": "Imuṣiṣẹ Labẹ",
+   "background_sync_mode": "Ipo amuṣiṣẹpọ abẹlẹ",
+   "backup": "Ṣẹ̀dà",
+   "backup_file": "Ṣẹ̀dà akọsílẹ̀",
+@@ -923,6 +924,8 @@
+   "understand": "Ó ye mi",
+   "unlock": "Sisalẹ",
+   "unmatched_currencies": "Irú owó ti àpamọ́wọ́ yín kì í ṣe irú ti yíya àmì ìlujá",
++  "unrestricted_background_service": "Iṣẹ ipilẹṣẹ ti ko nilẹ",
++  "unrestricted_background_service_notice": "Ni ibere lati mu ṣiṣẹpọ lẹhin ti o nilo lati ṣiṣẹ iṣẹ iṣẹ ti ko ni ibatan",
+   "unspent_change": "Yipada",
+   "unspent_coins_details_title": "Àwọn owó ẹyọ t'á kò tí ì san",
+   "unspent_coins_title": "Àwọn owó ẹyọ t'á kò tí ì san",
+diff --git a/res/values/strings_zh.arb b/res/values/strings_zh.arb
+index 598f90a006..e1767a28ff 100644
+--- a/res/values/strings_zh.arb
++++ b/res/values/strings_zh.arb
+@@ -69,6 +69,7 @@
+   "avg_savings": "平均储蓄",
+   "awaitDAppProcessing": "请等待 dApp 处理完成。",
+   "awaiting_payment_confirmation": "等待付款确认",
++  "background_sync": "背景同步",
+   "background_sync_mode": "后台同步模式",
+   "backup": "备份",
+   "backup_file": "备份文件",
+@@ -922,6 +923,8 @@
+   "understand": "我已知晓",
+   "unlock": "开锁",
+   "unmatched_currencies": "您当前钱包的货币与扫描的 QR 的货币不匹配",
++  "unrestricted_background_service": "不受限制的背景服务",
++  "unrestricted_background_service_notice": "为了启用背景同步，您需要启用无限制的背景服务",
+   "unspent_change": "改变",
+   "unspent_coins_details_title": "未使用代幣詳情",
+   "unspent_coins_title": "未使用的硬幣",

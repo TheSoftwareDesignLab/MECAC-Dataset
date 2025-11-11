@@ -1,0 +1,537 @@
+diff --git a/Localization/app.json b/Localization/app.json
+index 93c3f9955b..a965b23ae3 100644
+--- a/Localization/app.json
++++ b/Localization/app.json
+@@ -544,6 +544,12 @@
+             "keyobard": {
+                 "show_everything": "Show Everything",
+                 "show_mentions": "Show Mentions"
++            },
++            "follow_request": {
++                "accept": "Accept",
++                "accepted": "Accepted",
++                "reject": "reject",
++                "rejected": "Rejected"
+             }
+         },
+         "thread": {
+diff --git a/Mastodon.xcodeproj/xcuserdata/mainasuk.xcuserdatad/xcschemes/xcschememanagement.plist b/Mastodon.xcodeproj/xcuserdata/mainasuk.xcuserdatad/xcschemes/xcschememanagement.plist
+index 1399af14db..10b782b151 100644
+--- a/Mastodon.xcodeproj/xcuserdata/mainasuk.xcuserdatad/xcschemes/xcschememanagement.plist
++++ b/Mastodon.xcodeproj/xcuserdata/mainasuk.xcuserdatad/xcschemes/xcschememanagement.plist
+@@ -114,7 +114,7 @@
+ 		<key>MastodonIntent.xcscheme_^#shared#^_</key>
+ 		<dict>
+ 			<key>orderHint</key>
+-			<integer>24</integer>
++			<integer>23</integer>
+ 		</dict>
+ 		<key>MastodonIntents.xcscheme_^#shared#^_</key>
+ 		<dict>
+@@ -129,7 +129,7 @@
+ 		<key>NotificationService.xcscheme_^#shared#^_</key>
+ 		<dict>
+ 			<key>orderHint</key>
+-			<integer>23</integer>
++			<integer>24</integer>
+ 		</dict>
+ 		<key>ShareActionExtension.xcscheme_^#shared#^_</key>
+ 		<dict>
+diff --git a/Mastodon/Protocol/Provider/DataSourceFacade+Follow.swift b/Mastodon/Protocol/Provider/DataSourceFacade+Follow.swift
+index 83c5b41ba6..5351893680 100644
+--- a/Mastodon/Protocol/Provider/DataSourceFacade+Follow.swift
++++ b/Mastodon/Protocol/Provider/DataSourceFacade+Follow.swift
+@@ -9,6 +9,7 @@ import UIKit
+ import CoreDataStack
+ import class CoreDataStack.Notification
+ import MastodonSDK
++import MastodonLocalization
+ 
+ extension DataSourceFacade {
+     static func responseToUserFollowAction(
+@@ -47,10 +48,82 @@ extension DataSourceFacade {
+             throw APIService.APIError.implicit(.badRequest)
+         }
+         
+-        _ = try await dependency.context.apiService.followRequest(
+-            userID: userID,
+-            query: query,
+-            authenticationBox: authenticationBox
+-        )
++        let state: MastodonFollowRequestState = try await managedObjectContext.perform {
++            guard let notification = notification.object(in: managedObjectContext) else { return .init(state: .none) }
++            return notification.followRequestState
++        }
++        
++        guard state.state == .none else {
++            return
++        }
++        
++        try? await managedObjectContext.performChanges {
++            guard let notification = notification.object(in: managedObjectContext) else { return }
++            switch query {
++            case .accept:
++                notification.transientFollowRequestState = .init(state: .isAccepting)
++            case .reject:
++                notification.transientFollowRequestState = .init(state: .isRejecting)
++            }
++        }
++        
++        do {
++            _ = try await dependency.context.apiService.followRequest(
++                userID: userID,
++                query: query,
++                authenticationBox: authenticationBox
++            )
++        } catch {
++            try? await managedObjectContext.performChanges {
++                guard let notification = notification.object(in: managedObjectContext) else { return }
++                notification.transientFollowRequestState = .init(state: .none)
++            }
++
++            if let error = error as? Mastodon.API.Error {
++                switch error.httpResponseStatus {
++                case .notFound:
++                    let backgroundManagedObjectContext = dependency.context.backgroundManagedObjectContext
++                    try await backgroundManagedObjectContext.performChanges {
++                        guard let notification = notification.object(in: backgroundManagedObjectContext) else { return }
++                        for feed in notification.feeds {
++                            backgroundManagedObjectContext.delete(feed)
++                        }
++                        backgroundManagedObjectContext.delete(notification)
++                    }
++                default:
++                    let alertController = await UIAlertController(for: error, title: nil, preferredStyle: .alert)
++                    let okAction = await UIAlertAction(title: L10n.Common.Controls.Actions.ok, style: .default)
++                    await alertController.addAction(okAction)
++                    await dependency.coordinator.present(
++                        scene: .alertController(alertController: alertController),
++                        from: nil,
++                        transition: .alertController(animated: true, completion: nil)
++                    )
++                }
++            }
++            
++            return
++        }
++        
++        try? await managedObjectContext.performChanges {
++            guard let notification = notification.object(in: managedObjectContext) else { return }
++            switch query {
++            case .accept:
++                notification.transientFollowRequestState = .init(state: .isAccept)
++            case .reject:
++                notification.transientFollowRequestState = .init(state: .isReject)
++            }
++        }
++        
++        let backgroundManagedObjectContext = dependency.context.backgroundManagedObjectContext
++        try? await backgroundManagedObjectContext.performChanges {
++            guard let notification = notification.object(in: backgroundManagedObjectContext) else { return }
++            switch query {
++            case .accept:
++                notification.followRequestState = .init(state: .isAccept)
++            case .reject:
++                notification.followRequestState = .init(state: .isReject)
++            }
++        }
+     }   // end func
+ }
+diff --git a/Mastodon/Protocol/Provider/DataSourceProvider+NotificationTableViewCellDelegate.swift b/Mastodon/Protocol/Provider/DataSourceProvider+NotificationTableViewCellDelegate.swift
+index f525f7be1b..dab46bba85 100644
+--- a/Mastodon/Protocol/Provider/DataSourceProvider+NotificationTableViewCellDelegate.swift
++++ b/Mastodon/Protocol/Provider/DataSourceProvider+NotificationTableViewCellDelegate.swift
+@@ -87,6 +87,7 @@ extension NotificationTableViewCellDelegate where Self: DataSourceProvider {
+     }
+ }
+ 
++// MARK: - Follow Request
+ extension NotificationTableViewCellDelegate where Self: DataSourceProvider {
+  
+     func tableViewCell(
+diff --git a/Mastodon/Scene/Share/View/Content/NotificationView+Configuration.swift b/Mastodon/Scene/Share/View/Content/NotificationView+Configuration.swift
+index ff2451505b..45652321f4 100644
+--- a/Mastodon/Scene/Share/View/Content/NotificationView+Configuration.swift
++++ b/Mastodon/Scene/Share/View/Content/NotificationView+Configuration.swift
+@@ -29,6 +29,8 @@ extension NotificationView {
+ 
+ extension NotificationView {
+     public func configure(notification: Notification) {
++        viewModel.objects.insert(notification)
++
+         configureAuthor(notification: notification)
+         
+         guard let type = MastodonNotificationType(rawValue: notification.typeRaw) else {
+@@ -198,5 +200,12 @@ extension NotificationView {
+         }
+         .assign(to: \.isMyself, on: viewModel)
+         .store(in: &disposeBag)
++        // follow request state
++        notification.publisher(for: \.followRequestState)
++            .assign(to: \.followRequestState, on: viewModel)
++            .store(in: &disposeBag)
++        notification.publisher(for: \.transientFollowRequestState)
++            .assign(to: \.transientFollowRequestState, on: viewModel)
++            .store(in: &disposeBag)
+     }
+ }
+diff --git a/MastodonSDK/Sources/CoreDataStack/CoreData.xcdatamodeld/CoreData 3.xcdatamodel/contents b/MastodonSDK/Sources/CoreDataStack/CoreData.xcdatamodeld/CoreData 3.xcdatamodel/contents
+index 16a1c7c844..10c420eee6 100644
+--- a/MastodonSDK/Sources/CoreDataStack/CoreData.xcdatamodeld/CoreData 3.xcdatamodel/contents	
++++ b/MastodonSDK/Sources/CoreDataStack/CoreData.xcdatamodeld/CoreData 3.xcdatamodel/contents	
+@@ -1,5 +1,5 @@
+ <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+-<model type="com.apple.IDECoreDataModeler.DataModel" documentVersion="1.0" lastSavedToolsVersion="20086" systemVersion="21E258" minimumToolsVersion="Automatic" sourceLanguage="Swift" userDefinedModelVersionIdentifier="">
++<model type="com.apple.IDECoreDataModeler.DataModel" documentVersion="1.0" lastSavedToolsVersion="20086" systemVersion="21F79" minimumToolsVersion="Automatic" sourceLanguage="Swift" userDefinedModelVersionIdentifier="">
+     <entity name="Application" representedClassName="CoreDataStack.Application" syncable="YES">
+         <attribute name="identifier" optional="YES" attributeType="UUID" usesScalarValueType="NO"/>
+         <attribute name="name" attributeType="String"/>
+@@ -113,7 +113,9 @@
+     <entity name="Notification" representedClassName="CoreDataStack.Notification" syncable="YES">
+         <attribute name="createAt" attributeType="Date" usesScalarValueType="NO"/>
+         <attribute name="domain" attributeType="String"/>
++        <attribute name="followRequestState" optional="YES" attributeType="Binary"/>
+         <attribute name="id" attributeType="String"/>
++        <attribute name="transientFollowRequestState" optional="YES" transient="YES" attributeType="Binary"/>
+         <attribute name="typeRaw" attributeType="String"/>
+         <attribute name="updatedAt" attributeType="Date" usesScalarValueType="NO"/>
+         <attribute name="userID" attributeType="String"/>
+@@ -255,7 +257,7 @@
+         <element name="Instance" positionX="45" positionY="162" width="128" height="104"/>
+         <element name="MastodonAuthentication" positionX="0" positionY="0" width="128" height="224"/>
+         <element name="MastodonUser" positionX="0" positionY="0" width="128" height="734"/>
+-        <element name="Notification" positionX="9" positionY="162" width="128" height="164"/>
++        <element name="Notification" positionX="9" positionY="162" width="128" height="194"/>
+         <element name="Poll" positionX="0" positionY="0" width="128" height="224"/>
+         <element name="PollOption" positionX="0" positionY="0" width="128" height="149"/>
+         <element name="PrivateNote" positionX="0" positionY="0" width="128" height="89"/>
+diff --git a/MastodonSDK/Sources/CoreDataStack/Entity/Mastodon/Notification.swift b/MastodonSDK/Sources/CoreDataStack/Entity/Mastodon/Notification.swift
+index 85019b0dc4..7eec868423 100644
+--- a/MastodonSDK/Sources/CoreDataStack/Entity/Mastodon/Notification.swift
++++ b/MastodonSDK/Sources/CoreDataStack/Entity/Mastodon/Notification.swift
+@@ -36,6 +36,58 @@ public final class Notification: NSManagedObject {
+ 
+ }
+ 
++extension Notification {
++    // sourcery: autoUpdatableObject
++    @objc public var followRequestState: MastodonFollowRequestState {
++        get {
++            let keyPath = #keyPath(Notification.followRequestState)
++            willAccessValue(forKey: keyPath)
++            let _data = primitiveValue(forKey: keyPath) as? Data
++            didAccessValue(forKey: keyPath)
++            do {
++                guard let data = _data, !data.isEmpty else { return .init(state: .none) }
++                let state = try JSONDecoder().decode(MastodonFollowRequestState.self, from: data)
++                return state
++            } catch {
++                assertionFailure(error.localizedDescription)
++                return .init(state: .none)
++            }
++        }
++        set {
++            let keyPath = #keyPath(Notification.followRequestState)
++            let data = try? JSONEncoder().encode(newValue)
++            willChangeValue(forKey: keyPath)
++            setPrimitiveValue(data, forKey: keyPath)
++            didChangeValue(forKey: keyPath)
++        }
++    }
++    
++    // sourcery: autoUpdatableObject
++    @objc public var transientFollowRequestState: MastodonFollowRequestState {
++        get {
++            let keyPath = #keyPath(Notification.transientFollowRequestState)
++            willAccessValue(forKey: keyPath)
++            let _data = primitiveValue(forKey: keyPath) as? Data
++            didAccessValue(forKey: keyPath)
++            do {
++                guard let data = _data else { return .init(state: .none) }
++                let state = try JSONDecoder().decode(MastodonFollowRequestState.self, from: data)
++                return state
++            } catch {
++                assertionFailure(error.localizedDescription)
++                return .init(state: .none)
++            }
++        }
++        set {
++            let keyPath = #keyPath(Notification.transientFollowRequestState)
++            let data = try? JSONEncoder().encode(newValue)
++            willChangeValue(forKey: keyPath)
++            setPrimitiveValue(data, forKey: keyPath)
++            didChangeValue(forKey: keyPath)
++        }
++    }
++}
++
+ extension Notification: FeedIndexable { }
+ 
+ extension Notification {
+@@ -197,6 +249,16 @@ extension Notification: AutoUpdatableObject {
+     		self.updatedAt = updatedAt
+     	}
+     }
++    public func update(followRequestState: MastodonFollowRequestState) {
++    	if self.followRequestState != followRequestState {
++    		self.followRequestState = followRequestState
++    	}
++    }
++    public func update(transientFollowRequestState: MastodonFollowRequestState) {
++    	if self.transientFollowRequestState != transientFollowRequestState {
++    		self.transientFollowRequestState = transientFollowRequestState
++    	}
++    }
+     // sourcery:end
+ }
+ 
+diff --git a/MastodonSDK/Sources/CoreDataStack/Entity/Transient/MastodonFollowRequestState.swift b/MastodonSDK/Sources/CoreDataStack/Entity/Transient/MastodonFollowRequestState.swift
+new file mode 100644
+index 0000000000..c348d6cee1
+--- /dev/null
++++ b/MastodonSDK/Sources/CoreDataStack/Entity/Transient/MastodonFollowRequestState.swift
+@@ -0,0 +1,28 @@
++//
++//  MastodonFollowRequestState.swift
++//  
++//
++//  Created by MainasuK on 2022-6-29.
++//
++
++import SwiftUI
++
++public final class MastodonFollowRequestState: NSObject, Codable {
++    public let state: State
++
++    public init(
++        state: State
++    ) {
++        self.state = state
++    }
++}
++
++extension MastodonFollowRequestState {
++    public enum State: String, Codable {
++        case none
++        case isAccepting
++        case isAccept
++        case isRejecting
++        case isReject
++    }
++}
+diff --git a/MastodonSDK/Sources/MastodonUI/View/Content/NotificationView+ViewModel.swift b/MastodonSDK/Sources/MastodonUI/View/Content/NotificationView+ViewModel.swift
+index eec57cb5ab..03399ca1c7 100644
+--- a/MastodonSDK/Sources/MastodonUI/View/Content/NotificationView+ViewModel.swift
++++ b/MastodonSDK/Sources/MastodonUI/View/Content/NotificationView+ViewModel.swift
+@@ -13,10 +13,13 @@ import MastodonSDK
+ import MastodonAsset
+ import MastodonLocalization
+ import MastodonExtension
++import CoreData
++import CoreDataStack
+ 
+ extension NotificationView {
+     public final class ViewModel: ObservableObject {
+         public var disposeBag = Set<AnyCancellable>()
++        public var objects = Set<NSManagedObject>()
+ 
+         let logger = Logger(subsystem: "NotificationView", category: "ViewModel")
+         
+@@ -35,11 +38,13 @@ extension NotificationView {
+         
+         @Published public var timestamp: Date?
+         
++        @Published public var followRequestState = MastodonFollowRequestState(state: .none)
++        @Published public var transientFollowRequestState = MastodonFollowRequestState(state: .none)
++        
+         let timestampUpdatePublisher = Timer.publish(every: 1.0, on: .main, in: .common)
+             .autoconnect()
+             .share()
+             .eraseToAnyPublisher()
+-        
+     }
+ }
+ 
+@@ -47,6 +52,7 @@ extension NotificationView.ViewModel {
+     func bind(notificationView: NotificationView) {
+         bindAuthor(notificationView: notificationView)
+         bindAuthorMenu(notificationView: notificationView)
++        bindFollowRequest(notificationView: notificationView)
+         
+         $userIdentifier
+             .assign(to: \.userIdentifier, on: notificationView.statusView.viewModel)
+@@ -146,4 +152,54 @@ extension NotificationView.ViewModel {
+         }
+         .store(in: &disposeBag)
+     }
++    
++    private func bindFollowRequest(notificationView: NotificationView) {
++        Publishers.CombineLatest(
++            $followRequestState,
++            $transientFollowRequestState
++        )
++        .sink { followRequestState, transientFollowRequestState in
++            switch followRequestState.state {
++            case .isAccept:
++                notificationView.rejectFollowRequestButtonShadowBackgroundContainer.isHidden = true
++                notificationView.acceptFollowRequestButton.isUserInteractionEnabled = false
++                notificationView.acceptFollowRequestButton.setImage(nil, for: .normal)
++                notificationView.acceptFollowRequestButton.setTitle("Accepted", for: .normal)
++            case .isReject:
++                notificationView.acceptFollowRequestButtonShadowBackgroundContainer.isHidden = true
++                notificationView.rejectFollowRequestButton.isUserInteractionEnabled = false
++                notificationView.rejectFollowRequestButton.setImage(nil, for: .normal)
++                notificationView.rejectFollowRequestButton.setTitle("Rejected", for: .normal)
++            default:
++                break
++            }
++            
++            let state = transientFollowRequestState.state
++            if state == .isAccepting {
++                notificationView.acceptFollowRequestActivityIndicatorView.startAnimating()
++                notificationView.acceptFollowRequestButton.tintColor = .clear
++            } else {
++                notificationView.acceptFollowRequestActivityIndicatorView.stopAnimating()
++                notificationView.acceptFollowRequestButton.tintColor = .white
++            }
++            if state == .isRejecting {
++                notificationView.rejectFollowRequestActivityIndicatorView.startAnimating()
++                notificationView.rejectFollowRequestButton.tintColor = .clear
++            } else {
++                notificationView.rejectFollowRequestActivityIndicatorView.stopAnimating()
++                notificationView.rejectFollowRequestButton.tintColor = .white
++            }
++            
++            UIView.animate(withDuration: 0.3) {
++                if state == .isAccept {
++                    notificationView.rejectFollowRequestButtonShadowBackgroundContainer.isHidden = true
++                }
++                if state == .isReject {
++                    notificationView.acceptFollowRequestButtonShadowBackgroundContainer.isHidden = true
++                }
++            }
++        }
++        .store(in: &disposeBag)
++    }
++    
+ }
+diff --git a/MastodonSDK/Sources/MastodonUI/View/Content/NotificationView.swift b/MastodonSDK/Sources/MastodonUI/View/Content/NotificationView.swift
+index 6cef7cfe30..80a6d5e642 100644
+--- a/MastodonSDK/Sources/MastodonUI/View/Content/NotificationView.swift
++++ b/MastodonSDK/Sources/MastodonUI/View/Content/NotificationView.swift
+@@ -106,11 +106,12 @@ public final class NotificationView: UIView {
+     
+     // follow request
+     let followRequestAdaptiveMarginContainerView = AdaptiveMarginContainerView()
+-    let followRequestContainerView = UIView()
++    let followRequestContainerView = UIStackView()
+     
+     let acceptFollowRequestButtonShadowBackgroundContainer = ShadowBackgroundContainer()
+     private(set) lazy var acceptFollowRequestButton: UIButton = {
+         let button = UIButton()
++        button.titleLabel?.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
+         button.setImage(Asset.Editing.checkmark.image.withRenderingMode(.alwaysTemplate), for: .normal)
+         button.imageView?.contentMode = .scaleAspectFit
+         button.setBackgroundImage(.placeholder(color: .systemGreen), for: .normal)
+@@ -118,15 +119,18 @@ public final class NotificationView: UIView {
+         button.layer.masksToBounds = true
+         button.layer.cornerCurve = .continuous
+         button.layer.cornerRadius = 4
++        button.accessibilityLabel = "Accept"
+         acceptFollowRequestButtonShadowBackgroundContainer.cornerRadius = 4
+         acceptFollowRequestButtonShadowBackgroundContainer.shadowAlpha = 0.1
+         button.addTarget(self, action: #selector(NotificationView.acceptFollowRequestButtonDidPressed(_:)), for: .touchUpInside)
+         return button
+     }()
++    let acceptFollowRequestActivityIndicatorView = UIActivityIndicatorView(style: .medium)
+     
+     let rejectFollowRequestButtonShadowBackgroundContainer = ShadowBackgroundContainer()
+     private(set) lazy var rejectFollowRequestButton: UIButton = {
+         let button = UIButton()
++        button.titleLabel?.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
+         button.setImage(Asset.Editing.xmark.image.withRenderingMode(.alwaysTemplate), for: .normal)
+         button.imageView?.contentMode = .scaleAspectFit
+         button.imageEdgeInsets = UIEdgeInsets(top: 2, left: 2, bottom: 2, right: 2)     // tweak xmark size
+@@ -135,11 +139,13 @@ public final class NotificationView: UIView {
+         button.layer.masksToBounds = true
+         button.layer.cornerCurve = .continuous
+         button.layer.cornerRadius = 4
++        button.accessibilityLabel = "Reject"
+         rejectFollowRequestButtonShadowBackgroundContainer.cornerRadius = 4
+         rejectFollowRequestButtonShadowBackgroundContainer.shadowAlpha = 0.1
+         button.addTarget(self, action: #selector(NotificationView.rejectFollowRequestButtonDidPressed(_:)), for: .touchUpInside)
+         return button
+     }()
++    let rejectFollowRequestActivityIndicatorView = UIActivityIndicatorView(style: .medium)
+     
+     // status
+     public let statusView = StatusView()
+@@ -151,12 +157,19 @@ public final class NotificationView: UIView {
+     public func prepareForReuse() {
+         disposeBag.removeAll()
+         
++        viewModel.objects.removeAll()
+         viewModel.authorAvatarImageURL = nil
+         avatarButton.avatarImageView.cancelTask()
+         
+         authorContainerViewBottomPaddingView.isHidden = true
+         
+         followRequestAdaptiveMarginContainerView.isHidden = true
++        acceptFollowRequestButtonShadowBackgroundContainer.isHidden = false
++        rejectFollowRequestButtonShadowBackgroundContainer.isHidden = false
++        acceptFollowRequestActivityIndicatorView.stopAnimating()
++        rejectFollowRequestActivityIndicatorView.stopAnimating()
++        acceptFollowRequestButton.isUserInteractionEnabled = true
++        rejectFollowRequestButton.isUserInteractionEnabled = true
+         
+         statusView.isHidden = true
+         statusView.prepareForReuse()
+@@ -288,22 +301,34 @@ extension NotificationView {
+             rejectFollowRequestButton.bottomAnchor.constraint(equalTo: rejectFollowRequestButtonShadowBackgroundContainer.bottomAnchor),
+         ])
+         
+-        let followReqeustContainerBottomMargin: CGFloat = 8
+-        acceptFollowRequestButtonShadowBackgroundContainer.translatesAutoresizingMaskIntoConstraints = false
+-        followRequestContainerView.addSubview(acceptFollowRequestButtonShadowBackgroundContainer)
+-        rejectFollowRequestButtonShadowBackgroundContainer.translatesAutoresizingMaskIntoConstraints = false
+-        followRequestContainerView.addSubview(rejectFollowRequestButtonShadowBackgroundContainer)
++        followRequestContainerView.axis = .horizontal
++        followRequestContainerView.distribution = .fillEqually
++        followRequestContainerView.spacing = 8
++        followRequestContainerView.isLayoutMarginsRelativeArrangement = true
++        followRequestContainerView.layoutMargins = UIEdgeInsets(top: 0, left: 0, bottom: 16, right: 0)  // set bottom padding
++        followRequestContainerView.addArrangedSubview(acceptFollowRequestButtonShadowBackgroundContainer)
++        followRequestContainerView.addArrangedSubview(rejectFollowRequestButtonShadowBackgroundContainer)
++        followRequestAdaptiveMarginContainerView.isHidden = true
++        
++        acceptFollowRequestActivityIndicatorView.translatesAutoresizingMaskIntoConstraints = false
++        acceptFollowRequestButton.addSubview(acceptFollowRequestActivityIndicatorView)
+         NSLayoutConstraint.activate([
+-            acceptFollowRequestButtonShadowBackgroundContainer.topAnchor.constraint(equalTo: followRequestContainerView.topAnchor),
+-            acceptFollowRequestButtonShadowBackgroundContainer.leadingAnchor.constraint(equalTo: followRequestContainerView.leadingAnchor),
+-            followRequestContainerView.bottomAnchor.constraint(equalTo: acceptFollowRequestButtonShadowBackgroundContainer.bottomAnchor, constant: followReqeustContainerBottomMargin),
+-            rejectFollowRequestButtonShadowBackgroundContainer.topAnchor.constraint(equalTo: followRequestContainerView.topAnchor),
+-            rejectFollowRequestButtonShadowBackgroundContainer.leadingAnchor.constraint(equalTo: acceptFollowRequestButtonShadowBackgroundContainer.trailingAnchor, constant: 8),
+-            followRequestContainerView.trailingAnchor.constraint(equalTo: rejectFollowRequestButtonShadowBackgroundContainer.trailingAnchor),
+-            followRequestContainerView.bottomAnchor.constraint(equalTo: rejectFollowRequestButtonShadowBackgroundContainer.bottomAnchor, constant: followReqeustContainerBottomMargin),
+-            acceptFollowRequestButtonShadowBackgroundContainer.widthAnchor.constraint(equalTo: rejectFollowRequestButtonShadowBackgroundContainer.widthAnchor),
++            acceptFollowRequestActivityIndicatorView.centerXAnchor.constraint(equalTo: acceptFollowRequestButton.centerXAnchor),
++            acceptFollowRequestActivityIndicatorView.centerYAnchor.constraint(equalTo: acceptFollowRequestButton.centerYAnchor),
+         ])
+-        followRequestAdaptiveMarginContainerView.isHidden = true
++        acceptFollowRequestActivityIndicatorView.color = .white
++        acceptFollowRequestActivityIndicatorView.hidesWhenStopped = true
++        acceptFollowRequestActivityIndicatorView.stopAnimating()
++        
++        rejectFollowRequestActivityIndicatorView.translatesAutoresizingMaskIntoConstraints = false
++        rejectFollowRequestButton.addSubview(rejectFollowRequestActivityIndicatorView)
++        NSLayoutConstraint.activate([
++            rejectFollowRequestActivityIndicatorView.centerXAnchor.constraint(equalTo: rejectFollowRequestButton.centerXAnchor),
++            rejectFollowRequestActivityIndicatorView.centerYAnchor.constraint(equalTo: rejectFollowRequestButton.centerYAnchor),
++        ])
++        rejectFollowRequestActivityIndicatorView.color = .white
++        acceptFollowRequestActivityIndicatorView.hidesWhenStopped = true
++        rejectFollowRequestActivityIndicatorView.stopAnimating()
+         
+         // statusView
+         containerStackView.addArrangedSubview(statusView)

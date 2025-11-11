@@ -1,0 +1,510 @@
+diff --git a/lib/api/model/model.dart b/lib/api/model/model.dart
+index 75edd26b70..bf60ab6adb 100644
+--- a/lib/api/model/model.dart
++++ b/lib/api/model/model.dart
+@@ -3,6 +3,7 @@ import 'package:json_annotation/json_annotation.dart';
+ import 'events.dart';
+ import 'initial_snapshot.dart';
+ import 'reaction.dart';
++import 'submessage.dart';
+ 
+ export 'json.dart' show JsonNullable;
+ export 'reaction.dart';
+@@ -533,6 +534,9 @@ sealed class Message {
+   final String senderRealmStr;
+   @JsonKey(name: 'subject')
+   String topic;
++  /// Poll data if "submessages" describe a poll, `null` otherwise.
++  @JsonKey(name: 'submessages', readValue: _readPoll, fromJson: Poll.fromJson, toJson: Poll.toJson)
++  Poll? poll;
+   final int timestamp;
+   String get type;
+ 
+@@ -564,6 +568,13 @@ sealed class Message {
+     return list.map((raw) => MessageFlag.fromRawString(raw as String)).toList();
+   }
+ 
++  static Poll? _readPoll(Map<Object?, Object?> json, String key) {
++    return Submessage.parseSubmessagesJson(
++      json['submessages'] as List<Object?>? ?? [],
++      messageSenderId: (json['sender_id'] as num).toInt(),
++    );
++  }
++
+   Message({
+     required this.client,
+     required this.content,
+diff --git a/lib/api/model/model.g.dart b/lib/api/model/model.g.dart
+index 2c9ac0163c..87c24b1c2f 100644
+--- a/lib/api/model/model.g.dart
++++ b/lib/api/model/model.g.dart
+@@ -282,7 +282,7 @@ StreamMessage _$StreamMessageFromJson(Map<String, dynamic> json) {
+     matchTopic: json['match_subject'] as String?,
+     displayRecipient: json['display_recipient'] as String?,
+     streamId: (json['stream_id'] as num).toInt(),
+-  );
++  )..poll = Poll.fromJson(Message._readPoll(json, 'submessages'));
+ }
+ 
+ Map<String, dynamic> _$StreamMessageToJson(StreamMessage instance) {
+@@ -301,6 +301,7 @@ Map<String, dynamic> _$StreamMessageToJson(StreamMessage instance) {
+     'sender_id': instance.senderId,
+     'sender_realm_str': instance.senderRealmStr,
+     'subject': instance.topic,
++    'submessages': Poll.toJson(instance.poll),
+     'timestamp': instance.timestamp,
+     'flags': instance.flags,
+     'match_content': instance.matchContent,
+@@ -360,7 +361,7 @@ DmMessage _$DmMessageFromJson(Map<String, dynamic> json) => DmMessage(
+       matchTopic: json['match_subject'] as String?,
+       displayRecipient: const DmRecipientListConverter()
+           .fromJson(json['display_recipient'] as List),
+-    );
++    )..poll = Poll.fromJson(Message._readPoll(json, 'submessages'));
+ 
+ Map<String, dynamic> _$DmMessageToJson(DmMessage instance) => <String, dynamic>{
+       'client': instance.client,
+@@ -377,6 +378,7 @@ Map<String, dynamic> _$DmMessageToJson(DmMessage instance) => <String, dynamic>{
+       'sender_id': instance.senderId,
+       'sender_realm_str': instance.senderRealmStr,
+       'subject': instance.topic,
++      'submessages': Poll.toJson(instance.poll),
+       'timestamp': instance.timestamp,
+       'flags': instance.flags,
+       'match_content': instance.matchContent,
+diff --git a/lib/api/model/submessage.dart b/lib/api/model/submessage.dart
+index c9544d40f8..749a88b98b 100644
+--- a/lib/api/model/submessage.dart
++++ b/lib/api/model/submessage.dart
+@@ -1,5 +1,9 @@
++import 'dart:convert';
++
+ import 'package:json_annotation/json_annotation.dart';
+ 
++import '../../log.dart';
++
+ part 'submessage.g.dart';
+ 
+ /// Data used for Zulip "widgets" within messages, like polls and todo lists.
+@@ -41,6 +45,30 @@ class Submessage {
+   //   * the parsed [WidgetType] from the first [Message.submessages].
+   final String content;
+ 
++  /// Parse a JSON list into a [Poll].
++  // TODO: Use a generalized return type when supporting other Zulip widgets.
++  static Poll? parseSubmessagesJson(List<Object?> json, {
++    required int messageSenderId,
++  }) {
++    final submessages = json.map((e) => Submessage.fromJson(e as Map<String, Object?>)).toList();
++    if (submessages.isEmpty) return null;
++
++    assert(submessages.first.senderId == messageSenderId);
++
++    final widgetData = WidgetData.fromJson(jsonDecode(submessages.first.content));
++    switch (widgetData) {
++      case PollWidgetData():
++        return Poll.fromSubmessages(
++          widgetData: widgetData,
++          pollEventSubmessages: submessages.skip(1),
++          messageSenderId: messageSenderId,
++        );
++      case UnsupportedWidgetData():
++        assert(debugLog('Unsupported widgetData: ${widgetData.json}'));
++        return null;
++    }
++  }
++
+   factory Submessage.fromJson(Map<String, Object?> json) =>
+     _$SubmessageFromJson(json);
+ 
+@@ -319,3 +347,126 @@ class UnknownPollEventSubmessage extends PollEventSubmessage {
+   @override
+   Map<String, Object?> toJson() => json;
+ }
++
++/// States of a poll Zulip widget.
++///
++/// See also:
++/// - https://zulip.com/help/create-a-poll
++/// - https://github.com/zulip/zulip/blob/304d948416465c1a085122af5d752f03d6797003/web/shared/src/poll_data.ts
++class Poll {
++  /// Construct a poll from submessages.
++  ///
++  /// For a poll Zulip widget, the first submessage's content contains a
++  /// [PollWidgetData], and all the following submessages' content each contains
++  /// a [PollEventSubmessage].
++  factory Poll.fromSubmessages({
++    required PollWidgetData widgetData,
++    required Iterable<Submessage> pollEventSubmessages,
++    required int messageSenderId,
++  }) {
++    final poll = Poll._(
++      messageSenderId: messageSenderId,
++      question: widgetData.extraData.question,
++      options: widgetData.extraData.options,
++    );
++
++    for (final submessage in pollEventSubmessages) {
++      final event = PollEventSubmessage.fromJson(jsonDecode(submessage.content) as Map<String, Object?>);
++      poll._applyEvent(submessage.senderId, event);
++    }
++    return poll;
++  }
++
++  Poll._({
++    required this.messageSenderId,
++    required this.question,
++    required List<String> options,
++  }) {
++    for (int index = 0; index < options.length; index += 1) {
++      // Initial poll options use a placeholder senderId.
++      // See [PollEventSubmessage.optionKey] for details.
++      _addOption(senderId: null, idx: index, option: options[index]);
++    }
++  }
++
++  final int messageSenderId;
++  String question;
++
++  /// The limit of options any single user can add to a poll.
++  ///
++  /// See https://github.com/zulip/zulip/blob/304d948416465c1a085122af5d752f03d6797003/web/shared/src/poll_data.ts#L69-L71
++  static const _maxIdx = 1000;
++
++  Iterable<PollOption> get options => _options.values;
++  /// Contains the text of all options from [_options].
++  final Set<String> _existingOptionTexts = {};
++  final Map<PollOptionKey, PollOption> _options = {};
++
++  void _applyEvent(int senderId, PollEventSubmessage event) {
++    switch (event) {
++      case PollNewOptionEventSubmessage():
++        _addOption(senderId: senderId, idx: event.idx, option: event.option);
++
++      case PollQuestionEventSubmessage():
++        if (senderId != messageSenderId) {
++          // Only the message owner can edit the question.
++          assert(debugLog('unexpected poll data: user $senderId is not allowed to edit the question')); // TODO(log)
++          return;
++        }
++
++        question = event.question;
++
++      case PollVoteEventSubmessage():
++        final option = _options[event.key];
++        if (option == null) {
++          assert(debugLog('vote for unknown key ${event.key}')); // TODO(log)
++          return;
++        }
++
++        switch (event.op) {
++          case PollVoteOp.add:
++            option.voters.add(senderId);
++          case PollVoteOp.remove:
++            option.voters.remove(senderId);
++          case PollVoteOp.unknown:
++            assert(debugLog('unknown vote op ${event.op}')); // TODO(log)
++        }
++
++      case UnknownPollEventSubmessage():
++    }
++  }
++
++  void _addOption({required int? senderId, required int idx, required String option}) {
++    if (idx > _maxIdx || idx < 0) return;
++
++    // The web client suppresses duplicate options, which can be created through
++    // the /poll command as there is no server-side validation.
++    if (_existingOptionTexts.contains(option)) return;
++
++    final key = PollEventSubmessage.optionKey(senderId: senderId, idx: idx);
++    assert(!_options.containsKey(key));
++    _options[key] = PollOption(text: option);
++    _existingOptionTexts.add(option);
++  }
++
++  static Poll? fromJson(Object? json) {
++    // [Submessage.parseSubmessagesJson] does all the heavy lifting for parsing.
++    return json as Poll?;
++  }
++
++  static List<Submessage> toJson(Poll? poll) {
++    // Rather than maintaining a up-to-date submessages list, return as if it is
++    // empty, because we are not sending the submessages to the server anyway.
++    return [];
++  }
++}
++
++class PollOption {
++  PollOption({required this.text});
++
++  final String text;
++  final Set<int> voters = {};
++
++  @override
++  String toString() => 'PollOption(text: $text, voters: {${voters.join(', ')}})';
++}
+diff --git a/test/api/model/model_checks.dart b/test/api/model/model_checks.dart
+index 71d199e864..2e5e8e584b 100644
+--- a/test/api/model/model_checks.dart
++++ b/test/api/model/model_checks.dart
+@@ -1,5 +1,6 @@
+ import 'package:checks/checks.dart';
+ import 'package:zulip/api/model/model.dart';
++import 'package:zulip/api/model/submessage.dart';
+ 
+ extension UserChecks on Subject<User> {
+   Subject<int> get userId => has((x) => x.userId, 'userId');
+@@ -39,6 +40,7 @@ extension MessageChecks on Subject<Message> {
+   Subject<int> get senderId => has((e) => e.senderId, 'senderId');
+   Subject<String> get senderRealmStr => has((e) => e.senderRealmStr, 'senderRealmStr');
+   Subject<String> get topic => has((e) => e.topic, 'topic');
++  Subject<Poll?> get poll => has((e) => e.poll, 'poll');
+   Subject<int> get timestamp => has((e) => e.timestamp, 'timestamp');
+   Subject<String> get type => has((e) => e.type, 'type');
+   Subject<List<MessageFlag>> get flags => has((e) => e.flags, 'flags');
+diff --git a/test/api/model/submessage_checks.dart b/test/api/model/submessage_checks.dart
+index a234f8cc56..0b7eed2230 100644
+--- a/test/api/model/submessage_checks.dart
++++ b/test/api/model/submessage_checks.dart
+@@ -37,3 +37,13 @@ extension PollVoteEventChecks on Subject<PollVoteEventSubmessage> {
+   Subject<String> get key => has((e) => e.key, 'key');
+   Subject<PollVoteOp> get op => has((e) => e.op, 'op');
+ }
++
++extension PollChecks on Subject<Poll> {
++  Subject<String> get question => has((e) => e.question, 'question');
++  Subject<Iterable<PollOption>> get options => has((e) => e.options, 'options');
++}
++
++extension PollOptionChecks on Subject<PollOption> {
++  Subject<String> get text => has((e) => e.text, 'text');
++  Subject<Set<int>> get voters => has((e) => e.voters, 'voters');
++}
+diff --git a/test/api/model/submessage_test.dart b/test/api/model/submessage_test.dart
+index 4d049307b7..1c9c6f198c 100644
+--- a/test/api/model/submessage_test.dart
++++ b/test/api/model/submessage_test.dart
+@@ -114,4 +114,7 @@ void main() {
+       'key': PollEventSubmessage.optionKey(senderId: null, idx: 0)
+     })).isA<PollVoteEventSubmessage>().op.equals(PollVoteOp.unknown);
+   });
++
++  // Parsing polls with PollEventSubmessages are tested in
++  // `test/model/message_test.dart` in the "handleSubmessageEvent" test.
+ }
+diff --git a/test/example_data.dart b/test/example_data.dart
+index 3e3762a051..39c31f9ddb 100644
+--- a/test/example_data.dart
++++ b/test/example_data.dart
+@@ -1,3 +1,4 @@
++import 'dart:convert';
+ import 'dart:math';
+ 
+ import 'package:zulip/api/model/events.dart';
+@@ -343,6 +344,7 @@ StreamMessage streamMessage({
+   List<Reaction>? reactions,
+   int? timestamp,
+   List<MessageFlag>? flags,
++  List<Submessage>? submessages,
+ }) {
+   _checkPositive(id, 'message ID');
+   final effectiveStream = stream ?? _stream(streamId: defaultStreamMessageStreamId);
+@@ -362,6 +364,7 @@ StreamMessage streamMessage({
+     'id': id ?? _nextMessageId(),
+     'last_edit_timestamp': lastEditTimestamp,
+     'subject': topic ?? 'example topic',
++    'submessages': submessages ?? [],
+     'timestamp': timestamp ?? 1678139636,
+     'type': 'stream',
+   }) as Map<String, dynamic>);
+@@ -386,6 +389,7 @@ DmMessage dmMessage({
+   int? lastEditTimestamp,
+   int? timestamp,
+   List<MessageFlag>? flags,
++  List<Submessage>? submessages,
+ }) {
+   _checkPositive(id, 'message ID');
+   assert(!to.any((user) => user.userId == from.userId));
+@@ -401,6 +405,7 @@ DmMessage dmMessage({
+     'id': id ?? _nextMessageId(),
+     'last_edit_timestamp': lastEditTimestamp,
+     'subject': '',
++    'submessages': submessages ?? [],
+     'timestamp': timestamp ?? 1678139636,
+     'type': 'private',
+   }) as Map<String, dynamic>);
+@@ -414,6 +419,21 @@ PollWidgetData pollWidgetData({
+     extraData: PollWidgetExtraData(question: question, options: options));
+ }
+ 
++Submessage submessage({
++  SubmessageType? msgType,
++  required SubmessageData? content,
++  int? senderId,
++}) {
++  return Submessage(
++    msgType: msgType ?? SubmessageType.widget,
++    content: jsonEncode(content),
++    senderId: senderId ?? selfUser.userId,
++  );
++}
++
++PollOption pollOption({required String text, required Iterable<int> voters}) =>
++    PollOption(text: text)..voters.addAll(voters);
++
+ ////////////////////////////////////////////////////////////////
+ // Aggregate data structures.
+ //
+diff --git a/test/model/message_test.dart b/test/model/message_test.dart
+index d9d459818e..616fd89e95 100644
+--- a/test/model/message_test.dart
++++ b/test/model/message_test.dart
+@@ -1,13 +1,17 @@
++import 'dart:convert';
++
+ import 'package:checks/checks.dart';
+ import 'package:test/scaffolding.dart';
+ import 'package:zulip/api/model/events.dart';
+ import 'package:zulip/api/model/model.dart';
++import 'package:zulip/api/model/submessage.dart';
+ import 'package:zulip/model/message_list.dart';
+ import 'package:zulip/model/narrow.dart';
+ import 'package:zulip/model/store.dart';
+ 
+ import '../api/fake_api.dart';
+ import '../api/model/model_checks.dart';
++import '../api/model/submessage_checks.dart';
+ import '../example_data.dart' as eg;
+ import '../stdlib_checks.dart';
+ import 'message_list_test.dart';
+@@ -52,10 +56,14 @@ void main() {
+   /// Perform the initial message fetch for [messageList].
+   ///
+   /// The test case must have already called [prepare] to initialize the state.
++  ///
++  /// This does not support submessages. Use [prepareMessageWithSubmessages]
++  /// instead if needed.
+   Future<void> prepareMessages(
+     List<Message> messages, {
+     bool foundOldest = false,
+   }) async {
++    assert(messages.every((message) => message.poll == null));
+     connection.prepare(json:
+       newestResult(foundOldest: foundOldest, messages: messages).toJson());
+     await messageList.fetchInitial();
+@@ -576,4 +584,114 @@ void main() {
+         .reactions.isNotNull().jsonEquals([eg.unicodeEmojiReaction]);
+     });
+   });
++
++  group('handle Poll related events', () {
++    Condition<Object?> conditionPollOption(String text, {Iterable<int>? voters}) =>
++      (it) => it.isA<PollOption>()..text.equals(text)..voters.deepEquals(voters ?? []);
++
++    Subject<Poll> checkPoll(Message message) =>
++      check(store.messages[message.id]).isNotNull().poll.isNotNull();
++
++    group('handleMessageEvent with initial submessages', () {
++      late Message message;
++
++      final defaultPollWidgetData = eg.pollWidgetData(
++        question: 'example question',
++        options: ['foo', 'bar'],
++      );
++
++      final defaultOptionConditions = [
++        conditionPollOption('foo'),
++        conditionPollOption('bar'),
++      ];
++
++      Future<void> handlePollMessageEvent({
++        SubmessageData? widgetData,
++        List<(User sender, PollEventSubmessage event)> events = const [],
++      }) async {
++        message = eg.streamMessage(sender: eg.otherUser, submessages: [
++          eg.submessage(
++            content: widgetData ?? defaultPollWidgetData,
++            senderId: eg.otherUser.userId),
++          for (final (sender, event) in events)
++            eg.submessage(content: event, senderId: sender.userId),
++        ]);
++
++        await prepare();
++        await store.handleEvent(MessageEvent(id: 0, message: message));
++      }
++
++      test('smoke', () async {
++        await handlePollMessageEvent();
++        checkPoll(message)
++          ..question.equals(defaultPollWidgetData.extraData.question)
++          ..options.deepEquals(defaultOptionConditions);
++      });
++
++      test('contains new question event', () async {
++        await handlePollMessageEvent(events: [
++          (eg.otherUser, PollQuestionEventSubmessage(question: 'new question')),
++        ]);
++        checkPoll(message)
++          ..question.equals('new question')
++          ..options.deepEquals(defaultOptionConditions);
++      });
++
++      test('contains new option event', () async {
++        await handlePollMessageEvent(events: [
++          (eg.otherUser, PollNewOptionEventSubmessage(idx: 3, option: 'baz')),
++          (eg.selfUser,  PollNewOptionEventSubmessage(idx: 0, option: 'quz')),
++        ]);
++        checkPoll(message)
++          ..question.equals(defaultPollWidgetData.extraData.question)
++          ..options.deepEquals([
++            ...defaultOptionConditions,
++            conditionPollOption('baz'),
++            conditionPollOption('quz'),
++          ]);
++      });
++
++      test('contains vote events on initial canned options', () async {
++        await handlePollMessageEvent(events: [
++          (eg.otherUser, PollVoteEventSubmessage(key: 'canned,1', op: PollVoteOp.add)),
++          (eg.otherUser, PollVoteEventSubmessage(key: 'canned,2', op: PollVoteOp.add)),
++          (eg.otherUser, PollVoteEventSubmessage(key: 'canned,2', op: PollVoteOp.remove)),
++          (eg.selfUser,  PollVoteEventSubmessage(key: 'canned,1', op: PollVoteOp.add)),
++        ]);
++        checkPoll(message)
++          ..question.equals(defaultPollWidgetData.extraData.question)
++          ..options.deepEquals([
++            conditionPollOption('foo'),
++            conditionPollOption('bar', voters: [eg.otherUser.userId, eg.selfUser.userId]),
++          ]);
++      });
++
++      test('contains vote events on post-creation options', () async {
++        await handlePollMessageEvent(events: [
++          (eg.otherUser, PollNewOptionEventSubmessage(idx: 0, option: 'baz')),
++          (eg.otherUser, PollVoteEventSubmessage(key: '${eg.otherUser.userId},0', op: PollVoteOp.add)),
++          (eg.selfUser,  PollVoteEventSubmessage(key: '${eg.otherUser.userId},0', op: PollVoteOp.add)),
++        ]);
++        checkPoll(message)
++          ..question.equals(defaultPollWidgetData.extraData.question)
++          ..options.deepEquals([
++            ...defaultOptionConditions,
++            conditionPollOption('baz', voters: [eg.otherUser.userId, eg.selfUser.userId]),
++          ]);
++      });
++
++      test('content with invalid widget_type', () async {
++        message = eg.streamMessage(sender: eg.otherUser, submessages: [
++          Submessage(
++            msgType: SubmessageType.widget,
++            content: jsonEncode({'widget_type': 'other'}),
++            senderId: eg.otherUser.userId,
++          ),
++        ]);
++        await prepare();
++        await store.handleEvent(MessageEvent(id: 0, message: message));
++        check(store.messages[message.id]).isNotNull().poll.isNull();
++      });
++    });
++  });
+ }

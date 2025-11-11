@@ -1,0 +1,361 @@
+diff --git a/OsmAnd/src/net/osmand/plus/activities/MapActivity.java b/OsmAnd/src/net/osmand/plus/activities/MapActivity.java
+index d3b7460ee8a..5eb00800e21 100644
+--- a/OsmAnd/src/net/osmand/plus/activities/MapActivity.java
++++ b/OsmAnd/src/net/osmand/plus/activities/MapActivity.java
+@@ -735,8 +735,10 @@ protected void onResume() {
+ 
+ 		OsmandMapTileView mapView = getMapView();
+ 		if (settings.isLastKnownMapLocation()) {
+-			LatLon l = settings.getLastKnownMapLocation();
+-			mapView.setLatLon(l.getLatitude(), l.getLongitude());
++			LatLon mapLocation = settings.getLastKnownMapLocation();
++			float height = settings.getLastKnownMapHeight();
++			LatLon mapShiftedLocation = settings.getLastKnownMapLocationShifted();
++			mapView.setLatLon(mapLocation, height, mapShiftedLocation);
+ 			mapView.setZoomWithFloatPart(settings.getLastKnownMapZoom(), settings.getLastKnownMapZoomFloatPart());
+ 			mapView.initMapRotationByCompassMode();
+ 		}
+@@ -1235,7 +1237,12 @@ private void onPauseActivity() {
+ 		app.getDaynightHelper().stopSensorIfNeeded();
+ 		settings.APPLICATION_MODE.removeListener(applicationModeListener);
+ 
+-		settings.setLastKnownMapLocation((float) mapView.getLatitude(), (float) mapView.getLongitude());
++		LatLon mapLocation = new LatLon(mapView.getLatitude(), mapView.getLongitude());
++		LatLon mapLocationShifted = mapLocation;
++		float height = mapView.getHeight();
++		if (height != 0.0f)
++			mapLocationShifted = mapView.getTargetLatLon(mapLocationShifted);
++		settings.setLastKnownMapLocation(mapLocation, height, mapLocationShifted);
+ 		AnimateDraggingMapThread animatedThread = mapView.getAnimatedDraggingThread();
+ 		if (animatedThread.isAnimating() && animatedThread.getTargetIntZoom() != 0 && !getMapViewTrackingUtilities().isMapLinkedToLocation()) {
+ 			settings.setMapLocationToShow(animatedThread.getTargetLatitude(), animatedThread.getTargetLongitude(),
+diff --git a/OsmAnd/src/net/osmand/plus/settings/backend/OsmandSettings.java b/OsmAnd/src/net/osmand/plus/settings/backend/OsmandSettings.java
+index d7d3bca6e11..827a6dae1b7 100644
+--- a/OsmAnd/src/net/osmand/plus/settings/backend/OsmandSettings.java
++++ b/OsmAnd/src/net/osmand/plus/settings/backend/OsmandSettings.java
+@@ -2124,6 +2124,9 @@ public Object getGlobalPreferences() {
+ 	// This value is a key for saving last known location shown on the map
+ 	public static final String LAST_KNOWN_MAP_LAT = "last_known_map_lat"; //$NON-NLS-1$
+ 	public static final String LAST_KNOWN_MAP_LON = "last_known_map_lon"; //$NON-NLS-1$
++	public static final String LAST_KNOWN_MAP_HEIGHT = "last_known_map_height"; //$NON-NLS-1$
++	public static final String LAST_KNOWN_MAP_LAT_HEIGHT_SHIFTED = "last_known_map_lat_height_shifted"; //$NON-NLS-1$
++	public static final String LAST_KNOWN_MAP_LON_HEIGHT_SHIFTED = "last_known_map__lon_height_shifted"; //$NON-NLS-1$
+ 	public static final String LAST_KNOWN_MAP_ZOOM = "last_known_map_zoom"; //$NON-NLS-1$
+ 	public static final String LAST_KNOWN_MAP_ZOOM_FLOAT_PART = "last_known_map_zoom_float_part";
+ 
+@@ -2142,6 +2145,15 @@ public boolean isLastKnownMapLocation() {
+ 		return settingsAPI.contains(globalPreferences, LAST_KNOWN_MAP_LAT);
+ 	}
+ 
++	public float getLastKnownMapHeight() {
++		return settingsAPI.getFloat(globalPreferences, LAST_KNOWN_MAP_HEIGHT, 0);
++	}
++
++	public LatLon getLastKnownMapLocationShifted() {
++		float lat = settingsAPI.getFloat(globalPreferences, LAST_KNOWN_MAP_LAT_HEIGHT_SHIFTED, 0);
++		float lon = settingsAPI.getFloat(globalPreferences, LAST_KNOWN_MAP_LON_HEIGHT_SHIFTED, 0);
++		return new LatLon(lat, lon);
++	}
+ 
+ 	public LatLon getAndClearMapLocationToShow() {
+ 		if (!settingsAPI.contains(globalPreferences, MAP_LAT_TO_SHOW)) {
+@@ -2220,10 +2232,13 @@ public void setMapLocationToShow(double latitude, double longitude, int zoom, Po
+ 	}
+ 
+ 	// Do not use that method if you want to show point on map. Use setMapLocationToShow
+-	public void setLastKnownMapLocation(double latitude, double longitude) {
++	public void setLastKnownMapLocation(LatLon mapLocation, float heightInMeters, LatLon mapLocationShifted) {
+ 		SettingsEditor edit = settingsAPI.edit(globalPreferences);
+-		edit.putFloat(LAST_KNOWN_MAP_LAT, (float) latitude);
+-		edit.putFloat(LAST_KNOWN_MAP_LON, (float) longitude);
++		edit.putFloat(LAST_KNOWN_MAP_LAT, (float) mapLocation.getLatitude());
++		edit.putFloat(LAST_KNOWN_MAP_LON, (float) mapLocation.getLongitude());
++		edit.putFloat(LAST_KNOWN_MAP_HEIGHT, heightInMeters);
++		edit.putFloat(LAST_KNOWN_MAP_LAT_HEIGHT_SHIFTED, (float) mapLocationShifted.getLatitude());
++		edit.putFloat(LAST_KNOWN_MAP_LON_HEIGHT_SHIFTED, (float) mapLocationShifted.getLongitude());
+ 		edit.commit();
+ 	}
+ 
+diff --git a/OsmAnd/src/net/osmand/plus/views/AnimateDraggingMapThread.java b/OsmAnd/src/net/osmand/plus/views/AnimateDraggingMapThread.java
+index 8e4c5ccd6cf..1bfb0bfed0b 100644
+--- a/OsmAnd/src/net/osmand/plus/views/AnimateDraggingMapThread.java
++++ b/OsmAnd/src/net/osmand/plus/views/AnimateDraggingMapThread.java
+@@ -126,19 +126,27 @@ private void pendingRotateAnimation() {
+ 		}
+ 	}
+ 
++	/**
++	 * Make map target in sync with current map location coordinates and elevation
++	 */
++	public void resetMapTarget() {
++		MapRendererView renderer = getMapRenderer();
++		if (renderer != null && inconsistentMapTarget) {
++			inconsistentMapTarget = false;
++			renderer.resetMapTarget();
++		}
++	}
++
++	public void invalidateMapTarget() {
++		inconsistentMapTarget = true;
++	}
+ 
+ 	/**
+ 	 * Stop dragging async
+ 	 */
+ 	public void stopAnimating() {
+ 		stopped = true;
+-		if (inconsistentMapTarget) {
+-			inconsistentMapTarget = false;
+-			MapRendererView renderer = getMapRenderer();
+-			if (renderer != null) {
+-				renderer.resetMapTarget();
+-			}
+-		}
++		resetMapTarget();
+ 	}
+ 
+ 	public boolean isAnimating() {
+@@ -153,12 +161,9 @@ public void stopAnimatingSync() {
+ 		MapRendererView renderer = getMapRenderer();
+ 		if (renderer != null) {
+ 			renderer.pauseMapAnimation();
+-			if (inconsistentMapTarget) {
+-				inconsistentMapTarget = false;
+-				renderer.resetMapTarget();
+-			}
+ 		}
+ 		stopped = true;
++		resetMapTarget();
+ 		Thread tt;
+ 		while ((tt = currentThread) != null) {
+ 			try {
+@@ -684,6 +689,7 @@ public void startZooming(int zoomEnd, double zoomPart, boolean notifyListener) {
+ 		double targetLat = tileView.getLatitude();
+ 		double targetLon = tileView.getLongitude();
+ 
++		resetMapTarget();
+ 		MapRendererView mapRenderer = getMapRenderer();
+ 		MapAnimator animator = getAnimator();
+ 		if (mapRenderer != null && animator != null) {
+@@ -762,7 +768,7 @@ public void startDragging(float velocityX, float velocityY,
+ 
+ 			// Rescale speed to 31 coordinates
+ 			PointD velocity = new PointD(-velocityInMapSpaceX * scale31, -velocityInMapSpaceY * scale31);
+-			inconsistentMapTarget = true;
++			invalidateMapTarget();
+ 			animator.animateFlatTargetWith(velocity,
+ 					new PointD(TARGET_MOVE_DECELERATION * scale31, TARGET_MOVE_DECELERATION * scale31),
+ 					userInteractionAnimationKey);
+@@ -902,6 +908,7 @@ private void setTargetValues(int zoom, double zoomPart, double lat, double lon)
+ 	}
+ 
+ 	public void startRotate(float rotate) {
++		resetMapTarget();
+ 		MapRendererView mapRenderer = getMapRenderer();
+ 		if (mapRenderer != null) {
+ 			MapAnimator animator = mapRenderer.getMapAnimator();
+diff --git a/OsmAnd/src/net/osmand/plus/views/MultiTouchSupport.java b/OsmAnd/src/net/osmand/plus/views/MultiTouchSupport.java
+index a298faaa216..db267f2f670 100644
+--- a/OsmAnd/src/net/osmand/plus/views/MultiTouchSupport.java
++++ b/OsmAnd/src/net/osmand/plus/views/MultiTouchSupport.java
+@@ -6,6 +6,7 @@
+ import androidx.annotation.NonNull;
+ 
+ import net.osmand.PlatformUtil;
++import net.osmand.core.jni.PointI;
+ import net.osmand.plus.OsmandApplication;
+ import net.osmand.util.MapUtils;
+ 
+@@ -87,6 +88,7 @@ private void initMethods() {
+ 	private double zoomStartedDistance = 100;
+ 	private double zoomRelative = 1;
+ 	private PointF centerPoint = new PointF();
++	private PointF firstPoint = new PointF();
+ 	private PointF secondPoint = new PointF();
+ 	private PointF firstFingerStart = new PointF();
+ 	private PointF secondFingerStart = new PointF();
+@@ -137,6 +139,7 @@ public boolean onTouchEvent(MotionEvent event) {
+ 			}
+ 			if (actionCode == MotionEvent.ACTION_POINTER_DOWN) {
+ 				centerPoint = new PointF((x1 + x2) / 2, (y1 + y2) / 2);
++				firstPoint = new PointF(x1, y1);
+ 				secondPoint = new PointF(x2, y2);
+ 				firstFingerStart = new PointF(x1, y1);
+ 				secondFingerStart = new PointF(x2, y2);
+@@ -154,13 +157,13 @@ public boolean onTouchEvent(MotionEvent event) {
+ 				}
+ 				return true;
+ 			} else if (actionCode == MotionEvent.ACTION_MOVE) {
++				firstPoint = new PointF(x1, y1);
++				secondPoint = new PointF(x2, y2);
+ 				if (inZoomMode) {
+ 
+ 					// Keep zoom center fixed or flexible
+ 					centerPoint = new PointF((x1 + x2) / 2, (y1 + y2) / 2);
+ 
+-					secondPoint = new PointF(x2, y2);
+-
+ 					if (angleDefined) {
+ 						angleRelative = MapUtils.unifyRotationTo360(angle - angleStarted);
+ 					}
+@@ -216,8 +219,11 @@ public PointF getCenterPoint() {
+ 		return centerPoint;
+ 	}
+ 
+-	public PointF getSecondPoint() {
+-		return secondPoint;
++	public PointI getFirstPoint() {
++		return new PointI((int) firstPoint.x, (int) firstPoint.y);
++	}
++	public PointI getSecondPoint() {
++		return new PointI((int) secondPoint.x, (int) secondPoint.y);
+ 	}
+ 
+ 	public static boolean isTiltSupportEnabled(@NonNull OsmandApplication app) {
+diff --git a/OsmAnd/src/net/osmand/plus/views/OsmandMapTileView.java b/OsmAnd/src/net/osmand/plus/views/OsmandMapTileView.java
+index 745a0fd8b61..5cbddcf7654 100644
+--- a/OsmAnd/src/net/osmand/plus/views/OsmandMapTileView.java
++++ b/OsmAnd/src/net/osmand/plus/views/OsmandMapTileView.java
+@@ -38,6 +38,7 @@
+ import net.osmand.core.android.MapRendererView;
+ import net.osmand.core.jni.MapAnimator;
+ import net.osmand.core.jni.PointI;
++import net.osmand.core.jni.PointD;
+ import net.osmand.core.jni.ZoomLevel;
+ import net.osmand.data.LatLon;
+ import net.osmand.data.QuadPoint;
+@@ -226,8 +227,12 @@ public interface OnDrawMapListener {
+ 
+ 	private int targetPixelX;
+ 	private int targetPixelY;
+-	private int touchLocationX;
+-	private int touchLocationY;
++	private int firstTouchLocationX;
++	private int firstTouchLocationY;
++	private float firstTouchLocationHeight;
++	private int secondTouchLocationX;
++	private int secondTouchLocationY;
++	private float secondTouchLocationHeight;
+ 
+ 	public OsmandMapTileView(@NonNull Context ctx, int width, int height) {
+ 		this.ctx = ctx;
+@@ -615,6 +620,25 @@ public void setLatLon(double latitude, double longitude) {
+ 		setLatLon(latitude, longitude, false);
+ 	}
+ 
++	public void setLatLon(LatLon mapLocation, float heightInMeters, LatLon mapLocationShifted) {
++		if (!animatedDraggingThread.isAnimatingMapTilt()) {
++			animatedDraggingThread.stopAnimating();
++		}
++		MapRendererView mapRenderer = getMapRenderer();
++		if (mapRenderer != null) {
++			PointI target31 = new PointI(MapUtils.get31TileNumberX(mapLocation.getLongitude()),
++					MapUtils.get31TileNumberY(mapLocation.getLatitude()));
++			mapRenderer.setTarget(target31, heightInMeters);
++		}
++		if (heightInMeters == 0.0f)
++			currentViewport.setLatLonCenter(mapLocation.getLatitude(), mapLocation.getLongitude());
++		else {
++			currentViewport.setLatLonCenter(mapLocationShifted.getLatitude(), mapLocationShifted.getLongitude());
++			animatedDraggingThread.invalidateMapTarget();
++		}
++		refreshMap();
++	}
++
+ 	public void setLatLon(double latitude, double longitude, float ratiox, float ratioy) {
+ 		setLatLon(latitude, longitude, ratiox, ratioy, false);
+ 	}
+@@ -662,6 +686,25 @@ public double getLongitude() {
+ 		return currentViewport.getLongitude();
+ 	}
+ 
++	public float getHeight() {
++		float height = 0.0f;
++		MapRendererView mapRenderer = getMapRenderer();
++		if (mapRenderer != null) {
++			height = mapRenderer.getMapTargetHeightInMeters();
++		}
++		return height;
++	}
++
++	public LatLon getTargetLatLon(LatLon coordinates) {
++		LatLon result = coordinates;
++		MapRendererView mapRenderer = getMapRenderer();
++		if (mapRenderer != null) {
++			PointI target31 = mapRenderer.getState().getTarget31();
++			result = new LatLon(MapUtils.get31LatitudeY(target31.getY()), MapUtils.get31LongitudeX(target31.getX()));
++		}
++		return result;
++	}
++
+ 	public int getZoom() {
+ 		return currentViewport.getZoom();
+ 	}
+@@ -1554,11 +1597,15 @@ public boolean onTouchEvent(MotionEvent event) {
+ 			boolean firstTouch = actionCode == MotionEvent.ACTION_DOWN;
+ 			boolean primaryTouch = actionCode == MotionEvent.ACTION_POINTER_DOWN && actionIndex == 0;
+ 			boolean primaryUntouch = actionCode == MotionEvent.ACTION_POINTER_UP && actionIndex == 0;
++			boolean secondaryTouch = actionCode == MotionEvent.ACTION_POINTER_DOWN && actionIndex == 1;
+ 			if (actionCode == MotionEvent.ACTION_UP	|| actionCode == MotionEvent.ACTION_CANCEL) {
+ 				// Restore last target position after map dragging
+ 				mapRenderer.resetMapTargetPixelCoordinates(new PointI(targetPixelX, targetPixelY));
++				PointI target31 = mapRenderer.getTarget();
++				currentViewport.setLatLonCenter(MapUtils.get31LatitudeY(target31.getY()),
++						MapUtils.get31LongitudeX(target31.getX()));
+ 			} else if (firstTouch || (isMultiTouch && (primaryTouch || primaryUntouch))) {
+-				PointI touchScreenPosition;
++				PointI touchPosition;
+ 				if (firstTouch) {
+ 					// Remember last target position before map dragging
+ 					PointI targetPixelPosition = mapRenderer.getTargetScreenPosition();
+@@ -1566,16 +1613,26 @@ public boolean onTouchEvent(MotionEvent event) {
+ 					targetPixelY = targetPixelPosition.getY();
+ 				}
+ 				if (firstTouch || primaryTouch) {
+-					touchScreenPosition = new PointI((int) event.getX(), (int) event.getY());
+-				} else {
+-					PointF secondTouch = multiTouchSupport.getSecondPoint();
+-					touchScreenPosition = new PointI((int) secondTouch.x, (int) secondTouch.y);
+-				}
+-				PointI touchLocation31 = new PointI();
+-				if (mapRenderer.getLocationFromElevatedPoint(touchScreenPosition, touchLocation31)) {
+-					touchLocationX = touchLocation31.getX();
+-					touchLocationY = touchLocation31.getY();
+-				}
++					touchPosition = new PointI((int) event.getX(), (int) event.getY());
++				} else
++					touchPosition = multiTouchSupport.getSecondPoint();
++				secondTouchLocationX = firstTouchLocationX;
++				secondTouchLocationY = firstTouchLocationY;
++				secondTouchLocationHeight = firstTouchLocationHeight;
++				PointI touchLocation31 = new PointI(firstTouchLocationX, firstTouchLocationY);
++				float height = mapRenderer.getHeightAndLocationFromElevatedPoint(touchPosition, touchLocation31);
++				firstTouchLocationX = touchLocation31.getX();
++				firstTouchLocationY = touchLocation31.getY();
++				firstTouchLocationHeight = height > NativeUtilities.MIN_ALTITUDE_VALUE ? height : 0.0f;
++				currentViewport.setLatLonCenter(MapUtils.get31LatitudeY(firstTouchLocationY),
++						MapUtils.get31LongitudeX(firstTouchLocationX));
++			} else if (isMultiTouch && secondaryTouch) {
++				PointI touchPosition = multiTouchSupport.getSecondPoint();
++				PointI touchLocation31 = new PointI(secondTouchLocationX, secondTouchLocationY);
++				float height = mapRenderer.getHeightAndLocationFromElevatedPoint(touchPosition, touchLocation31);
++				secondTouchLocationX = touchLocation31.getX();
++				secondTouchLocationY = touchLocation31.getY();
++				secondTouchLocationHeight = height > NativeUtilities.MIN_ALTITUDE_VALUE ? height : 0.0f;
+ 			}
+ 		}
+ 
+@@ -1977,11 +2034,8 @@ public boolean onScroll(MotionEvent e1, MotionEvent e2, float distanceX, float d
+ 			if (multiTouchSupport != null && !multiTouchSupport.isInTiltMode()) {
+ 				MapRendererView mapRenderer = getMapRenderer();
+ 				if (mapRenderer != null) {
+-					mapRenderer.setMapTarget(
+-							new PointI((int) e2.getX(), (int) e2.getY()),
+-							new PointI(touchLocationX, touchLocationY));
+-					currentViewport.setLatLonCenter(MapUtils.get31LatitudeY(touchLocationY),
+-							MapUtils.get31LongitudeX(touchLocationX));
++					PointI touchPoint = new PointI((int) e2.getX(), (int) e2.getY());
++					mapRenderer.setMapTarget(touchPoint, new PointI(firstTouchLocationX, firstTouchLocationY));
+ 					refreshMap();
+ 					notifyLocationListeners(getLatitude(), getLongitude());
+ 				} else

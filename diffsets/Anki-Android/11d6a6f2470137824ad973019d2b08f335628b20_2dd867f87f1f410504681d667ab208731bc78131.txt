@@ -1,0 +1,300 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/BackupManager.java b/AnkiDroid/src/main/java/com/ichi2/anki/BackupManager.java
+index 55165aff9417..c59a596d4817 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/BackupManager.java
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/BackupManager.java
+@@ -17,12 +17,13 @@
+ package com.ichi2.anki;
+ 
+ import android.content.SharedPreferences;
+-import android.os.StatFs;
+ 
+ 
+ import com.ichi2.compat.CompatHelper;
+ import com.ichi2.libanki.Collection;
+ import com.ichi2.libanki.Utils;
++import com.ichi2.utils.FileUtil;
++
+ import java.io.BufferedOutputStream;
+ import java.io.File;
+ import java.io.FileOutputStream;
+@@ -206,12 +207,7 @@ public static long getFreeDiscSpace(String path) {
+ 
+ 
+     private static long getFreeDiscSpace(File file) {
+-        try {
+-            return CompatHelper.getCompat().getAvailableBytes(new StatFs(file.getParentFile().getPath()));
+-        } catch (IllegalArgumentException e) {
+-            Timber.e(e, "Free space could not be retrieved");
+-            return MIN_FREE_SPACE * 1024 * 1024;
+-        }
++        return FileUtil.getFreeDiskSpace(file, MIN_FREE_SPACE * 1024 * 1024);
+     }
+ 
+ 
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/CollectionHelper.java b/AnkiDroid/src/main/java/com/ichi2/anki/CollectionHelper.java
+index db2e33da67fc..c629ad78d2eb 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/CollectionHelper.java
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/CollectionHelper.java
+@@ -16,18 +16,20 @@
+ 
+ package com.ichi2.anki;
+ 
+-import android.Manifest;
+ import android.content.Context;
+ import android.content.SharedPreferences;
+-import android.content.pm.PackageManager;
+ import android.os.Environment;
+ import android.preference.PreferenceManager;
+-import androidx.core.content.ContextCompat;
++import android.text.format.Formatter;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
+ 
+ import com.ichi2.anki.exception.StorageAccessException;
+ import com.ichi2.libanki.Collection;
+ import com.ichi2.libanki.Storage;
+ import com.ichi2.preferences.PreferenceExtensions;
++import com.ichi2.utils.FileUtil;
+ 
+ import java.io.File;
+ import java.io.IOException;
+@@ -52,6 +54,18 @@ public class CollectionHelper {
+      * <p>Accessed only from synchronized methods.
+      */
+     private boolean mCollectionLocked;
++
++    @Nullable
++    public static Long getCollectionSize(Context context) {
++        try {
++            String path = getCollectionPath(context);
++            return new File(path).length();
++        } catch (Exception e) {
++            Timber.e(e, "Error getting collection Length");
++            return null;
++        }
++    }
++
+     public synchronized void lockCollection() {
+         mCollectionLocked = true;
+     }
+@@ -225,4 +239,104 @@ private static String getParentDirectory(String path) {
+         return new File(path).getParentFile().getAbsolutePath();
+     }
+ 
++    /**
++     * This currently stores either:
++     * An error message stating the reason that a storage check must be performed
++     * OR
++     * The current storage requirements, and the current available storage.
++     */
++    public static class CollectionIntegrityStorageCheck {
++
++        @Nullable
++        private final String mErrorMessage;
++
++        //OR:
++        @Nullable
++        private final Long mRequiredSpace;
++        @Nullable
++        private final Long mFreeSpace;
++
++        private CollectionIntegrityStorageCheck(long requiredSpace, long freeSpace) {
++            this.mFreeSpace = freeSpace;
++            this.mRequiredSpace = requiredSpace;
++            this.mErrorMessage = null;
++        }
++
++        private CollectionIntegrityStorageCheck(@NonNull String errorMessage) {
++            this.mRequiredSpace = null;
++            this.mFreeSpace = null;
++            this.mErrorMessage = errorMessage;
++        }
++
++        private static CollectionIntegrityStorageCheck fromError(String errorMessage) {
++            return new CollectionIntegrityStorageCheck(errorMessage);
++        }
++
++        private static String defaultRequiredFreeSpace(Context context) {
++            long oneHundredFiftyMB = 150 * 1000 * 1000; //tested, 1024 displays 157MB. 1000 displays 150
++            return Formatter.formatShortFileSize(context, oneHundredFiftyMB);
++        }
++
++        public static CollectionIntegrityStorageCheck createInstance(Context context) {
++
++            Long maybeCurrentCollectionSizeInBytes = getCollectionSize(context);
++            if (maybeCurrentCollectionSizeInBytes == null) {
++                Timber.w("Error obtaining collection file size.");
++                String requiredFreeSpace = defaultRequiredFreeSpace(context);
++                return fromError(context.getResources().getString(R.string.integrity_check_insufficient_space, requiredFreeSpace));
++            }
++
++            // This means that when VACUUMing a database, as much as twice the size of the original database file is
++            // required in free disk space. - https://www.sqlite.org/lang_vacuum.html
++            long requiredSpaceInBytes = maybeCurrentCollectionSizeInBytes * 2;
++
++            // We currently use the same directory as the collection for VACUUM/ANALYZE due to the SQLite APIs
++            File collectionFile = new File(getCollectionPath(context));
++            long freeSpace = FileUtil.getFreeDiskSpace(collectionFile, -1);
++
++            if (freeSpace == -1) {
++                Timber.w("Error obtaining free space for '%s'", collectionFile.getPath());
++                String readableFileSize  = Formatter.formatFileSize(context, requiredSpaceInBytes);
++                return fromError(context.getResources().getString(R.string.integrity_check_insufficient_space, readableFileSize));
++            }
++
++            return new CollectionIntegrityStorageCheck(requiredSpaceInBytes, freeSpace);
++        }
++
++        public boolean shouldWarnOnIntegrityCheck() {
++            return this.mErrorMessage != null || fileSystemDoesNotHaveSpaceForBackup();
++        }
++
++        private boolean fileSystemDoesNotHaveSpaceForBackup() {
++            //only to be called when mErrorMessage == null
++            if (mFreeSpace == null || mRequiredSpace == null) {
++                Timber.e("fileSystemDoesNotHaveSpaceForBackup called in invalid state.");
++                return true;
++            }
++            Timber.d("Required Free Space: %d. Current: %d", mRequiredSpace, mFreeSpace);
++            return mRequiredSpace > mFreeSpace;
++        }
++
++
++        public String getWarningDetails(Context context) {
++            if (mErrorMessage != null) {
++                return mErrorMessage;
++            }
++            if (mFreeSpace == null || mRequiredSpace == null) {
++                Timber.e("CollectionIntegrityCheckStatus in an invalid state");
++                String defaultRequiredFreeSpace = defaultRequiredFreeSpace(context);
++                return context.getResources().getString(R.string.integrity_check_insufficient_space, defaultRequiredFreeSpace);
++            }
++
++            String required = Formatter.formatShortFileSize(context, mRequiredSpace);
++            String insufficientSpace = context.getResources().getString(
++                    R.string.integrity_check_insufficient_space, required);
++
++            //Also concat in the extra content showing the current free space.
++            String currentFree = Formatter.formatShortFileSize(context, mFreeSpace);
++            String insufficientSpaceCurrentFree = context.getResources().getString(
++                    R.string.integrity_check_insufficient_space_extra_content, currentFree);
++            return insufficientSpace + insufficientSpaceCurrentFree;
++        }
++    }
+ }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.java b/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.java
+index 5c1371327c36..db7d42875fe4 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.java
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.java
+@@ -71,6 +71,7 @@
+ import com.getbase.floatingactionbutton.FloatingActionButton;
+ import com.getbase.floatingactionbutton.FloatingActionsMenu;
+ import com.ichi2.anim.ActivityTransitionAnimation;
++import com.ichi2.anki.CollectionHelper.CollectionIntegrityStorageCheck;
+ import com.ichi2.anki.StudyOptionsFragment.StudyOptionsListener;
+ import com.ichi2.anki.analytics.UsageAnalytics;
+ import com.ichi2.anki.dialogs.AsyncDialogFragment;
+@@ -1039,7 +1040,21 @@ private void showStartupScreensAndDialogs(SharedPreferences preferences, int ski
+                 //noinspection ConstantConditions
+                 if (!skipDbCheck && previous < upgradeDbVersion) {
+                     Timber.i("showStartupScreensAndDialogs() running integrityCheck()");
+-                    integrityCheck();
++                    //#5852 - since we may have a warning about disk space, we don't want to force a check database
++                    //and show a warning before the user knows what is happening.
++                    new MaterialDialog.Builder(this)
++                            .title(R.string.integrity_check_startup_title)
++                            .content(R.string.integrity_check_startup_content)
++                            .positiveText(R.string.integrity_check_positive)
++                            .negativeText(R.string.close)
++                            .onPositive((materialDialog, dialogAction) -> integrityCheck())
++                            .onNeutral((materialDialog, dialogAction) -> restartActivity())
++                            .onNegative((materialDialog, dialogAction) ->  restartActivity())
++                            .canceledOnTouchOutside(false)
++                            .cancelable(false)
++                            .build()
++                            .show();
++
+                 } else if (previous < upgradePrefsVersion) {
+                     // If integrityCheck() doesn't occur, but we did update preferences we should restart DeckPicker to
+                     // proceed
+@@ -1264,6 +1279,26 @@ public void onPostExecute(DeckTask.TaskData result) {
+ 
+     // Callback method to handle database integrity check
+     public void integrityCheck() {
++        //#5852 - We were having issues with integrity checks where the users had run out of space.
++        //display a dialog box if we don't have the space
++        CollectionIntegrityStorageCheck status = CollectionIntegrityStorageCheck.createInstance(this);
++        if (status.shouldWarnOnIntegrityCheck()) {
++            Timber.d("Displaying File Size confirmation");
++            new MaterialDialog.Builder(this)
++                    .title(R.string.check_db_title)
++                    .content(status.getWarningDetails(this))
++                    .positiveText(R.string.integrity_check_continue_anyway)
++                    .onPositive((dialog, which) -> performIntegrityCheck())
++                    .negativeText(R.string.dialog_cancel)
++                    .show();
++        } else {
++            performIntegrityCheck();
++        }
++    }
++
++
++    private void performIntegrityCheck() {
++        Timber.d("performIntegrityCheck()");
+         DeckTask.launchDeckTask(DeckTask.TASK_TYPE_CHECK_DATABASE, new DeckTask.TaskListener() {
+             @Override
+             public void onPreExecute() {
+@@ -1295,7 +1330,7 @@ public void onPostExecute(TaskData result) {
+ 
+ 
+             @Override
+-            public void onProgressUpdate(DeckTask.TaskData... values) {
++            public void onProgressUpdate(TaskData... values) {
+                 mProgressDialog.setContent(values[0].getString());
+             }
+         });
+diff --git a/AnkiDroid/src/main/java/com/ichi2/utils/FileUtil.java b/AnkiDroid/src/main/java/com/ichi2/utils/FileUtil.java
+new file mode 100644
+index 000000000000..c265902563a4
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/utils/FileUtil.java
+@@ -0,0 +1,21 @@
++package com.ichi2.utils;
++
++import android.os.StatFs;
++
++import com.ichi2.compat.CompatHelper;
++
++import java.io.File;
++
++import timber.log.Timber;
++
++public class FileUtil {
++    /** Gets the free disk space given a file */
++    public static long getFreeDiskSpace(File file, long defaultValue) {
++        try {
++            return CompatHelper.getCompat().getAvailableBytes(new StatFs(file.getParentFile().getPath()));
++        } catch (IllegalArgumentException e) {
++            Timber.e(e, "Free space could not be retrieved");
++            return defaultValue;
++        }
++    }
++}
+diff --git a/AnkiDroid/src/main/res/values/03-dialogs.xml b/AnkiDroid/src/main/res/values/03-dialogs.xml
+index 27101aec5fb1..5ad4c969476f 100644
+--- a/AnkiDroid/src/main/res/values/03-dialogs.xml
++++ b/AnkiDroid/src/main/res/values/03-dialogs.xml
+@@ -151,4 +151,12 @@
+     <string name="collection_load_welcome_request_permissions_title">Welcome to AnkiDroid!</string>
+     <string name="collection_load_welcome_request_permissions_details">AnkiDroid requires storage permission, which we use exclusively to store your AnkiDroid collection, flashcard media and backups. Our code is open-source, written by volunteers, and trusted by millions.\n\nIf you have any questions, please access our in-app manual or visit our support forums.\n\nThank you for trying AnkiDroid!\n—AnkiDroid Development Team</string>
+     <string name="mutimedia_editor_assertion_failed">Unknown error occurred displaying Advanced Editor</string>
++
++    <!-- Database Integrity Check -->
++    <string name="integrity_check_startup_title">AnkiDroid Upgraded</string>
++    <string name="integrity_check_startup_content">AnkiDroid has been upgraded. This upgrade includes fixes for possible database problems, and we advise you to run check database now.</string>
++    <string name="integrity_check_positive">Check Database</string>
++    <string name="integrity_check_continue_anyway">Continue Anyway</string>
++    <string name="integrity_check_insufficient_space">Check Database uses a large amount of temporary storage.\n\nIt is strongly recommended that you have at least %s free space on your device before continuing.</string>>
++    <string name="integrity_check_insufficient_space_extra_content">\n\nYou currently have %s free.</string>
+ </resources>

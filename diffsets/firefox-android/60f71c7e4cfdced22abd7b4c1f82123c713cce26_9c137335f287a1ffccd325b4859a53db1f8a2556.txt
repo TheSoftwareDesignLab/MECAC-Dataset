@@ -1,0 +1,1175 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/controller/LoginsListController.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/controller/LoginsListController.kt
+index 8d4c5629fd58..56453210441a 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/controller/LoginsListController.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/controller/LoginsListController.kt
+@@ -45,6 +45,12 @@ class LoginsListController(
+         )
+     }
+ 
++    fun handleAddLoginClicked() {
++        navController.navigate(
++            SavedLoginsFragmentDirections.actionSavedLoginsFragmentToAddLoginFragment()
++        )
++    }
++
+     fun handleLearnMoreClicked() {
+         browserNavigator.invoke(
+             SupportUtils.getGenericSumoURLForTopic(SupportUtils.SumoTopic.SYNC_SETUP),
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/controller/SavedLoginsStorageController.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/controller/SavedLoginsStorageController.kt
+index e8e52e216ab5..69efa7eedeb7 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/controller/SavedLoginsStorageController.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/controller/SavedLoginsStorageController.kt
+@@ -23,11 +23,13 @@ import org.mozilla.fenix.R
+ import org.mozilla.fenix.settings.logins.LoginsAction
+ import org.mozilla.fenix.settings.logins.LoginsFragmentStore
+ import org.mozilla.fenix.settings.logins.fragment.EditLoginFragmentDirections
++import org.mozilla.fenix.settings.logins.fragment.AddLoginFragmentDirections
+ import org.mozilla.fenix.settings.logins.mapToSavedLogin
+ 
+ /**
+  * Controller for all saved logins interactions with the password storage component
+  */
++@Suppress("TooManyFunctions", "LargeClass")
+ open class SavedLoginsStorageController(
+     private val passwordsStorage: SyncableLoginsStorage,
+     private val lifecycleScope: CoroutineScope,
+@@ -56,6 +58,50 @@ open class SavedLoginsStorageController(
+         }
+     }
+ 
++    fun add(hostnameText: String, usernameText: String, passwordText: String) {
++        var saveLoginJob: Deferred<Unit>? = null
++        lifecycleScope.launch(ioDispatcher) {
++            saveLoginJob = async {
++                val loginToSave = Login(
++                    guid = null,
++                    origin = hostnameText,
++                    username = usernameText,
++                    password = passwordText,
++                    httpRealm = hostnameText
++                )
++                val newLoginId = add(loginToSave)
++                if (newLoginId.isNotEmpty()) {
++                    val newLogin = passwordsStorage.get(newLoginId)
++                    syncAndUpdateList(newLogin!!)
++                }
++            }
++            saveLoginJob?.await()
++            withContext(Dispatchers.Main) {
++                val directions =
++                    AddLoginFragmentDirections.actionAddLoginFragmentToSavedLoginsFragment()
++                navController.navigate(directions)
++            }
++        }
++        saveLoginJob?.invokeOnCompletion {
++            if (it is CancellationException) {
++                saveLoginJob?.cancel()
++            }
++        }
++    }
++
++    private suspend fun add(loginToSave: Login): String {
++        var newLoginId = ""
++        try {
++            newLoginId = passwordsStorage.add(loginToSave)
++        } catch (loginException: LoginsStorageException) {
++            Log.e(
++                "Add new login",
++                "Failed to add new login.", loginException
++            )
++        }
++        return newLoginId
++    }
++
+     fun save(loginId: String, usernameText: String, passwordText: String) {
+         var saveLoginJob: Deferred<Unit>? = null
+         lifecycleScope.launch(ioDispatcher) {
+@@ -148,6 +194,38 @@ open class SavedLoginsStorageController(
+         }
+     }
+ 
++    fun findPotentialDuplicates(hostnameText: String, usernameText: String, passwordText: String) {
++        var deferredLogin: Deferred<List<Login>>? = null
++        val fetchLoginJob = lifecycleScope.launch(ioDispatcher) {
++            deferredLogin = async {
++                val login = Login(
++                    guid = null,
++                    origin = hostnameText,
++                    username = usernameText,
++                    password = passwordText,
++                    httpRealm = hostnameText
++                )
++                passwordsStorage.getPotentialDupesIgnoringUsername(login)
++            }
++            val fetchedDuplicatesList = deferredLogin?.await()
++            fetchedDuplicatesList?.let { list ->
++                withContext(Dispatchers.Main) {
++                    val savedLoginList = list.map { it.mapToSavedLogin() }
++                    loginsFragmentStore.dispatch(
++                        LoginsAction.ListOfDupes(
++                            savedLoginList
++                        )
++                    )
++                }
++            }
++        }
++        fetchLoginJob.invokeOnCompletion {
++            if (it is CancellationException) {
++                deferredLogin?.cancel()
++            }
++        }
++    }
++
+     fun fetchLoginDetails(loginId: String) {
+         var deferredLogin: Deferred<List<Login>>? = null
+         val fetchLoginJob = lifecycleScope.launch(ioDispatcher) {
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/fragment/AddLoginFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/fragment/AddLoginFragment.kt
+new file mode 100644
+index 000000000000..510f7c8ea2b1
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/fragment/AddLoginFragment.kt
+@@ -0,0 +1,354 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.settings.logins.fragment
++
++import android.content.Context
++import android.content.res.ColorStateList
++import android.os.Bundle
++import android.text.Editable
++import android.text.InputType
++import android.text.TextWatcher
++import android.view.Menu
++import android.view.MenuInflater
++import android.view.MenuItem
++import android.view.View
++import android.view.inputmethod.InputMethodManager
++import android.webkit.URLUtil
++import androidx.core.content.ContextCompat
++import androidx.core.view.isVisible
++import androidx.fragment.app.Fragment
++import androidx.lifecycle.lifecycleScope
++import androidx.navigation.fragment.findNavController
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import mozilla.components.lib.state.ext.consumeFrom
++import mozilla.components.support.ktx.android.view.hideKeyboard
++import org.mozilla.fenix.R
++import org.mozilla.fenix.components.StoreProvider
++import org.mozilla.fenix.databinding.FragmentAddLoginBinding
++import org.mozilla.fenix.ext.components
++import org.mozilla.fenix.ext.redirectToReAuth
++import org.mozilla.fenix.ext.showToolbar
++import org.mozilla.fenix.ext.toEditable
++import org.mozilla.fenix.ext.settings
++import org.mozilla.fenix.settings.logins.controller.SavedLoginsStorageController
++import org.mozilla.fenix.settings.logins.interactor.AddLoginInteractor
++import org.mozilla.fenix.settings.logins.LoginsFragmentStore
++import org.mozilla.fenix.settings.logins.SavedLogin
++import org.mozilla.fenix.settings.logins.createInitialLoginsListState
++
++/**
++ * Displays the editable new login information for a single website
++ */
++@ExperimentalCoroutinesApi
++@Suppress("TooManyFunctions", "NestedBlockDepth", "ForbiddenComment")
++class AddLoginFragment : Fragment(R.layout.fragment_add_login) {
++
++    private lateinit var loginsFragmentStore: LoginsFragmentStore
++    private lateinit var interactor: AddLoginInteractor
++
++    private var listOfPossibleDupes: List<SavedLogin>? = null
++
++    private var validPassword = true
++    private var validUsername = true
++    private var validHostname = false
++
++    private var _binding: FragmentAddLoginBinding? = null
++    private val binding get() = _binding!!
++
++    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
++        super.onViewCreated(view, savedInstanceState)
++        setHasOptionsMenu(true)
++
++        _binding = FragmentAddLoginBinding.bind(view)
++
++        loginsFragmentStore = StoreProvider.get(this) {
++            LoginsFragmentStore(
++                createInitialLoginsListState(requireContext().settings())
++            )
++        }
++
++        interactor = AddLoginInteractor(
++            SavedLoginsStorageController(
++                passwordsStorage = requireContext().components.core.passwordsStorage,
++                lifecycleScope = lifecycleScope,
++                navController = findNavController(),
++                loginsFragmentStore = loginsFragmentStore
++            )
++        )
++
++        initEditableValues()
++
++        setUpClickListeners()
++        setUpTextListeners()
++
++        consumeFrom(loginsFragmentStore) {
++            listOfPossibleDupes = loginsFragmentStore.state.duplicateLogins
++        }
++    }
++
++    private fun initEditableValues() {
++        binding.hostnameText.text = "".toEditable()
++        binding.usernameText.text = "".toEditable()
++        binding.passwordText.text = "".toEditable()
++
++        binding.hostnameText.inputType = InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
++        binding.usernameText.inputType = InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
++
++        // TODO: extend PasswordTransformationMethod() to change bullets to asterisks
++        binding.passwordText.inputType =
++            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
++
++        binding.passwordText.compoundDrawablePadding =
++            requireContext().resources
++                .getDimensionPixelOffset(R.dimen.saved_logins_end_icon_drawable_padding)
++    }
++
++    private fun setUpClickListeners() {
++        binding.hostnameText.requestFocus()
++        val imm =
++            requireContext().getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
++        imm.toggleSoftInput(InputMethodManager.SHOW_IMPLICIT, 0)
++
++        binding.clearHostnameTextButton.setOnClickListener {
++            binding.hostnameText.text?.clear()
++            binding.hostnameText.isCursorVisible = true
++            binding.hostnameText.hasFocus()
++            binding.inputLayoutHostname.hasFocus()
++            it.isEnabled = false
++        }
++
++        binding.clearUsernameTextButton.setOnClickListener {
++            binding.usernameText.text?.clear()
++            binding.usernameText.isCursorVisible = true
++            binding.usernameText.hasFocus()
++            binding.inputLayoutUsername.hasFocus()
++            it.isEnabled = false
++        }
++
++        binding.clearPasswordTextButton.setOnClickListener {
++            binding.passwordText.text?.clear()
++            binding.passwordText.isCursorVisible = true
++            binding.passwordText.hasFocus()
++            binding.inputLayoutPassword.hasFocus()
++            it.isEnabled = false
++        }
++    }
++
++    private fun setUpTextListeners() {
++        val frag = view?.findViewById<View>(R.id.addLoginFragment)
++
++        frag?.onFocusChangeListener = View.OnFocusChangeListener { _, hasFocus ->
++            if (hasFocus) {
++                view?.hideKeyboard()
++            }
++        }
++
++        binding.addLoginLayout.onFocusChangeListener = View.OnFocusChangeListener { _, hasFocus ->
++            if (!hasFocus) {
++                view?.hideKeyboard()
++            }
++        }
++
++        binding.hostnameText.addTextChangedListener(object : TextWatcher {
++            override fun afterTextChanged(h: Editable?) {
++                val hostnameText = h.toString()
++
++                when {
++                    hostnameText.isEmpty() -> {
++                        setHostnameError()
++                        binding.clearHostnameTextButton.isEnabled = false
++                    }
++                    !URLUtil.isHttpUrl(hostnameText) && !URLUtil.isHttpsUrl(hostnameText) -> {
++                        setHostnameError()
++                        binding.clearHostnameTextButton.isEnabled = true
++                    }
++                    else -> {
++                        validHostname = true
++
++                        binding.clearHostnameTextButton.isEnabled = true
++                        binding.inputLayoutHostname.error = null
++                        binding.inputLayoutHostname.errorIconDrawable = null
++
++                        interactor.findPotentialDuplicates(
++                            hostnameText = h.toString(),
++                            binding.usernameText.text.toString(),
++                            binding.passwordText.text.toString()
++                        )
++                    }
++                }
++                setSaveButtonState()
++            }
++
++            override fun beforeTextChanged(u: CharSequence?, start: Int, count: Int, after: Int) {
++                // NOOP
++            }
++
++            override fun onTextChanged(u: CharSequence?, start: Int, before: Int, count: Int) {
++                // NOOP
++            }
++        })
++
++        binding.usernameText.addTextChangedListener(object : TextWatcher {
++            override fun afterTextChanged(u: Editable?) {
++                when {
++                    u.toString().isEmpty() -> {
++                        binding.clearUsernameTextButton.isVisible = false
++                        setUsernameError()
++                    }
++                    else -> {
++                        setDupeError()
++                        binding.inputLayoutUsername.error = null
++                        binding.inputLayoutUsername.errorIconDrawable = null
++                    }
++                }
++                binding.clearUsernameTextButton.isEnabled = u.toString().isNotEmpty()
++                setSaveButtonState()
++            }
++
++            override fun beforeTextChanged(u: CharSequence?, start: Int, count: Int, after: Int) {
++                // NOOP
++            }
++
++            override fun onTextChanged(u: CharSequence?, start: Int, before: Int, count: Int) {
++                // NOOP
++            }
++        })
++
++        binding.passwordText.addTextChangedListener(object : TextWatcher {
++            override fun afterTextChanged(p: Editable?) {
++                when {
++                    p.toString().isEmpty() -> {
++                        binding.clearPasswordTextButton.isVisible = false
++                        setPasswordError()
++                    }
++                    else -> {
++                        validPassword = true
++                        binding.inputLayoutPassword.error = null
++                        binding.inputLayoutPassword.errorIconDrawable = null
++                        binding.clearPasswordTextButton.isVisible = true
++                    }
++                }
++                setSaveButtonState()
++            }
++
++            override fun beforeTextChanged(p: CharSequence?, start: Int, count: Int, after: Int) {
++                // NOOP
++            }
++
++            override fun onTextChanged(p: CharSequence?, start: Int, before: Int, count: Int) {
++                // NOOP
++            }
++        })
++    }
++
++    private fun isDupe(username: String): Boolean =
++        loginsFragmentStore.state.duplicateLogins.filter { it.username == username }.any()
++
++    private fun setDupeError() {
++        if (isDupe(binding.usernameText.text.toString())) {
++            binding.inputLayoutUsername.let {
++                validUsername = false
++                it.error = context?.getString(R.string.saved_login_duplicate)
++                it.setErrorIconDrawable(R.drawable.mozac_ic_warning_with_bottom_padding)
++                it.setErrorIconTintList(
++                    ColorStateList.valueOf(
++                        ContextCompat.getColor(requireContext(), R.color.design_error)
++                    )
++                )
++                binding.clearUsernameTextButton.isVisible = false
++            }
++        } else {
++            validUsername = true
++            binding.inputLayoutUsername.error = null
++            binding.inputLayoutUsername.errorIconDrawable = null
++            binding.clearUsernameTextButton.isVisible = true
++        }
++    }
++
++    private fun setPasswordError() {
++        binding.inputLayoutPassword.let { layout ->
++            validPassword = false
++            layout.error = context?.getString(R.string.saved_login_password_required)
++            layout.setErrorIconDrawable(R.drawable.mozac_ic_warning_with_bottom_padding)
++            layout.setErrorIconTintList(
++                ColorStateList.valueOf(
++                    ContextCompat.getColor(requireContext(), R.color.design_error)
++                )
++            )
++        }
++    }
++
++    private fun setUsernameError() {
++        binding.inputLayoutUsername.let { layout ->
++            validUsername = false
++            layout.error = context?.getString(R.string.saved_login_username_required)
++            layout.setErrorIconDrawable(R.drawable.mozac_ic_warning_with_bottom_padding)
++            layout.setErrorIconTintList(
++                ColorStateList.valueOf(
++                    ContextCompat.getColor(requireContext(), R.color.design_error)
++                )
++            )
++        }
++    }
++
++    private fun setHostnameError() {
++        binding.inputLayoutHostname.let { layout ->
++            validHostname = false
++            layout.error = context?.getString(R.string.add_login_hostname_invalid_text_2)
++            layout.setErrorIconDrawable(R.drawable.mozac_ic_warning_with_bottom_padding)
++            layout.setErrorIconTintList(
++                ColorStateList.valueOf(
++                    ContextCompat.getColor(requireContext(), R.color.design_error)
++                )
++            )
++        }
++    }
++
++    private fun setSaveButtonState() {
++        activity?.invalidateOptionsMenu()
++    }
++
++    override fun onCreateOptionsMenu(menu: Menu, inflater: MenuInflater) {
++        inflater.inflate(R.menu.login_save, menu)
++    }
++
++    override fun onPrepareOptionsMenu(menu: Menu) {
++        val saveButton = menu.findItem(R.id.save_login_button)
++        val changesMadeWithNoErrors = validHostname && validUsername && validPassword
++        saveButton.isEnabled = changesMadeWithNoErrors
++    }
++
++    override fun onPause() {
++        redirectToReAuth(
++            listOf(R.id.loginDetailFragment, R.id.savedLoginsFragment),
++            findNavController().currentDestination?.id,
++            R.id.editLoginFragment
++        )
++        super.onPause()
++    }
++
++    override fun onResume() {
++        super.onResume()
++        showToolbar(getString(R.string.add_login))
++    }
++
++    override fun onOptionsItemSelected(item: MenuItem): Boolean = when (item.itemId) {
++        R.id.save_login_button -> {
++            view?.hideKeyboard()
++            interactor.onAddLogin(
++                binding.hostnameText.text.toString(),
++                binding.usernameText.text.toString(),
++                binding.passwordText.text.toString()
++            )
++            true
++        }
++        else -> false
++    }
++
++    override fun onDestroyView() {
++        super.onDestroyView()
++        _binding = null
++    }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/fragment/EditLoginFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/fragment/EditLoginFragment.kt
+index 38bd7a66fb5f..cadb1f17f027 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/fragment/EditLoginFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/fragment/EditLoginFragment.kt
+@@ -271,7 +271,7 @@ class EditLoginFragment : Fragment(R.layout.fragment_edit_login) {
+ 
+     override fun onPause() {
+         redirectToReAuth(
+-            listOf(R.id.loginDetailFragment),
++            listOf(R.id.loginDetailFragment, R.id.savedLoginsFragment),
+             findNavController().currentDestination?.id,
+             R.id.editLoginFragment
+         )
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/fragment/SavedLoginsFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/fragment/SavedLoginsFragment.kt
+index a7a4cac1f717..ab47c93fa664 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/fragment/SavedLoginsFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/fragment/SavedLoginsFragment.kt
+@@ -151,7 +151,7 @@ class SavedLoginsFragment : Fragment() {
+         setHasOptionsMenu(false)
+ 
+         redirectToReAuth(
+-            listOf(R.id.loginDetailFragment),
++            listOf(R.id.loginDetailFragment, R.id.addLoginFragment),
+             findNavController().currentDestination?.id,
+             R.id.savedLoginsFragment
+         )
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/interactor/AddLoginInteractor.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/interactor/AddLoginInteractor.kt
+new file mode 100644
+index 000000000000..8b1421d6f783
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/interactor/AddLoginInteractor.kt
+@@ -0,0 +1,24 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.settings.logins.interactor
++
++import org.mozilla.fenix.settings.logins.controller.SavedLoginsStorageController
++
++/**
++ * Interactor for the add login screen
++ *
++ * @property savedLoginsController controller for the saved logins storage
++ */
++class AddLoginInteractor(
++    private val savedLoginsController: SavedLoginsStorageController
++) {
++    fun findPotentialDuplicates(hostnameText: String, usernameText: String, passwordText: String) {
++        savedLoginsController.findPotentialDuplicates(hostnameText, usernameText, passwordText)
++    }
++
++    fun onAddLogin(hostnameText: String, usernameText: String, passwordText: String) {
++        savedLoginsController.add(hostnameText, usernameText, passwordText)
++    }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/interactor/SavedLoginsInteractor.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/interactor/SavedLoginsInteractor.kt
+index 5bf69a99b877..662c3a7ffb09 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/interactor/SavedLoginsInteractor.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/interactor/SavedLoginsInteractor.kt
+@@ -36,4 +36,8 @@ class SavedLoginsInteractor(
+     fun loadAndMapLogins() {
+         savedLoginsStorageController.handleLoadAndMapLogins()
+     }
++
++    fun onAddLoginClick() {
++        loginsListController.handleAddLoginClicked()
++    }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/view/SavedLoginsListView.kt b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/view/SavedLoginsListView.kt
+index 362261aa9531..69f73265f570 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/view/SavedLoginsListView.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/settings/logins/view/SavedLoginsListView.kt
+@@ -50,6 +50,8 @@ class SavedLoginsListView(
+                 appName
+             )
+         }
++
++        binding.addLoginButton.addLoginLayout.setOnClickListener { interactor.onAddLoginClick() }
+     }
+ 
+     fun update(state: LoginsListState) {
+diff --git a/fenix/app/src/main/res/layout/component_saved_logins.xml b/fenix/app/src/main/res/layout/component_saved_logins.xml
+index 9fdc87e133ef..861866ff9b3d 100644
+--- a/fenix/app/src/main/res/layout/component_saved_logins.xml
++++ b/fenix/app/src/main/res/layout/component_saved_logins.xml
+@@ -19,39 +19,55 @@
+         app:layout_constraintTop_toTopOf="parent"
+         app:layout_constraintStart_toStartOf="parent" />
+ 
+-    <androidx.constraintlayout.widget.ConstraintLayout
+-        android:id="@+id/saved_passwords_empty_view"
++    <androidx.appcompat.widget.LinearLayoutCompat
+         android:layout_width="match_parent"
+         android:layout_height="wrap_content"
+-        android:visibility="gone"
+-        android:layout_margin="@dimen/exceptions_description_margin">
++        android:orientation="vertical">
+ 
+-        <TextView
+-            android:id="@+id/saved_passwords_empty_message"
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:padding="4dp"
+-            android:text="@string/preferences_passwords_saved_logins_description_empty_text"
+-            android:textColor="?secondaryText"
+-            android:textSize="16sp"
+-            app:layout_constraintTop_toTopOf="parent"
+-            app:layout_constraintStart_toStartOf="parent"/>
+-
+-        <org.mozilla.fenix.utils.LinkTextView
+-            android:id="@+id/saved_passwords_empty_learn_more"
++        <androidx.constraintlayout.widget.ConstraintLayout
++            android:id="@+id/saved_passwords_empty_view"
+             android:layout_width="match_parent"
+             android:layout_height="wrap_content"
+-            android:padding="4dp"
+-            android:text="@string/preferences_passwords_saved_logins_description_empty_learn_more_link"
+-            android:textColor="?secondaryText"
+-            android:textSize="16sp"
+-            app:layout_constraintTop_toBottomOf="@id/saved_passwords_empty_message" />
+-    </androidx.constraintlayout.widget.ConstraintLayout>
+-    <androidx.recyclerview.widget.RecyclerView
+-        android:id="@+id/saved_logins_list"
+-        android:layout_width="match_parent"
+-        android:layout_height="match_parent"
+-        android:visibility="gone"
+-        tools:listitem="@layout/logins_item" />
++            android:visibility="gone"
++            android:layout_margin="@dimen/exceptions_description_margin">
++
++            <TextView
++                android:id="@+id/saved_passwords_empty_message"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:padding="4dp"
++                android:text="@string/preferences_passwords_saved_logins_description_empty_text"
++                android:textColor="?secondaryText"
++                android:textSize="16sp"
++                app:layout_constraintTop_toTopOf="parent"
++                app:layout_constraintStart_toStartOf="parent" />
++
++            <org.mozilla.fenix.utils.LinkTextView
++                android:id="@+id/saved_passwords_empty_learn_more"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:padding="4dp"
++                android:text="@string/preferences_passwords_saved_logins_description_empty_learn_more_link"
++                android:textColor="?secondaryText"
++                android:textSize="16sp"
++                app:layout_constraintTop_toBottomOf="@id/saved_passwords_empty_message" />
++        </androidx.constraintlayout.widget.ConstraintLayout>
++
++            <androidx.recyclerview.widget.RecyclerView
++                android:id="@+id/saved_logins_list"
++                android:layout_width="match_parent"
++                android:layout_height="match_parent"
++                android:visibility="gone"
++                tools:listitem="@layout/logins_item" />
++
++            <include
++                android:id="@+id/add_login_button"
++                layout="@layout/layout_add_login"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                app:layout_constraintBottom_toBottomOf="parent"
++                app:layout_constraintTop_toBottomOf="@id/saved_logins_list" />
++
++    </androidx.appcompat.widget.LinearLayoutCompat>
+ 
+ </FrameLayout>
+diff --git a/fenix/app/src/main/res/layout/fragment_add_login.xml b/fenix/app/src/main/res/layout/fragment_add_login.xml
+new file mode 100644
+index 000000000000..cf7dfb9ee6e2
+--- /dev/null
++++ b/fenix/app/src/main/res/layout/fragment_add_login.xml
+@@ -0,0 +1,232 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++
++<androidx.constraintlayout.widget.ConstraintLayout
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:id="@+id/addLoginLayout"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:layout_marginStart="20dp"
++    android:layout_marginEnd="20dp"
++    android:layout_marginTop="16dp"
++    android:clickable="true"
++    android:focusable="true" >
++
++    <TextView
++        android:id="@+id/hostnameHeaderText"
++        android:layout_width="0dp"
++        android:layout_height="wrap_content"
++        android:paddingStart="3dp"
++        android:paddingEnd="0dp"
++        android:gravity="center_vertical"
++        android:text="@string/preferences_passwords_saved_logins_site"
++        android:textColor="?primaryText"
++        android:textSize="12sp"
++        android:letterSpacing="0.05"
++        app:fontFamily="@font/metropolis_semibold"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toTopOf="parent"
++        app:layout_constraintVertical_chainStyle="packed" />
++
++    <com.google.android.material.textfield.TextInputLayout
++        android:id="@+id/inputLayoutHostname"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:colorControlHighlight="?primaryText"
++        android:colorControlActivated="?primaryText"
++        android:textColor="?primaryText"
++        app:layout_constraintEnd_toEndOf="@id/hostnameHeaderText"
++        app:layout_constraintStart_toStartOf="@id/hostnameHeaderText"
++        app:layout_constraintTop_toBottomOf="@id/hostnameHeaderText"
++        app:helperTextEnabled="true"
++        app:helperText="@string/add_login_hostname_invalid_text_1"
++        app:hintEnabled="false" >
++
++        <com.google.android.material.textfield.TextInputEditText
++            android:id="@+id/hostnameText"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:textSize="16sp"
++            android:fontFamily="sans-serif"
++            android:textStyle="normal"
++            android:colorControlHighlight="?primaryText"
++            android:colorControlActivated="?primaryText"
++            android:textColor="?primaryText"
++            android:letterSpacing="0.01"
++            android:lineSpacingExtra="8sp"
++            android:hint="@string/add_login_hostname_hint_text"
++            android:inputType="textNoSuggestions"
++            android:ellipsize="end"
++            android:maxLines="1"
++            android:singleLine="true"
++            android:clickable="true"
++            android:focusable="true"
++            android:cursorVisible="true"
++            android:textCursorDrawable="@null"
++            app:backgroundTint="?primaryText"
++            tools:ignore="Autofill"/>
++    </com.google.android.material.textfield.TextInputLayout>
++
++    <ImageButton
++        android:id="@+id/clearHostnameTextButton"
++        android:layout_width="48dp"
++        android:layout_height="30dp"
++        android:layout_marginTop="3dp"
++        android:layout_marginBottom="10dp"
++        android:background="@null"
++        android:contentDescription="@string/saved_login_clear_hostname"
++        android:visibility="invisible"
++        app:tint="@color/saved_login_clear_edit_text_tint"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintTop_toTopOf="@id/inputLayoutHostname"
++        app:srcCompat="@drawable/mozac_ic_clear" />
++
++    <TextView
++        android:id="@+id/usernameHeader"
++        android:layout_width="0dp"
++        android:layout_height="16dp"
++        android:gravity="center_vertical"
++        android:paddingStart="3dp"
++        android:paddingEnd="0dp"
++        android:layout_marginTop="20dp"
++        android:text="@string/preferences_passwords_saved_logins_username"
++        android:textColor="?primaryText"
++        android:textSize="12sp"
++        android:letterSpacing="0.05"
++        app:fontFamily="@font/metropolis_semibold"
++        app:layout_constraintBottom_toTopOf="@id/inputLayoutUsername"
++        app:layout_constraintEnd_toStartOf="@id/clearUsernameTextButton"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toBottomOf="@id/inputLayoutHostname"
++        app:layout_constraintVertical_chainStyle="packed" />
++
++    <com.google.android.material.textfield.TextInputLayout
++        android:id="@+id/inputLayoutUsername"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:colorControlHighlight="?primaryText"
++        android:colorControlActivated="?primaryText"
++        android:textColor="?primaryText"
++        android:contentDescription="@string/saved_login_username_description"
++        app:layout_constraintEnd_toEndOf="@id/usernameHeader"
++        app:layout_constraintStart_toStartOf="@id/usernameHeader"
++        app:layout_constraintTop_toBottomOf="@id/usernameHeader"
++        app:layout_constraintVertical_chainStyle="packed"
++        app:hintEnabled="false">
++
++        <com.google.android.material.textfield.TextInputEditText
++            android:id="@+id/usernameText"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:textSize="16sp"
++            android:fontFamily="sans-serif"
++            android:textStyle="normal"
++            android:colorControlHighlight="?primaryText"
++            android:colorControlActivated="?primaryText"
++            android:textColor="?primaryText"
++            android:letterSpacing="0.01"
++            android:lineSpacingExtra="8sp"
++            android:inputType="textNoSuggestions"
++            android:ellipsize="end"
++            android:maxLines="1"
++            android:singleLine="true"
++            android:clickable="true"
++            android:focusable="true"
++            android:cursorVisible="true"
++            android:textCursorDrawable="@null"
++            app:backgroundTint="?primaryText"
++            tools:ignore="Autofill"/>
++    </com.google.android.material.textfield.TextInputLayout>
++
++    <ImageButton
++        android:id="@+id/clearUsernameTextButton"
++        android:layout_width="48dp"
++        android:layout_height="30dp"
++        android:layout_marginTop="3dp"
++        android:layout_marginBottom="10dp"
++        android:background="@null"
++        android:contentDescription="@string/saved_login_clear_username"
++        android:visibility="invisible"
++        app:tint="@color/saved_login_clear_edit_text_tint"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintTop_toTopOf="@id/inputLayoutUsername"
++        app:srcCompat="@drawable/mozac_ic_clear" />
++
++    <TextView
++        android:id="@+id/passwordHeader"
++        android:layout_width="0dp"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="10dp"
++        android:gravity="center_vertical"
++        android:letterSpacing="0.05"
++        android:paddingStart="3dp"
++        android:paddingEnd="0dp"
++        android:text="@string/preferences_passwords_saved_logins_password"
++        android:textColor="?primaryText"
++        android:textSize="12sp"
++        app:fontFamily="@font/metropolis_semibold"
++        app:layout_constraintBottom_toTopOf="@id/inputLayoutPassword"
++        app:layout_constraintEnd_toStartOf="@+id/clearPasswordTextButton"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toBottomOf="@id/inputLayoutUsername"
++        app:layout_constraintVertical_chainStyle="packed" />
++
++    <com.google.android.material.textfield.TextInputLayout
++        android:id="@+id/inputLayoutPassword"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:colorControlActivated="?primaryText"
++        android:colorControlHighlight="?primaryText"
++        android:contentDescription="@string/saved_login_password_description"
++        android:paddingBottom="11dp"
++        android:textColor="?primaryText"
++        app:hintEnabled="false"
++        app:layout_constraintEnd_toEndOf="@id/passwordHeader"
++        app:layout_constraintStart_toStartOf="@id/passwordHeader"
++        app:layout_constraintTop_toBottomOf="@id/passwordHeader"
++        app:layout_constraintVertical_chainStyle="packed">
++
++        <com.google.android.material.textfield.TextInputEditText
++            android:id="@+id/passwordText"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:clickable="true"
++            android:colorControlActivated="?primaryText"
++            android:colorControlHighlight="?primaryText"
++            android:cursorVisible="true"
++            android:ellipsize="end"
++            android:focusable="true"
++            android:fontFamily="sans-serif"
++            android:inputType="textNoSuggestions"
++            android:letterSpacing="0.01"
++            android:lineSpacingExtra="8sp"
++            android:maxLines="1"
++            android:singleLine="true"
++            android:textColor="?primaryText"
++            android:textCursorDrawable="@null"
++            android:textSize="16sp"
++            android:textStyle="normal"
++            app:backgroundTint="?primaryText"
++            tools:ignore="Autofill" />
++    </com.google.android.material.textfield.TextInputLayout>
++
++    <ImageButton
++        android:id="@+id/clearPasswordTextButton"
++        android:layout_width="48dp"
++        android:layout_height="30dp"
++        android:layout_marginTop="3dp"
++        android:layout_marginBottom="10dp"
++        android:background="@null"
++        android:contentDescription="@string/saved_logins_clear_password"
++        android:visibility="invisible"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintTop_toTopOf="@id/inputLayoutPassword"
++        app:srcCompat="@drawable/mozac_ic_clear"
++        app:tint="@color/saved_login_clear_edit_text_tint" />
++
++</androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/fenix/app/src/main/res/layout/fragment_edit_login.xml b/fenix/app/src/main/res/layout/fragment_edit_login.xml
+index e9689689d42b..d88ed95fd9b0 100644
+--- a/fenix/app/src/main/res/layout/fragment_edit_login.xml
++++ b/fenix/app/src/main/res/layout/fragment_edit_login.xml
+@@ -10,9 +10,9 @@
+     android:id="@+id/editLoginLayout"
+     android:layout_width="match_parent"
+     android:layout_height="wrap_content"
+-    android:layout_marginStart="72dp"
++    android:layout_marginStart="20dp"
+     android:layout_marginEnd="20dp"
+-    android:layout_marginTop="12dp"
++    android:layout_marginTop="16dp"
+     android:clickable="true"
+     android:focusable="true" >
+ 
+diff --git a/fenix/app/src/main/res/layout/fragment_login_detail.xml b/fenix/app/src/main/res/layout/fragment_login_detail.xml
+index cfb6bb0daa7d..107d0e5abde4 100644
+--- a/fenix/app/src/main/res/layout/fragment_login_detail.xml
++++ b/fenix/app/src/main/res/layout/fragment_login_detail.xml
+@@ -8,8 +8,9 @@
+     android:id="@+id/loginDetailLayout"
+     android:layout_width="match_parent"
+     android:layout_height="wrap_content"
+-    android:layout_marginStart="73dp"
+-    android:layout_marginTop="12dp">
++    android:layout_marginStart="20dp"
++    android:layout_marginEnd="20dp"
++    android:layout_marginTop="16dp">
+ 
+     <TextView
+         android:id="@+id/webAddressHeader"
+diff --git a/fenix/app/src/main/res/layout/layout_add_login.xml b/fenix/app/src/main/res/layout/layout_add_login.xml
+new file mode 100644
+index 000000000000..23750d5c9fae
+--- /dev/null
++++ b/fenix/app/src/main/res/layout/layout_add_login.xml
+@@ -0,0 +1,39 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<androidx.constraintlayout.widget.ConstraintLayout
++    android:id="@+id/add_login_layout"
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:background="?attr/selectableItemBackground"
++    android:clickable="true"
++    android:focusable="true">
++
++    <androidx.appcompat.widget.AppCompatImageView
++        android:id="@+id/add_login_icon"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginStart="@dimen/credit_cards_saved_cards_item_margin_start"
++        app:srcCompat="@drawable/ic_new"
++        android:importantForAccessibility="no"
++        app:layout_constraintBottom_toBottomOf="@id/add_login_text"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toTopOf="@id/add_login_text" />
++
++    <com.google.android.material.textview.MaterialTextView
++        android:id="@+id/add_login_text"
++        android:layout_width="0dp"
++        android:layout_height="wrap_content"
++        android:layout_margin="@dimen/credit_cards_saved_cards_item_margin_start"
++        android:text="@string/preferences_logins_add_login"
++        style="@style/Body16TextStyle"
++        app:layout_constraintBottom_toBottomOf="parent"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toEndOf="@id/add_login_icon"
++        app:layout_constraintTop_toTopOf="parent"
++        android:textAlignment="viewStart" />
++
++</androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/fenix/app/src/main/res/navigation/nav_graph.xml b/fenix/app/src/main/res/navigation/nav_graph.xml
+index d29b594d0c16..a123a0fc3259 100644
+--- a/fenix/app/src/main/res/navigation/nav_graph.xml
++++ b/fenix/app/src/main/res/navigation/nav_graph.xml
+@@ -344,6 +344,11 @@
+         <action
+             android:id="@+id/action_savedLoginsFragment_to_loginDetailFragment"
+             app:destination="@id/loginDetailFragment" />
++        <action
++            android:id="@+id/action_savedLoginsFragment_to_addLoginFragment"
++            app:destination="@id/addLoginFragment"
++            app:popUpTo="@id/addLoginFragment"
++            app:popUpToInclusive="true" />
+         <action
+             android:id="@+id/action_savedLoginsFragment_to_browserFragment"
+             app:destination="@id/browserFragment"
+@@ -388,6 +393,18 @@
+             app:popUpToInclusive="true" />
+     </fragment>
+ 
++    <fragment
++        android:id="@+id/addLoginFragment"
++        android:name="org.mozilla.fenix.settings.logins.fragment.AddLoginFragment"
++        android:label="@string/add_login"
++        tools:layout="@layout/fragment_add_login">
++        <action
++            android:id="@+id/action_addLoginFragment_to_savedLoginsFragment"
++            app:destination="@id/savedLoginsFragment"
++            app:popUpTo="@id/savedLoginsFragment"
++            app:popUpToInclusive="true" />
++    </fragment>
++
+     <fragment
+         android:id="@+id/settingsFragment"
+         android:name="org.mozilla.fenix.settings.SettingsFragment"
+diff --git a/fenix/app/src/main/res/values/strings.xml b/fenix/app/src/main/res/values/strings.xml
+index 028e162ddf5c..e61495f611df 100644
+--- a/fenix/app/src/main/res/values/strings.xml
++++ b/fenix/app/src/main/res/values/strings.xml
+@@ -1492,6 +1492,8 @@
+     <string name="preferences_android_autofill">Autofill in other apps</string>
+     <!-- Description for the preference for autofilling logins from Fenix in other apps (e.g. autofilling the Twitter app) -->
+     <string name="preferences_android_autofill_description">Fill usernames and passwords in other apps on your device.</string>
++    <!-- Preference option for adding a login -->
++    <string name="preferences_logins_add_login">Add login</string>
+ 
+     <!-- Preference for syncing saved logins in Fenix -->
+     <string name="preferences_passwords_sync_logins">Sync logins</string>
+@@ -1555,6 +1557,8 @@
+     <string name="saved_login_copy_username">Copy username</string>
+     <!-- Content Description (for screenreaders etc) read for the button to clear a username while editing a login -->
+     <string name="saved_login_clear_username">Clear username</string>
++    <!-- Content Description (for screenreaders etc) read for the button to clear the hostname field while creating a login -->
++    <string name="saved_login_clear_hostname">Clear hostname</string>
+     <!-- Content Description (for screenreaders etc) read for the button to copy a site in logins -->
+     <string name="saved_login_copy_site">Copy site</string>
+     <!-- Content Description (for screenreaders etc) read for the button to open a site in logins -->
+@@ -1762,14 +1766,26 @@
+     <string name="discard_changes">Discard changes</string>
+     <!--  The page title for editing a saved login. -->
+     <string name="edit">Edit</string>
+-    <!--  The error message in edit login view when password field is blank. -->
++    <!--  The page title for adding new login. -->
++    <string name="add_login">Add new login</string>
++    <!--  The error message in add/edit login view when password field is blank. -->
+     <string name="saved_login_password_required">Password required</string>
++    <!--  The error message in add login view when username field is blank. -->
++    <string name="saved_login_username_required">Username required</string>
++    <!--  The error message in add login view when hostname field is blank. -->
++    <string name="saved_login_hostname_required" tools:ignore="UnusedResources">Hostname required</string>
+     <!-- Voice search button content description  -->
+     <string name="voice_search_content_description">Voice search</string>
+     <!-- Voice search prompt description displayed after the user presses the voice search button -->
+     <string name="voice_search_explainer">Speak now</string>
+     <!--  The error message in edit login view when a duplicate username exists. -->
+     <string name="saved_login_duplicate">A login with that username already exists</string>
++    <!-- This is the hint text that is shown inline on the hostname field of the create new login page. -->
++    <string name="add_login_hostname_hint_text">https://www.example.com</string>
++    <!-- This is an error message shown below the hostname field of the add login page when a hostname does not contain http or https. -->
++    <string name="add_login_hostname_invalid_text_1">Web address must contain \“https://\“ or \“http://\“</string>
++    <!-- This is an error message shown below the hostname field of the add login page when a hostname is invalid. -->
++    <string name="add_login_hostname_invalid_text_2">Valid hostname required</string>
+ 
+     <!-- Synced Tabs -->
+     <!-- Text displayed to ask user to connect another device as no devices found with account -->
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/settings/logins/AddLoginInteractorTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/settings/logins/AddLoginInteractorTest.kt
+new file mode 100644
+index 000000000000..7fbf38656d07
+--- /dev/null
++++ b/fenix/app/src/test/java/org/mozilla/fenix/settings/logins/AddLoginInteractorTest.kt
+@@ -0,0 +1,51 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.settings.logins
++
++import io.mockk.mockk
++import io.mockk.verify
++import org.junit.Test
++import org.mozilla.fenix.settings.logins.controller.SavedLoginsStorageController
++import org.mozilla.fenix.settings.logins.interactor.AddLoginInteractor
++
++class AddLoginInteractorTest {
++
++    private val loginsController: SavedLoginsStorageController = mockk(relaxed = true)
++    private val interactor = AddLoginInteractor(loginsController)
++
++    private val hostname = "https://www.cats.com"
++    private val username = "myFunUsername111"
++    private val password = "superDuperSecure123!"
++
++    @Test
++    fun findPotentialDupesTest() {
++        interactor.findPotentialDuplicates(
++            hostname,
++            username,
++            password
++        )
++
++        verify {
++            loginsController.findPotentialDuplicates(
++                hostname,
++                username,
++                password
++            )
++        }
++    }
++
++    @Test
++    fun addNewLoginTest() {
++        interactor.onAddLogin(hostname, username, password)
++
++        verify {
++            loginsController.add(
++                hostname,
++                username,
++                password
++            )
++        }
++    }
++}
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/settings/logins/LoginsListControllerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/settings/logins/LoginsListControllerTest.kt
+index 8d6cac06e43d..d5ac6ab9da02 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/settings/logins/LoginsListControllerTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/settings/logins/LoginsListControllerTest.kt
+@@ -39,7 +39,7 @@ class LoginsListControllerTest {
+         )
+ 
+     @Test
+-    fun `GIVEN a sorting strategy, WHEN handleSort is called on the controller, THEN the correct action should be dispatched and the strategy saved in sharedPref`() {
++    fun `handle selecting the sorting strategy and save pref`() {
+         controller.handleSort(sortingStrategy)
+ 
+         verifyAll {
+@@ -53,7 +53,7 @@ class LoginsListControllerTest {
+     }
+ 
+     @Test
+-    fun `GIVEN a SavedLogin, WHEN handleItemClicked is called for it, THEN LoginsAction$LoginSelected should be emitted`() {
++    fun `handle login item clicked`() {
+         val login: SavedLogin = mockk(relaxed = true)
+ 
+         controller.handleItemClicked(login)
+@@ -68,7 +68,7 @@ class LoginsListControllerTest {
+     }
+ 
+     @Test
+-    fun `GIVEN the learn more option, WHEN handleLearnMoreClicked is called for it, then we should open the right support webpage`() {
++    fun `Open the correct support webpage when Learn More is clicked`() {
+         controller.handleLearnMoreClicked()
+ 
+         verifyAll {
+@@ -79,4 +79,15 @@ class LoginsListControllerTest {
+             )
+         }
+     }
++
++    @Test
++    fun `handle add login clicked`() {
++        controller.handleAddLoginClicked()
++
++        verifyAll {
++            navController.navigate(
++                SavedLoginsFragmentDirections.actionSavedLoginsFragmentToAddLoginFragment()
++            )
++        }
++    }
+ }
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/settings/logins/SavedLoginsInteractorTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/settings/logins/SavedLoginsInteractorTest.kt
+index 9838abb29e2c..9322bdbdb03b 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/settings/logins/SavedLoginsInteractorTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/settings/logins/SavedLoginsInteractorTest.kt
+@@ -63,4 +63,10 @@ class SavedLoginsInteractorTest {
+         interactor.loadAndMapLogins()
+         verifyAll { savedLoginsStorageController.handleLoadAndMapLogins() }
+     }
++
++    @Test
++    fun `Handle add login button click`() {
++        interactor.onAddLoginClick()
++        verifyAll { listController.handleAddLoginClicked() }
++    }
+ }

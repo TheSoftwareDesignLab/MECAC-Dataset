@@ -1,0 +1,1241 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt
+index 62f4dabfafc4..93852d84b3e0 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt
+@@ -18,6 +18,7 @@ import android.view.accessibility.AccessibilityManager
+ import androidx.appcompat.app.AppCompatActivity
+ import androidx.coordinatorlayout.widget.CoordinatorLayout
+ import androidx.fragment.app.Fragment
++import androidx.lifecycle.ViewModelProviders
+ import androidx.navigation.Navigation
+ import com.google.android.material.snackbar.Snackbar
+ import kotlinx.android.synthetic.main.component_search.*
+@@ -54,6 +55,10 @@ import org.mozilla.fenix.DefaultThemeManager
+ import org.mozilla.fenix.HomeActivity
+ import org.mozilla.fenix.IntentReceiverActivity
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.collections.CreateCollectionFragment
++import org.mozilla.fenix.collections.CreateCollectionViewModel
++import org.mozilla.fenix.collections.SaveCollectionStep
++import org.mozilla.fenix.collections.Tab
+ import org.mozilla.fenix.components.FenixSnackbar
+ import org.mozilla.fenix.components.FindInPageIntegration
+ import org.mozilla.fenix.components.metrics.Event
+@@ -68,6 +73,7 @@ import org.mozilla.fenix.customtabs.CustomTabsIntegration
+ import org.mozilla.fenix.ext.components
+ import org.mozilla.fenix.ext.requireComponents
+ import org.mozilla.fenix.ext.share
++import org.mozilla.fenix.ext.urlToHost
+ import org.mozilla.fenix.lib.Do
+ import org.mozilla.fenix.mvi.ActionBusFactory
+ import org.mozilla.fenix.mvi.getAutoDisposeObservable
+@@ -547,12 +553,10 @@ class BrowserFragment : Fragment(), BackHandler, CoroutineScope,
+                 val directions = BrowserFragmentDirections
+                     .actionBrowserFragmentToSearchFragment(null)
+                 Navigation.findNavController(view!!).navigate(directions)
+-                (activity as HomeActivity).browsingModeManager.mode = BrowsingModeManager.Mode.Normal
+-            }
+-            ToolbarMenu.Item.SaveToCollection -> {
+-                ItsNotBrokenSnack(requireContext())
+-                    .showSnackbar("1843")
++                (activity as HomeActivity).browsingModeManager.mode =
++                    BrowsingModeManager.Mode.Normal
+             }
++            ToolbarMenu.Item.SaveToCollection -> showSaveToCollection()
+             ToolbarMenu.Item.OpenInFenix -> {
+                 val intent = Intent(context, IntentReceiverActivity::class.java)
+                 intent.action = Intent.ACTION_VIEW
+@@ -562,6 +566,24 @@ class BrowserFragment : Fragment(), BackHandler, CoroutineScope,
+         }
+     }
+ 
++    private fun showSaveToCollection() {
++        getSessionById()?.let {
++            val tabs = Tab(it.id, it.url, it.url.urlToHost(), it.title)
++            val viewModel = activity?.run {
++                ViewModelProviders.of(this).get(CreateCollectionViewModel::class.java)
++            }
++            viewModel?.tabs = listOf(tabs)
++            val selectedSet = setOf(tabs)
++            viewModel?.selectedTabs = selectedSet
++            viewModel?.saveCollectionStep = SaveCollectionStep.SelectCollection
++            CreateCollectionFragment()
++                .show(
++                    requireActivity().supportFragmentManager,
++                    CreateCollectionFragment.createCollectionTag
++                )
++        }
++    }
++
+     private fun assignSitePermissionsRules() {
+         val settings = Settings.getInstance(requireContext())
+ 
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/collections/CollectionCreationComponent.kt b/fenix/app/src/main/java/org/mozilla/fenix/collections/CollectionCreationComponent.kt
+index 043969d4a9e4..bc1614cbc95c 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/collections/CollectionCreationComponent.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/collections/CollectionCreationComponent.kt
+@@ -47,6 +47,7 @@ sealed class CollectionCreationChange : Change {
+ sealed class CollectionCreationAction : Action {
+     object Close : CollectionCreationAction()
+     object SelectAllTapped : CollectionCreationAction()
++    object AddNewCollection : CollectionCreationAction()
+     data class AddTabToSelection(val tab: Tab) : CollectionCreationAction()
+     data class RemoveTabFromSelection(val tab: Tab) : CollectionCreationAction()
+     data class SaveTabsToCollection(val tabs: List<Tab>) : CollectionCreationAction()
+@@ -56,8 +57,6 @@ sealed class CollectionCreationAction : Action {
+ 
+     data class SelectCollection(val collection: Collection) :
+         CollectionCreationAction()
+-
+-    data class AddNewCollection(val tabs: List<Tab>) : CollectionCreationAction()
+ }
+ 
+ class CollectionCreationComponent(
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/collections/CollectionCreationTabListAdapter.kt b/fenix/app/src/main/java/org/mozilla/fenix/collections/CollectionCreationTabListAdapter.kt
+index 2ac573f4bc8e..6b5b87a7b6dd 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/collections/CollectionCreationTabListAdapter.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/collections/CollectionCreationTabListAdapter.kt
+@@ -1,5 +1,9 @@
+ package org.mozilla.fenix.collections
+ 
++/* This Source Code Form is subject to the terms of the Mozilla Public
++   License, v. 2.0. If a copy of the MPL was not distributed with this
++   file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
+ import android.view.LayoutInflater
+ import android.view.View
+ import android.view.ViewGroup
+@@ -24,9 +28,11 @@ class CollectionCreationTabListAdapter(
+     private var tabs: List<Tab> = listOf()
+     private var selectedTabs: Set<Tab> = setOf()
+     private lateinit var job: Job
++    private var hideCheckboxes = false
+ 
+     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): TabViewHolder {
+-        val view = LayoutInflater.from(parent.context).inflate(TabViewHolder.LAYOUT_ID, parent, false)
++        val view =
++            LayoutInflater.from(parent.context).inflate(TabViewHolder.LAYOUT_ID, parent, false)
+ 
+         return TabViewHolder(view, actionEmitter, job)
+     }
+@@ -34,7 +40,7 @@ class CollectionCreationTabListAdapter(
+     override fun onBindViewHolder(holder: TabViewHolder, position: Int) {
+         val tab = tabs[position]
+         val isSelected = selectedTabs.contains(tab)
+-        holder.bind(tab, isSelected)
++        holder.bind(tab, isSelected, hideCheckboxes)
+     }
+ 
+     override fun getItemCount(): Int = tabs.size
+@@ -49,11 +55,21 @@ class CollectionCreationTabListAdapter(
+         job.cancel()
+     }
+ 
+-    fun updateData(tabs: List<Tab>, selectedTabs: Set<Tab>) {
+-        val diffUtil = DiffUtil.calculateDiff(TabDiffUtil(this.tabs, tabs, this.selectedTabs, selectedTabs))
++    fun updateData(tabs: List<Tab>, selectedTabs: Set<Tab>, hideCheckboxes: Boolean = false) {
++        val diffUtil = DiffUtil.calculateDiff(
++            TabDiffUtil(
++                this.tabs,
++                tabs,
++                this.selectedTabs,
++                selectedTabs,
++                this.hideCheckboxes,
++                hideCheckboxes
++            )
++        )
+ 
+         this.tabs = tabs
+         this.selectedTabs = selectedTabs
++        this.hideCheckboxes = hideCheckboxes
+ 
+         diffUtil.dispatchUpdatesTo(this)
+     }
+@@ -63,15 +79,19 @@ private class TabDiffUtil(
+     val old: List<Tab>,
+     val new: List<Tab>,
+     val oldSelected: Set<Tab>,
+-    val newSelected: Set<Tab>
++    val newSelected: Set<Tab>,
++    val oldHideCheckboxes: Boolean,
++    val newHideCheckboxes: Boolean
+ ) : DiffUtil.Callback() {
+     override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean =
+         old[oldItemPosition].sessionId == new[newItemPosition].sessionId
+ 
+     override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+         val isSameTab = old[oldItemPosition].url == new[newItemPosition].url
+-        val sameSelectedState = oldSelected.contains(old[oldItemPosition]) == newSelected.contains(new[newItemPosition])
+-        return isSameTab && sameSelectedState
++        val sameSelectedState =
++            oldSelected.contains(old[oldItemPosition]) == newSelected.contains(new[newItemPosition])
++        val isSameHideCheckboxes = oldHideCheckboxes == newHideCheckboxes
++        return isSameTab && sameSelectedState && isSameHideCheckboxes
+     }
+ 
+     override fun getOldListSize(): Int = old.size
+@@ -105,11 +125,13 @@ class TabViewHolder(
+         }
+     }
+ 
+-    fun bind(tab: Tab, isSelected: Boolean) {
++    fun bind(tab: Tab, isSelected: Boolean, shouldHideCheckBox: Boolean) {
+         this.tab = tab
+ 
+         view.hostname.text = tab.hostname
+         view.tab_title.text = tab.title
++        checkbox.visibility = if (shouldHideCheckBox) View.GONE else View.VISIBLE
++        view.isClickable = !shouldHideCheckBox
+         checkbox.setOnCheckedChangeListener(null)
+         if (checkbox.isChecked != isSelected) {
+             checkbox.isChecked = isSelected
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/collections/CollectionCreationUIView.kt b/fenix/app/src/main/java/org/mozilla/fenix/collections/CollectionCreationUIView.kt
+index 470bd042c021..380250d8948b 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/collections/CollectionCreationUIView.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/collections/CollectionCreationUIView.kt
+@@ -4,21 +4,25 @@ package org.mozilla.fenix.collections
+    License, v. 2.0. If a copy of the MPL was not distributed with this
+    file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-import android.content.Context.INPUT_METHOD_SERVICE
++import android.os.Handler
+ import android.view.KeyEvent
+ import android.view.LayoutInflater
+ import android.view.View
+ import android.view.ViewGroup
+ import android.view.inputmethod.EditorInfo
+-import android.view.inputmethod.InputMethodManager
+-import android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT
++import androidx.constraintlayout.widget.ConstraintSet
+ import androidx.recyclerview.widget.LinearLayoutManager
+ import androidx.recyclerview.widget.RecyclerView
++import androidx.transition.AutoTransition
++import androidx.transition.Transition
++import androidx.transition.TransitionManager
+ import io.reactivex.Observable
+ import io.reactivex.Observer
+ import io.reactivex.functions.Consumer
+ import kotlinx.android.synthetic.main.component_collection_creation.*
+ import kotlinx.android.synthetic.main.component_collection_creation.view.*
++import mozilla.components.support.ktx.android.view.hideKeyboard
++import mozilla.components.support.ktx.android.view.showKeyboard
+ import org.mozilla.fenix.R
+ import org.mozilla.fenix.ext.increaseTapArea
+ import org.mozilla.fenix.mvi.UIView
+@@ -41,8 +45,24 @@ class CollectionCreationUIView(
+     private val collectionCreationTabListAdapter = CollectionCreationTabListAdapter(actionEmitter)
+     private val collectionSaveListAdapter = SaveCollectionListAdapter(actionEmitter)
+     private var selectedTabs: Set<Tab> = setOf()
++    private val selectTabsConstraints = ConstraintSet()
++    private val selectCollectionConstraints = ConstraintSet()
++    private val nameCollectionConstraints = ConstraintSet()
++    private val transition = AutoTransition()
+ 
+     init {
++        transition.duration = TRANSITION_DURATION
++
++        selectTabsConstraints.clone(collection_constraint_layout)
++        selectCollectionConstraints.clone(
++            view.context,
++            R.layout.component_collection_creation_select_collection
++        )
++        nameCollectionConstraints.clone(
++            view.context,
++            R.layout.component_collection_creation_name_collection
++        )
++
+         view.select_all_button.setOnClickListener {
+             actionEmitter.onNext(CollectionCreationAction.SelectAllTapped)
+         }
+@@ -54,7 +74,7 @@ class CollectionCreationUIView(
+             }
+         }
+ 
+-        name_collection_edittext.setOnEditorActionListener { v, actionId, event ->
++        view.name_collection_edittext.setOnEditorActionListener { v, actionId, event ->
+             if (actionId == EditorInfo.IME_ACTION_DONE) {
+                 actionEmitter.onNext(
+                     CollectionCreationAction.SaveCollectionName(
+@@ -67,12 +87,12 @@ class CollectionCreationUIView(
+             false
+         }
+ 
+-        view.add_tabs_button.setOnClickListener {
++        view.save_button.setOnClickListener {
+             actionEmitter.onNext(CollectionCreationAction.SaveTabsToCollection(selectedTabs.toList()))
+         }
+ 
+         view.add_collection_button.setOnClickListener {
+-            actionEmitter.onNext(CollectionCreationAction.AddNewCollection(selectedTabs.toList()))
++            actionEmitter.onNext(CollectionCreationAction.AddNewCollection)
+         }
+ 
+         view.tab_list.run {
+@@ -86,6 +106,7 @@ class CollectionCreationUIView(
+         }
+     }
+ 
++    @Suppress("ComplexMethod")
+     override fun updateView() = Consumer<CollectionCreationState> {
+         step = it.saveCollectionStep
+         when (it.saveCollectionStep) {
+@@ -93,73 +114,97 @@ class CollectionCreationUIView(
+                 back_button.setOnClickListener {
+                     actionEmitter.onNext(CollectionCreationAction.BackPressed(SaveCollectionStep.SelectTabs))
+                 }
+-
+-                name_collection_edittext.visibility = View.GONE
+-                collections_list.visibility = View.GONE
+-                add_collection_button.visibility = View.GONE
+-                divider.visibility = View.GONE
++                TransitionManager.beginDelayedTransition(
++                    view.collection_constraint_layout,
++                    transition
++                )
++                val constraint = selectTabsConstraints
++                constraint.applyTo(view.collection_constraint_layout)
+ 
+                 this.selectedTabs = it.selectedTabs
+                 collectionCreationTabListAdapter.updateData(it.tabs, it.selectedTabs)
+ 
+                 back_button.text = view.context.getString(R.string.create_collection_select_tabs)
+ 
+-                val buttonText = if (it.selectedTabs.isEmpty()) {
++                val selectTabsText = if (it.selectedTabs.isEmpty()) {
+                     view.context.getString(R.string.create_collection_save_to_collection_empty)
+                 } else {
+-                    view.context.getString(
+-                        R.string.create_collection_save_to_collection_full,
++                    view.context.resources.getQuantityString(
++                        R.plurals.create_collection_save_to_collection_full_plural,
++                        it.selectedTabs.size,
+                         it.selectedTabs.size
+                     )
+                 }
++                view.select_tabs_layout_text.text = selectTabsText
+ 
+-                tab_list.visibility = View.VISIBLE
+-                select_all_button.visibility = View.VISIBLE
+-                add_tabs_button.visibility = View.VISIBLE
+-
+-                val enableSaveButton = it.selectedTabs.isNotEmpty()
+-                view.add_tabs_button.isClickable = enableSaveButton
+-
+-                view.add_tabs_button.contentDescription = buttonText
+-                view.add_tabs_button_text.text = buttonText
++                save_button.visibility = if (it.selectedTabs.isEmpty()) {
++                    View.GONE
++                } else {
++                    View.VISIBLE
++                }
+             }
+             is SaveCollectionStep.SelectCollection -> {
++                // Only show selected tabs and hide checkboxes
++                collectionCreationTabListAdapter.updateData(it.selectedTabs.toList(), setOf(), true)
++
+                 back_button.setOnClickListener {
+                     actionEmitter.onNext(CollectionCreationAction.BackPressed(SaveCollectionStep.SelectCollection))
+                 }
+-                collections_list.visibility = View.VISIBLE
+-                add_collection_button.visibility = View.VISIBLE
+-                divider.visibility = View.VISIBLE
+-                tab_list.visibility = View.GONE
+-                select_all_button.visibility = View.GONE
+-                add_tabs_button.visibility = View.GONE
+-                name_collection_edittext.visibility = View.GONE
+-
++                TransitionManager.beginDelayedTransition(
++                    view.collection_constraint_layout,
++                    transition
++                )
++                val constraint = selectCollectionConstraints
++                constraint.applyTo(view.collection_constraint_layout)
+                 back_button.text =
+                     view.context.getString(R.string.create_collection_select_collection)
+             }
+             is SaveCollectionStep.NameCollection -> {
+                 back_button.setOnClickListener {
+-                    actionEmitter.onNext(CollectionCreationAction.BackPressed(SaveCollectionStep.NameCollection))
++                    name_collection_edittext.hideKeyboard()
++                    val handler = Handler()
++                    handler.postDelayed({
++                        actionEmitter.onNext(CollectionCreationAction.BackPressed(SaveCollectionStep.NameCollection))
++                    }, TRANSITION_DURATION)
+                 }
+-                name_collection_edittext.visibility = View.VISIBLE
+-                name_collection_edittext.requestFocus()
+-                val imm =
+-                    view.context.getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager
+-                imm?.showSoftInput(name_collection_edittext, SHOW_IMPLICIT)
+-                collections_list.visibility = View.GONE
+-                add_collection_button.visibility = View.GONE
+-                divider.visibility = View.GONE
+-
+-                tab_list.visibility = View.GONE
+-                select_all_button.visibility = View.GONE
+-                add_tabs_button.visibility = View.GONE
++                transition.addListener(object : Transition.TransitionListener {
++                    override fun onTransitionStart(transition: Transition) {
++                    }
++
++                    override fun onTransitionEnd(transition: Transition) {
++                        view.name_collection_edittext.showKeyboard()
++                        transition.removeListener(this)
++                    }
++
++                    override fun onTransitionCancel(transition: Transition) {}
++                    override fun onTransitionPause(transition: Transition) {}
++                    override fun onTransitionResume(transition: Transition) {}
++                })
++                TransitionManager.beginDelayedTransition(
++                    view.collection_constraint_layout,
++                    transition
++                )
++                val constraint = nameCollectionConstraints
++                constraint.applyTo(view.collection_constraint_layout)
++                name_collection_edittext.setText(
++                    view.context.getString(
++                        R.string.create_collection_default_name,
++                        1
++                    )
++                )
++                name_collection_edittext.setSelection(name_collection_edittext.text.length)
+                 back_button.text =
+                     view.context.getString(R.string.create_collection_name_collection)
+             }
+         }
+     }
+ 
++    fun onResumed() {
++        if (step == SaveCollectionStep.NameCollection) {
++            view.name_collection_edittext.showKeyboard()
++        }
++    }
++
+     fun onKey(keyCode: Int, event: KeyEvent?): Boolean {
+         if (event?.action == KeyEvent.ACTION_UP && keyCode == KeyEvent.KEYCODE_BACK) {
+             when (step) {
+@@ -178,6 +223,7 @@ class CollectionCreationUIView(
+     }
+ 
+     companion object {
++        private const val TRANSITION_DURATION = 200L
+         private const val increaseButtonByDps = 16
+     }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/collections/CreateCollectionFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/collections/CreateCollectionFragment.kt
+index 4e8ecdc53491..a65d82bb9a85 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/collections/CreateCollectionFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/collections/CreateCollectionFragment.kt
+@@ -10,11 +10,13 @@ import android.os.Bundle
+ import android.view.LayoutInflater
+ import android.view.View
+ import android.view.ViewGroup
+-import android.view.inputmethod.InputMethodManager
+ import androidx.fragment.app.DialogFragment
+ import androidx.lifecycle.ViewModelProviders
++import com.google.android.material.snackbar.Snackbar
+ import kotlinx.android.synthetic.main.fragment_create_collection.view.*
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.components.FenixSnackbar
++import org.mozilla.fenix.ext.getRootView
+ import org.mozilla.fenix.mvi.ActionBusFactory
+ import org.mozilla.fenix.mvi.getAutoDisposeObservable
+ import org.mozilla.fenix.mvi.getManagedEmitter
+@@ -40,11 +42,16 @@ class CreateCollectionFragment : DialogFragment() {
+         }
+         val tabs = viewModel!!.tabs
+         val selectedTabs = viewModel.selectedTabs
++        val step = viewModel.saveCollectionStep
+ 
+         collectionCreationComponent = CollectionCreationComponent(
+             view.create_collection_wrapper,
+             ActionBusFactory.get(this),
+-            CollectionCreationState(tabs = tabs, selectedTabs = selectedTabs)
++            CollectionCreationState(
++                tabs = tabs,
++                selectedTabs = selectedTabs,
++                saveCollectionStep = step
++            )
+         )
+         return view
+     }
+@@ -59,6 +66,7 @@ class CreateCollectionFragment : DialogFragment() {
+ 
+     override fun onResume() {
+         super.onResume()
++        (collectionCreationComponent.uiView as CollectionCreationUIView).onResumed()
+         subscribeToActions()
+     }
+ 
+@@ -80,6 +88,21 @@ class CreateCollectionFragment : DialogFragment() {
+                     CollectionCreationChange.StepChanged(SaveCollectionStep.NameCollection)
+                 )
+                 is CollectionCreationAction.BackPressed -> handleBackPress(backPressFrom = it.backPressFrom)
++                is CollectionCreationAction.SaveCollectionName -> {
++                    showSavedSnackbar(it.tabs.size)
++                    dismiss()
++                }
++            }
++        }
++    }
++
++    private fun showSavedSnackbar(tabSize: Int) {
++        context?.let { context: Context ->
++            val rootView = context.getRootView()
++            rootView?.let { view: View ->
++                val string = context.resources.getQuantityString(R.plurals.create_collection_tabs_saved, tabSize)
++                FenixSnackbar.make(view, Snackbar.LENGTH_LONG).setText(string)
++                    .show()
+             }
+         }
+     }
+@@ -91,9 +114,6 @@ class CreateCollectionFragment : DialogFragment() {
+                 CollectionCreationChange.StepChanged(SaveCollectionStep.SelectTabs)
+             )
+             SaveCollectionStep.NameCollection -> {
+-                val imm =
+-                    view?.context?.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+-                imm?.hideSoftInputFromWindow(view?.windowToken, 0)
+                 getManagedEmitter<CollectionCreationChange>().onNext(
+                     CollectionCreationChange.StepChanged(SaveCollectionStep.SelectCollection)
+                 )
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/collections/CreateCollectionViewModel.kt b/fenix/app/src/main/java/org/mozilla/fenix/collections/CreateCollectionViewModel.kt
+index cecdada112d6..7addd4c97149 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/collections/CreateCollectionViewModel.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/collections/CreateCollectionViewModel.kt
+@@ -9,4 +9,5 @@ import androidx.lifecycle.ViewModel
+ class CreateCollectionViewModel : ViewModel() {
+     var selectedTabs = setOf<Tab>()
+     var tabs = listOf<Tab>()
++    var saveCollectionStep: SaveCollectionStep = SaveCollectionStep.SelectTabs
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/ext/Context.kt b/fenix/app/src/main/java/org/mozilla/fenix/ext/Context.kt
+index 8fd9a7bb7141..45213340109e 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/ext/Context.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/ext/Context.kt
+@@ -13,6 +13,8 @@ import android.content.Intent.EXTRA_SUBJECT
+ import android.content.Intent.EXTRA_TEXT
+ import android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+ import android.view.ContextThemeWrapper
++import android.view.View
++import android.view.ViewGroup
+ import androidx.annotation.StringRes
+ import androidx.fragment.app.FragmentActivity
+ import mozilla.components.support.base.log.Log
+@@ -69,3 +71,11 @@ fun Context.share(text: String, subject: String = ""): Boolean {
+         false
+     }
+ }
++
++/**
++ *  Gets the Root View with an activity context
++ *
++ * @return ViewGroup? if it is able to get a root view from the context
++ */
++fun Context.getRootView(): View? =
++    asActivity()?.window?.decorView?.findViewById<View>(android.R.id.content) as? ViewGroup
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
+index 368da83f594a..5a0488d14acf 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
+@@ -37,6 +37,7 @@ import org.mozilla.fenix.HomeActivity
+ import org.mozilla.fenix.R
+ import org.mozilla.fenix.collections.CreateCollectionFragment
+ import org.mozilla.fenix.collections.CreateCollectionViewModel
++import org.mozilla.fenix.collections.SaveCollectionStep
+ import org.mozilla.fenix.collections.Tab
+ import org.mozilla.fenix.components.metrics.Event
+ import org.mozilla.fenix.ext.requireComponents
+@@ -75,7 +76,8 @@ class HomeFragment : Fragment(), CoroutineScope {
+     ): View? {
+         job = Job()
+         val view = inflater.inflate(R.layout.fragment_home, container, false)
+-        val mode = if ((activity as HomeActivity).browsingModeManager.isPrivate) Mode.Private else Mode.Normal
++        val mode =
++            if ((activity as HomeActivity).browsingModeManager.isPrivate) Mode.Private else Mode.Normal
+         sessionControlComponent = SessionControlComponent(
+             view.homeLayout,
+             bus,
+@@ -126,7 +128,8 @@ class HomeFragment : Fragment(), CoroutineScope {
+                 orientation = BrowserMenu.Orientation.DOWN
+             )
+         }
+-        val roundToInt = (toolbarPaddingDp * Resources.getSystem().displayMetrics.density).roundToInt()
++        val roundToInt =
++            (toolbarPaddingDp * Resources.getSystem().displayMetrics.density).roundToInt()
+         view.toolbar.compoundDrawablePadding = roundToInt
+         view.toolbar.setOnClickListener {
+             val directions = HomeFragmentDirections.actionHomeFragmentToSearchFragment(null)
+@@ -137,7 +140,8 @@ class HomeFragment : Fragment(), CoroutineScope {
+ 
+         val isPrivate = (activity as HomeActivity).browsingModeManager.isPrivate
+ 
+-        privateBrowsingButton.contentDescription = contentDescriptionForPrivateBrowsingButton(isPrivate)
++        privateBrowsingButton.contentDescription =
++            contentDescriptionForPrivateBrowsingButton(isPrivate)
+ 
+         privateBrowsingButton.setOnClickListener {
+             val browsingModeManager = (activity as HomeActivity).browsingModeManager
+@@ -189,39 +193,25 @@ class HomeFragment : Fragment(), CoroutineScope {
+     private fun handleTabAction(action: TabAction) {
+         Do exhaustive when (action) {
+             is TabAction.SaveTabGroup -> {
+-                val tabs = requireComponents.core.sessionManager.sessions
+-                    .map { Tab(it.id, it.url, it.url.urlToHost(), it.title) }
+-
+-                activity?.run {
+-                    ViewModelProviders.of(this).get(CreateCollectionViewModel::class.java)
+-                }!!.tabs = tabs
+-
+-                val selectedTabs = tabs.find { tab -> tab.sessionId == action.selectedTabSessionId }
+-                val selectedSet = if (selectedTabs == null) setOf() else setOf(selectedTabs)
+-                activity?.run {
+-                    ViewModelProviders.of(this).get(CreateCollectionViewModel::class.java)
+-                }!!.selectedTabs = selectedSet
+-
+-                CreateCollectionFragment()
+-                    .show(
+-                        requireActivity().supportFragmentManager,
+-                        CreateCollectionFragment.createCollectionTag
+-                    )
++                showCollectionCreationFragment(action.selectedTabSessionId)
+             }
+             is TabAction.Select -> {
+-                val session = requireComponents.core.sessionManager.findSessionById(action.sessionId)
++                val session =
++                    requireComponents.core.sessionManager.findSessionById(action.sessionId)
+                 requireComponents.core.sessionManager.select(session!!)
+                 (activity as HomeActivity).openToBrowser(BrowserDirection.FromHome)
+             }
+             is TabAction.Close -> {
+-                requireComponents.core.sessionManager.findSessionById(action.sessionId)?.let { session ->
+-                    requireComponents.core.sessionManager.remove(session)
+-                }
++                requireComponents.core.sessionManager.findSessionById(action.sessionId)
++                    ?.let { session ->
++                        requireComponents.core.sessionManager.remove(session)
++                    }
+             }
+             is TabAction.Share -> {
+-                requireComponents.core.sessionManager.findSessionById(action.sessionId)?.let { session ->
+-                    requireContext().share(session.url)
+-                }
++                requireComponents.core.sessionManager.findSessionById(action.sessionId)
++                    ?.let { session ->
++                        requireContext().share(session.url)
++                    }
+             }
+             is TabAction.CloseAll -> {
+                 requireComponents.useCases.tabsUseCases.removeAllTabsOfType.invoke(action.private)
+@@ -231,7 +221,8 @@ class HomeFragment : Fragment(), CoroutineScope {
+                     searchTermOrURL = SupportUtils.getGenericSumoURLForTopic
+                         (SupportUtils.SumoTopic.PRIVATE_BROWSING_MYTHS),
+                     newTab = true,
+-                    from = BrowserDirection.FromHome)
++                    from = BrowserDirection.FromHome
++                )
+             }
+             is TabAction.Add -> {
+                 val directions = HomeFragmentDirections.actionHomeFragmentToSearchFragment(null)
+@@ -333,16 +324,24 @@ class HomeFragment : Fragment(), CoroutineScope {
+         )
+     }
+ 
+-    private fun openSessionMenu(sessionType: SessionBottomSheetFragment.SessionType) {
+-        SessionBottomSheetFragment
+-            .create(sessionType)
+-            .apply {
+-                onDelete = {
+-                    val isPrivate = sessionType is SessionBottomSheetFragment.SessionType.Private
+-                    requireComponents.useCases.tabsUseCases.removeAllTabsOfType.invoke(isPrivate)
+-                }
+-            }
+-            .show(requireActivity().supportFragmentManager, SessionBottomSheetFragment.overflowFragmentTag)
++    private fun showCollectionCreationFragment(selectedTabId: String?) {
++        val tabs = requireComponents.core.sessionManager.sessions
++            .map { Tab(it.id, it.url, it.url.urlToHost(), it.title) }
++
++        val viewModel = activity?.run {
++            ViewModelProviders.of(this).get(CreateCollectionViewModel::class.java)
++        }
++        viewModel?.tabs = tabs
++        val selectedTabs = tabs.find { tab -> tab.sessionId == selectedTabId }
++        val selectedSet = if (selectedTabs == null) setOf() else setOf(selectedTabs)
++        viewModel?.selectedTabs = selectedSet
++        viewModel?.saveCollectionStep = SaveCollectionStep.SelectTabs
++
++        CreateCollectionFragment()
++            .show(
++                requireActivity().supportFragmentManager,
++                CreateCollectionFragment.createCollectionTag
++            )
+     }
+ 
+     companion object {
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/utils/ItsNotBrokenSnack.kt b/fenix/app/src/main/java/org/mozilla/fenix/utils/ItsNotBrokenSnack.kt
+index ec1dad82cb92..f28727b5dbd2 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/utils/ItsNotBrokenSnack.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/utils/ItsNotBrokenSnack.kt
+@@ -5,24 +5,24 @@
+ package org.mozilla.fenix.utils
+ 
+ import android.content.Context
+-import android.view.View
+-import android.view.ViewGroup
+ import org.mozilla.fenix.components.FenixSnackbar
+-import org.mozilla.fenix.ext.asActivity
+ import org.mozilla.fenix.ext.components
++import org.mozilla.fenix.ext.getRootView
+ 
+ class ItsNotBrokenSnack(val context: Context) {
+     fun showSnackbar(issueNumber: String) {
+         val rootView =
+-            context.asActivity()?.window?.decorView?.findViewById<View>(android.R.id.content) as ViewGroup
++            context.getRootView()
+ 
+-        FenixSnackbar.make(rootView, FenixSnackbar.LENGTH_SHORT)
+-            .setText(message.replace("%", issueNumber))
+-            .setAction("Add Tab to Issue") {
+-                context.components.useCases.tabsUseCases.addTab
+-                    .invoke(issues + issueNumber)
+-            }
+-            .show()
++        rootView?.let {
++            FenixSnackbar.make(it, FenixSnackbar.LENGTH_SHORT)
++                .setText(message.replace("%", issueNumber))
++                .setAction("Add Tab to Issue") {
++                    context.components.useCases.tabsUseCases.addTab
++                        .invoke(issues + issueNumber)
++                }
++                .show()
++        }
+     }
+ 
+     companion object {
+diff --git a/fenix/app/src/main/res/drawable/add_tabs_to_collection_background.xml b/fenix/app/src/main/res/drawable/add_tabs_to_collection_background.xml
+index 6b6d8c02a11b..f139685df384 100644
+--- a/fenix/app/src/main/res/drawable/add_tabs_to_collection_background.xml
++++ b/fenix/app/src/main/res/drawable/add_tabs_to_collection_background.xml
+@@ -5,5 +5,5 @@
+ 
+ <shape xmlns:android="http://schemas.android.com/apk/res/android">
+     <corners android:radius="8dp"/>
+-    <solid android:color="?accentHighContrast" />
++    <solid android:color="?accentBright" />
+ </shape>
+\ No newline at end of file
+diff --git a/fenix/app/src/main/res/layout/component_collection_creation.xml b/fenix/app/src/main/res/layout/component_collection_creation.xml
+index 803c2fd482f9..2c077fe95b1e 100644
+--- a/fenix/app/src/main/res/layout/component_collection_creation.xml
++++ b/fenix/app/src/main/res/layout/component_collection_creation.xml
+@@ -5,6 +5,7 @@
+ <androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:app="http://schemas.android.com/apk/res-auto"
+     xmlns:tools="http://schemas.android.com/tools"
++    android:id="@+id/collection_constraint_layout"
+     android:layout_width="match_parent"
+     android:layout_height="match_parent"
+     android:clipToPadding="false">
+@@ -86,7 +87,7 @@
+         android:paddingTop="12dp"
+         android:paddingEnd="20dp"
+         android:paddingBottom="12dp"
+-        android:text="Collection 1"
++        android:text="@string/create_collection_default_name"
+         android:textColor="?primaryText"
+         android:textSize="16sp"
+         android:visibility="gone"
+@@ -102,21 +103,30 @@
+         android:layout_marginEnd="16dp"
+         android:fadingEdgeLength="30dp"
+         android:requiresFadingEdge="vertical"
+-        app:layout_constraintBottom_toTopOf="@+id/add_tabs_button"
++        app:layout_constraintBottom_toTopOf="@+id/add_tabs_layout"
+         app:layout_constraintEnd_toEndOf="parent"
+         app:layout_constraintStart_toStartOf="parent"
+         app:layout_constraintTop_toBottomOf="@id/back_button" />
+ 
++    <View
++        android:id="@+id/tab_list_dim"
++        android:layout_width="0dp"
++        android:layout_height="0dp"
++        android:alpha="0"
++        android:background="@drawable/scrim_background"
++        android:visibility="gone"
++        app:layout_constraintBottom_toBottomOf="@+id/tab_list"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toTopOf="parent" />
++
+     <androidx.constraintlayout.widget.ConstraintLayout
+-        android:id="@+id/add_tabs_button"
++        android:id="@+id/add_tabs_layout"
+         android:layout_width="match_parent"
+         android:layout_height="wrap_content"
+         android:layout_margin="16dp"
+         android:background="@drawable/add_tabs_to_collection_background"
+-        android:clickable="true"
+         android:clipToPadding="false"
+-        android:focusable="true"
+-        android:foreground="?android:attr/selectableItemBackgroundBorderless"
+         app:layout_constraintBottom_toBottomOf="parent"
+         app:layout_constraintEnd_toEndOf="parent"
+         app:layout_constraintStart_toStartOf="parent">
+@@ -135,12 +145,12 @@
+             app:layout_constraintTop_toTopOf="parent" />
+ 
+         <TextView
+-            android:id="@+id/add_tabs_button_text"
++            android:id="@+id/select_tabs_layout_text"
+             android:layout_width="0dp"
+             android:layout_height="wrap_content"
+             android:layout_marginStart="8dp"
+             android:layout_marginEnd="8dp"
+-            android:importantForAccessibility="no"
++            android:gravity="center_vertical"
+             android:singleLine="true"
+             android:text="@string/create_collection_save_to_collection_empty"
+             android:textColor="?neutral"
+@@ -150,16 +160,16 @@
+             app:layout_constraintStart_toEndOf="@id/close_icon"
+             app:layout_constraintTop_toTopOf="parent" />
+ 
+-        <ImageView
+-            android:id="@+id/save_icon"
++        <Button
++            android:id="@+id/save_button"
+             android:layout_width="wrap_content"
+             android:layout_height="wrap_content"
+-            android:layout_margin="16dp"
+-            android:importantForAccessibility="no"
+-            android:tint="?neutral"
++            android:background="?android:attr/selectableItemBackground"
++            android:text="@string/create_collection_save"
++            android:textAppearance="@style/TextAppearance.MaterialComponents.Button"
++            android:textColor="?neutral"
+             app:layout_constraintBottom_toBottomOf="parent"
+             app:layout_constraintEnd_toEndOf="parent"
+-            app:layout_constraintTop_toTopOf="parent"
+-            app:srcCompat="@drawable/ic_archive" />
++            app:layout_constraintTop_toTopOf="parent" />
+     </androidx.constraintlayout.widget.ConstraintLayout>
+ </androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/fenix/app/src/main/res/layout/component_collection_creation_name_collection.xml b/fenix/app/src/main/res/layout/component_collection_creation_name_collection.xml
+new file mode 100644
+index 000000000000..3cde3d30e4e7
+--- /dev/null
++++ b/fenix/app/src/main/res/layout/component_collection_creation_name_collection.xml
+@@ -0,0 +1,182 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:id="@+id/collection_constraint_layout"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:clipToPadding="false">
++
++    <Button
++        android:id="@+id/back_button"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_margin="16dp"
++        android:background="?android:attr/selectableItemBackgroundBorderless"
++        android:drawableStart="@drawable/mozac_ic_back"
++        android:drawablePadding="8dp"
++        android:drawableTint="@color/neutral_text"
++        android:text="@string/create_collection_name_collection"
++        android:textAppearance="@style/HeaderTextStyle"
++        android:textColor="@color/neutral_text"
++        android:textSize="20sp"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toTopOf="parent" />
++
++    <Button
++        android:id="@+id/select_all_button"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_margin="16dp"
++        android:alpha="0"
++        android:background="?android:attr/selectableItemBackgroundBorderless"
++        android:text="@string/create_collection_select_all"
++        android:textAllCaps="false"
++        android:textColor="@color/neutral_text"
++        android:textSize="16sp"
++        android:visibility="gone"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintTop_toTopOf="parent" />
++
++    <androidx.recyclerview.widget.RecyclerView
++        android:id="@+id/collections_list"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:alpha="0"
++        android:visibility="gone"
++        app:layout_constraintBottom_toTopOf="@+id/add_collection_button" />
++
++    <TextView
++        android:id="@+id/add_collection_button"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:alpha="0"
++        android:background="?foundation"
++        android:drawableStart="@drawable/ic_new"
++        android:drawablePadding="14dp"
++        android:drawableTint="?accent"
++        android:paddingStart="20dp"
++        android:paddingTop="12dp"
++        android:paddingBottom="12dp"
++        android:text="@string/create_collection_add_new_collection"
++        android:textColor="?primaryText"
++        android:textSize="16sp"
++        android:visibility="gone"
++        app:layout_constraintBottom_toTopOf="@+id/divider"
++        tools:targetApi="m" />
++
++    <View
++        android:id="@+id/divider"
++        android:layout_width="match_parent"
++        android:layout_height="1dp"
++        android:background="?neutralFaded"
++        android:visibility="gone"
++        app:layout_constraintBottom_toBottomOf="parent" />
++
++    <EditText
++        android:id="@+id/name_collection_edittext"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_gravity="bottom|center"
++        android:alpha="1"
++        android:autofillHints="false"
++        android:background="?foundation"
++        android:focusedByDefault="true"
++        android:imeOptions="actionDone"
++        android:importantForAutofill="no"
++        android:inputType="text"
++        android:paddingStart="20dp"
++        android:paddingTop="12dp"
++        android:paddingEnd="20dp"
++        android:paddingBottom="12dp"
++        android:text="@string/create_collection_default_name"
++        android:textColor="?primaryText"
++        android:textSize="16sp"
++        android:visibility="visible"
++        app:layout_constraintBottom_toBottomOf="parent"
++        tools:targetApi="o" />
++
++    <androidx.recyclerview.widget.RecyclerView
++        android:id="@+id/tab_list"
++        android:layout_width="0dp"
++        android:layout_height="0dp"
++        android:layout_marginStart="16dp"
++        android:layout_marginTop="16dp"
++        android:layout_marginEnd="16dp"
++        android:fadingEdgeLength="30dp"
++        android:requiresFadingEdge="vertical"
++        app:layout_constraintBottom_toTopOf="@+id/name_collection_edittext"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toBottomOf="@id/back_button" />
++
++    <View
++        android:id="@+id/tab_list_dim"
++        android:layout_width="0dp"
++        android:layout_height="0dp"
++        android:alpha="0.5"
++        android:background="@drawable/scrim_background"
++        android:visibility="visible"
++        app:layout_constraintBottom_toBottomOf="@+id/tab_list"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toTopOf="parent" />
++
++    <androidx.constraintlayout.widget.ConstraintLayout
++        android:id="@+id/add_tabs_layout"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_margin="16dp"
++        android:alpha="0"
++        android:background="@drawable/add_tabs_to_collection_background"
++        android:clipToPadding="false"
++        android:visibility="gone"
++        app:layout_constraintBottom_toBottomOf="parent"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="parent">
++
++        <ImageButton
++            android:id="@+id/close_icon"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_margin="16dp"
++            android:background="?android:attr/selectableItemBackground"
++            android:contentDescription="@string/create_collection_close"
++            android:src="@drawable/mozac_ic_close"
++            android:tint="?neutral"
++            app:layout_constraintBottom_toBottomOf="parent"
++            app:layout_constraintStart_toStartOf="parent"
++            app:layout_constraintTop_toTopOf="parent" />
++
++        <TextView
++            android:id="@+id/select_tabs_layout_text"
++            android:layout_width="0dp"
++            android:layout_height="wrap_content"
++            android:layout_marginStart="8dp"
++            android:layout_marginEnd="8dp"
++            android:gravity="center_vertical"
++            android:singleLine="true"
++            android:text="@string/create_collection_save_to_collection_empty"
++            android:textColor="?neutral"
++            android:textSize="16sp"
++            android:textStyle="bold"
++            app:layout_constraintBottom_toBottomOf="parent"
++            app:layout_constraintStart_toEndOf="@id/close_icon"
++            app:layout_constraintTop_toTopOf="parent" />
++
++        <Button
++            android:id="@+id/save_button"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:background="?android:attr/selectableItemBackground"
++            android:text="@string/create_collection_save"
++            android:textAppearance="@style/TextAppearance.MaterialComponents.Button"
++            android:textColor="?neutral"
++            app:layout_constraintBottom_toBottomOf="parent"
++            app:layout_constraintEnd_toEndOf="parent"
++            app:layout_constraintTop_toTopOf="parent" />
++    </androidx.constraintlayout.widget.ConstraintLayout>
++</androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/fenix/app/src/main/res/layout/component_collection_creation_select_collection.xml b/fenix/app/src/main/res/layout/component_collection_creation_select_collection.xml
+new file mode 100644
+index 000000000000..9f372b37d0a6
+--- /dev/null
++++ b/fenix/app/src/main/res/layout/component_collection_creation_select_collection.xml
+@@ -0,0 +1,183 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:id="@+id/collection_constraint_layout"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:clipToPadding="false">
++
++    <Button
++        android:id="@+id/back_button"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_margin="16dp"
++        android:background="?android:attr/selectableItemBackgroundBorderless"
++        android:drawableStart="@drawable/mozac_ic_back"
++        android:drawablePadding="8dp"
++        android:drawableTint="@color/neutral_text"
++        android:text="@string/create_collection_select_collection"
++        android:textAppearance="@style/HeaderTextStyle"
++        android:textColor="@color/neutral_text"
++        android:textSize="20sp"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toTopOf="parent" />
++
++    <Button
++        android:id="@+id/select_all_button"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_margin="16dp"
++        android:alpha="0"
++        android:background="?android:attr/selectableItemBackgroundBorderless"
++        android:text="@string/create_collection_select_all"
++        android:textAllCaps="false"
++        android:textColor="@color/neutral_text"
++        android:textSize="16sp"
++        android:visibility="gone"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintTop_toTopOf="parent" />
++
++    <androidx.recyclerview.widget.RecyclerView
++        android:id="@+id/collections_list"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:alpha="1"
++        android:visibility="visible"
++        app:layout_constraintBottom_toTopOf="@+id/add_collection_button" />
++
++    <TextView
++        android:id="@+id/add_collection_button"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:alpha="1"
++        android:background="?foundation"
++        android:drawableStart="@drawable/ic_new"
++        android:drawablePadding="14dp"
++        android:drawableTint="?accent"
++        android:paddingStart="20dp"
++        android:paddingTop="12dp"
++        android:paddingBottom="12dp"
++        android:text="@string/create_collection_add_new_collection"
++        android:textColor="?primaryText"
++        android:textSize="16sp"
++        android:visibility="visible"
++        app:layout_constraintBottom_toTopOf="@+id/divider"
++        tools:targetApi="m" />
++
++    <View
++        android:id="@+id/divider"
++        android:layout_width="match_parent"
++        android:layout_height="1dp"
++        android:alpha="1"
++        android:background="?neutralFaded"
++        android:visibility="visible"
++        app:layout_constraintBottom_toBottomOf="parent" />
++
++    <EditText
++        android:id="@+id/name_collection_edittext"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_gravity="bottom|center"
++        android:alpha="0"
++        android:autofillHints="false"
++        android:background="?foundation"
++        android:focusedByDefault="true"
++        android:imeOptions="actionDone"
++        android:importantForAutofill="no"
++        android:inputType="text"
++        android:paddingStart="20dp"
++        android:paddingTop="12dp"
++        android:paddingEnd="20dp"
++        android:paddingBottom="12dp"
++        android:text="@string/create_collection_default_name"
++        android:textColor="?primaryText"
++        android:textSize="16sp"
++        android:visibility="gone"
++        app:layout_constraintBottom_toBottomOf="parent"
++        tools:targetApi="o" />
++
++    <androidx.recyclerview.widget.RecyclerView
++        android:id="@+id/tab_list"
++        android:layout_width="0dp"
++        android:layout_height="0dp"
++        android:layout_marginStart="16dp"
++        android:layout_marginTop="16dp"
++        android:layout_marginEnd="16dp"
++        android:fadingEdgeLength="30dp"
++        android:requiresFadingEdge="vertical"
++        app:layout_constraintBottom_toTopOf="@+id/collections_list"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toBottomOf="@id/back_button" />
++
++    <View
++        android:id="@+id/tab_list_dim"
++        android:layout_width="0dp"
++        android:layout_height="0dp"
++        android:alpha="0.5"
++        android:background="@drawable/scrim_background"
++        android:visibility="visible"
++        app:layout_constraintBottom_toBottomOf="@+id/tab_list"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="parent"
++        app:layout_constraintTop_toTopOf="parent" />
++
++    <androidx.constraintlayout.widget.ConstraintLayout
++        android:id="@+id/add_tabs_layout"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_margin="16dp"
++        android:alpha="0"
++        android:background="@drawable/add_tabs_to_collection_background"
++        android:clipToPadding="false"
++        android:visibility="gone"
++        app:layout_constraintBottom_toBottomOf="parent"
++        app:layout_constraintEnd_toEndOf="parent"
++        app:layout_constraintStart_toStartOf="parent">
++
++        <ImageButton
++            android:id="@+id/close_icon"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_margin="16dp"
++            android:background="?android:attr/selectableItemBackground"
++            android:contentDescription="@string/create_collection_close"
++            android:src="@drawable/mozac_ic_close"
++            android:tint="?neutral"
++            app:layout_constraintBottom_toBottomOf="parent"
++            app:layout_constraintStart_toStartOf="parent"
++            app:layout_constraintTop_toTopOf="parent" />
++
++        <TextView
++            android:id="@+id/select_tabs_layout_text"
++            android:layout_width="0dp"
++            android:layout_height="wrap_content"
++            android:layout_marginStart="8dp"
++            android:layout_marginEnd="8dp"
++            android:gravity="center_vertical"
++            android:singleLine="true"
++            android:text="@string/create_collection_save_to_collection_empty"
++            android:textColor="?neutral"
++            android:textSize="16sp"
++            android:textStyle="bold"
++            app:layout_constraintBottom_toBottomOf="parent"
++            app:layout_constraintStart_toEndOf="@id/close_icon"
++            app:layout_constraintTop_toTopOf="parent" />
++
++        <Button
++            android:id="@+id/save_button"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:background="?android:attr/selectableItemBackground"
++            android:text="@string/create_collection_save"
++            android:textAppearance="@style/TextAppearance.MaterialComponents.Button"
++            android:textColor="?neutral"
++            app:layout_constraintBottom_toBottomOf="parent"
++            app:layout_constraintEnd_toEndOf="parent"
++            app:layout_constraintTop_toTopOf="parent" />
++    </androidx.constraintlayout.widget.ConstraintLayout>
++</androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/fenix/app/src/main/res/values/strings.xml b/fenix/app/src/main/res/values/strings.xml
+index d86e64edfab4..929d4a2f8ace 100644
+--- a/fenix/app/src/main/res/values/strings.xml
++++ b/fenix/app/src/main/res/values/strings.xml
+@@ -436,7 +436,16 @@
+ 
+     <!-- Text to prompt users to select how many tabs they have
+     selected in the "select tabs" stepof the collection creator -->
+-    <string name="create_collection_save_to_collection_full">%d tabs selected</string>
++    <plurals name="create_collection_save_to_collection_full_plural">
++        <item quantity="one">%d tab selected</item>
++        <item quantity="other">%d tabs selected</item>
++    </plurals>
++
++    <!-- Text shown in snackbar when tab(s) have been saved in a collection -->
++    <plurals name="create_collection_tabs_saved">
++        <item quantity="one">Tab saved!</item>
++        <item quantity="other">Tabs saved!</item>
++    </plurals>
+ 
+     <!-- Content description (not visible, for screen readers etc.): button to close the collection creator -->
+     <string name="create_collection_close">Close</string>
+@@ -444,6 +453,18 @@
+     <!-- Button to save currently selected tabs in the "select tabs" step of the collection creator-->
+     <string name="create_collection_save">Save</string>
+ 
++    <!-- Default name for a new collection in "name new collection" step of the collection creator-->
++    <string name="create_collection_default_name">Collection %d</string>
++
++    <!-- Text shown in snackbar when user deletes a collection -->
++    <string name="snackbar_collection_deleted">Collection deleted</string>
++
++    <!-- Text shown in snackbar when user deletes a tab -->
++    <string name="snackbar_tab_deleted">Tab deleted</string>
++
++    <!-- Text for action to undo deleting a tab or collection shown in snackbar -->
++    <string name="snackbar_deleted_undo">UNDO</string>
++
+     <!-- QR code scanner prompt which appears after scanning a code, but before navigating to it
+         First parameter is the name of the app, second parameter is the URL or text scanned-->
+     <string name="qr_scanner_confirmation_dialog_message">Allow %1$s to open %2$s</string>

@@ -1,0 +1,322 @@
+diff --git a/lib/model/message.dart b/lib/model/message.dart
+index 1e3abbbcdb..a3094941f0 100644
+--- a/lib/model/message.dart
++++ b/lib/model/message.dart
+@@ -82,6 +82,12 @@ class MessageStoreImpl with MessageStore {
+     }
+   }
+ 
++  void handleUserTopicEvent(UserTopicEvent event) {
++    for (final view in _messageListViews) {
++      view.handleUserTopicEvent(event);
++    }
++  }
++
+   void handleMessageEvent(MessageEvent event) {
+     // If the message is one we already know about (from a fetch),
+     // clobber it with the one from the event system.
+diff --git a/lib/model/message_list.dart b/lib/model/message_list.dart
+index f20960e221..95d660d4f5 100644
+--- a/lib/model/message_list.dart
++++ b/lib/model/message_list.dart
+@@ -5,6 +5,7 @@ import '../api/model/events.dart';
+ import '../api/model/model.dart';
+ import '../api/route/messages.dart';
+ import 'algorithms.dart';
++import 'channel.dart';
+ import 'content.dart';
+ import 'narrow.dart';
+ import 'store.dart';
+@@ -158,6 +159,38 @@ mixin _MessageSequence {
+     _processMessage(messages.length - 1);
+   }
+ 
++  /// Removes all messages from the list that satisfy [test].
++  ///
++  /// Returns true if any messages were removed, false otherwise.
++  bool _removeMessagesWhere(bool Function(Message) test) {
++    // Before we find a message to remove, there's no need to copy elements.
++    // This is like the loop below, but simplified for `target == candidate`.
++    int candidate = 0;
++    while (true) {
++      if (candidate == messages.length) return false;
++      if (test(messages[candidate])) break;
++      candidate++;
++    }
++
++    int target = candidate;
++    candidate++;
++    assert(contents.length == messages.length);
++    while (candidate < messages.length) {
++      if (test(messages[candidate])) {
++        candidate++;
++        continue;
++      }
++      messages[target] = messages[candidate];
++      contents[target] = contents[candidate];
++      target++; candidate++;
++    }
++    messages.length = target;
++    contents.length = target;
++    assert(contents.length == messages.length);
++    _reprocessAll();
++    return true;
++  }
++
+   /// Removes the given messages, if present.
+   ///
+   /// Returns true if at least one message was present, false otherwise.
+@@ -389,6 +422,24 @@ class MessageListView with ChangeNotifier, _MessageSequence {
+     }
+   }
+ 
++  /// Whether this event could affect the result that [_messageVisible]
++  /// would ever have returned for any possible message in this message list.
++  VisibilityEffect _canAffectVisibility(UserTopicEvent event) {
++    switch (narrow) {
++      case CombinedFeedNarrow():
++        return store.willChangeIfTopicVisible(event);
++
++      case ChannelNarrow(:final streamId):
++        if (event.streamId != streamId) return VisibilityEffect.none;
++        return store.willChangeIfTopicVisibleInStream(event);
++
++      case TopicNarrow():
++      case DmNarrow():
++      case MentionsNarrow():
++        return VisibilityEffect.none;
++    }
++  }
++
+   /// Whether [_messageVisible] is true for all possible messages.
+   ///
+   /// This is useful for an optimization.
+@@ -477,6 +528,31 @@ class MessageListView with ChangeNotifier, _MessageSequence {
+     }
+   }
+ 
++  void handleUserTopicEvent(UserTopicEvent event) {
++    switch (_canAffectVisibility(event)) {
++      case VisibilityEffect.none:
++        return;
++
++      case VisibilityEffect.muted:
++        if (_removeMessagesWhere((message) =>
++            (message is StreamMessage
++             && message.streamId == event.streamId
++             && message.topic == event.topicName))) {
++          notifyListeners();
++        }
++
++      case VisibilityEffect.unmuted:
++        // TODO get the newly-unmuted messages from the message store
++        // For now, we simplify the task by just refetching this message list
++        // from scratch.
++        if (fetched) {
++          _reset();
++          notifyListeners();
++          fetchInitial();
++        }
++    }
++  }
++
+   void handleDeleteMessageEvent(DeleteMessageEvent event) {
+     if (_removeMessagesById(event.messageIds)) {
+       notifyListeners();
+diff --git a/lib/model/store.dart b/lib/model/store.dart
+index 228ff2b37e..bdd6c0d9a5 100644
+--- a/lib/model/store.dart
++++ b/lib/model/store.dart
+@@ -503,6 +503,8 @@ class PerAccountStore extends ChangeNotifier with ChannelStore, MessageStore {
+ 
+       case UserTopicEvent():
+         assert(debugLog("server event: user_topic"));
++        _messages.handleUserTopicEvent(event);
++        // Update _channels last, so other handlers can compare to the old value.
+         _channels.handleUserTopicEvent(event);
+         notifyListeners();
+ 
+diff --git a/test/model/message_list_test.dart b/test/model/message_list_test.dart
+index 486a04fe7e..ccb006e78a 100644
+--- a/test/model/message_list_test.dart
++++ b/test/model/message_list_test.dart
+@@ -311,6 +311,179 @@ void main() {
+     check(model).fetched.isFalse();
+   });
+ 
++  group('UserTopicEvent', () {
++    // The ChannelStore.willChangeIfTopicVisible/InStream methods have their own
++    // thorough unit tests.  So these tests focus on the rest of the logic.
++
++    final stream = eg.stream();
++    const String topic = 'foo';
++
++    Future<void> setVisibility(UserTopicVisibilityPolicy policy) async {
++      await store.handleEvent(eg.userTopicEvent(stream.streamId, topic, policy));
++    }
++
++    /// (Should run after `prepare`.)
++    Future<void> prepareMutes([
++      bool streamMuted = false,
++      UserTopicVisibilityPolicy policy = UserTopicVisibilityPolicy.none,
++    ]) async {
++      await store.addStream(stream);
++      await store.addSubscription(eg.subscription(stream, isMuted: streamMuted));
++      await setVisibility(policy);
++    }
++
++    void checkHasMessageIds(Iterable<int> messageIds) {
++      check(model.messages.map((m) => m.id)).deepEquals(messageIds);
++    }
++
++    test('mute a visible topic', () async {
++      await prepare(narrow: const CombinedFeedNarrow());
++      await prepareMutes();
++      final otherStream = eg.stream();
++      await store.addStream(otherStream);
++      await store.addSubscription(eg.subscription(otherStream));
++      await prepareMessages(foundOldest: true, messages: [
++        eg.streamMessage(id: 1, stream: stream, topic: 'bar'),
++        eg.streamMessage(id: 2, stream: stream, topic: topic),
++        eg.streamMessage(id: 3, stream: otherStream, topic: 'elsewhere'),
++        eg.dmMessage(    id: 4, from: eg.otherUser, to: [eg.selfUser]),
++      ]);
++      checkHasMessageIds([1, 2, 3, 4]);
++
++      await setVisibility(UserTopicVisibilityPolicy.muted);
++      checkNotifiedOnce();
++      checkHasMessageIds([1, 3, 4]);
++    });
++
++    test('in CombinedFeedNarrow, use combined-feed visibility', () async {
++      // Compare the parallel ChannelNarrow test below.
++      await prepare(narrow: const CombinedFeedNarrow());
++      // Mute the stream, so that combined-feed vs. stream visibility differ.
++      await prepareMutes(true, UserTopicVisibilityPolicy.followed);
++      await prepareMessages(foundOldest: true, messages: [
++        eg.streamMessage(id: 1, stream: stream, topic: topic),
++      ]);
++      checkHasMessageIds([1]);
++
++      // Dropping from followed to none hides the message
++      // (whereas it'd have no effect in a stream narrow).
++      await setVisibility(UserTopicVisibilityPolicy.none);
++      checkNotifiedOnce();
++      checkHasMessageIds([]);
++
++      // Dropping from none to muted has no further effect
++      // (whereas it'd hide the message in a stream narrow).
++      await setVisibility(UserTopicVisibilityPolicy.muted);
++      checkNotNotified();
++      checkHasMessageIds([]);
++    });
++
++    test('in ChannelNarrow, use stream visibility', () async {
++      // Compare the parallel CombinedFeedNarrow test above.
++      await prepare(narrow: ChannelNarrow(stream.streamId));
++      // Mute the stream, so that combined-feed vs. stream visibility differ.
++      await prepareMutes(true, UserTopicVisibilityPolicy.followed);
++      await prepareMessages(foundOldest: true, messages: [
++        eg.streamMessage(id: 1, stream: stream, topic: topic),
++      ]);
++      checkHasMessageIds([1]);
++
++      // Dropping from followed to none has no effect
++      // (whereas it'd hide the message in the combined feed).
++      await setVisibility(UserTopicVisibilityPolicy.none);
++      checkNotNotified();
++      checkHasMessageIds([1]);
++
++      // Dropping from none to muted hides the message
++      // (whereas it'd have no effect in a stream narrow).
++      await setVisibility(UserTopicVisibilityPolicy.muted);
++      checkNotifiedOnce();
++      checkHasMessageIds([]);
++    });
++
++    test('in TopicNarrow, stay visible', () async {
++      await prepare(narrow: TopicNarrow(stream.streamId, topic));
++      await prepareMutes();
++      await prepareMessages(foundOldest: true, messages: [
++        eg.streamMessage(id: 1, stream: stream, topic: topic),
++      ]);
++      checkHasMessageIds([1]);
++
++      await setVisibility(UserTopicVisibilityPolicy.muted);
++      checkNotNotified();
++      checkHasMessageIds([1]);
++    });
++
++    test('in DmNarrow, do nothing (smoke test)', () async {
++      await prepare(narrow:
++        DmNarrow.withUser(eg.otherUser.userId, selfUserId: eg.selfUser.userId));
++      await prepareMutes();
++      await prepareMessages(foundOldest: true, messages: [
++        eg.dmMessage(id: 1, from: eg.otherUser, to: [eg.selfUser]),
++      ]);
++      checkHasMessageIds([1]);
++
++      await setVisibility(UserTopicVisibilityPolicy.muted);
++      checkNotNotified();
++      checkHasMessageIds([1]);
++    });
++
++    test('no affected messages -> no notification', () async {
++      await prepare(narrow: const CombinedFeedNarrow());
++      await prepareMutes();
++      await prepareMessages(foundOldest: true, messages: [
++        eg.streamMessage(id: 1, stream: stream, topic: 'bar'),
++      ]);
++      checkHasMessageIds([1]);
++
++      await setVisibility(UserTopicVisibilityPolicy.muted);
++      checkNotNotified();
++      checkHasMessageIds([1]);
++    });
++
++    test('unmute a topic -> refetch from scratch', () => awaitFakeAsync((async) async {
++      await prepare(narrow: const CombinedFeedNarrow());
++      await prepareMutes(true);
++      final messages = [
++        eg.dmMessage(id: 1, from: eg.otherUser, to: [eg.selfUser]),
++        eg.streamMessage(id: 2, stream: stream, topic: topic),
++      ];
++      await prepareMessages(foundOldest: true, messages: messages);
++      checkHasMessageIds([1]);
++
++      connection.prepare(
++        json: newestResult(foundOldest: true, messages: messages).toJson());
++      await setVisibility(UserTopicVisibilityPolicy.unmuted);
++      checkNotifiedOnce();
++      check(model).fetched.isFalse();
++      checkHasMessageIds([]);
++
++      async.elapse(Duration.zero);
++      checkNotifiedOnce();
++      checkHasMessageIds([1, 2]);
++    }));
++
++    test('unmute a topic before initial fetch completes -> do nothing', () => awaitFakeAsync((async) async {
++      await prepare(narrow: const CombinedFeedNarrow());
++      await prepareMutes(true);
++      final messages = [
++        eg.streamMessage(id: 1, stream: stream, topic: topic),
++      ];
++
++      connection.prepare(
++        json: newestResult(foundOldest: true, messages: messages).toJson());
++      final fetchFuture = model.fetchInitial();
++
++      await setVisibility(UserTopicVisibilityPolicy.unmuted);
++      checkNotNotified();
++
++      // The new policy does get applied when the fetch eventually completes.
++      await fetchFuture;
++      checkNotifiedOnce();
++      checkHasMessageIds([1]);
++    }));
++  });
++
+   group('DeleteMessageEvent', () {
+     final stream = eg.stream();
+     final messages = List.generate(30, (i) => eg.streamMessage(stream: stream));

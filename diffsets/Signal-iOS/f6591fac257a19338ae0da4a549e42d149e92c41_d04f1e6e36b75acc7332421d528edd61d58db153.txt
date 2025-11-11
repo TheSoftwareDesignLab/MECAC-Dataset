@@ -1,0 +1,565 @@
+diff --git a/Signal/src/ViewControllers/DebugUI/DebugUIMessages.m b/Signal/src/ViewControllers/DebugUI/DebugUIMessages.m
+index f82105167dc..ad4a722f7a2 100644
+--- a/Signal/src/ViewControllers/DebugUI/DebugUIMessages.m
++++ b/Signal/src/ViewControllers/DebugUI/DebugUIMessages.m
+@@ -127,7 +127,7 @@ - (nullable OWSTableSection *)sectionForThread:(nullable TSThread *)thread
+                         actionBlock:^{
+                             [DebugUIMessages sendNTextMessagesInThread:thread];
+                         }],
+-        [OWSTableItem itemWithTitle:@"Send multi-image messages"
++        [OWSTableItem itemWithTitle:@"Send Multi-Image Message"
+                         actionBlock:^{
+                             [DebugUIMessages sendMultiImageMessageInThread:thread];
+                         }],
+diff --git a/Signal/src/ViewControllers/MediaGalleryViewController.swift b/Signal/src/ViewControllers/MediaGalleryViewController.swift
+index a222b7ec19f..2319f74a28e 100644
+--- a/Signal/src/ViewControllers/MediaGalleryViewController.swift
++++ b/Signal/src/ViewControllers/MediaGalleryViewController.swift
+@@ -634,7 +634,8 @@ class MediaGallery: NSObject, MediaGalleryDataSource, MediaTileViewControllerDel
+     var hasFetchedMostRecent = false
+ 
+     func buildGalleryItem(message: TSMessage, transaction: YapDatabaseReadTransaction) -> MediaGalleryItem? {
+-        guard let attachmentStream = message.attachment(with: transaction) as? TSAttachmentStream else {
++        // TODO: Support multi-image messages.
++        guard let attachmentStream = message.attachments(with: transaction).first as? TSAttachmentStream else {
+             owsFailDebug("attachment was unexpectedly empty")
+             return nil
+         }
+diff --git a/SignalMessaging/ViewModels/OWSQuotedReplyModel.m b/SignalMessaging/ViewModels/OWSQuotedReplyModel.m
+index b7be0720e85..ec31ccb1048 100644
+--- a/SignalMessaging/ViewModels/OWSQuotedReplyModel.m
++++ b/SignalMessaging/ViewModels/OWSQuotedReplyModel.m
+@@ -167,7 +167,7 @@ + (nullable instancetype)quotedReplyForSendingWithConversationViewItem:(id<Conve
+     BOOL hasText = quotedText.length > 0;
+     BOOL hasAttachment = NO;
+ 
+-    TSAttachment *_Nullable attachment = [message attachmentWithTransaction:transaction];
++    TSAttachment *_Nullable attachment = [message attachmentsWithTransaction:transaction].firstObject;
+     TSAttachmentStream *quotedAttachment;
+     if (attachment && [attachment isKindOfClass:[TSAttachmentStream class]]) {
+ 
+diff --git a/SignalMessaging/attachments/SignalAttachment.swift b/SignalMessaging/attachments/SignalAttachment.swift
+index c41370a801b..0953efe5b20 100644
+--- a/SignalMessaging/attachments/SignalAttachment.swift
++++ b/SignalMessaging/attachments/SignalAttachment.swift
+@@ -239,6 +239,11 @@ public class SignalAttachment: NSObject {
+         return errorDescription
+     }
+ 
++    @objc
++    public var outgoingAttachmentInfo: OutgoingAttachmentInfo {
++        return OutgoingAttachmentInfo(dataSource: dataSource, contentType: mimeType, sourceFilename: filenameOrDefault)
++    }
++    
+     @objc
+     public func image() -> UIImage? {
+         if let cachedImage = cachedImage {
+diff --git a/SignalMessaging/utils/ThreadUtil.m b/SignalMessaging/utils/ThreadUtil.m
+index 51d78d3e557..3952e97cea5 100644
+--- a/SignalMessaging/utils/ThreadUtil.m
++++ b/SignalMessaging/utils/ThreadUtil.m
+@@ -127,11 +127,11 @@ + (TSOutgoingMessage *)enqueueMessageWithAttachments:(NSArray<SignalAttachment *
+                                                       quotedMessage:[quotedReplyModel buildQuotedMessageForSending]
+                                                        contactShare:nil];
+ 
+-    [self.messageSenderJobQueue addMediaMessage:message
+-                                     dataSource:attachment.dataSource
+-                                    contentType:attachment.mimeType
+-                                 sourceFilename:attachment.filenameOrDefault
+-                          isTemporaryAttachment:NO];
++    NSMutableArray<OWSOutgoingAttachmentInfo *> *attachmentInfos = [NSMutableArray new];
++    for (SignalAttachment *attachment in attachments) {
++        [attachmentInfos addObject:attachment.outgoingAttachmentInfo];
++    }
++    [self.messageSenderJobQueue addMediaMessage:message attachmentInfos:attachmentInfos isTemporaryAttachment:NO];
+ 
+     return message;
+ }
+diff --git a/SignalServiceKit/src/Messages/Attachments/TSAttachmentStream.h b/SignalServiceKit/src/Messages/Attachments/TSAttachmentStream.h
+index 06ad4f80f59..553619328da 100644
+--- a/SignalServiceKit/src/Messages/Attachments/TSAttachmentStream.h
++++ b/SignalServiceKit/src/Messages/Attachments/TSAttachmentStream.h
+@@ -60,9 +60,6 @@ typedef void (^OWSThumbnailFailure)(void);
+ - (BOOL)writeData:(NSData *)data error:(NSError **)error;
+ - (BOOL)writeDataSource:(DataSource *)dataSource;
+ 
+-- (BOOL)isOversizeText;
+-- (nullable NSString *)readOversizeText;
+-
+ + (void)deleteAttachments;
+ 
+ + (NSString *)attachmentsFolder;
+diff --git a/SignalServiceKit/src/Messages/Attachments/TSAttachmentStream.m b/SignalServiceKit/src/Messages/Attachments/TSAttachmentStream.m
+index ccdf0d407fe..cc19429f9a0 100644
+--- a/SignalServiceKit/src/Messages/Attachments/TSAttachmentStream.m
++++ b/SignalServiceKit/src/Messages/Attachments/TSAttachmentStream.m
+@@ -630,27 +630,6 @@ - (nullable OWSBackupFragment *)lazyRestoreFragment
+     return [OWSBackupFragment fetchObjectWithUniqueID:self.lazyRestoreFragmentId];
+ }
+ 
+-- (BOOL)isOversizeText
+-{
+-    return [self.contentType isEqualToString:OWSMimeTypeOversizeTextMessage];
+-}
+-
+-- (nullable NSString *)readOversizeText
+-{
+-    if (!self.isOversizeText) {
+-        OWSFailDebug(@"oversize text attachment has unexpected content type.");
+-        return nil;
+-    }
+-    NSError *error;
+-    NSData *_Nullable data = [self readDataFromFileWithError:&error];
+-    if (error || !data) {
+-        OWSFailDebug(@"could not read oversize text attachment: %@.", error);
+-        return nil;
+-    }
+-    NSString *_Nullable string = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+-    return string;
+-}
+-
+ #pragma mark - Thumbnails
+ 
+ - (nullable UIImage *)thumbnailImageWithSizeHint:(CGSize)sizeHint
+diff --git a/SignalServiceKit/src/Messages/Interactions/OWSContact.m b/SignalServiceKit/src/Messages/Interactions/OWSContact.m
+index 80c9d9bb242..1a4aa9485c7 100644
+--- a/SignalServiceKit/src/Messages/Interactions/OWSContact.m
++++ b/SignalServiceKit/src/Messages/Interactions/OWSContact.m
+@@ -489,7 +489,6 @@ - (nullable TSAttachment *)avatarAttachmentWithTransaction:(YapDatabaseReadTrans
+     return [TSAttachment fetchObjectWithUniqueID:self.avatarAttachmentId transaction:transaction];
+ }
+ 
+-
+ - (void)saveAvatarImage:(UIImage *)image transaction:(YapDatabaseReadWriteTransaction *)transaction
+ {
+     NSData *imageData = UIImageJPEGRepresentation(image, (CGFloat)0.9);
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSMessage.h b/SignalServiceKit/src/Messages/Interactions/TSMessage.h
+index 869ccdc4104..99273bda448 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSMessage.h
++++ b/SignalServiceKit/src/Messages/Interactions/TSMessage.h
+@@ -41,9 +41,11 @@ NS_ASSUME_NONNULL_BEGIN
+ - (nullable instancetype)initWithCoder:(NSCoder *)coder NS_DESIGNATED_INITIALIZER;
+ 
+ - (BOOL)hasAttachments;
+-- (nullable TSAttachment *)attachmentWithTransaction:(YapDatabaseReadTransaction *)transaction;
++- (NSArray<TSAttachment *> *)attachmentsWithTransaction:(YapDatabaseReadTransaction *)transaction;
+ 
+ - (void)setQuotedMessageThumbnailAttachmentStream:(TSAttachmentStream *)attachmentStream;
++
++- (nullable NSString *)oversizeTextWithTransaction:(YapDatabaseReadTransaction *)transaction;
+ - (nullable NSString *)bodyTextWithTransaction:(YapDatabaseReadTransaction *)transaction;
+ 
+ - (BOOL)shouldStartExpireTimerWithTransaction:(YapDatabaseReadTransaction *)transaction;
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSMessage.m b/SignalServiceKit/src/Messages/Interactions/TSMessage.m
+index 78381f9f864..7182a0e8dc0 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSMessage.m
++++ b/SignalServiceKit/src/Messages/Interactions/TSMessage.m
+@@ -199,14 +199,19 @@ - (BOOL)hasAttachments
+     return self.attachmentIds ? (self.attachmentIds.count > 0) : NO;
+ }
+ 
+-- (nullable TSAttachment *)attachmentWithTransaction:(YapDatabaseReadTransaction *)transaction
++- (NSArray<TSAttachment *> *)attachmentsWithTransaction:(YapDatabaseReadTransaction *)transaction
+ {
+-    if (!self.hasAttachments) {
+-        return nil;
++    NSMutableArray<TSAttachment *> *attachments = [NSMutableArray new];
++    for (NSString *attachmentId in self.attachmentIds) {
++        TSAttachment *_Nullable attachment =
++            [TSAttachment fetchObjectWithUniqueID:attachmentId transaction:transaction];
++        if (attachment) {
++            [attachments addObject:attachment];
++        } else {
++            OWSFailDebug(@"Missing attachment for: %@.", attachmentId);
++        }
+     }
+-
+-    OWSAssertDebug(self.attachmentIds.count == 1);
+-    return [TSAttachment fetchObjectWithUniqueID:self.attachmentIds.firstObject transaction:transaction];
++    return [attachments copy];
+ }
+ 
+ - (NSString *)debugDescription
+@@ -223,23 +228,40 @@ - (NSString *)debugDescription
+     }
+ }
+ 
++- (nullable NSString *)oversizeTextWithTransaction:(YapDatabaseReadTransaction *)transaction
++{
++    if (self.attachmentIds.count != 1) {
++        return nil;
++    }
++
++    TSAttachment *_Nullable attachment = [self attachmentsWithTransaction:transaction].firstObject;
++    OWSAssertDebug(attachment);
++
++    if (![OWSMimeTypeOversizeTextMessage isEqualToString:attachment.contentType]
++        || ![attachment isKindOfClass:TSAttachmentStream.class]) {
++        return nil;
++    }
++
++    TSAttachmentStream *attachmentStream = (TSAttachmentStream *)attachment;
++
++    NSData *_Nullable data = [NSData dataWithContentsOfFile:attachmentStream.originalFilePath];
++    if (!data) {
++        OWSFailDebug(@"Can't load oversize text data.");
++        return nil;
++    }
++    NSString *_Nullable text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
++    if (!text) {
++        OWSFailDebug(@"Can't parse oversize text data.");
++        return nil;
++    }
++    return text.filterStringForDisplay;
++}
++
+ - (nullable NSString *)bodyTextWithTransaction:(YapDatabaseReadTransaction *)transaction
+ {
+-    if (self.hasAttachments) {
+-        TSAttachment *_Nullable attachment = [self attachmentWithTransaction:transaction];
+-
+-        if ([OWSMimeTypeOversizeTextMessage isEqualToString:attachment.contentType] &&
+-            [attachment isKindOfClass:TSAttachmentStream.class]) {
+-            TSAttachmentStream *attachmentStream = (TSAttachmentStream *)attachment;
+-
+-            NSData *_Nullable data = [NSData dataWithContentsOfFile:attachmentStream.originalFilePath];
+-            if (data) {
+-                NSString *_Nullable text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+-                if (text) {
+-                    return text.filterStringForDisplay;
+-                }
+-            }
+-        }
++    NSString *_Nullable oversizeText = [self oversizeTextWithTransaction:transaction];
++    if (oversizeText) {
++        return oversizeText;
+     }
+ 
+     if (self.body.length > 0) {
+diff --git a/SignalServiceKit/src/Messages/Interactions/TSQuotedMessage.m b/SignalServiceKit/src/Messages/Interactions/TSQuotedMessage.m
+index 27a6a408adb..5bb9bd2652d 100644
+--- a/SignalServiceKit/src/Messages/Interactions/TSQuotedMessage.m
++++ b/SignalServiceKit/src/Messages/Interactions/TSQuotedMessage.m
+@@ -253,7 +253,8 @@ + (nullable TSAttachmentStream *)tryToDeriveLocalThumbnailWithAttachmentInfo:(OW
+         return nil;
+     }
+ 
+-    TSAttachment *attachment = [quotedMessage attachmentWithTransaction:transaction];
++    // We quote _the first_ attachment, if any.
++    TSAttachment *_Nullable attachment = [quotedMessage attachmentsWithTransaction:transaction].firstObject;
+     if (![attachment isKindOfClass:[TSAttachmentStream class]]) {
+         return nil;
+     }
+diff --git a/SignalServiceKit/src/Messages/OWSMessageSender.h b/SignalServiceKit/src/Messages/OWSMessageSender.h
+index a7b182ebce1..483d75c0b4f 100644
+--- a/SignalServiceKit/src/Messages/OWSMessageSender.h
++++ b/SignalServiceKit/src/Messages/OWSMessageSender.h
+@@ -33,6 +33,23 @@ typedef void (^RetryableFailureHandler)(NSError *_Nonnull error);
+ 
+ #pragma mark -
+ 
++NS_SWIFT_NAME(OutgoingAttachmentInfo)
++@interface OWSOutgoingAttachmentInfo : NSObject
++
++@property (nonatomic, readonly) DataSource *dataSource;
++@property (nonatomic, readonly) NSString *contentType;
++@property (nonatomic, readonly, nullable) NSString *sourceFilename;
++
++- (instancetype)init NS_UNAVAILABLE;
++
++- (instancetype)initWithDataSource:(DataSource *)dataSource
++                       contentType:(NSString *)contentType
++                    sourceFilename:(nullable NSString *)sourceFilename NS_DESIGNATED_INITIALIZER;
++
++@end
++
++#pragma mark -
++
+ NS_SWIFT_NAME(MessageSender)
+ @interface OWSMessageSender : NSObject
+ 
+@@ -71,6 +88,8 @@ NS_SWIFT_NAME(MessageSender)
+ 
+ @end
+ 
++#pragma mark -
++
+ @interface OutgoingMessagePreparer : NSObject
+ 
+ /// Persists all necessary data to disk before sending, e.g. generate thumbnails
+@@ -80,11 +99,10 @@ NS_SWIFT_NAME(MessageSender)
+                      transaction:(YapDatabaseReadWriteTransaction *)transaction;
+ 
+ /// Writes attachment to disk and applies original filename to message attributes
+-+ (void)prepareAttachmentWithDataSource:(DataSource *)dataSource
+-                            contentType:(NSString *)contentType
+-                         sourceFilename:(nullable NSString *)sourceFilename
+-                              inMessage:(TSOutgoingMessage *)outgoingMessage
+-                      completionHandler:(void (^)(NSError *_Nullable error))completionHandler;
+++ (void)prepareAttachments:(NSArray<OWSOutgoingAttachmentInfo *> *)attachmentInfos
++                 inMessage:(TSOutgoingMessage *)outgoingMessage
++         completionHandler:(void (^)(NSError *_Nullable error))completionHandler
++    NS_SWIFT_NAME(prepareAttachments(_:inMessage:completionHandler:));
+ 
+ @end
+ 
+diff --git a/SignalServiceKit/src/Messages/OWSMessageSender.m b/SignalServiceKit/src/Messages/OWSMessageSender.m
+index 737a57b4f8d..9edc3a6a937 100644
+--- a/SignalServiceKit/src/Messages/OWSMessageSender.m
++++ b/SignalServiceKit/src/Messages/OWSMessageSender.m
+@@ -81,6 +81,28 @@ void AssertIsOnSendingQueue()
+ 
+ #pragma mark -
+ 
++@implementation OWSOutgoingAttachmentInfo
++
++- (instancetype)initWithDataSource:(DataSource *)dataSource
++                       contentType:(NSString *)contentType
++                    sourceFilename:(nullable NSString *)sourceFilename
++{
++    self = [super init];
++    if (!self) {
++        return self;
++    }
++
++    _dataSource = dataSource;
++    _contentType = contentType;
++    _sourceFilename = sourceFilename;
++
++    return self;
++}
++
++@end
++
++#pragma mark -
++
+ /**
+  * OWSSendMessageOperation encapsulates all the work associated with sending a message, e.g. uploading attachments,
+  * getting proper keys, and retrying upon failure.
+@@ -156,13 +178,14 @@ - (nullable NSError *)checkForPreconditionError
+ 
+     // Sanity check preconditions
+     if (self.message.hasAttachments) {
+-        [self.dbConnection readWithBlock:^(YapDatabaseReadTransaction * transaction) {
+-            TSAttachmentStream *attachmentStream
+-                = (TSAttachmentStream *)[self.message attachmentWithTransaction:transaction];
+-            OWSAssertDebug(attachmentStream);
+-            OWSAssertDebug([attachmentStream isKindOfClass:[TSAttachmentStream class]]);
+-            OWSAssertDebug(attachmentStream.serverId);
+-            OWSAssertDebug(attachmentStream.isUploaded);
++        [self.dbConnection readWithBlock:^(YapDatabaseReadTransaction *transaction) {
++            for (TSAttachment *attachment in [self.message attachmentsWithTransaction:transaction]) {
++                OWSAssertDebug([attachment isKindOfClass:[TSAttachmentStream class]]);
++                TSAttachmentStream *attachmentStream = (TSAttachmentStream *)attachment;
++                OWSAssertDebug(attachmentStream);
++                OWSAssertDebug(attachmentStream.serverId);
++                OWSAssertDebug(attachmentStream.isUploaded);
++            }
+         }];
+     }
+ 
+@@ -431,17 +454,18 @@ - (void)sendAttachment:(DataSource *)dataSource
+                failure:(void (^)(NSError *error))failureHandler
+ {
+     OWSAssertDebug(dataSource);
+-    [OutgoingMessagePreparer prepareAttachmentWithDataSource:dataSource
+-                                                 contentType:contentType
+-                                              sourceFilename:sourceFilename
+-                                                   inMessage:message
+-                                           completionHandler:^(NSError *_Nullable error) {
+-                                               if (error) {
+-                                                   failureHandler(error);
+-                                                   return;
+-                                               }
+-                                               [self sendMessage:message success:successHandler failure:failureHandler];
+-                                           }];
++    OWSOutgoingAttachmentInfo *attachmentInfo = [[OWSOutgoingAttachmentInfo alloc] initWithDataSource:dataSource
++                                                                                          contentType:contentType
++                                                                                       sourceFilename:sourceFilename];
++    [OutgoingMessagePreparer prepareAttachments:@[ attachmentInfo ]
++                                      inMessage:message
++                              completionHandler:^(NSError *_Nullable error) {
++                                  if (error) {
++                                      failureHandler(error);
++                                      return;
++                                  }
++                                  [self sendMessage:message success:successHandler failure:failureHandler];
++                              }];
+ }
+ 
+ - (void)sendMessageToService:(TSOutgoingMessage *)message
+@@ -1768,35 +1792,42 @@ + (void)prepareMessageForSending:(TSOutgoingMessage *)message
+     [message updateWithMarkingAllUnsentRecipientsAsSendingWithTransaction:transaction];
+ }
+ 
+-+ (void)prepareAttachmentWithDataSource:(DataSource *)dataSource
+-                            contentType:(NSString *)contentType
+-                         sourceFilename:(nullable NSString *)sourceFilename
+-                              inMessage:(TSOutgoingMessage *)outgoingMessage
+-                      completionHandler:(void (^)(NSError *_Nullable error))completionHandler
+++ (void)prepareAttachments:(NSArray<OWSOutgoingAttachmentInfo *> *)attachmentInfos
++                 inMessage:(TSOutgoingMessage *)outgoingMessage
++         completionHandler:(void (^)(NSError *_Nullable error))completionHandler
+ {
+-    OWSAssertDebug(dataSource);
++    OWSAssertDebug(attachmentInfos.count > 0);
++    OWSAssertDebug(outgoingMessage);
+ 
+     dispatch_async([OWSDispatch attachmentsQueue], ^{
+-        TSAttachmentStream *attachmentStream =
+-            [[TSAttachmentStream alloc] initWithContentType:contentType
+-                                                  byteCount:(UInt32)dataSource.dataLength
+-                                             sourceFilename:sourceFilename];
+-        if (outgoingMessage.isVoiceMessage) {
+-            attachmentStream.attachmentType = TSAttachmentTypeVoiceMessage;
+-        }
++        NSMutableArray<TSAttachmentStream *> *attachmentStreams = [NSMutableArray new];
++        for (OWSOutgoingAttachmentInfo *attachmentInfo in attachmentInfos) {
++            TSAttachmentStream *attachmentStream =
++                [[TSAttachmentStream alloc] initWithContentType:attachmentInfo.contentType
++                                                      byteCount:(UInt32)attachmentInfo.dataSource.dataLength
++                                                 sourceFilename:attachmentInfo.sourceFilename];
++            if (outgoingMessage.isVoiceMessage) {
++                attachmentStream.attachmentType = TSAttachmentTypeVoiceMessage;
++            }
+ 
+-        if (![attachmentStream writeDataSource:dataSource]) {
+-            OWSProdError([OWSAnalyticsEvents messageSenderErrorCouldNotWriteAttachment]);
+-            NSError *error = OWSErrorMakeWriteAttachmentDataError();
+-            completionHandler(error);
++            if (![attachmentStream writeDataSource:attachmentInfo.dataSource]) {
++                OWSProdError([OWSAnalyticsEvents messageSenderErrorCouldNotWriteAttachment]);
++                NSError *error = OWSErrorMakeWriteAttachmentDataError();
++                completionHandler(error);
++                return;
++            }
++
++            [attachmentStreams addObject:attachmentStream];
+         }
+ 
+         [self.dbConnection readWriteWithBlock:^(YapDatabaseReadWriteTransaction *_Nonnull transaction) {
+-            [attachmentStream saveWithTransaction:transaction];
++            for (TSAttachmentStream *attachmentStream in attachmentStreams) {
++                [attachmentStream saveWithTransaction:transaction];
+ 
+-            [outgoingMessage.attachmentIds addObject:attachmentStream.uniqueId];
+-            if (sourceFilename) {
+-                outgoingMessage.attachmentFilenameMap[attachmentStream.uniqueId] = sourceFilename;
++                [outgoingMessage.attachmentIds addObject:attachmentStream.uniqueId];
++                if (attachmentStream.sourceFilename) {
++                    outgoingMessage.attachmentFilenameMap[attachmentStream.uniqueId] = attachmentStream.sourceFilename;
++                }
+             }
+             [outgoingMessage saveWithTransaction:transaction];
+         }];
+diff --git a/SignalServiceKit/src/Network/MessageSenderJobQueue.swift b/SignalServiceKit/src/Network/MessageSenderJobQueue.swift
+index 7976a3a0f41..755f6ecdb22 100644
+--- a/SignalServiceKit/src/Network/MessageSenderJobQueue.swift
++++ b/SignalServiceKit/src/Network/MessageSenderJobQueue.swift
+@@ -34,20 +34,25 @@ public class MessageSenderJobQueue: NSObject, JobQueue {
+ 
+     @objc(addMediaMessage:dataSource:contentType:sourceFilename:isTemporaryAttachment:)
+     public func add(mediaMessage: TSOutgoingMessage, dataSource: DataSource, contentType: String, sourceFilename: String?, isTemporaryAttachment: Bool) {
+-        OutgoingMessagePreparer.prepareAttachment(with: dataSource,
+-                                                       contentType: contentType,
+-                                                       sourceFilename: sourceFilename,
+-                                                       in: mediaMessage) { error in
+-                                                        if let error = error {
+-                                                            self.dbConnection.readWrite { transaction in
+-                                                                mediaMessage.update(sendingError: error, transaction: transaction)
+-                                                            }
+-                                                        } else {
+-                                                            self.dbConnection.readWrite { transaction in
+-                                                                self.add(message: mediaMessage, removeMessageAfterSending: isTemporaryAttachment, transaction: transaction)
+-                                                            }
++        let attachmentInfo = OutgoingAttachmentInfo(dataSource: dataSource, contentType: contentType, sourceFilename: sourceFilename)
++        add(mediaMessage: mediaMessage, attachmentInfos: [attachmentInfo], isTemporaryAttachment: isTemporaryAttachment)
++    }
++
++    @objc(addMediaMessage:attachmentInfos:isTemporaryAttachment:)
++    public func add(mediaMessage: TSOutgoingMessage, attachmentInfos: [OutgoingAttachmentInfo], isTemporaryAttachment: Bool) {
++        OutgoingMessagePreparer.prepareAttachments(attachmentInfos,
++                                                  inMessage: mediaMessage,
++                                                  completionHandler: { error in
++                                                    if let error = error {
++                                                        self.dbConnection.readWrite { transaction in
++                                                            mediaMessage.update(sendingError: error, transaction: transaction)
+                                                         }
+-        }
++                                                    } else {
++                                                        self.dbConnection.readWrite { transaction in
++                                                            self.add(message: mediaMessage, removeMessageAfterSending: isTemporaryAttachment, transaction: transaction)
++                                                        }
++                                                    }
++        })
+     }
+ 
+     private func add(message: TSOutgoingMessage, removeMessageAfterSending: Bool, transaction: YapDatabaseReadWriteTransaction) {
+diff --git a/SignalServiceKit/src/Storage/FullTextSearchFinder.swift b/SignalServiceKit/src/Storage/FullTextSearchFinder.swift
+index 1ccf7f9885f..626304e92e0 100644
+--- a/SignalServiceKit/src/Storage/FullTextSearchFinder.swift
++++ b/SignalServiceKit/src/Storage/FullTextSearchFinder.swift
+@@ -204,29 +204,7 @@ public class FullTextSearchFinder: NSObject {
+     }
+ 
+     private static func oversizeText(forMessage message: TSMessage, transaction: YapDatabaseReadTransaction) -> String? {
+-        guard message.hasAttachments() else {
+-            return nil
+-        }
+-
+-        guard let attachment = message.attachment(with: transaction) else {
+-            owsFailDebug("attachment was unexpectedly nil")
+-            return nil
+-        }
+-
+-        guard let attachmentStream = attachment as? TSAttachmentStream else {
+-            return nil
+-        }
+-
+-        guard attachmentStream.isOversizeText() else {
+-            return nil
+-        }
+-
+-        guard let text = attachmentStream.readOversizeText() else {
+-            owsFailDebug("Could not load oversize text attachment")
+-            return nil
+-        }
+-
+-        return text
++        return message.oversizeText(with: transaction)
+     }
+ 
+     private class func indexContent(object: Any, transaction: YapDatabaseReadTransaction) -> String? {
+diff --git a/SignalServiceKit/src/Storage/OWSMediaGalleryFinder.m b/SignalServiceKit/src/Storage/OWSMediaGalleryFinder.m
+index 4c9c0a11ead..b3a0b39197c 100644
+--- a/SignalServiceKit/src/Storage/OWSMediaGalleryFinder.m
++++ b/SignalServiceKit/src/Storage/OWSMediaGalleryFinder.m
+@@ -147,17 +147,20 @@ + (YapDatabaseAutoView *)mediaGalleryDatabaseExtension
+             return nil;
+         }
+         TSMessage *message = (TSMessage *)object;
+-        
+-        OWSAssertDebug(message.attachmentIds.count <= 1);
+-        NSString *attachmentId = message.attachmentIds.firstObject;
+-        if (attachmentId.length == 0) {
+-            return nil;
++
++        BOOL allAttachmentsAreMedia = message.attachmentIds.count > 0;
++        for (NSString *attachmentId in message.attachmentIds) {
++            OWSAssertDebug(attachmentId.length > 0);
++            if (![self attachmentIdShouldAppearInMediaGallery:attachmentId transaction:transaction]) {
++                allAttachmentsAreMedia = NO;
++                break;
++            }
+         }
+-        
+-        if ([self attachmentIdShouldAppearInMediaGallery:attachmentId transaction:transaction]) {
++
++        if (allAttachmentsAreMedia) {
+             return [self mediaGroupWithThreadId:message.uniqueThreadId];
+         }
+-        
++
+         return nil;
+     }];
+     

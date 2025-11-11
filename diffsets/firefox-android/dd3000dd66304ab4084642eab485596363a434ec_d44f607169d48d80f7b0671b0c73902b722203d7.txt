@@ -1,0 +1,335 @@
+diff --git a/focus-android/app/src/main/AndroidManifest.xml b/focus-android/app/src/main/AndroidManifest.xml
+index 0c0a0dcb6bce..8e72cb701d7b 100644
+--- a/focus-android/app/src/main/AndroidManifest.xml
++++ b/focus-android/app/src/main/AndroidManifest.xml
+@@ -126,6 +126,11 @@
+         <service android:name=".session.SessionNotificationService"
+             android:exported="false" />
+ 
++        <service
++            android:name=".utils.ExperimentsSyncService"
++            android:exported="false"
++            android:permission="android.permission.BIND_JOB_SERVICE" />
++
+         <meta-data android:name="android.webkit.WebView.MetricsOptOut"
+                    android:value="true" />
+     </application>
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt b/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
+index 04362e6de3ea..97c1cf03a570 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
+@@ -8,7 +8,6 @@ package org.mozilla.focus
+ import android.os.StrictMode
+ import android.support.v7.preference.PreferenceManager
+ import kotlinx.coroutines.experimental.CoroutineDispatcher
+-import kotlinx.coroutines.experimental.Job
+ import kotlinx.coroutines.experimental.asCoroutineDispatcher
+ import kotlinx.coroutines.experimental.launch
+ import kotlinx.coroutines.experimental.runBlocking
+@@ -43,8 +42,7 @@ class FocusApplication : LocaleAwareApplication() {
+     lateinit var fretboard: Fretboard
+ 
+     companion object {
+-        private const val FRETBOARD_BLOCKING_DISK_READ_TIMEOUT = 1000
+-        private const val FRETBOARD_BLOCKING_NETWORK_READ_TIMEOUT = 5000
++        private const val FRETBOARD_BLOCKING_NETWORK_READ_TIMEOUT = 10000
+     }
+ 
+     var visibilityLifeCycleCallback: VisibilityLifeCycleCallback? = null
+@@ -59,7 +57,7 @@ class FocusApplication : LocaleAwareApplication() {
+         PreferenceManager.setDefaultValues(this, R.xml.settings, false)
+ 
+         runBlocking {
+-            val experimentLoadJob = loadExperiments()
++            loadExperiments()
+ 
+             enableStrictMode()
+ 
+@@ -71,34 +69,34 @@ class FocusApplication : LocaleAwareApplication() {
+                 registerForLocaleUpdates(this@FocusApplication)
+             }
+ 
+-            experimentLoadJob.join()
+-            WebViewProvider.determineEngine(this@FocusApplication)
+-
+             TelemetryWrapper.init(this@FocusApplication)
+             AdjustHelper.setupAdjustIfNeeded(this@FocusApplication)
+ 
+             visibilityLifeCycleCallback = VisibilityLifeCycleCallback(this@FocusApplication)
+             registerActivityLifecycleCallbacks(visibilityLifeCycleCallback)
+ 
+-            val sessions = SessionManager.getInstance().sessions
+-            sessions.observeForever(NotificationSessionObserver(this@FocusApplication))
+-            sessions.observeForever(TelemetrySessionObserver())
+-            sessions.observeForever(CleanupSessionObserver(this@FocusApplication))
+-
+-            val customTabSessions = SessionManager.getInstance().customTabSessions
+-            customTabSessions.observeForever(TelemetrySessionObserver())
++            setupSessions()
+         }
+     }
+ 
+-    private suspend fun loadExperiments(): Job {
++    private fun setupSessions() {
++        val sessions = SessionManager.getInstance().sessions
++        sessions.observeForever(NotificationSessionObserver(this@FocusApplication))
++        sessions.observeForever(TelemetrySessionObserver())
++        sessions.observeForever(CleanupSessionObserver(this@FocusApplication))
++
++        val customTabSessions = SessionManager.getInstance().customTabSessions
++        customTabSessions.observeForever(TelemetrySessionObserver())
++    }
++
++    private suspend fun loadExperiments() {
+         val experimentsFile = File(filesDir, EXPERIMENTS_JSON_FILENAME)
+         val experimentSource = KintoExperimentSource(
+                 EXPERIMENTS_BASE_URL, EXPERIMENTS_BUCKET_NAME, EXPERIMENTS_COLLECTION_NAME)
+         fretboard = Fretboard(experimentSource, FlatFileExperimentStorage(experimentsFile))
+-        withTimeoutOrNull(FRETBOARD_BLOCKING_DISK_READ_TIMEOUT) {
+-            fretboard.loadExperiments() // load current settings from disk
+-        }
+-        return launch(IO) {
++        fretboard.loadExperiments()
++        WebViewProvider.determineEngine(this@FocusApplication)
++        launch(IO) {
+             withTimeoutOrNull(FRETBOARD_BLOCKING_NETWORK_READ_TIMEOUT) {
+                 fretboard.updateExperiments() // then update disk and memory from the network
+             }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
+index 1cefce6b7170..44b55a8a288e 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/activity/MainActivity.kt
+@@ -29,6 +29,7 @@ import org.mozilla.focus.settings.ExperimentsSettingsFragment
+ import org.mozilla.focus.telemetry.SentryWrapper
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.utils.AppConstants
++import org.mozilla.focus.utils.ExperimentsSyncService
+ import org.mozilla.focus.utils.Settings
+ import org.mozilla.focus.utils.SupportUtils
+ import org.mozilla.focus.utils.ViewUtils
+@@ -179,6 +180,7 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+         super.onStop()
+ 
+         TelemetryWrapper.stopMainActivity()
++        ExperimentsSyncService.scheduleSync(this)
+     }
+ 
+     override fun onNewIntent(unsafeIntent: Intent) {
+@@ -336,5 +338,7 @@ open class MainActivity : LocaleAwareAppCompatActivity() {
+         const val EXTRA_NOTIFICATION = "notification"
+ 
+         private const val EXTRA_SHORTCUT = "shortcut"
++
++        const val EXPERIMENTS_JOB_ID: Int = 4141
+     }
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetrySettingsProvider.kt b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetrySettingsProvider.kt
+index 4fc5d5372a31..ea58badbb1e9 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetrySettingsProvider.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetrySettingsProvider.kt
+@@ -10,6 +10,7 @@ import org.mozilla.focus.R
+ import org.mozilla.focus.search.CustomSearchEngineStore
+ import org.mozilla.focus.utils.Browsers
+ import org.mozilla.focus.utils.Settings
++import org.mozilla.focus.utils.app
+ import org.mozilla.telemetry.TelemetryHolder
+ import org.mozilla.telemetry.measurement.SettingsMeasurement
+ 
+@@ -22,11 +23,13 @@ internal class TelemetrySettingsProvider(
+ ) : SettingsMeasurement.SharedPreferenceSettingsProvider() {
+     private val prefKeyDefaultBrowser: String
+     private val prefKeySearchEngine: String
++    private val prefKeyFretboardBucketNumber: String
+ 
+     init {
+         val resources = context.resources
+         prefKeyDefaultBrowser = resources.getString(R.string.pref_key_default_browser)
+         prefKeySearchEngine = resources.getString(R.string.pref_key_search_engine)
++        prefKeyFretboardBucketNumber = resources.getString(R.string.pref_key_fretboard_bucket_number)
+     }
+ 
+     override fun containsKey(key: String): Boolean {
+@@ -42,31 +45,35 @@ internal class TelemetrySettingsProvider(
+     }
+ 
+     override fun getValue(key: String): Any {
+-        if (key == prefKeyDefaultBrowser) {
+-            // The default browser is not actually a setting. We determine if we are the
+-            // default and then inject this into telemetry.
+-            val context = TelemetryHolder.get().configuration.context
+-            val browsers = Browsers(context, Browsers.TRADITIONAL_BROWSER_URL)
+-            return java.lang.Boolean.toString(browsers.isDefaultBrowser(context))
+-        }
+ 
+-        if (key == prefKeySearchEngine) {
+-            var value: Any? = super.getValue(key)
+-            if (value == null) {
+-                // If the user has never selected a search engine then this value is null.
+-                // However we still want to report the current search engine of the user.
+-                // Therefore we inject this value at runtime.
+-                value = Components.searchEngineManager.getDefaultSearchEngine(
+-                        context,
+-                        Settings.getInstance(context).defaultSearchEngineName
+-                ).name
+-            } else if (CustomSearchEngineStore.isCustomSearchEngine((value as String?)!!, context)) {
+-                // Don't collect possibly sensitive info for custom search engines, send "custom" instead
+-                value = CustomSearchEngineStore.ENGINE_TYPE_CUSTOM
++        return when (key) {
++            prefKeyDefaultBrowser -> {
++                // The default browser is not actually a setting. We determine if we are the
++                // default and then inject this into telemetry.
++                val context = TelemetryHolder.get().configuration.context
++                val browsers = Browsers(context, Browsers.TRADITIONAL_BROWSER_URL)
++                java.lang.Boolean.toString(browsers.isDefaultBrowser(context))
++            }
++            prefKeySearchEngine -> {
++                var value: Any? = super.getValue(key)
++                if (value == null) {
++                    // If the user has never selected a search engine then this value is null.
++                    // However we still want to report the current search engine of the user.
++                    // Therefore we inject this value at runtime.
++                    value = Components.searchEngineManager.getDefaultSearchEngine(
++                            context,
++                            Settings.getInstance(context).defaultSearchEngineName
++                    ).name
++                } else if (CustomSearchEngineStore.isCustomSearchEngine((value as String?)!!, context)) {
++                    // Don't collect possibly sensitive info for custom search engines, send "custom" instead
++                    value = CustomSearchEngineStore.ENGINE_TYPE_CUSTOM
++                }
++                value
+             }
+-            return value
++            prefKeyFretboardBucketNumber -> {
++                context.app.fretboard.getUserBucket(context)
++            }
++            else -> super.getValue(key)
+         }
+-
+-        return super.getValue(key)
+     }
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
+index bdeaa7207bfb..9b6b5cbfd2fa 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
+@@ -16,7 +16,7 @@ import android.preference.PreferenceManager
+ import android.support.annotation.CheckResult
+ import android.support.annotation.VisibleForTesting
+ import kotlinx.coroutines.experimental.runBlocking
+-import mozilla.components.ui.autocomplete.InlineAutocompleteEditText.AutocompleteResult
++import mozilla.components.ui.autocomplete.InlineAutocompleteEditText
+ import org.json.JSONObject
+ import org.mozilla.focus.BuildConfig
+ import org.mozilla.focus.Components
+@@ -44,6 +44,7 @@ import java.net.URI
+ import java.text.SimpleDateFormat
+ import java.util.Date
+ import java.util.Locale
++import kotlin.collections.HashSet
+ 
+ @Suppress(
+         // Yes, this a large class with a lot of functions. But it's very simple and still easy to read.
+@@ -246,13 +247,14 @@ object TelemetryWrapper {
+                             resources.getString(R.string.pref_key_remote_debugging),
+                             resources.getString(R.string.pref_key_homescreen_tips),
+                             resources.getString(R.string.pref_key_open_new_tab),
+-                            resources.getString(R.string.pref_key_show_search_suggestions))
++                            resources.getString(R.string.pref_key_show_search_suggestions),
++                            resources.getString(R.string.pref_key_fretboard_bucket_number))
+                     .setSettingsProvider(TelemetrySettingsProvider(context))
+                     .setCollectionEnabled(telemetryEnabled)
+                     .setUploadEnabled(telemetryEnabled)
+                     .setBuildId(TelemetryConfiguration(context).buildId +
+                     (if (AppConstants.isGeckoBuild)
+-                        ("-" + TELEMETRY_APP_ENGINE_GECKOVIEW) else ""))
++                        ("-$TELEMETRY_APP_ENGINE_GECKOVIEW") else ""))
+ 
+             val serializer = JSONPingSerializer()
+             val storage = FileTelemetryStorage(configuration, serializer)
+@@ -368,7 +370,7 @@ object TelemetryWrapper {
+     }
+ 
+     @JvmStatic
+-    fun urlBarEvent(isUrl: Boolean, autocompleteResult: AutocompleteResult) {
++    fun urlBarEvent(isUrl: Boolean, autocompleteResult: InlineAutocompleteEditText.AutocompleteResult) {
+         if (isUrl) {
+             TelemetryWrapper.browseEvent(autocompleteResult)
+         } else {
+@@ -376,7 +378,7 @@ object TelemetryWrapper {
+         }
+     }
+ 
+-    private fun browseEvent(autocompleteResult: AutocompleteResult) {
++    private fun browseEvent(autocompleteResult: InlineAutocompleteEditText.AutocompleteResult) {
+         val event = TelemetryEvent.create(Category.ACTION, Method.TYPE_URL, Object.SEARCH_BAR)
+                 .extra(Extra.AUTOCOMPLETE, (!autocompleteResult.isEmpty).toString())
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/utils/Experiments.kt b/focus-android/app/src/main/java/org/mozilla/focus/utils/Experiments.kt
+index ada131e91629..66d32ebc7490 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/utils/Experiments.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/utils/Experiments.kt
+@@ -24,4 +24,5 @@ fun Context.isInExperiment(descriptor: ExperimentDescriptor): Boolean =
+         app.fretboard.isInExperiment(this, descriptor)
+ 
+ val Context.activeExperimentNames: List<String>
+-    get() = app.fretboard.getActiveExperiments(this).map { it.name }
++    get() = app.fretboard.getExperimentsMap(this)
++            .map { it.key + if (it.value) "-B" else "-A" }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/utils/ExperimentsSyncService.kt b/focus-android/app/src/main/java/org/mozilla/focus/utils/ExperimentsSyncService.kt
+new file mode 100644
+index 000000000000..5d4d2cad02db
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/utils/ExperimentsSyncService.kt
+@@ -0,0 +1,26 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.utils
++
++import android.content.ComponentName
++import android.content.Context
++import mozilla.components.service.fretboard.Fretboard
++import mozilla.components.service.fretboard.scheduler.jobscheduler.JobSchedulerSyncScheduler
++import mozilla.components.service.fretboard.scheduler.jobscheduler.SyncJob
++import org.mozilla.focus.activity.MainActivity
++
++class ExperimentsSyncService : SyncJob() {
++    companion object {
++        fun scheduleSync(context: Context) {
++            val scheduler = JobSchedulerSyncScheduler(context)
++            scheduler.schedule(MainActivity.EXPERIMENTS_JOB_ID,
++                    ComponentName(context, ExperimentsSyncService::class.java))
++        }
++    }
++
++    override fun getFretboard(): Fretboard {
++        return app.fretboard
++    }
++}
+diff --git a/focus-android/app/src/main/res/values/preference_keys.xml b/focus-android/app/src/main/res/values/preference_keys.xml
+index 2b34eac7c14a..c31952e771a6 100644
+--- a/focus-android/app/src/main/res/values/preference_keys.xml
++++ b/focus-android/app/src/main/res/values/preference_keys.xml
+@@ -18,6 +18,8 @@
+ 
+     <string name="pref_key_default_browser" translatable="false"><xliff:g id="preference_key">pref_default_browser</xliff:g></string>
+ 
++    <string name="pref_key_fretboard_bucket_number" translatable="false"><xliff:g id="preference_key">pref_fretboard_bucket_number</xliff:g></string>
++
+     <string name="pref_key_telemetry" translatable="false"><xliff:g id="preference_key">pref_telemetry</xliff:g></string>
+ 
+     <string name="pref_key_secure" translatable="false"><xliff:g id="preference_key">pref_secure</xliff:g></string>
+diff --git a/focus-android/build.gradle b/focus-android/build.gradle
+index d132cb9eb879..7b013277e76f 100644
+--- a/focus-android/build.gradle
++++ b/focus-android/build.gradle
+@@ -8,7 +8,7 @@ buildscript {
+     ext.geckoview_revision = '61db99a4972c43cf440169f5c3e7cc9e696267a3'
+     ext.geckoview_version = '62.0.2.20180921002357' // GeckoView 62 RelBranch from 2018.09.21
+     ext.spotbugs_version = '3.1.2'
+-    ext.mozilla_components_version = '0.23'
++    ext.mozilla_components_version = '0.24'
+ 
+     repositories {
+         google()

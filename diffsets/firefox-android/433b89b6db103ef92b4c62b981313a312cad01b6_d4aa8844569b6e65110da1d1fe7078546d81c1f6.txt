@@ -1,0 +1,159 @@
+diff --git a/taskcluster/android_taskgraph/gradle.py b/taskcluster/android_taskgraph/gradle.py
+index 50b9c28b6753..c38899f6c8d9 100644
+--- a/taskcluster/android_taskgraph/gradle.py
++++ b/taskcluster/android_taskgraph/gradle.py
+@@ -10,7 +10,7 @@
+ from collections import defaultdict
+ from taskgraph.util.memoize import memoize
+ 
+-from android_taskgraph import FOCUS_DIR
++from android_taskgraph import FOCUS_DIR, ANDROID_COMPONENTS_DIR
+ from android_taskgraph.build_config import get_components
+ 
+ 
+@@ -25,7 +25,15 @@
+ 
+ 
+ @memoize
+-def get_upstream_deps_for_gradle_projects(gradle_root):
++def get_upstream_deps_for_all_gradle_projects():
++    all_deps = {}
++    for gradle_root in (ANDROID_COMPONENTS_DIR, FOCUS_DIR):
++        all_deps.update(_get_upstream_deps_for_single_root(gradle_root))
++
++    return all_deps
++
++
++def _get_upstream_deps_for_single_root(gradle_root):
+     """Return the full list of local upstream dependencies of a component."""
+     project_dependencies = defaultdict(set)
+     gradle_projects = _get_gradle_projects(gradle_root)
+@@ -61,7 +69,10 @@ def get_upstream_deps_for_gradle_projects(gradle_root):
+ def _get_gradle_projects(gradle_root):
+     if gradle_root.endswith("android-components"):
+         return [c["name"] for c in get_components()]
+-    # TODO: Support focus and fenix
++    elif gradle_root.endswith("focus-android"):
++        return ["app"]
++
++    # TODO: Support fenix
+     raise NotImplementedError(f"Cannot find gradle projects for {gradle_root}")
+ 
+ 
+diff --git a/taskcluster/android_taskgraph/transforms/build_apk.py b/taskcluster/android_taskgraph/transforms/build_apk.py
+index ee609c3d31a2..d2b7c73054cd 100644
+--- a/taskcluster/android_taskgraph/transforms/build_apk.py
++++ b/taskcluster/android_taskgraph/transforms/build_apk.py
+@@ -7,9 +7,8 @@
+ """
+ 
+ 
+-import datetime
+-
+ from taskgraph.transforms.base import TransformSequence
++from taskgraph.util.schema import resolve_keyed_by
+ from android_taskgraph.gradle import get_variant
+ 
+ 
+@@ -25,6 +24,22 @@ def add_variant_config(config, tasks):
+         yield task
+ 
+ 
++@transforms.add
++def resolve_keys(config, tasks):
++    for task in tasks:
++        for field in (
++            'optimization',
++        ):
++            resolve_keyed_by(
++                task, field, item_name=task["name"],
++                **{
++                    'tasks-for': config.params["tasks_for"],
++                }
++            )
++
++        yield task
++
++
+ @transforms.add
+ def add_shippable_secrets(config, tasks):
+     for task in tasks:
+diff --git a/taskcluster/android_taskgraph/transforms/gradle_optimization.py b/taskcluster/android_taskgraph/transforms/gradle_optimization.py
+index 8c3a343bf9f1..bf13b22270c9 100644
+--- a/taskcluster/android_taskgraph/transforms/gradle_optimization.py
++++ b/taskcluster/android_taskgraph/transforms/gradle_optimization.py
+@@ -1,7 +1,7 @@
+ from taskgraph.transforms.base import TransformSequence
+ 
+-from ..build_config import get_path, ANDROID_COMPONENTS_DIR
+-from ..gradle import get_upstream_deps_for_gradle_projects
++from ..build_config import get_path
++from ..gradle import get_upstream_deps_for_all_gradle_projects
+ 
+ 
+ transforms = TransformSequence()
+@@ -9,14 +9,16 @@
+ 
+ @transforms.add
+ def extend_optimization_if_one_already_exists(config, tasks):
+-    deps_per_component = get_upstream_deps_for_gradle_projects(ANDROID_COMPONENTS_DIR)
++    deps_per_component = get_upstream_deps_for_all_gradle_projects()
+ 
+     for task in tasks:
+         optimization = task.get("optimization")
+         if optimization:
+             skip_unless_changed = optimization["skip-unless-changed"]
+ 
+-            component = task["attributes"]["component"]
++            component = task["attributes"].get("component")
++            if not component:
++                component = "app" # == Focus. TODO: Support Fenix
+             # TODO Remove this special case when ui-test.sh is able to accept "browser-engine-gecko"
+             if component == "browser":
+                 component = "browser-engine-gecko"
+@@ -24,9 +26,18 @@ def extend_optimization_if_one_already_exists(config, tasks):
+             dependencies = deps_per_component[component]
+             component_and_deps = [component] + dependencies
+ 
+-            skip_unless_changed.extend([
+-                f"android-components/{get_path(component)}/**"
++            skip_unless_changed.extend(sorted([
++                _get_path(component)
+                 for component in component_and_deps
+-            ])
++            ]))
+ 
+         yield task
++
++
++def _get_path(component):
++    if component == "app":
++        return "focus-android/**"
++    elif component == "service-telemetry":
++        return "focus-android/service-telemetry/**"
++    else:
++        return f"android-components/{get_path(component)}/**"
+diff --git a/taskcluster/ci/build-apk/kind.yml b/taskcluster/ci/build-apk/kind.yml
+index f928ff03e3d2..9df4c53b40e7 100644
+--- a/taskcluster/ci/build-apk/kind.yml
++++ b/taskcluster/ci/build-apk/kind.yml
+@@ -6,6 +6,7 @@ loader: taskgraph.loader.transform:loader
+ 
+ transforms:
+     - android_taskgraph.transforms.build_apk:transforms
++    - android_taskgraph.transforms.gradle_optimization:transforms
+     - taskgraph.transforms.job:transforms
+     - taskgraph.transforms.task:transforms
+ 
+@@ -22,6 +23,11 @@ task-defaults:
+         toolchain:
+             - android-sdk-linux
+             - android-gradle-dependencies
++    optimization:
++        by-tasks-for:
++            github-pu(sh|ll-request.*):
++                skip-unless-changed: [] # Paths are dynamically added by transforms
++            default: {}
+     run:
+         using: gradlew
+         use-caches: false

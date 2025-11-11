@@ -1,0 +1,484 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/BackupManager.kt b/AnkiDroid/src/main/java/com/ichi2/anki/BackupManager.kt
+index 135cdb67601a..a511f79e270b 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/BackupManager.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/BackupManager.kt
+@@ -20,6 +20,8 @@ import android.content.SharedPreferences
+ import android.text.format.DateFormat
+ import androidx.annotation.VisibleForTesting
+ import androidx.core.content.edit
++import anki.config.Preferences.BackupLimits
++import anki.config.copy
+ import com.ichi2.anki.preferences.sharedPrefs
+ import com.ichi2.compat.CompatHelper
+ import com.ichi2.libanki.Collection
+@@ -35,6 +37,8 @@ import java.io.FileOutputStream
+ import java.io.IOException
+ import java.text.ParseException
+ import java.text.SimpleDateFormat
++import java.time.LocalDate
++import java.time.temporal.ChronoUnit
+ import java.util.*
+ import java.util.zip.ZipEntry
+ import java.util.zip.ZipOutputStream
+@@ -45,19 +49,18 @@ open class BackupManager {
+      *
+      * Returns false:
+      * * If backups are disabled
+-     * * If [interval] hours have not elapsed since the last backup
++     * * If the frequency between backups set by the user in preferences wasn't respected(see preferences key "minutes_between_automatic_backups")
+      * * If the filename creation failed
+-     * * If [interval] is 0, and the backup already exists
++     * * If the backup already exists
+      * * If the user has insufficient space
+      * * If the collection is too small to be valid
+      *
+      * @param colPath The path of the collection file
+-     * @param interval If this amount of hours has not elapsed since last backup, return false and do not create backup. See: [BACKUP_INTERVAL]
+      *
+      * @return Whether a thread was started to create a backup
+      */
+     @Suppress("PMD.NPathComplexity")
+-    fun performBackupInBackground(colPath: String, interval: Int, time: Time): Boolean {
++    fun performBackupInBackground(colPath: String, time: Time): Boolean {
+         val prefs = AnkiDroidApp.instance.baseContext.sharedPrefs()
+         if (hasDisabledBackups(prefs)) {
+             Timber.w("backups are disabled")
+@@ -69,11 +72,12 @@ open class BackupManager {
+             Timber.d("performBackup: No backup necessary due to no collection changes")
+             return false
+         }
+-
+-        // Abort backup if one was already made less than [interval] hours ago (default: 5 hours - BACKUP_INTERVAL)
++        // the frequency(in minutes) allowed for backups(default is 30 minutes)
++        val frequency = prefs.getInt("minutes_between_automatic_backups", 30)
++        // Abort backup if one was already made less than the allowed frequency
+         val lastBackupDate = getLastBackupDate(colBackups)
+-        if (lastBackupDate != null && lastBackupDate.time + interval * 3600000L > time.intTimeMS()) {
+-            Timber.d("performBackup: No backup created. Last backup younger than 5 hours")
++        if (lastBackupDate != null && lastBackupDate.time + frequency * 60_000L > time.intTimeMS()) {
++            Timber.d("performBackup: No backup created. Last backup younger than the frequency allowed from preferences(currently set to $frequency minutes)")
+             return false
+         }
+         val backupFilename = getNameForNewBackup(time) ?: return false
+@@ -156,7 +160,12 @@ open class BackupManager {
+             zos.close()
+             // Delete old backup files if needed
+             val prefs = AnkiDroidApp.instance.baseContext.sharedPrefs()
+-            deleteColBackups(colPath, prefs.getInt("backupMax", 8))
++            val backupLimits = BackupLimits.newBuilder()
++                .setDaily(prefs.getInt("daily_backups_to_keep", 8))
++                .setWeekly(prefs.getInt("weekly_backups_to_keep", 8))
++                .setMonthly(prefs.getInt("monthly_backups_to_keep", 8))
++                .build()
++            deleteColBackups(colPath, backupLimits)
+             // set timestamp of file in order to avoid creating a new backup unless its changed
+             if (!backupFile.setLastModified(colFile.lastModified())) {
+                 Timber.w(
+@@ -201,8 +210,6 @@ open class BackupManager {
+             Regex("(?:collection|backup)-((\\d{4})-(\\d{2})-(\\d{2})-(\\d{2})[.-](\\d{2}))(?:\\.\\d{2})?.colpkg")
+         }
+ 
+-        /** Number of hours after which a backup new backup is created  */
+-        private const val BACKUP_INTERVAL = 5
+         private val legacyDateFormat = SimpleDateFormat("yyyy-MM-dd-HH-mm")
+         private val newDateFormat = SimpleDateFormat("yyyy-MM-dd-HH.mm")
+ 
+@@ -405,19 +412,39 @@ open class BackupManager {
+ 
+         /**
+          * Deletes the first files until only the given number of files remain
++         *
+          * @param colPath Path of collection file whose backups should be deleted
+-         * @param keepNumber How many files to keep
++         * @param backupLimits the user's choice on how many backup files to keep
++         * @param today, the day in which the user exists, only use in tests or if you want to alter
++         * the time continuum
+          */
+-        fun deleteColBackups(colPath: String, keepNumber: Int): Boolean {
+-            return deleteColBackups(getBackups(File(colPath)), keepNumber)
++        fun deleteColBackups(
++            colPath: String,
++            backupLimits: BackupLimits,
++            today: LocalDate = LocalDate.now()
++        ): Boolean {
++            return deleteColBackups(getBackups(File(colPath)), backupLimits, today)
+         }
+ 
+-        private fun deleteColBackups(backups: Array<File>, keepNumber: Int): Boolean {
+-            for (i in 0 until backups.size - keepNumber) {
+-                if (!backups[i].delete()) {
+-                    Timber.e("deleteColBackups() failed to delete %s", backups[i].absolutePath)
++        private fun deleteColBackups(
++            backups: Array<File>,
++            backupLimits: BackupLimits,
++            today: LocalDate
++        ): Boolean {
++            val unpackedBackups = backups.map {
++                // based on the format used, 0 is for "collection|backup" prefix and 1,2,3 are for
++                // year(4 digits), month(with 0 prefix, 1 is January) and day(with 0 prefix, starting from 1)
++                val nameSplits = it.nameWithoutExtension.split("-")
++                UnpackedBackup(
++                    file = it,
++                    date = LocalDate.of(nameSplits[1].toInt(), nameSplits[2].toInt(), nameSplits[3].toInt())
++                )
++            }
++            BackupFilter(today, backupLimits).getObsoleteBackups(unpackedBackups).forEach { backup ->
++                if (!backup.file.delete()) {
++                    Timber.e("deleteColBackups() failed to delete %s", backup.file.absolutePath)
+                 } else {
+-                    Timber.i("deleteColBackups: backup file %s deleted.", backups[i].absolutePath)
++                    Timber.i("deleteColBackups: backup file %s deleted.", backup.file.absolutePath)
+                 }
+             }
+             return true
+@@ -473,3 +500,81 @@ class LocalizedUnambiguousBackupTimeFormatter {
+         return formatter.format(backupDate)
+     }
+ }
++
++private data class UnpackedBackup(
++    val file: File,
++    val date: LocalDate
++) : Comparable<UnpackedBackup> {
++    override fun compareTo(other: UnpackedBackup): Int = date.compareTo(other.date)
++    private val epoch = LocalDate.ofEpochDay(0)
++
++    fun day(): Long = ChronoUnit.DAYS.between(epoch, date)
++
++    fun week(): Long = ChronoUnit.WEEKS.between(epoch, date)
++
++    fun month(): Long = ChronoUnit.MONTHS.between(epoch, date)
++}
++
++enum class BackupStage {
++    Daily, Weekly, Monthly,
++}
++
++// see https://github.com/ankitects/anki/blob/f3bb845961973bcfab34acfdc4d314294285ee74/rslib/src/collection/backup.rs#L186
++private class BackupFilter(private val today: LocalDate, private var limits: BackupLimits) {
++    private val epoch = LocalDate.ofEpochDay(0)
++    private var lastKeptDay: Long = ChronoUnit.DAYS.between(epoch, today)
++    private var lastKeptWeek: Long = ChronoUnit.WEEKS.between(epoch, today)
++    private var lastKeptMonth: Long = ChronoUnit.MONTHS.between(epoch, today)
++    private val obsolete = mutableListOf<UnpackedBackup>()
++
++    fun getObsoleteBackups(backups: List<UnpackedBackup>): List<UnpackedBackup> {
++        for (backup in backups.sortedDescending()) {
++            if (isRecent(backup)) {
++                markFresh(null, backup)
++            } else if (remaining(BackupStage.Daily)) {
++                markFreshOrObsolete(BackupStage.Daily, backup)
++            } else if (remaining(BackupStage.Weekly)) {
++                markFreshOrObsolete(BackupStage.Weekly, backup)
++            } else if (remaining(BackupStage.Monthly)) {
++                markFreshOrObsolete(BackupStage.Monthly, backup)
++            } else {
++                obsolete.add(backup)
++            }
++        }
++        return obsolete
++    }
++
++    private fun isRecent(backup: UnpackedBackup): Boolean = backup.date == today
++
++    fun remaining(stage: BackupStage): Boolean = when (stage) {
++        BackupStage.Daily -> limits.daily > 0
++        BackupStage.Weekly -> limits.weekly > 0
++        BackupStage.Monthly -> limits.monthly > 0
++    }
++
++    fun markFreshOrObsolete(stage: BackupStage, backup: UnpackedBackup) {
++        val keep = when (stage) {
++            BackupStage.Daily -> backup.day() < lastKeptDay
++            BackupStage.Weekly -> backup.week() < lastKeptWeek
++            BackupStage.Monthly -> backup.month() < lastKeptMonth
++        }
++        if (keep) {
++            markFresh(stage, backup)
++        } else {
++            obsolete.add(backup)
++        }
++    }
++
++    // Adjusts limits as per the stage of the kept backup, and last kept times.
++    fun markFresh(stage: BackupStage?, backup: UnpackedBackup) {
++        lastKeptDay = backup.day()
++        lastKeptWeek = backup.week()
++        lastKeptMonth = backup.month()
++        when (stage) {
++            BackupStage.Daily -> limits = limits.copy { daily -= 1 }
++            BackupStage.Weekly -> limits = limits.copy { weekly -= 1 }
++            BackupStage.Monthly -> limits = limits.copy { monthly -= 1 }
++            else -> {} // ignore, null will be received for a fresh backup
++        }
++    }
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/analytics/UsageAnalytics.kt b/AnkiDroid/src/main/java/com/ichi2/anki/analytics/UsageAnalytics.kt
+index 9330069c32cd..8b6894a2cdde 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/analytics/UsageAnalytics.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/analytics/UsageAnalytics.kt
+@@ -539,7 +539,6 @@ object UsageAnalytics {
+         "showCardAnswerButtonTime",
+         // Advanced
+         "deckPath", // AnkiDroid directory
+-        "backupMax", // Max number of backups
+         "double_scrolling", // Double scrolling
+         "softwareRender", // Disable card hardware render
+         "safeDisplay", // Safe display mode
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/servicelayer/PreferenceUpgradeService.kt b/AnkiDroid/src/main/java/com/ichi2/anki/servicelayer/PreferenceUpgradeService.kt
+index b38e8860be40..a3db585957be 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/servicelayer/PreferenceUpgradeService.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/servicelayer/PreferenceUpgradeService.kt
+@@ -82,7 +82,7 @@ object PreferenceUpgradeService {
+             const val upgradeVersionPrefKey = "preferenceUpgradeVersion"
+ 
+             /** Returns all instances of preference upgrade classes */
+-            internal fun getAllInstances(legacyPreviousVersionCode: LegacyVersionIdentifier) = sequence<PreferenceUpgrade> {
++            private fun getAllInstances(legacyPreviousVersionCode: LegacyVersionIdentifier) = sequence {
+                 yield(LegacyPreferenceUpgrade(legacyPreviousVersionCode))
+                 yield(UpdateNoteEditorToolbarPrefs())
+                 yield(UpgradeGesturesToControls())
+@@ -91,6 +91,7 @@ object PreferenceUpgradeService {
+                 yield(UpgradeAppLocale())
+                 yield(RemoveScrollingButtons())
+                 yield(RemoveAnswerRecommended())
++                yield(RemoveBackupMax())
+             }
+ 
+             /** Returns a list of preference upgrade classes which have not been applied */
+@@ -426,6 +427,23 @@ object PreferenceUpgradeService {
+                 }
+             }
+         }
++
++        /**
++         * Switch from using a single backup option to using separate preferences for
++         * daily/weekly/monthly as well as frequency of backups.
++         */
++        internal class RemoveBackupMax : PreferenceUpgrade(13) {
++            override fun upgrade(preferences: SharedPreferences) {
++                val legacyValue = preferences.getInt("backupMax", 4)
++                preferences.edit {
++                    remove("backupMax")
++                    putInt("minutes_between_automatic_backups", 30) // 30 minutes default
++                    putInt("daily_backups_to_keep", legacyValue)
++                    putInt("weekly_backups_to_keep", legacyValue)
++                    putInt("monthly_backups_to_keep", legacyValue)
++                }
++            }
++        }
+     }
+ }
+ 
+diff --git a/AnkiDroid/src/main/res/values/10-preferences.xml b/AnkiDroid/src/main/res/values/10-preferences.xml
+index 2ff47f61d0fe..548e3bbc2180 100644
+--- a/AnkiDroid/src/main/res/values/10-preferences.xml
++++ b/AnkiDroid/src/main/res/values/10-preferences.xml
+@@ -141,7 +141,6 @@
+     <string name="disable_extended_text_ui_summ">Allows \'Cloze Deletion\' context menu when in landscape mode.</string>
+     <string name="vertical_centering" maxLength="41">Center align</string>
+     <string name="vertical_centering_summ">Center the content of cards vertically</string>
+-    <string name="pref_backup_max" maxLength="41">Max number of backups</string>
+     <string name="pref_double_tap_time_interval" maxLength="41">Double tap time interval (milliseconds)</string>
+     <string name="pref_double_tap_time_interval_summary">A second tap of the answer buttons will be ignored if this time has not elapsed. This prevents accidental double taps</string>
+     <string name="pref_show_answer_long_press" maxLength="41">Show answer long-press time (ms)</string>
+diff --git a/AnkiDroid/src/main/res/values/preferences.xml b/AnkiDroid/src/main/res/values/preferences.xml
+index fcf060d0585d..f1caa1432a26 100644
+--- a/AnkiDroid/src/main/res/values/preferences.xml
++++ b/AnkiDroid/src/main/res/values/preferences.xml
+@@ -167,7 +167,6 @@
+     <string name="about_screen_key">aboutScreen</string>
+ 
+     <!-- Backup limits -->
+-    <string name="pref_backup_max_key">backupMax</string>
+     <string name="pref_backups_help_key">backups_help</string>
+     <string name="pref_minutes_between_automatic_backups_key">minutes_between_automatic_backups</string>
+     <string name="pref_daily_backups_to_keep_key">daily_backups_to_keep</string>
+diff --git a/AnkiDroid/src/main/res/xml/preferences_advanced.xml b/AnkiDroid/src/main/res/xml/preferences_advanced.xml
+index 18578ca6374b..102285c90332 100644
+--- a/AnkiDroid/src/main/res/xml/preferences_advanced.xml
++++ b/AnkiDroid/src/main/res/xml/preferences_advanced.xml
+@@ -32,13 +32,6 @@
+             android:key="@string/pref_ankidroid_directory_key"
+             android:title="@string/col_path"
+             app1:useSimpleSummaryProvider="true"/>
+-        <com.ichi2.preferences.IncrementerNumberRangePreferenceCompat
+-            android:defaultValue="8"
+-            android:key="@string/pref_backup_max_key"
+-            android:title="@string/pref_backup_max"
+-            app1:useSimpleSummaryProvider="true"
+-            app:min="0"
+-            app:max="99" />
+         <SwitchPreferenceCompat
+             android:defaultValue="false"
+             android:key="@string/tts_key"
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/BackupManagerSimpleTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/BackupManagerSimpleTest.kt
+index 3c0e81449ef7..cb41a8e0f7a5 100644
+--- a/AnkiDroid/src/test/java/com/ichi2/anki/BackupManagerSimpleTest.kt
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/BackupManagerSimpleTest.kt
+@@ -16,6 +16,7 @@
+ 
+ package com.ichi2.anki
+ 
++import anki.config.Preferences.BackupLimits
+ import com.ichi2.anki.BackupManager.Companion.getLatestBackup
+ import com.ichi2.testutils.MockTime
+ import org.hamcrest.CoreMatchers.*
+@@ -26,6 +27,7 @@ import org.junit.Rule
+ import org.junit.Test
+ import org.junit.rules.TemporaryFolder
+ import java.io.File
++import java.time.LocalDate
+ import kotlin.test.assertEquals
+ import kotlin.test.assertNotNull
+ import kotlin.test.assertNull
+@@ -120,25 +122,113 @@ class BackupManagerSimpleTest {
+         assertThat(backups, arrayContainingInAnyOrder(f1, f3, f4))
+     }
+ 
++    private fun File.newBackupFile(name: String): File = File(this, name).also { it.createNewFile() }
++
++    private fun newBackupLimits(daily: Int, weekly: Int, monthly: Int): BackupLimits = BackupLimits.newBuilder()
++        .setDaily(daily)
++        .setWeekly(weekly)
++        .setMonthly(monthly)
++        .build()
++
+     @Test
+-    fun deleteDeckBackupsTest() {
++    fun keepsAllBackupsForToday() {
+         val colFile = tempDirectory.newFile()
+         val backupDir = BackupManager.getBackupDirectory(tempDirectory.root)
++        val today = LocalDate.of(2022, 10, 17)
++        val f1 = backupDir.newBackupFile("collection-2022-10-17-23-04.colpkg")
++        val f2 = backupDir.newBackupFile("collection-2022-10-17-13-54.colpkg")
++        val f3 = backupDir.newBackupFile("collection-2022-10-17-13-04.colpkg")
++        val f4 = backupDir.newBackupFile("collection-2022-10-17-10-09.colpkg")
++        val f5 = backupDir.newBackupFile("collection-2022-10-16-23-04.colpkg")
++        val f6 = backupDir.newBackupFile("collection-2022-10-15-23-04.colpkg")
++        val f7 = backupDir.newBackupFile("collection-2022-10-01-23-04.colpkg")
++        val f8 = backupDir.newBackupFile("collection-2022-09-22-23-04.colpkg")
++        val f9 = backupDir.newBackupFile("collection-2022-08-11-23-04.colpkg")
+ 
+-        val f1 = File(backupDir, "collection-2000-12-31-23-04.colpkg")
+-        val f2 = File(backupDir, "collection-1990-08-31-45-04.colpkg")
+-        val f3 = File(backupDir, "collection-2010-12-06-13-04.colpkg")
+-        val f4 = File(backupDir, "collection-1980-01-12-11-04.colpkg")
+-        f1.createNewFile()
+-        f2.createNewFile()
+-        f3.createNewFile()
+-        f4.createNewFile()
++        BackupManager.deleteColBackups(colFile.path, newBackupLimits(1, 1, 1), today)
++
++        assertThat("Current day backup should have been kept", f1, anExistingFile()) // current day backup
++        assertThat("Current day backup should have been kept", f2, anExistingFile()) // current day backup
++        assertThat("Current day backup should have been kept", f3, anExistingFile()) // current day backup
++        assertThat("Current day backup should have been kept", f4, anExistingFile()) // current day backup
++        assertThat("Newer daily backup should have been kept", f5, anExistingFile()) // daily backup
++        assertThat("Obsolete weekly backup should have been removed", f6, not(anExistingFile())) // obsolete week backup
++        assertThat("Newer weekly backup should have been kept", f7, anExistingFile()) // weekly backup
++        assertThat("Newer monthly backup should have been kept", f8, anExistingFile()) // monthly backup
++        assertThat("Obsolete monthly backup should have been removed", f9, not(anExistingFile())) // obsolete limits were reached
++    }
++
++    @Test
++    fun handlesDailyLimitsCorrectly() {
++        val colFile = tempDirectory.newFile()
++        val backupDir = BackupManager.getBackupDirectory(tempDirectory.root)
++        val f1 = backupDir.newBackupFile("collection-2022-09-25-23-04.colpkg")
++        val f2 = backupDir.newBackupFile("collection-2022-09-24-23-04.colpkg")
++        val f3 = backupDir.newBackupFile("collection-2022-09-18-23-04.colpkg")
++        val f4 = backupDir.newBackupFile("collection-2022-09-09-23-04.colpkg")
++        val f5 = backupDir.newBackupFile("collection-2022-08-22-23-04.colpkg")
++        val f6 = backupDir.newBackupFile("collection-2022-07-11-23-04.colpkg")
++        val f7 = backupDir.newBackupFile("collection-2022-06-10-23-04.colpkg")
++
++        BackupManager.deleteColBackups(colFile.path, newBackupLimits(2, 2, 2))
++
++        assertThat("Newer daily backup should have been kept", f1, anExistingFile()) // daily backup
++        assertThat("Newer daily backup should have been kept", f2, anExistingFile()) // daily backup
++        assertThat("Newer weekly backup should have been kept", f3, anExistingFile()) // weekly backup
++        assertThat("Newer weekly backups should have been kept", f4, anExistingFile()) // weekly backup
++        assertThat("Newer monthly backup should have been kept", f5, anExistingFile()) // monthly backup
++        assertThat("Newer monthly backup should have been kept", f6, anExistingFile()) // monthly backup
++        assertThat("Obsolete backup should have been removed", f7, not(anExistingFile())) // obsolete, limits were reached
++    }
++
++    @Test
++    fun handlesWeeklyLimitsCorrectly() {
++        val colFile = tempDirectory.newFile()
++        val backupDir = BackupManager.getBackupDirectory(tempDirectory.root)
++        val f1 = backupDir.newBackupFile("collection-2022-10-25-23-04.colpkg")
++        val f2 = backupDir.newBackupFile("collection-2022-09-19-23-04.colpkg")
++        val f3 = backupDir.newBackupFile("collection-2022-09-18-23-04.colpkg")
++        val f4 = backupDir.newBackupFile("collection-2022-09-04-23-04.colpkg")
++        val f5 = backupDir.newBackupFile("collection-2022-09-03-23-04.colpkg")
++        val f6 = backupDir.newBackupFile("collection-2022-08-20-23-04.colpkg")
++        val f7 = backupDir.newBackupFile("collection-2022-06-15-23-04.colpkg")
++        val f8 = backupDir.newBackupFile("collection-2022-06-14-23-04.colpkg")
++
++        BackupManager.deleteColBackups(colFile.path, newBackupLimits(1, 3, 1))
++
++        assertThat("Newer daily backup should have been kept", f1, anExistingFile()) // daily backup
++        assertThat("Newer weekly backup should have been kept", f2, anExistingFile()) // weekly backup
++        assertThat("Obsolete backup should have been removed", f3, not(anExistingFile())) // obsolete, same week backup
++        assertThat("Newer weekly backup should have been kept", f4, anExistingFile()) // weekly backup
++        assertThat("Obsolete backup should have been removed", f5, not(anExistingFile())) // obsolete, same week backup
++        assertThat("Newer weekly backup should have been kept", f6, anExistingFile()) // weekly backup
++        assertThat("Newer monthly backup should have been kept", f7, anExistingFile()) // monthly backup
++        assertThat("Obsolete backup should have been removed", f8, not(anExistingFile())) // obsolete, limits were reached
++    }
++
++    @Test
++    fun handlesMonthlyLimitsCorrectly() {
++        val colFile = tempDirectory.newFile()
++        val backupDir = BackupManager.getBackupDirectory(tempDirectory.root)
++        val f1 = backupDir.newBackupFile("collection-2022-10-05-23-04.colpkg")
++        val f2 = backupDir.newBackupFile("collection-2022-09-20-23-04.colpkg")
++        val f3 = backupDir.newBackupFile("collection-2022-08-17-23-04.colpkg")
++        val f4 = backupDir.newBackupFile("collection-2022-08-04-23-04.colpkg")
++        val f5 = backupDir.newBackupFile("collection-2022-07-16-23-04.colpkg")
++        val f6 = backupDir.newBackupFile("collection-2022-07-14-23-04.colpkg")
++        val f7 = backupDir.newBackupFile("collection-2022-06-15-23-04.colpkg")
++        val f8 = backupDir.newBackupFile("collection-2022-06-14-23-04.colpkg")
++
++        BackupManager.deleteColBackups(colFile.path, newBackupLimits(1, 1, 3))
+ 
+-        BackupManager.deleteColBackups(colFile.path, 2)
+-        assertThat("Older backups should have been deleted", f2, not(anExistingFile()))
+-        assertThat("Older backups should have been deleted", f4, not(anExistingFile()))
+-        assertThat("Newer backups should have been kept", f1, anExistingFile())
+-        assertThat("Newer backups should have been kept", f3, anExistingFile())
++        assertThat("Newer daily backup should have been kept", f1, anExistingFile()) // daily backup
++        assertThat("Newer weekly backup should have been kept", f2, anExistingFile()) // weekly backup
++        assertThat("Newer monthly backup should have been kept", f3, anExistingFile()) // monthly backup
++        assertThat("Obsolete backup should have been removed", f4, not(anExistingFile())) // obsolete, same month
++        assertThat("Newer monthly backup should have been kept", f5, anExistingFile()) // monthly backup
++        assertThat("Obsolete backup should have been removed", f6, not(anExistingFile())) // obsolete, same month
++        assertThat("Newer monthly backup should have been kept", f7, anExistingFile()) // monthly backup
++        assertThat("Obsolete backup should have been removed", f8, not(anExistingFile())) // obsolete, limits were reached
+     }
+ 
+     @Test
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/BackupManagerTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/BackupManagerTest.kt
+index 1379cc0f946e..56b8dba0c99a 100644
+--- a/AnkiDroid/src/test/java/com/ichi2/anki/BackupManagerTest.kt
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/BackupManagerTest.kt
+@@ -41,7 +41,7 @@ open class BackupManagerTest {
+ 
+         // assert
+         assertThat("should fail if backups are disabled", performBackupResult, equalTo(false))
+-        verify(bm, times(1)).performBackupInBackground(anyString(), anyInt(), any())
++        verify(bm, times(1)).performBackupInBackground(anyString(), any())
+         verify(bm, times(1)).hasDisabledBackups(any())
+         verifyNoMoreInteractions(bm)
+     }
+@@ -94,7 +94,7 @@ open class BackupManagerTest {
+     }
+ 
+     private fun performBackup(bm: BackupManager, time: Time = MockTime(100000000)): Boolean {
+-        return bm.performBackupInBackground("/AnkiDroid/", 100, time)
++        return bm.performBackupInBackground("/AnkiDroid/", time)
+     }
+ 
+     /** Returns a spy of BackupManager which would pass  */

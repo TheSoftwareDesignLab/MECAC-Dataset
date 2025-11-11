@@ -1,0 +1,924 @@
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt b/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt
+index 119af293a5f1..5d92c00bb1f0 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt
+@@ -321,7 +321,7 @@ open class HomeActivity : LocaleAwareAppCompatActivity() {
+         BrowserDirection.FromGlobal ->
+             NavGraphDirections.actionGlobalBrowser(customTabSessionId)
+         BrowserDirection.FromHome ->
+-            HomeFragmentDirections.actionHomeFragmentToBrowserFragment(customTabSessionId)
++            HomeFragmentDirections.actionHomeFragmentToBrowserFragment(customTabSessionId, true)
+         BrowserDirection.FromSearch ->
+             SearchFragmentDirections.actionSearchFragmentToBrowserFragment(customTabSessionId)
+         BrowserDirection.FromSettings ->
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt
+index 16b8f08b8841..a58f930df0e2 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt
+@@ -6,8 +6,6 @@ package org.mozilla.fenix.browser
+ 
+ import android.content.Context
+ import android.content.Intent
+-import android.graphics.Color
+-import android.graphics.drawable.ColorDrawable
+ import android.os.Bundle
+ import android.view.Gravity
+ import android.view.LayoutInflater
+@@ -15,11 +13,9 @@ import android.view.View
+ import android.view.ViewGroup
+ import androidx.annotation.CallSuper
+ import androidx.coordinatorlayout.widget.CoordinatorLayout
+-import androidx.core.graphics.drawable.toDrawable
+ import androidx.core.net.toUri
+ import androidx.fragment.app.Fragment
+ import androidx.lifecycle.lifecycleScope
+-import androidx.navigation.NavDirections
+ import androidx.navigation.fragment.findNavController
+ import com.google.android.material.appbar.AppBarLayout
+ import com.google.android.material.snackbar.Snackbar
+@@ -89,6 +85,7 @@ import org.mozilla.fenix.ext.sessionsOfType
+ import org.mozilla.fenix.ext.settings
+ import org.mozilla.fenix.settings.SupportUtils
+ import org.mozilla.fenix.theme.ThemeManager
++import java.lang.ref.WeakReference
+ 
+ /**
+  * Base fragment extended by [BrowserFragment].
+@@ -98,6 +95,7 @@ import org.mozilla.fenix.theme.ThemeManager
+ @Suppress("TooManyFunctions", "LargeClass")
+ abstract class BaseBrowserFragment : Fragment(), UserInteractionHandler, SessionManager.Observer {
+     protected lateinit var browserFragmentStore: BrowserFragmentStore
++    private lateinit var browserAnimator: BrowserAnimator
+ 
+     private var _browserInteractor: BrowserToolbarViewInteractor? = null
+     protected val browserInteractor: BrowserToolbarViewInteractor
+@@ -164,6 +162,15 @@ abstract class BaseBrowserFragment : Fragment(), UserInteractionHandler, Session
+ 
+         initializeEngineView(toolbarHeight)
+ 
++        browserAnimator = BrowserAnimator(
++            fragment = WeakReference(this),
++            engineView = WeakReference(engineView),
++            swipeRefresh = WeakReference(swipeRefresh),
++            arguments = arguments!!
++        ).apply {
++            beginAnimationIfNecessary()
++        }
++
+         return getSessionById()?.also { session ->
+             val browserToolbarController = DefaultBrowserToolbarController(
+                 store = browserFragmentStore,
+@@ -177,10 +184,9 @@ abstract class BaseBrowserFragment : Fragment(), UserInteractionHandler, Session
+                 browsingModeManager = (activity as HomeActivity).browsingModeManager,
+                 sessionManager = requireComponents.core.sessionManager,
+                 findInPageLauncher = { findInPageIntegration.withFeature { it.launch() } },
+-                browserLayout = view.browserLayout,
+                 engineView = engineView,
+                 swipeRefresh = swipeRefresh,
+-                adjustBackgroundAndNavigate = ::adjustBackgroundAndNavigate,
++                browserAnimator = browserAnimator,
+                 customTabSession = customTabSessionId?.let { sessionManager.findSessionById(it) },
+                 getSupportUrl = {
+                     SupportUtils.getSumoURLForTopic(
+@@ -499,26 +505,6 @@ abstract class BaseBrowserFragment : Fragment(), UserInteractionHandler, Session
+         view: View
+     ): List<ContextMenuCandidate>
+ 
+-    private fun adjustBackgroundAndNavigate(directions: NavDirections) {
+-        context?.let {
+-            viewLifecycleOwner.lifecycleScope.launch {
+-                // isAdded check is necessary because of a bug in viewLifecycleOwner. See AC#3828
+-                if (!this@BaseBrowserFragment.isAdded) return@launch
+-
+-                engineView.captureThumbnail { bitmap ->
+-                    if (!this@BaseBrowserFragment.isAdded) return@captureThumbnail
+-
+-                    // If the bitmap is null, the best we can do to reduce the flash is set transparent
+-                    swipeRefresh.background = bitmap?.toDrawable(it.resources)
+-                        ?: ColorDrawable(Color.TRANSPARENT)
+-
+-                    engineView.asView().visibility = View.GONE
+-                    findNavController().nav(R.id.browserFragment, directions)
+-                }
+-            }
+-        }
+-    }
+-
+     @CallSuper
+     override fun onSessionSelected(session: Session) {
+         (activity as HomeActivity).updateThemeForSession(session)
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserAnimator.kt b/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserAnimator.kt
+new file mode 100644
+index 000000000000..5b7e6b01964d
+--- /dev/null
++++ b/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserAnimator.kt
+@@ -0,0 +1,125 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.browser
++
++import android.animation.ValueAnimator
++import android.graphics.Color
++import android.graphics.drawable.ColorDrawable
++import android.os.Bundle
++import android.view.View
++import android.view.animation.DecelerateInterpolator
++import androidx.core.animation.doOnEnd
++import androidx.core.graphics.drawable.toDrawable
++import androidx.fragment.app.Fragment
++import androidx.lifecycle.LifecycleCoroutineScope
++import androidx.lifecycle.lifecycleScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import mozilla.components.concept.engine.EngineView
++import java.lang.ref.WeakReference
++
++/**
++ * Handles properly animating the browser engine based on `SHOULD_ANIMATE_FLAG` passed in through
++ * nav arguments.
++ */
++class BrowserAnimator(
++    private val fragment: WeakReference<Fragment>,
++    private val engineView: WeakReference<EngineView>,
++    private val swipeRefresh: WeakReference<View>,
++    private val arguments: Bundle
++) {
++
++    private val viewLifeCycleScope: LifecycleCoroutineScope?
++        get() = fragment.get()?.viewLifecycleOwner?.lifecycleScope
++
++    private val unwrappedEngineView: EngineView?
++        get() = engineView.get()
++
++    private val unwrappedSwipeRefresh: View?
++        get() = swipeRefresh.get()
++
++    /**
++     * Triggers the browser animation to run if necessary (based on the SHOULD_ANIMATE_FLAG). Also
++     * removes the flag from the bundle so it is not played on future entries into the fragment.
++     */
++    fun beginAnimationIfNecessary() {
++        val shouldAnimate = arguments.getBoolean(SHOULD_ANIMATE_FLAG, false)
++        if (shouldAnimate) {
++            viewLifeCycleScope?.launch(Dispatchers.Main) {
++                delay(ANIMATION_DELAY)
++                captureEngineViewAndDrawStatically {
++                    animateBrowserEngine(unwrappedSwipeRefresh)
++                }
++            }
++        } else {
++            unwrappedSwipeRefresh?.alpha = 1f
++            unwrappedEngineView?.asView()?.visibility = View.VISIBLE
++            unwrappedSwipeRefresh?.background = null
++        }
++    }
++
++    /**
++     * Details exactly how the browserEngine animation should look and plays it.
++     */
++    private fun animateBrowserEngine(browserEngine: View?) {
++        val valueAnimator = ValueAnimator.ofFloat(0f, END_ANIMATOR_VALUE)
++
++        valueAnimator.addUpdateListener {
++            browserEngine?.scaleX = STARTING_XY_SCALE + XY_SCALE_MULTIPLIER * it.animatedFraction
++            browserEngine?.scaleY = STARTING_XY_SCALE + XY_SCALE_MULTIPLIER * it.animatedFraction
++            browserEngine?.alpha = it.animatedFraction
++        }
++
++        valueAnimator.doOnEnd {
++            unwrappedEngineView?.asView()?.visibility = View.VISIBLE
++            unwrappedSwipeRefresh?.background = null
++            arguments.putBoolean(SHOULD_ANIMATE_FLAG, false)
++        }
++
++        valueAnimator.interpolator = DecelerateInterpolator()
++        valueAnimator.duration = ANIMATION_DURATION
++        valueAnimator.start()
++    }
++
++    /**
++     * Makes the swipeRefresh background a screenshot of the engineView in its current state.
++     * This allows us to "animate" the engineView.
++     */
++    fun captureEngineViewAndDrawStatically(onComplete: () -> Unit) {
++        unwrappedEngineView?.asView()?.context.let {
++            viewLifeCycleScope?.launch {
++                // isAdded check is necessary because of a bug in viewLifecycleOwner. See AC#3828
++                if (!fragment.isAdded()) { return@launch }
++                unwrappedEngineView?.captureThumbnail { bitmap ->
++                    if (!fragment.isAdded()) { return@captureThumbnail }
++
++                    unwrappedSwipeRefresh?.apply {
++                        alpha = 0f
++                        // If the bitmap is null, the best we can do to reduce the flash is set transparent
++                        background = bitmap?.toDrawable(context.resources)
++                            ?: ColorDrawable(Color.TRANSPARENT)
++                    }
++
++                    onComplete()
++                }
++            }
++        }
++    }
++
++    private fun WeakReference<Fragment>.isAdded(): Boolean {
++        val unwrapped = get()
++        return unwrapped != null && unwrapped.isAdded
++    }
++
++    companion object {
++        private const val SHOULD_ANIMATE_FLAG = "shouldAnimate"
++        private const val ANIMATION_DELAY = 50L
++        private const val ANIMATION_DURATION = 115L
++        private const val END_ANIMATOR_VALUE = 500f
++        private const val XY_SCALE_MULTIPLIER = .05f
++        private const val STARTING_XY_SCALE = .95f
++    }
++}
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt
+index 6d49cf4ac8a1..55fc1d047798 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/browser/BrowserFragment.kt
+@@ -64,7 +64,7 @@ class BrowserFragment : BaseBrowserFragment(), UserInteractionHandler {
+         savedInstanceState: Bundle?
+     ): View {
+         val view = super.onCreateView(inflater, container, savedInstanceState)
+-        view.browserLayout.transitionName = "$TAB_ITEM_TRANSITION_NAME${getSessionById()?.id}"
++
+         startPostponedEnterTransition()
+         return view
+     }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/BrowserToolbarController.kt b/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/BrowserToolbarController.kt
+index f2161395c1ce..1fe3f3511962 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/BrowserToolbarController.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/components/toolbar/BrowserToolbarController.kt
+@@ -6,16 +6,8 @@ package org.mozilla.fenix.components.toolbar
+ 
+ import android.app.Activity
+ import android.content.Intent
+-import android.graphics.Color
+-import android.graphics.drawable.ColorDrawable
+-import android.view.View
+-import android.view.ViewGroup
+ import androidx.annotation.VisibleForTesting
+-import androidx.core.graphics.drawable.toDrawable
+ import androidx.navigation.NavController
+-import androidx.navigation.NavDirections
+-import androidx.navigation.NavOptions
+-import androidx.navigation.fragment.FragmentNavigator
+ import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+ import com.google.android.material.snackbar.Snackbar
+ import kotlinx.coroutines.CoroutineScope
+@@ -30,6 +22,7 @@ import mozilla.components.concept.engine.prompt.ShareData
+ import mozilla.components.support.ktx.kotlin.isUrl
+ import org.mozilla.fenix.NavGraphDirections
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.browser.BrowserAnimator
+ import org.mozilla.fenix.browser.BrowserFragment
+ import org.mozilla.fenix.browser.BrowserFragmentDirections
+ import org.mozilla.fenix.browser.browsingmode.BrowsingMode
+@@ -57,6 +50,8 @@ interface BrowserToolbarController {
+     fun handleTabCounterClick()
+ }
+ 
++typealias onComplete = () -> Unit
++
+ @Suppress("LargeClass")
+ class DefaultBrowserToolbarController(
+     private val store: BrowserFragmentStore,
+@@ -66,9 +61,8 @@ class DefaultBrowserToolbarController(
+     private val browsingModeManager: BrowsingModeManager,
+     private val sessionManager: SessionManager,
+     private val findInPageLauncher: () -> Unit,
+-    private val browserLayout: ViewGroup,
+     private val engineView: EngineView,
+-    private val adjustBackgroundAndNavigate: (NavDirections) -> Unit,
++    private val browserAnimator: BrowserAnimator,
+     private val swipeRefresh: SwipeRefreshLayout,
+     private val customTabSession: Session?,
+     private val getSupportUrl: () -> String,
+@@ -89,12 +83,14 @@ class DefaultBrowserToolbarController(
+     internal var ioScope: CoroutineScope = CoroutineScope(Dispatchers.IO)
+ 
+     override fun handleToolbarPaste(text: String) {
+-        adjustBackgroundAndNavigate.invoke(
+-            BrowserFragmentDirections.actionBrowserFragmentToSearchFragment(
++        browserAnimator.captureEngineViewAndDrawStatically {
++            val directions = BrowserFragmentDirections.actionBrowserFragmentToSearchFragment(
+                 sessionId = currentSession?.id,
+                 pastedText = text
+             )
+-        )
++
++            navController.nav(R.id.browserFragment, directions)
++        }
+     }
+ 
+     override fun handleToolbarPasteAndGo(text: String) {
+@@ -112,9 +108,14 @@ class DefaultBrowserToolbarController(
+         activity.components.analytics.metrics.track(
+             Event.SearchBarTapped(Event.SearchBarTapped.Source.BROWSER)
+         )
+-        adjustBackgroundAndNavigate.invoke(
+-            BrowserFragmentDirections.actionBrowserFragmentToSearchFragment(currentSession?.id)
+-        )
++
++        browserAnimator.captureEngineViewAndDrawStatically {
++            val directions = BrowserFragmentDirections.actionBrowserFragmentToSearchFragment(
++                currentSession?.id
++            )
++
++            navController.nav(R.id.browserFragment, directions)
++        }
+     }
+ 
+     override fun handleTabCounterClick() {
+@@ -132,12 +133,14 @@ class DefaultBrowserToolbarController(
+             ToolbarMenu.Item.Forward -> sessionUseCases.goForward.invoke(currentSession)
+             ToolbarMenu.Item.Reload -> sessionUseCases.reload.invoke(currentSession)
+             ToolbarMenu.Item.Stop -> sessionUseCases.stopLoading.invoke(currentSession)
+-            ToolbarMenu.Item.Settings -> adjustBackgroundAndNavigate.invoke(
+-                BrowserFragmentDirections.actionBrowserFragmentToSettingsFragment()
+-            )
+-            ToolbarMenu.Item.Library -> adjustBackgroundAndNavigate.invoke(
+-                BrowserFragmentDirections.actionBrowserFragmentToLibraryFragment()
+-            )
++            ToolbarMenu.Item.Settings -> browserAnimator.captureEngineViewAndDrawStatically {
++                val directions = BrowserFragmentDirections.actionBrowserFragmentToSettingsFragment()
++                navController.nav(R.id.browserFragment, directions)
++            }
++            ToolbarMenu.Item.Library -> browserAnimator.captureEngineViewAndDrawStatically {
++                val directions = BrowserFragmentDirections.actionBrowserFragmentToLibraryFragment()
++                navController.nav(R.id.browserFragment, directions)
++            }
+             is ToolbarMenu.Item.RequestDesktop -> sessionUseCases.requestDesktopSite.invoke(
+                 item.isChecked,
+                 currentSession
+@@ -297,28 +300,14 @@ class DefaultBrowserToolbarController(
+     }
+ 
+     private fun animateTabAndNavigateHome() {
+-        // We need to dynamically add the options here because if you do it in XML it overwrites
+-        val options = NavOptions.Builder().setPopUpTo(R.id.nav_graph, false)
+-            .setEnterAnim(R.anim.fade_in).build()
+-        val extras = FragmentNavigator.Extras.Builder().addSharedElement(
+-            browserLayout,
+-            "${TAB_ITEM_TRANSITION_NAME}${currentSession?.id}"
+-        ).build()
+-        engineView.captureThumbnail { bitmap ->
+-            scope.launch {
+-                // If the bitmap is null, the best we can do to reduce the flash is set transparent
+-                swipeRefresh.background = bitmap?.toDrawable(activity.resources)
+-                    ?: ColorDrawable(Color.TRANSPARENT)
+-                engineView.asView().visibility = View.GONE
+-                if (!navController.popBackStack(R.id.homeFragment, false)) {
+-                    navController.nav(
+-                        R.id.browserFragment,
+-                        R.id.action_browserFragment_to_homeFragment,
+-                        null,
+-                        options,
+-                        extras
+-                    )
+-                }
++        browserAnimator.captureEngineViewAndDrawStatically {
++            if (!navController.popBackStack(R.id.homeFragment, false)) {
++                val directions = BrowserFragmentDirections.actionBrowserFragmentToHomeFragment()
++                navController.nav(
++                    R.id.browserFragment,
++                    directions,
++                    null
++                )
+             }
+         }
+     }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
+index 458dba221bb4..c10082a79a95 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/HomeFragment.kt
+@@ -38,7 +38,6 @@ import androidx.navigation.fragment.findNavController
+ import androidx.recyclerview.widget.LinearLayoutManager
+ import androidx.recyclerview.widget.RecyclerView
+ import androidx.recyclerview.widget.RecyclerView.SCROLL_STATE_IDLE
+-import androidx.transition.TransitionInflater
+ import com.google.android.material.appbar.AppBarLayout
+ import com.google.android.material.snackbar.Snackbar
+ import kotlinx.android.synthetic.main.fragment_home.*
+@@ -60,8 +59,8 @@ import mozilla.components.feature.media.ext.getSession
+ import mozilla.components.feature.media.state.MediaState
+ import mozilla.components.feature.media.state.MediaStateMachine
+ import mozilla.components.feature.tab.collections.TabCollection
+-import mozilla.components.support.ktx.android.util.dpToPx
+ import mozilla.components.feature.top.sites.TopSite
++import mozilla.components.support.ktx.android.util.dpToPx
+ import org.mozilla.fenix.BrowserDirection
+ import org.mozilla.fenix.HomeActivity
+ import org.mozilla.fenix.R
+@@ -145,9 +144,6 @@ class HomeFragment : Fragment() {
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         postponeEnterTransition()
+-        sharedElementEnterTransition =
+-            TransitionInflater.from(context).inflateTransition(android.R.transition.move)
+-                .setDuration(SHARED_TRANSITION_MS)
+ 
+         val sessionObserver = BrowserSessionsObserver(sessionManager, singleSessionObserver) {
+             emitSessionChanges()
+@@ -270,6 +266,10 @@ class HomeFragment : Fragment() {
+                 sessionControlView!!.view.layoutManager?.onRestoreInstanceState(parcelable)
+             }
+             homeViewModel.layoutManagerState = null
++
++            // We have to delay so that the keyboard collapses and the view is resized before the
++            // animation from SearchFragment happens
++            delay(ANIMATION_DELAY)
+         }
+ 
+         viewLifecycleOwner.lifecycleScope.launch(IO) {
+@@ -309,14 +309,7 @@ class HomeFragment : Fragment() {
+         view.toolbar_wrapper.setOnClickListener {
+             invokePendingDeleteJobs()
+             hideOnboardingIfNeeded()
+-            val directions = HomeFragmentDirections.actionHomeFragmentToSearchFragment(
+-                sessionId = null
+-            )
+-            val extras =
+-                FragmentNavigator.Extras.Builder()
+-                    .addSharedElement(toolbar_wrapper, "toolbar_wrapper_transition")
+-                    .build()
+-            nav(R.id.homeFragment, directions, extras)
++            navigateToSearch()
+             requireComponents.analytics.metrics.track(Event.SearchBarTapped(Event.SearchBarTapped.Source.HOME))
+         }
+ 
+@@ -550,7 +543,12 @@ class HomeFragment : Fragment() {
+         val directions = HomeFragmentDirections.actionHomeFragmentToSearchFragment(
+             sessionId = null
+         )
+-        nav(R.id.homeFragment, directions)
++
++        val extras = FragmentNavigator.Extras.Builder()
++                .addSharedElement(toolbar_wrapper, "toolbar_wrapper_transition")
++                .build()
++
++        nav(R.id.homeFragment, directions, extras)
+     }
+ 
+     private fun openSettingsScreen() {
+@@ -897,12 +895,13 @@ class HomeFragment : Fragment() {
+     }
+ 
+     companion object {
++        private const val ANIMATION_DELAY = 100L
++
+         private const val NON_TAB_ITEM_NUM = 3
+         private const val ANIM_SCROLL_DELAY = 100L
+         private const val ANIM_ON_SCREEN_DELAY = 200L
+         private const val FADE_ANIM_DURATION = 150L
+         private const val ANIM_SNACKBAR_DELAY = 100L
+-        private const val SHARED_TRANSITION_MS = 200L
+         private const val CFR_WIDTH_DIVIDER = 1.7
+         private const val CFR_Y_OFFSET = -20
+ 
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlController.kt b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlController.kt
+index f31d6e4399dd..a774fd26d3b4 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlController.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/home/sessioncontrol/SessionControlController.kt
+@@ -6,7 +6,6 @@ package org.mozilla.fenix.home.sessioncontrol
+ 
+ import android.view.View
+ import androidx.navigation.NavController
+-import androidx.navigation.fragment.FragmentNavigator
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.launch
+@@ -341,27 +340,19 @@ class DefaultSessionControlController(
+         invokePendingDeleteJobs()
+         val session = sessionManager.findSessionById(sessionId)
+         sessionManager.select(session!!)
+-        val directions = HomeFragmentDirections.actionHomeFragmentToBrowserFragment(null)
+-        val extras =
+-            FragmentNavigator.Extras.Builder()
+-                .addSharedElement(
+-                    tabView,
+-                    "$TAB_ITEM_TRANSITION_NAME$sessionId"
+-                )
+-                .build()
+-        navController.nav(R.id.homeFragment, directions, extras)
++        activity.openToBrowser(BrowserDirection.FromHome)
+     }
+ 
+     override fun handleSelectTopSite(url: String) {
++        invokePendingDeleteJobs()
+         metrics.track(Event.TopSiteOpenInNewTab)
+-        if (url == SupportUtils.POCKET_TRENDING_URL) {
+-            metrics.track(Event.PocketTopSiteClicked)
+-        }
+-        activity.components.useCases.tabsUseCases.addTab.invoke(url, true, true)
+-        navController.nav(
+-            R.id.homeFragment,
+-            HomeFragmentDirections.actionHomeFragmentToBrowserFragment(null)
++        if (url == SupportUtils.POCKET_TRENDING_URL) { metrics.track(Event.PocketTopSiteClicked) }
++        activity.components.useCases.tabsUseCases.addTab.invoke(
++            url = url,
++            selectTab = true,
++            startLoading = true
+         )
++        activity.openToBrowser(BrowserDirection.FromHome)
+     }
+ 
+     override fun handleShareTabs() {
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/search/SearchFragment.kt b/fenix/app/src/main/java/org/mozilla/fenix/search/SearchFragment.kt
+index a990a8d34bc1..6ef4f97feec3 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/search/SearchFragment.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/search/SearchFragment.kt
+@@ -59,11 +59,11 @@ class SearchFragment : Fragment(), UserInteractionHandler {
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         postponeEnterTransition()
++
+         sharedElementEnterTransition =
+             TransitionInflater.from(context).inflateTransition(android.R.transition.move)
+-                .setDuration(
+-                    SHARED_TRANSITION_MS
+-                )
++                .setDuration(SHARED_TRANSITION_MS)
++
+         requireComponents.analytics.metrics.track(Event.InteractWithSearchURLArea)
+     }
+ 
+@@ -346,7 +346,7 @@ class SearchFragment : Fragment(), UserInteractionHandler {
+     }
+ 
+     companion object {
+-        private const val SHARED_TRANSITION_MS = 200L
++        private const val SHARED_TRANSITION_MS = 250L
+         private const val REQUEST_CODE_CAMERA_PERMISSIONS = 1
+     }
+ }
+diff --git a/fenix/app/src/main/java/org/mozilla/fenix/utils/FragmentPreDrawManager.kt b/fenix/app/src/main/java/org/mozilla/fenix/utils/FragmentPreDrawManager.kt
+index 75f7a3b0cff0..0160ac7a7458 100644
+--- a/fenix/app/src/main/java/org/mozilla/fenix/utils/FragmentPreDrawManager.kt
++++ b/fenix/app/src/main/java/org/mozilla/fenix/utils/FragmentPreDrawManager.kt
+@@ -19,7 +19,7 @@ class FragmentPreDrawManager(
+         fragment.postponeEnterTransition()
+     }
+ 
+-    fun execute(code: () -> Unit) {
++    fun execute(code: suspend () -> Unit) {
+         fragment.view?.doOnPreDraw {
+             fragment.viewLifecycleOwner.lifecycleScope.launch {
+                 code()
+diff --git a/fenix/app/src/main/res/anim/fade_in.xml b/fenix/app/src/main/res/anim/fade_in.xml
+index 8024b31fd5df..aebd4461c454 100644
+--- a/fenix/app/src/main/res/anim/fade_in.xml
++++ b/fenix/app/src/main/res/anim/fade_in.xml
+@@ -5,4 +5,4 @@
+ <alpha xmlns:android="http://schemas.android.com/apk/res/android"
+        android:interpolator="@android:interpolator/decelerate_quad"
+        android:fromAlpha="0.0" android:toAlpha="1.0"
+-       android:duration="250" />
+\ No newline at end of file
++       android:duration="150" />
+\ No newline at end of file
+diff --git a/fenix/app/src/main/res/anim/fade_out.xml b/fenix/app/src/main/res/anim/fade_out.xml
+index 4c00bc4a6983..50a520082ec1 100644
+--- a/fenix/app/src/main/res/anim/fade_out.xml
++++ b/fenix/app/src/main/res/anim/fade_out.xml
+@@ -5,4 +5,4 @@
+ <alpha xmlns:android="http://schemas.android.com/apk/res/android"
+        android:interpolator="@android:interpolator/accelerate_quad"
+        android:fromAlpha="1.0" android:toAlpha="0"
+-       android:duration="250" />
+\ No newline at end of file
++       android:duration="150" />
+\ No newline at end of file
+diff --git a/fenix/app/src/main/res/anim/zoom_in_fade.xml b/fenix/app/src/main/res/anim/zoom_in_fade.xml
+new file mode 100644
+index 000000000000..5248878fd88a
+--- /dev/null
++++ b/fenix/app/src/main/res/anim/zoom_in_fade.xml
+@@ -0,0 +1,19 @@
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++        License, v. 2.0. If a copy of the MPL was not distributed with this
++        file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++
++<set xmlns:android="http://schemas.android.com/apk/res/android">
++    <alpha
++        android:interpolator="@android:interpolator/linear"
++        android:fromAlpha="1.0" android:toAlpha="0"
++        android:duration="125" />
++    <scale
++        android:interpolator="@android:interpolator/linear"
++        android:pivotX="50%"
++        android:pivotY="50%"
++        android:fromXScale="100%"
++        android:toXScale="113%"
++        android:fromYScale="100%"
++        android:toYScale="113%"
++        android:duration="125" />
++</set>
+\ No newline at end of file
+diff --git a/fenix/app/src/main/res/layout/component_browser_top_toolbar.xml b/fenix/app/src/main/res/layout/component_browser_top_toolbar.xml
+index ea19bfc1a58a..0b904a14d111 100644
+--- a/fenix/app/src/main/res/layout/component_browser_top_toolbar.xml
++++ b/fenix/app/src/main/res/layout/component_browser_top_toolbar.xml
+@@ -15,6 +15,7 @@
+     android:background="@drawable/toolbar_background_top"
+     android:clickable="true"
+     android:focusable="true"
++    android:transitionName="toolbar_wrapper_transition"
+     android:focusableInTouchMode="true"
+     app:layout_scrollFlags="scroll|enterAlways|snap|exitUntilCollapsed"
+     app:browserToolbarClearColor="?primaryText"
+diff --git a/fenix/app/src/main/res/layout/fragment_browser.xml b/fenix/app/src/main/res/layout/fragment_browser.xml
+index 0f6f70d496b8..79030138e428 100644
+--- a/fenix/app/src/main/res/layout/fragment_browser.xml
++++ b/fenix/app/src/main/res/layout/fragment_browser.xml
+@@ -14,9 +14,11 @@
+         android:id="@+id/swipeRefresh"
+         android:layout_width="match_parent"
+         android:layout_height="match_parent"
++        android:alpha="0"
+         app:layout_behavior="@string/appbar_scrolling_view_behavior">
+         <mozilla.components.concept.engine.EngineView
+             android:id="@+id/engineView"
++            android:visibility="gone"
+             android:layout_width="match_parent"
+             android:layout_height="match_parent" />
+     </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
+diff --git a/fenix/app/src/main/res/navigation/nav_graph.xml b/fenix/app/src/main/res/navigation/nav_graph.xml
+index b1755f7823ab..4a9431c3305b 100644
+--- a/fenix/app/src/main/res/navigation/nav_graph.xml
++++ b/fenix/app/src/main/res/navigation/nav_graph.xml
+@@ -75,7 +75,7 @@
+         <action
+             android:id="@+id/action_homeFragment_to_browserFragment"
+             app:destination="@id/browserFragment"
+-            app:exitAnim="@anim/fade_out"
++            app:exitAnim="@anim/zoom_in_fade"
+             app:popEnterAnim="@anim/fade_in" />
+         <action
+             android:id="@+id/action_homeFragment_to_libraryFragment"
+@@ -187,6 +187,10 @@
+             android:name="activeSessionId"
+             app:argType="string"
+             app:nullable="true" />
++        <argument
++            android:name="shouldAnimate"
++            app:argType="boolean"
++            android:defaultValue="false" />
+         <action
+             android:id="@+id/action_browserFragment_to_settingsFragment"
+             app:destination="@id/settingsFragment" />
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/components/toolbar/DefaultBrowserToolbarControllerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/components/toolbar/DefaultBrowserToolbarControllerTest.kt
+index 8b1d338ef76e..21a6c5f58621 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/components/toolbar/DefaultBrowserToolbarControllerTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/components/toolbar/DefaultBrowserToolbarControllerTest.kt
+@@ -6,7 +6,6 @@ package org.mozilla.fenix.components.toolbar
+ 
+ import android.content.Context
+ import android.content.Intent
+-import android.view.ViewGroup
+ import androidx.lifecycle.LifecycleCoroutineScope
+ import androidx.navigation.NavController
+ import androidx.navigation.NavDirections
+@@ -16,12 +15,14 @@ import io.mockk.every
+ import io.mockk.just
+ import io.mockk.mockk
+ import io.mockk.mockkStatic
++import io.mockk.slot
+ import io.mockk.verify
+ import io.mockk.verifyOrder
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+ import kotlinx.coroutines.ObsoleteCoroutinesApi
+ import kotlinx.coroutines.newSingleThreadContext
++import kotlinx.coroutines.runBlocking
+ import kotlinx.coroutines.test.resetMain
+ import kotlinx.coroutines.test.runBlockingTest
+ import kotlinx.coroutines.test.setMain
+@@ -37,6 +38,7 @@ import org.junit.Before
+ import org.junit.Test
+ import org.mozilla.fenix.HomeActivity
+ import org.mozilla.fenix.R
++import org.mozilla.fenix.browser.BrowserAnimator
+ import org.mozilla.fenix.browser.BrowserFragment
+ import org.mozilla.fenix.browser.BrowserFragmentDirections
+ import org.mozilla.fenix.browser.browsingmode.BrowsingMode
+@@ -59,7 +61,6 @@ import org.mozilla.fenix.settings.deletebrowsingdata.deleteAndQuit
+ class DefaultBrowserToolbarControllerTest {
+ 
+     private val mainThreadSurrogate = newSingleThreadContext("UI thread")
+-    private var browserLayout: ViewGroup = mockk(relaxed = true)
+     private var swipeRefreshLayout: SwipeRefreshLayout = mockk(relaxed = true)
+     private var activity: HomeActivity = mockk(relaxed = true)
+     private var analytics: Analytics = mockk(relaxed = true)
+@@ -75,7 +76,7 @@ class DefaultBrowserToolbarControllerTest {
+     private val searchUseCases: SearchUseCases = mockk(relaxed = true)
+     private val sessionUseCases: SessionUseCases = mockk(relaxed = true)
+     private val scope: LifecycleCoroutineScope = mockk(relaxed = true)
+-    private val adjustBackgroundAndNavigate: (NavDirections) -> Unit = mockk(relaxed = true)
++    private val browserAnimator: BrowserAnimator = mockk(relaxed = true)
+     private val snackbar = mockk<FenixSnackbar>(relaxed = true)
+     private val tabCollectionStorage = mockk<TabCollectionStorage>(relaxed = true)
+     private val topSiteStorage = mockk<TopSiteStorage>(relaxed = true)
+@@ -92,12 +93,11 @@ class DefaultBrowserToolbarControllerTest {
+             browsingModeManager = browsingModeManager,
+             findInPageLauncher = findInPageLauncher,
+             engineView = engineView,
+-            adjustBackgroundAndNavigate = adjustBackgroundAndNavigate,
++            browserAnimator = browserAnimator,
+             customTabSession = null,
+             getSupportUrl = getSupportUrl,
+             openInFenixIntent = openInFenixIntent,
+             scope = scope,
+-            browserLayout = browserLayout,
+             swipeRefresh = swipeRefreshLayout,
+             tabCollectionStorage = tabCollectionStorage,
+             topSiteStorage = topSiteStorage,
+@@ -122,7 +122,9 @@ class DefaultBrowserToolbarControllerTest {
+         every { activity.components.useCases.sessionUseCases } returns sessionUseCases
+         every { activity.components.useCases.searchUseCases } returns searchUseCases
+         every { activity.components.core.sessionManager.selectedSession } returns currentSession
+-        every { adjustBackgroundAndNavigate.invoke(any()) } just Runs
++
++        val onComplete = slot<() -> Unit>()
++        every { browserAnimator.captureEngineViewAndDrawStatically(capture(onComplete)) } answers { onComplete.captured.invoke() }
+     }
+ 
+     @Test
+@@ -133,12 +135,11 @@ class DefaultBrowserToolbarControllerTest {
+         controller.handleToolbarPaste(pastedText)
+ 
+         verify {
+-            adjustBackgroundAndNavigate.invoke(
+-                BrowserFragmentDirections.actionBrowserFragmentToSearchFragment(
+-                    sessionId = "1",
+-                    pastedText = pastedText
+-                )
++            val directions = BrowserFragmentDirections.actionBrowserFragmentToSearchFragment(
++                sessionId = "1",
++                pastedText = pastedText
+             )
++            navController.nav(R.id.browserFragment, directions)
+         }
+     }
+ 
+@@ -178,11 +179,10 @@ class DefaultBrowserToolbarControllerTest {
+ 
+         verify { metrics.track(Event.SearchBarTapped(Event.SearchBarTapped.Source.BROWSER)) }
+         verify {
+-            adjustBackgroundAndNavigate.invoke(
+-                BrowserFragmentDirections.actionBrowserFragmentToSearchFragment(
++                val directions = BrowserFragmentDirections.actionBrowserFragmentToSearchFragment(
+                     sessionId = "1"
+                 )
+-            )
++                navController.nav(R.id.browserFragment, directions)
+         }
+     }
+ 
+@@ -229,16 +229,15 @@ class DefaultBrowserToolbarControllerTest {
+     }
+ 
+     @Test
+-    fun handleToolbarSettingsPress() {
++    fun handleToolbarSettingsPress() = runBlocking {
+         val item = ToolbarMenu.Item.Settings
+ 
+         controller.handleToolbarItemInteraction(item)
+ 
+         verify { metrics.track(Event.BrowserMenuItemTapped(Event.BrowserMenuItemTapped.Item.SETTINGS)) }
+         verify {
+-            adjustBackgroundAndNavigate.invoke(
+-                BrowserFragmentDirections.actionBrowserFragmentToSettingsFragment()
+-            )
++            val directions = BrowserFragmentDirections.actionBrowserFragmentToSettingsFragment()
++            navController.nav(R.id.browserFragment, directions)
+         }
+     }
+ 
+@@ -250,9 +249,8 @@ class DefaultBrowserToolbarControllerTest {
+ 
+         verify { metrics.track(Event.BrowserMenuItemTapped(Event.BrowserMenuItemTapped.Item.LIBRARY)) }
+         verify {
+-            adjustBackgroundAndNavigate.invoke(
+-                BrowserFragmentDirections.actionBrowserFragmentToLibraryFragment()
+-            )
++            val directions = BrowserFragmentDirections.actionBrowserFragmentToLibraryFragment()
++            navController.nav(R.id.browserFragment, directions)
+         }
+     }
+ 
+@@ -304,12 +302,11 @@ class DefaultBrowserToolbarControllerTest {
+             browsingModeManager = browsingModeManager,
+             findInPageLauncher = findInPageLauncher,
+             engineView = engineView,
+-            adjustBackgroundAndNavigate = adjustBackgroundAndNavigate,
++            browserAnimator = browserAnimator,
+             customTabSession = null,
+             getSupportUrl = getSupportUrl,
+             openInFenixIntent = openInFenixIntent,
+             scope = this,
+-            browserLayout = browserLayout,
+             swipeRefresh = swipeRefreshLayout,
+             tabCollectionStorage = tabCollectionStorage,
+             topSiteStorage = topSiteStorage,
+@@ -500,12 +497,11 @@ class DefaultBrowserToolbarControllerTest {
+             browsingModeManager = browsingModeManager,
+             findInPageLauncher = findInPageLauncher,
+             engineView = engineView,
+-            adjustBackgroundAndNavigate = adjustBackgroundAndNavigate,
++            browserAnimator = browserAnimator,
+             customTabSession = currentSession,
+             getSupportUrl = getSupportUrl,
+             openInFenixIntent = openInFenixIntent,
+             scope = scope,
+-            browserLayout = browserLayout,
+             swipeRefresh = swipeRefreshLayout,
+             tabCollectionStorage = tabCollectionStorage,
+             topSiteStorage = topSiteStorage,
+@@ -542,12 +538,11 @@ class DefaultBrowserToolbarControllerTest {
+             browsingModeManager = browsingModeManager,
+             findInPageLauncher = findInPageLauncher,
+             engineView = engineView,
+-            adjustBackgroundAndNavigate = adjustBackgroundAndNavigate,
++            browserAnimator = browserAnimator,
+             customTabSession = null,
+             getSupportUrl = getSupportUrl,
+             openInFenixIntent = openInFenixIntent,
+             scope = testScope,
+-            browserLayout = browserLayout,
+             swipeRefresh = swipeRefreshLayout,
+             tabCollectionStorage = tabCollectionStorage,
+             topSiteStorage = topSiteStorage,
+diff --git a/fenix/app/src/test/java/org/mozilla/fenix/home/DefaultSessionControlControllerTest.kt b/fenix/app/src/test/java/org/mozilla/fenix/home/DefaultSessionControlControllerTest.kt
+index 0cb57cdcce94..0ad389af963c 100644
+--- a/fenix/app/src/test/java/org/mozilla/fenix/home/DefaultSessionControlControllerTest.kt
++++ b/fenix/app/src/test/java/org/mozilla/fenix/home/DefaultSessionControlControllerTest.kt
+@@ -20,18 +20,17 @@ import kotlinx.coroutines.test.setMain
+ import mozilla.components.browser.session.SessionManager
+ import mozilla.components.concept.engine.Engine
+ import mozilla.components.feature.tab.collections.TabCollection
++import mozilla.components.feature.tabs.TabsUseCases
+ import org.junit.After
+ import org.junit.Before
+ import org.junit.Test
+ import org.mozilla.fenix.BrowserDirection
+ import org.mozilla.fenix.HomeActivity
+-import org.mozilla.fenix.R
+ import org.mozilla.fenix.browser.browsingmode.BrowsingModeManager
+ import org.mozilla.fenix.components.TabCollectionStorage
+ import org.mozilla.fenix.components.metrics.Event
+ import org.mozilla.fenix.components.metrics.MetricController
+ import org.mozilla.fenix.ext.components
+-import org.mozilla.fenix.ext.nav
+ import org.mozilla.fenix.home.sessioncontrol.DefaultSessionControlController
+ import org.mozilla.fenix.settings.SupportUtils
+ import mozilla.components.feature.tab.collections.Tab as ComponentTab
+@@ -61,6 +60,7 @@ class DefaultSessionControlControllerTest {
+     private val sessionManager: SessionManager = mockk(relaxed = true)
+     private val engine: Engine = mockk(relaxed = true)
+     private val tabCollectionStorage: TabCollectionStorage = mockk(relaxed = true)
++    private val tabsUseCases: TabsUseCases = mockk(relaxed = true)
+ 
+     private lateinit var controller: DefaultSessionControlController
+ 
+@@ -71,6 +71,7 @@ class DefaultSessionControlControllerTest {
+         every { activity.components.core.engine } returns engine
+         every { activity.components.core.sessionManager } returns sessionManager
+         every { activity.components.core.tabCollectionStorage } returns tabCollectionStorage
++        every { activity.components.useCases.tabsUseCases } returns tabsUseCases
+ 
+         every { store.state } returns state
+         every { state.collections } returns emptyList()
+@@ -194,10 +195,24 @@ class DefaultSessionControlControllerTest {
+     fun handleSelectTab() {
+         val tabView: View = mockk(relaxed = true)
+         val sessionId = "hello"
+-        val directions = HomeFragmentDirections.actionHomeFragmentToBrowserFragment(null)
+         controller.handleSelectTab(tabView, sessionId)
+         verify { invokePendingDeleteJobs() }
+-        verify { navController.nav(R.id.homeFragment, directions) }
++        verify { activity.openToBrowser(BrowserDirection.FromHome) }
++    }
++
++    @Test
++    fun handleSelectTopSite() {
++        val topSiteUrl = "mozilla.org"
++
++        controller.handleSelectTopSite(topSiteUrl)
++        verify { invokePendingDeleteJobs() }
++        verify { metrics.track(Event.TopSiteOpenInNewTab) }
++        verify { tabsUseCases.addTab.invoke(
++            topSiteUrl,
++            selectTab = true,
++            startLoading = true
++        ) }
++        verify { activity.openToBrowser(BrowserDirection.FromHome) }
+     }
+ 
+     @Test

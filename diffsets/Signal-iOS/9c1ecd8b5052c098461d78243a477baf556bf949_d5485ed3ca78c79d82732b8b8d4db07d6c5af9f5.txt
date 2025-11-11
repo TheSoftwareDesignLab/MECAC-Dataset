@@ -1,0 +1,175 @@
+diff --git a/Signal/src/ViewControllers/ConversationView/CV/CVAttachments.swift b/Signal/src/ViewControllers/ConversationView/CV/CVAttachments.swift
+index c4dbec94a19..a64eeb127d3 100644
+--- a/Signal/src/ViewControllers/ConversationView/CV/CVAttachments.swift
++++ b/Signal/src/ViewControllers/ConversationView/CV/CVAttachments.swift
+@@ -3,14 +3,49 @@
+ //
+ 
+ import Foundation
++import SignalServiceKit
+ 
+ // Represents a _playable_ audio attachment.
+-public class AudioAttachment: NSObject {
+-    public enum State {
++public class AudioAttachment {
++    public enum State: Equatable {
+         case attachmentStream(attachmentStream: TSAttachmentStream, audioDurationSeconds: TimeInterval)
+         case attachmentPointer(attachmentPointer: TSAttachmentPointer)
+     }
+     public let state: State
++    public let owningMessage: TSMessage?
++
++    // Set at time of init. Value doesn't change even after download completes
++    // to ensure that conversation view diffing catches the need to redraw the cell
++    public let isDownloading: Bool
++
++    public required init?(attachment: TSAttachment, owningMessage: TSMessage?) {
++        if let attachmentStream = attachment as? TSAttachmentStream {
++            let audioDurationSeconds = attachmentStream.audioDurationSeconds()
++            guard audioDurationSeconds > 0 else {
++                return nil
++            }
++            state = .attachmentStream(attachmentStream: attachmentStream, audioDurationSeconds: audioDurationSeconds)
++            isDownloading = false
++        } else if let attachmentPointer = attachment as? TSAttachmentPointer {
++            state = .attachmentPointer(attachmentPointer: attachmentPointer)
++
++            switch attachmentPointer.state {
++            case .failed, .pendingMessageRequest, .pendingManualDownload:
++                isDownloading = false
++            case .enqueued, .downloading:
++                isDownloading = true
++            }
++        } else {
++            owsFailDebug("Invalid attachment.")
++            return nil
++        }
++
++        self.owningMessage = owningMessage
++    }
++}
++
++extension AudioAttachment: Dependencies {
++    var isDownloaded: Bool { attachmentStream != nil }
+ 
+     public var attachment: TSAttachment {
+         switch state {
+@@ -39,7 +74,6 @@ public class AudioAttachment: NSObject {
+         }
+     }
+ 
+-    public let owningMessage: TSMessage?
+ 
+     public var durationSeconds: TimeInterval {
+         switch state {
+@@ -50,23 +84,6 @@ public class AudioAttachment: NSObject {
+         }
+     }
+ 
+-    public required init?(attachment: TSAttachment, owningMessage: TSMessage?) {
+-        if let attachmentStream = attachment as? TSAttachmentStream {
+-            let audioDurationSeconds = attachmentStream.audioDurationSeconds()
+-            guard audioDurationSeconds > 0 else {
+-                return nil
+-            }
+-            state = .attachmentStream(attachmentStream: attachmentStream, audioDurationSeconds: audioDurationSeconds)
+-        } else if let attachmentPointer = attachment as? TSAttachmentPointer {
+-            state = .attachmentPointer(attachmentPointer: attachmentPointer)
+-        } else {
+-            owsFailDebug("Invalid attachment.")
+-            return nil
+-        }
+-
+-        self.owningMessage = owningMessage
+-    }
+-
+     public func markOwningMessageAsViewed() -> Bool {
+         AssertIsOnMainThread()
+         guard let incomingMessage = owningMessage as? TSIncomingMessage, !incomingMessage.wasViewed else { return false }
+@@ -86,3 +103,11 @@ public class AudioAttachment: NSObject {
+         return true
+     }
+ }
++
++extension AudioAttachment: Equatable {
++    public static func == (lhs: AudioAttachment, rhs: AudioAttachment) -> Bool {
++        lhs.state == rhs.state &&
++        lhs.owningMessage == rhs.owningMessage &&
++        lhs.isDownloading == rhs.isDownloading
++    }
++}
+diff --git a/Signal/src/ViewControllers/ConversationView/CV/CVComponents/CVComponentAudioAttachment.swift b/Signal/src/ViewControllers/ConversationView/CV/CVComponents/CVComponentAudioAttachment.swift
+index 425dbdc9e38..340e5245d1d 100644
+--- a/Signal/src/ViewControllers/ConversationView/CV/CVComponents/CVComponentAudioAttachment.swift
++++ b/Signal/src/ViewControllers/ConversationView/CV/CVComponents/CVComponentAudioAttachment.swift
+@@ -130,8 +130,24 @@ public class CVComponentAudioAttachment: CVComponentBase, CVComponent {
+                                    componentDelegate: CVComponentDelegate,
+                                    componentView: CVComponentView,
+                                    renderItem: CVRenderItem) -> Bool {
+-        cvAudioPlayer.togglePlayState(forAudioAttachment: audioAttachment)
+-        return true
++        if audioAttachment.isDownloaded {
++            cvAudioPlayer.togglePlayState(forAudioAttachment: audioAttachment)
++            return true
++
++        } else if audioAttachment.isDownloading, let pointerId = audioAttachment.attachmentPointer?.uniqueId {
++            Logger.debug("Cancelling in-progress download because of user action: \(interaction.uniqueId):\(pointerId)")
++            Self.attachmentDownloads.cancelDownload(attachmentId: pointerId)
++            return true
++
++        } else if let message = interaction as? TSMessage {
++            Logger.debug("Retrying download for message: \(message.uniqueId)")
++            componentDelegate.cvc_didTapFailedOrPendingDownloads(message)
++            return true
++
++        } else {
++            owsFailDebug("Unexpected message type")
++            return false
++        }
+     }
+ 
+     // MARK: - Scrub Audio With Pan
+diff --git a/Signal/src/ViewControllers/ConversationView/Cells/AudioMessageView.swift b/Signal/src/ViewControllers/ConversationView/Cells/AudioMessageView.swift
+index faae5619f4a..1c22b2dbc4d 100644
+--- a/Signal/src/ViewControllers/ConversationView/Cells/AudioMessageView.swift
++++ b/Signal/src/ViewControllers/ConversationView/Cells/AudioMessageView.swift
+@@ -11,21 +11,6 @@ class AudioMessageView: ManualStackView {
+     private var attachment: TSAttachment { audioAttachment.attachment }
+     private var attachmentStream: TSAttachmentStream? { audioAttachment.attachmentStream }
+     private var durationSeconds: TimeInterval { audioAttachment.durationSeconds }
+-    private var isDownloaded: Bool { audioAttachment.attachmentStream != nil }
+-    private var isDownloading: Bool {
+-        guard let attachmentPointer = audioAttachment.attachmentPointer else {
+-            return false
+-        }
+-        switch attachmentPointer.state {
+-        case .failed, .pendingMessageRequest, .pendingManualDownload:
+-            return false
+-        case .enqueued, .downloading:
+-            return true
+-        @unknown default:
+-            owsFailDebug("Invalid value.")
+-            return false
+-        }
+-    }
+ 
+     private let isIncoming: Bool
+     private weak var componentDelegate: CVComponentDelegate?
+@@ -96,7 +81,7 @@ class AudioMessageView: ManualStackView {
+         progressSlider.setThumbImage(UIImage(named: "audio_message_thumb")?.asTintedImage(color: thumbColor), for: .normal)
+         progressSlider.setMinimumTrackImage(trackImage(color: playedColor), for: .normal)
+         progressSlider.setMaximumTrackImage(trackImage(color: unplayedColor), for: .normal)
+-        progressSlider.isEnabled = isDownloaded
++        progressSlider.isEnabled = audioAttachment.isDownloaded
+         progressSlider.isUserInteractionEnabled = false
+ 
+         waveformContainer.addSubview(progressSlider) { [progressSlider] view in
+@@ -112,7 +97,7 @@ class AudioMessageView: ManualStackView {
+         playbackTimeLabel.setContentHuggingHigh()
+ 
+         let leftView: UIView
+-        if isDownloaded {
++        if audioAttachment.isDownloaded {
+             let playPauseAnimation = self.playPauseAnimation
+             let playedDotAnimation = self.playedDotAnimation
+ 

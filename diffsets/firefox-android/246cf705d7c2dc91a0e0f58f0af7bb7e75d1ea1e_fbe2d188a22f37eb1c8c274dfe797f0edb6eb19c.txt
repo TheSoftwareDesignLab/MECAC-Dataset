@@ -1,0 +1,272 @@
+diff --git a/focus-android/app/metrics.yaml b/focus-android/app/metrics.yaml
+index 1342c5b0c673..cb872847489e 100644
+--- a/focus-android/app/metrics.yaml
++++ b/focus-android/app/metrics.yaml
+@@ -83,3 +83,52 @@ legacy_ids:
+     notification_emails:
+       - jalmeida@mozilla.com
+     expires: never
++
++browser.search:
++  with_ads:
++    type: labeled_counter
++    description: |
++      Records counts of SERP pages with adverts displayed.
++      The key format is `<provider-name>`.
++    send_in_pings:
++      - metrics
++    bugs:
++      - https://github.com/mozilla-mobile/fenix/issues/4967
++    data_reviews:
++      - https://github.com/mozilla-mobile/focus-android/pull/4968#issuecomment-879256443
++    data_sensitivity:
++      - interaction
++    notification_emails:
++      - android-probes@mozilla.com
++    expires: "2022-07-01"
++  ad_clicks:
++    type: labeled_counter
++    description: |
++      Records clicks of adverts on SERP pages.
++      The key format is `<provider-name>`.
++    send_in_pings:
++      - metrics
++    bugs:
++      - https://github.com/mozilla-mobile/fenix/issues/4967
++    data_reviews:
++      - https://github.com/mozilla-mobile/focus-android/pull/4968#issuecomment-879256443
++    data_sensitivity:
++      - interaction
++    notification_emails:
++      - android-probes@mozilla.com
++    expires: "2022-07-01"
++  in_content:
++    type: labeled_counter
++    description: |
++      Records the type of interaction a user has on SERP pages.
++    send_in_pings:
++      - metrics
++    bugs:
++      - https://github.com/mozilla-mobile/fenix/issues/4967
++    data_reviews:
++      - https://github.com/mozilla-mobile/focus-android/pull/4968#issuecomment-879256443
++    data_sensitivity:
++      - interaction
++    notification_emails:
++      - android-probes@mozilla.com
++    expires: "2022-07-01"
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/Components.kt b/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
+index 7848b63df6a0..5fd17bdb830f 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/Components.kt
+@@ -19,8 +19,11 @@ import mozilla.components.feature.downloads.DownloadMiddleware
+ import mozilla.components.feature.downloads.DownloadsUseCases
+ import mozilla.components.feature.prompts.PromptMiddleware
+ import mozilla.components.feature.search.SearchUseCases
++import mozilla.components.feature.search.middleware.AdsTelemetryMiddleware
+ import mozilla.components.feature.search.middleware.SearchMiddleware
+ import mozilla.components.feature.search.region.RegionMiddleware
++import mozilla.components.feature.search.telemetry.ads.AdsTelemetry
++import mozilla.components.feature.search.telemetry.incontent.InContentTelemetry
+ import mozilla.components.feature.session.SessionUseCases
+ import mozilla.components.feature.session.SettingsUseCases
+ import mozilla.components.feature.session.TrackingProtectionUseCases
+@@ -115,7 +118,8 @@ class Components(
+                 RegionMiddleware(context, locationService),
+                 SearchMiddleware(context, migration = SearchMigration(context)),
+                 SearchFilterMiddleware(),
+-                PromptMiddleware()
++                PromptMiddleware(),
++                AdsTelemetryMiddleware(adsTelemetry)
+             ) + EngineMiddleware.create(engine)
+         )
+     }
+@@ -147,6 +151,10 @@ class Components(
+     val crashReporter: CrashReporter by lazy { createCrashReporter(context) }
+ 
+     val metrics: GleanMetricsService by lazy { GleanMetricsService(context) }
++
++    val adsTelemetry: AdsTelemetry by lazy { AdsTelemetry() }
++
++    val searchTelemetry: InContentTelemetry by lazy { InContentTelemetry() }
+ }
+ 
+ private fun determineInitialScreen(context: Context): Screen {
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt b/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
+index 99c867b74522..b0cf08be4d9c 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/FocusApplication.kt
+@@ -18,6 +18,7 @@ import org.mozilla.focus.biometrics.LockObserver
+ import org.mozilla.focus.locale.LocaleAwareApplication
+ import org.mozilla.focus.navigation.StoreLink
+ import org.mozilla.focus.session.VisibilityLifeCycleCallback
++import org.mozilla.focus.telemetry.FactsProcessor
+ import org.mozilla.focus.telemetry.TelemetryWrapper
+ import org.mozilla.focus.utils.AdjustHelper
+ import org.mozilla.focus.utils.AppConstants
+@@ -47,6 +48,7 @@ open class FocusApplication : LocaleAwareApplication(), CoroutineScope {
+ 
+             TelemetryWrapper.init(this)
+             components.metrics.initialize(this)
++            FactsProcessor.initialize()
+ 
+             enableStrictMode()
+ 
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/FactsProcessor.kt b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/FactsProcessor.kt
+new file mode 100644
+index 000000000000..e591f4f80459
+--- /dev/null
++++ b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/FactsProcessor.kt
+@@ -0,0 +1,41 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.telemetry
++
++import androidx.annotation.VisibleForTesting
++import mozilla.components.feature.search.telemetry.ads.AdsTelemetry
++import mozilla.components.feature.search.telemetry.incontent.InContentTelemetry
++import mozilla.components.support.base.Component
++import mozilla.components.support.base.facts.Fact
++import mozilla.components.support.base.facts.FactProcessor
++import mozilla.components.support.base.facts.Facts
++
++/**
++ * Processes all [Fact]s emitted from Android Components based on which the appropriate telemetry
++ * will be collected.
++ */
++object FactsProcessor {
++    fun initialize() {
++        Facts.registerProcessor(object : FactProcessor {
++            override fun process(fact: Fact) {
++                fact.process()
++            }
++        })
++    }
++
++    @VisibleForTesting
++    internal fun Fact.process() = when (Pair(component, item)) {
++        Component.FEATURE_SEARCH to AdsTelemetry.SERP_ADD_CLICKED -> {
++            TelemetryWrapper.clickAddInSearchEvent(value!!)
++        }
++        Component.FEATURE_SEARCH to AdsTelemetry.SERP_SHOWN_WITH_ADDS -> {
++            TelemetryWrapper.searchWithAdsShownEvent(value!!)
++        }
++        Component.FEATURE_SEARCH to InContentTelemetry.IN_CONTENT_SEARCH -> {
++            TelemetryWrapper.inContentSearchEvent(value!!)
++        }
++        else -> Unit
++    }
++}
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/GleanMetricsService.kt b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/GleanMetricsService.kt
+index 379583b5f484..bd4fc0107196 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/GleanMetricsService.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/GleanMetricsService.kt
+@@ -5,6 +5,7 @@
+ package org.mozilla.focus.telemetry
+ 
+ import android.content.Context
++import androidx.annotation.VisibleForTesting
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.DelicateCoroutinesApi
+ import kotlinx.coroutines.Dispatchers.IO
+@@ -58,6 +59,10 @@ class GleanMetricsService(context: Context) : MetricsService {
+ 
+         Glean.registerPings(Pings)
+ 
++        if (telemetryEnabled) {
++            installSearchTelemetryExtensions(components)
++        }
++
+         // Do this immediately after init.
+         GlobalScope.launch(IO) {
+ 
+@@ -93,4 +98,13 @@ class GleanMetricsService(context: Context) : MetricsService {
+             searchEngine?.name ?: "<none>"
+         }
+     }
++
++    @VisibleForTesting
++    internal fun installSearchTelemetryExtensions(components: Components) {
++        val engine = components.engine
++        components.store.apply {
++            components.adsTelemetry.install(engine, this)
++            components.searchTelemetry.install(engine, this)
++        }
++    }
+ }
+diff --git a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
+index dd9b5f28fddc..64457eceb2a8 100644
+--- a/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
++++ b/focus-android/app/src/main/java/org/mozilla/focus/telemetry/TelemetryWrapper.kt
+@@ -21,6 +21,7 @@ import mozilla.components.browser.state.selector.privateTabs
+ import mozilla.components.browser.state.state.selectedOrDefaultSearchEngine
+ import org.json.JSONObject
+ import org.mozilla.focus.BuildConfig
++import org.mozilla.focus.GleanMetrics.BrowserSearch
+ import org.mozilla.focus.R
+ import org.mozilla.focus.ext.components
+ import org.mozilla.focus.utils.AppConstants
+@@ -964,6 +965,18 @@ object TelemetryWrapper {
+         TelemetryEvent.create(Category.ACTION, Method.CLICK, Object.TIP, telemetryValue).queue()
+     }
+ 
++    fun searchWithAdsShownEvent(provider: String) {
++        BrowserSearch.withAds[provider].add()
++    }
++
++    fun clickAddInSearchEvent(provider: String) {
++        BrowserSearch.adClicks[provider].add()
++    }
++
++    fun inContentSearchEvent(provider: String) {
++        BrowserSearch.inContent[provider].add()
++    }
++
+     private fun isDeviceWithTelemetryDisabled(): Boolean {
+         val brand = "blackberry"
+         val device = "bbf100"
+diff --git a/focus-android/app/src/test/java/org/mozilla/focus/telemetry/GleanMetricsServiceTest.kt b/focus-android/app/src/test/java/org/mozilla/focus/telemetry/GleanMetricsServiceTest.kt
+new file mode 100644
+index 000000000000..ab5b5f1c5252
+--- /dev/null
++++ b/focus-android/app/src/test/java/org/mozilla/focus/telemetry/GleanMetricsServiceTest.kt
+@@ -0,0 +1,37 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.focus.telemetry
++
++import android.content.Context
++import mozilla.components.browser.state.store.BrowserStore
++import mozilla.components.concept.engine.Engine
++import mozilla.components.feature.search.telemetry.ads.AdsTelemetry
++import mozilla.components.feature.search.telemetry.incontent.InContentTelemetry
++import org.junit.Test
++import org.mockito.Mockito.doReturn
++import org.mockito.Mockito.mock
++import org.mockito.Mockito.verify
++import org.mozilla.focus.Components
++
++class GleanMetricsServiceTest {
++    @Test
++    fun `WHEN installSearchTelemetryExtensions is called THEN install the ads and search telemetry extensions`() {
++        val components = mock(Components::class.java)
++        val store = mock(BrowserStore::class.java)
++        val engine = mock(Engine::class.java)
++        val adsExtension = mock(AdsTelemetry::class.java)
++        val searchExtension = mock(InContentTelemetry::class.java)
++        doReturn(engine).`when`(components).engine
++        doReturn(store).`when`(components).store
++        doReturn(adsExtension).`when`(components).adsTelemetry
++        doReturn(searchExtension).`when`(components).searchTelemetry
++        val glean = GleanMetricsService(mock(Context::class.java))
++
++        glean.installSearchTelemetryExtensions(components)
++
++        verify(adsExtension).install(engine, store)
++        verify(searchExtension).install(engine, store)
++    }
++}

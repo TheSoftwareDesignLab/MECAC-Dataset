@@ -1,0 +1,625 @@
+diff --git a/Localization/app.json b/Localization/app.json
+index 78171749dd..639bca4f3b 100644
+--- a/Localization/app.json
++++ b/Localization/app.json
+@@ -140,7 +140,8 @@
+                     "unreblog": "Undo reblog",
+                     "favorite": "Favorite",
+                     "unfavorite": "Unfavorite",
+-                    "menu": "Menu"
++                    "menu": "Menu",
++                    "hide": "Hide"
+                 },
+                 "tag": {
+                     "url": "URL",
+diff --git a/Mastodon/Protocol/Provider/DataSourceProvider+StatusTableViewCellDelegate.swift b/Mastodon/Protocol/Provider/DataSourceProvider+StatusTableViewCellDelegate.swift
+index ffd3de8b1b..a348085b03 100644
+--- a/Mastodon/Protocol/Provider/DataSourceProvider+StatusTableViewCellDelegate.swift
++++ b/Mastodon/Protocol/Provider/DataSourceProvider+StatusTableViewCellDelegate.swift
+@@ -6,9 +6,9 @@
+ //
+ 
+ import UIKit
++import CoreDataStack
+ import MetaTextKit
+ import MastodonUI
+-import CoreDataStack
+ 
+ // MARK: - header
+ extension StatusTableViewCellDelegate where Self: DataSourceProvider {
+@@ -367,7 +367,29 @@ extension StatusTableViewCellDelegate where Self: DataSourceProvider {
+     func tableViewCell(
+         _ cell: UITableViewCell,
+         statusView: StatusView,
+-        contentWarningToggleButtonDidPressed button: UIButton
++        spoilerOverlayViewDidPressed overlayView: SpoilerOverlayView
++    ) {
++        Task {
++            let source = DataSourceItem.Source(tableViewCell: cell, indexPath: nil)
++            guard let item = await item(from: source) else {
++                assertionFailure()
++                return
++            }
++            guard case let .status(status) = item else {
++                assertionFailure("only works for status data provider")
++                return
++            }
++            try await DataSourceFacade.responseToToggleSensitiveAction(
++                dependency: self,
++                status: status
++            )
++        }   // end Task
++    }
++    
++    func tableViewCell(
++        _ cell: UITableViewCell,
++        statusView: StatusView,
++        spoilerBannerViewDidPressed bannerView: SpoilerBannerView
+     ) {
+         Task {
+             let source = DataSourceItem.Source(tableViewCell: cell, indexPath: nil)
+diff --git a/Mastodon/Scene/Settings/Cell/SettingsAppearanceTableViewCell+ViewModel.swift b/Mastodon/Scene/Settings/Cell/SettingsAppearanceTableViewCell+ViewModel.swift
+index ea589da96c..f73be2357a 100644
+--- a/Mastodon/Scene/Settings/Cell/SettingsAppearanceTableViewCell+ViewModel.swift
++++ b/Mastodon/Scene/Settings/Cell/SettingsAppearanceTableViewCell+ViewModel.swift
+@@ -37,9 +37,11 @@ extension SettingsAppearanceTableViewCell {
+ extension SettingsAppearanceTableViewCell.ViewModel {
+     func bind(cell: SettingsAppearanceTableViewCell) {
+         Publishers.CombineLatest(
+-            $customUserInterfaceStyle,
+-            $preferredTrueBlackDarkMode
++            $customUserInterfaceStyle.removeDuplicates(),
++            $preferredTrueBlackDarkMode.removeDuplicates()
+         )
++        .debounce(for: 0.1, scheduler: DispatchQueue.main)
++        .receive(on: DispatchQueue.main)
+         .sink { customUserInterfaceStyle, preferredTrueBlackDarkMode in
+             cell.appearanceViews.forEach { view in
+                 view.selected = false
+diff --git a/Mastodon/Scene/Share/View/TableviewCell/StatusTableViewCellDelegate.swift b/Mastodon/Scene/Share/View/TableviewCell/StatusTableViewCellDelegate.swift
+index 322441ba2a..10f28455dd 100644
+--- a/Mastodon/Scene/Share/View/TableviewCell/StatusTableViewCellDelegate.swift
++++ b/Mastodon/Scene/Share/View/TableviewCell/StatusTableViewCellDelegate.swift
+@@ -31,7 +31,8 @@ protocol StatusTableViewCellDelegate: AnyObject, AutoGenerateProtocolDelegate {
+     func tableViewCell(_ cell: UITableViewCell, statusView: StatusView, pollVoteButtonPressed button: UIButton)
+     func tableViewCell(_ cell: UITableViewCell, statusView: StatusView, actionToolbarContainer: ActionToolbarContainer, buttonDidPressed button: UIButton, action: ActionToolbarContainer.Action)
+     func tableViewCell(_ cell: UITableViewCell, statusView: StatusView, menuButton button: UIButton, didSelectAction action: MastodonMenu.Action)
+-    func tableViewCell(_ cell: UITableViewCell, statusView: StatusView, contentWarningToggleButtonDidPressed button: UIButton)
++    func tableViewCell(_ cell: UITableViewCell, statusView: StatusView, spoilerOverlayViewDidPressed overlayView: SpoilerOverlayView)
++    func tableViewCell(_ cell: UITableViewCell, statusView: StatusView, spoilerBannerViewDidPressed bannerView: SpoilerBannerView)
+     // sourcery:end
+ }
+ 
+@@ -72,8 +73,12 @@ extension StatusViewDelegate where Self: StatusViewContainerTableViewCell {
+         delegate?.tableViewCell(self, statusView: statusView, menuButton: button, didSelectAction: action)
+     }
+ 
+-    func statusView(_ statusView: StatusView, contentWarningToggleButtonDidPressed button: UIButton) {
+-        delegate?.tableViewCell(self, statusView: statusView, contentWarningToggleButtonDidPressed: button)
++    func statusView(_ statusView: StatusView, spoilerOverlayViewDidPressed overlayView: SpoilerOverlayView) {
++        delegate?.tableViewCell(self, statusView: statusView, spoilerOverlayViewDidPressed: overlayView)
++    }
++
++    func statusView(_ statusView: StatusView, spoilerBannerViewDidPressed bannerView: SpoilerBannerView) {
++        delegate?.tableViewCell(self, statusView: statusView, spoilerBannerViewDidPressed: bannerView)
+     }
+     // sourcery:end
+ }
+diff --git a/MastodonSDK/Sources/MastodonUI/Extension/MetaLabel.swift b/MastodonSDK/Sources/MastodonUI/Extension/MetaLabel.swift
+index ee9bc73ef0..119e9e031c 100644
+--- a/MastodonSDK/Sources/MastodonUI/Extension/MetaLabel.swift
++++ b/MastodonSDK/Sources/MastodonUI/Extension/MetaLabel.swift
+@@ -15,7 +15,8 @@ extension MetaLabel {
+         case statusHeader
+         case statusName
+         case statusUsername
+-        case statusSpoiler
++        case statusSpoilerOverlay
++        case statusSpoilerBanner
+         case notificationTitle
+         case profileFieldName
+         case profileFieldValue
+@@ -57,11 +58,15 @@ extension MetaLabel {
+             font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: .systemFont(ofSize: 15, weight: .regular))
+             textColor = Asset.Colors.Label.secondary.color
+             
+-        case .statusSpoiler:
+-            font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: .systemFont(ofSize: 17, weight: .regular))
+-            textColor = Asset.Colors.Label.secondary.color
++        case .statusSpoilerOverlay:
++            font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: .systemFont(ofSize: 20, weight: .semibold))
++            textColor = Asset.Colors.Label.primary.color
+             textAlignment = .center
+             paragraphStyle.alignment = .center
++        
++        case .statusSpoilerBanner:
++            font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: .systemFont(ofSize: 17, weight: .regular))
++            textColor = Asset.Colors.Label.primary.color
+             
+         case .notificationTitle:
+             font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: .systemFont(ofSize: 14, weight: .regular))
+diff --git a/MastodonSDK/Sources/MastodonUI/View/Content/NotificationView.swift b/MastodonSDK/Sources/MastodonUI/View/Content/NotificationView.swift
+index 74fcb9434c..fd8d3c3258 100644
+--- a/MastodonSDK/Sources/MastodonUI/View/Content/NotificationView.swift
++++ b/MastodonSDK/Sources/MastodonUI/View/Content/NotificationView.swift
+@@ -380,7 +380,11 @@ extension NotificationView: StatusViewDelegate {
+         assertionFailure()
+     }
+     
+-    public func statusView(_ statusView: StatusView, contentWarningToggleButtonDidPressed button: UIButton) {
++    public func statusView(_ statusView: StatusView, spoilerOverlayViewDidPressed overlayView: SpoilerOverlayView) {
++        assertionFailure()
++    }
++    
++    public func statusView(_ statusView: StatusView, spoilerBannerViewDidPressed bannerView: SpoilerBannerView) {
+         assertionFailure()
+     }
+     
+diff --git a/MastodonSDK/Sources/MastodonUI/View/Content/StatusView+ViewModel.swift b/MastodonSDK/Sources/MastodonUI/View/Content/StatusView+ViewModel.swift
+index 60079ce966..ec61db1683 100644
+--- a/MastodonSDK/Sources/MastodonUI/View/Content/StatusView+ViewModel.swift
++++ b/MastodonSDK/Sources/MastodonUI/View/Content/StatusView+ViewModel.swift
+@@ -256,8 +256,12 @@ extension StatusView.ViewModel {
+         .sink { spoilerContent, content, isContentReveal in
+             if let spoilerContent = spoilerContent {
+                 statusView.spoilerOverlayView.spoilerMetaLabel.configure(content: spoilerContent)
++                statusView.spoilerBannerView.label.configure(content: spoilerContent)
++                statusView.setSpoilerBannerViewHidden(isHidden: !isContentReveal)
++
+             } else {
+                 statusView.spoilerOverlayView.spoilerMetaLabel.reset()
++                statusView.spoilerBannerView.label.reset()
+             }
+             
+             if let content = content {
+@@ -273,7 +277,7 @@ extension StatusView.ViewModel {
+                 statusView.contentMetaText.textView.accessibilityLabel = ""
+             }
+             
+-            statusView.setSpoilerOverlayViewHidden(isContentReveal)
++            statusView.setSpoilerOverlayViewHidden(isHidden: isContentReveal)
+         }
+         .store(in: &disposeBag)
+         // visibility
+@@ -299,16 +303,13 @@ extension StatusView.ViewModel {
+             }
+         }
+         .store(in: &disposeBag)
+-        $isSensitive
+-            .sink { isSensitive in
+-                if isSensitive {
+-                    let image = Asset.Human.eyeCircleFill.image
+-                    statusView.contentWarningToggleButton.setImage(image, for: .normal)
+-                    statusView.contentWarningToggleButton.tintColor = .systemGray
+-                    statusView.setContentWarningToggleButtonDisplay()
+-                }
+-            }
+-            .store(in: &disposeBag)
++//        $isSensitive
++//            .sink { isSensitive in
++//                if isSensitive {
++//                    statusView.setStatusSpoilerBannerViewDisplay()
++//                }
++//            }
++//            .store(in: &disposeBag)
+ //        $spoilerContent
+ //            .sink { metaContent in
+ //                guard let metaContent = metaContent else {
+diff --git a/MastodonSDK/Sources/MastodonUI/View/Content/StatusView.swift b/MastodonSDK/Sources/MastodonUI/View/Content/StatusView.swift
+index fec2535da6..fa0dde84e0 100644
+--- a/MastodonSDK/Sources/MastodonUI/View/Content/StatusView.swift
++++ b/MastodonSDK/Sources/MastodonUI/View/Content/StatusView.swift
+@@ -22,7 +22,8 @@ public protocol StatusViewDelegate: AnyObject {
+     func statusView(_ statusView: StatusView, pollVoteButtonPressed button: UIButton)
+     func statusView(_ statusView: StatusView, actionToolbarContainer: ActionToolbarContainer, buttonDidPressed button: UIButton, action: ActionToolbarContainer.Action)
+     func statusView(_ statusView: StatusView, menuButton button: UIButton, didSelectAction action: MastodonMenu.Action)
+-    func statusView(_ statusView: StatusView, contentWarningToggleButtonDidPressed button: UIButton)
++    func statusView(_ statusView: StatusView, spoilerOverlayViewDidPressed overlayView: SpoilerOverlayView)
++    func statusView(_ statusView: StatusView, spoilerBannerViewDidPressed bannerView: SpoilerBannerView)
+ //    func statusView(_ statusView: StatusView, contentWarningOverlayViewDidPressed contentWarningOverlayView: ContentWarningOverlayView)
+ //    func statusView(_ statusView: StatusView, playerContainerView: PlayerContainerView, contentWarningOverlayViewDidPressed contentWarningOverlayView: ContentWarningOverlayView)
+ }
+@@ -100,9 +101,6 @@ public final class StatusView: UIView {
+         return button
+     }()
+     
+-    // contentWarningToggleButton
+-    public let contentWarningToggleButton = UIButton(type: .system)
+-    
+     // content
+     let contentContainer = UIStackView()
+     public let contentMetaText: MetaText = {
+@@ -134,6 +132,7 @@ public final class StatusView: UIView {
+         return metaText
+     }()
+     
++    // content warning
+     let spoilerOverlayView = SpoilerOverlayView()
+ 
+     // media
+@@ -197,6 +196,9 @@ public final class StatusView: UIView {
+     // visibility
+     public let statusVisibilityView = StatusVisibilityView()
+     
++    // spoiler banner
++    public let spoilerBannerView = SpoilerBannerView()
++    
+     // toolbar
+     public let actionToolbarContainer = ActionToolbarContainer()
+ 
+@@ -222,11 +224,11 @@ public final class StatusView: UIView {
+         }
+         
+         headerContainerView.isHidden = true
+-        contentWarningToggleButton.isHidden = true
+-        setSpoilerOverlayViewHidden(true)
++        setSpoilerOverlayViewHidden(isHidden: true)
+         mediaContainerView.isHidden = true
+         pollContainerView.isHidden = true
+         statusVisibilityView.isHidden = true
++        setSpoilerBannerViewHidden(isHidden: true)
+     }
+ 
+     public override init(frame: CGRect) {
+@@ -265,12 +267,15 @@ extension StatusView {
+         authorNameLabel.isUserInteractionEnabled = false
+         authorUsernameLabel.isUserInteractionEnabled = false
+         
+-        // contentWarningToggleButton
+-        contentWarningToggleButton.addTarget(self, action: #selector(StatusView.contentWarningToggleButtonDidPressed(_:)), for: .touchUpInside)
+         
+         // dateLabel
+         dateLabel.isUserInteractionEnabled = false
+         
++        // content warning
++        let spoilerOverlayViewTapGestureRecognizer = UITapGestureRecognizer.singleTapGestureRecognizer
++        spoilerOverlayView.addGestureRecognizer(spoilerOverlayViewTapGestureRecognizer)
++        spoilerOverlayViewTapGestureRecognizer.addTarget(self, action: #selector(StatusView.spoilerOverlayViewTapGestureRecognizerHandler(_:)))
++        
+         // content
+         contentMetaText.textView.delegate = self
+         contentMetaText.textView.linkDelegate = self
+@@ -287,6 +292,11 @@ extension StatusView {
+         pollTableView.delegate = self
+         pollVoteButton.addTarget(self, action: #selector(StatusView.pollVoteButtonDidPressed(_:)), for: .touchUpInside)
+         
++        // statusSpoilerBannerView
++        let spoilerBannerViewTapGestureRecognizer = UITapGestureRecognizer.singleTapGestureRecognizer
++        spoilerBannerView.addGestureRecognizer(spoilerBannerViewTapGestureRecognizer)
++        spoilerBannerViewTapGestureRecognizer.addTarget(self, action: #selector(StatusView.spoilerBannerViewTapGestureRecognizerHandler(_:)))
++        
+         // toolbar
+         actionToolbarContainer.delegate = self
+     }
+@@ -305,16 +315,22 @@ extension StatusView {
+         delegate?.statusView(self, authorAvatarButtonDidPressed: avatarButton)
+     }
+     
+-    @objc private func contentWarningToggleButtonDidPressed(_ sender: UIButton) {
+-        logger.log(level: .debug, "\((#file as NSString).lastPathComponent, privacy: .public)[\(#line, privacy: .public)], \(#function, privacy: .public)")
+-        delegate?.statusView(self, contentWarningToggleButtonDidPressed: contentWarningToggleButton)
+-    }
+     
+     @objc private func pollVoteButtonDidPressed(_ sender: UIButton) {
+         logger.log(level: .debug, "\((#file as NSString).lastPathComponent, privacy: .public)[\(#line, privacy: .public)], \(#function, privacy: .public)")
+         delegate?.statusView(self, pollVoteButtonPressed: pollVoteButton)
+     }
+     
++    @objc private func spoilerOverlayViewTapGestureRecognizerHandler(_ sender: UITapGestureRecognizer) {
++        logger.log(level: .debug, "\((#file as NSString).lastPathComponent, privacy: .public)[\(#line, privacy: .public)], \(#function, privacy: .public)")
++        delegate?.statusView(self, spoilerOverlayViewDidPressed: spoilerOverlayView)
++    }
++    
++    @objc private func spoilerBannerViewTapGestureRecognizerHandler(_ sender: UITapGestureRecognizer) {
++        logger.log(level: .debug, "\((#file as NSString).lastPathComponent, privacy: .public)[\(#line, privacy: .public)], \(#function, privacy: .public)")
++        delegate?.statusView(self, spoilerBannerViewDidPressed: spoilerBannerView)
++    }
++    
+ }
+ 
+ extension StatusView {
+@@ -354,7 +370,7 @@ extension StatusView.Style {
+         }
+     }
+     
+-    func inline(statusView: StatusView) {
++    private func base(statusView: StatusView) {
+         // container: V - [ header container | author container | content container | media container | pollTableView | actionToolbarContainer ]
+         statusView.containerStackView.layoutMargins = StatusView.containerLayoutMargin
+         
+@@ -440,11 +456,6 @@ extension StatusView.Style {
+         statusView.dateLabel.setContentCompressionResistancePriority(.required - 1, for: .horizontal)
+         authorSecondaryMetaContainer.addArrangedSubview(UIView())
+         
+-        // contentWarningToggleButton
+-        statusView.authorContainerView.addArrangedSubview(statusView.contentWarningToggleButton)
+-        statusView.contentWarningToggleButton.setContentHuggingPriority(.required - 2, for: .horizontal)
+-        statusView.contentWarningToggleButton.setContentCompressionResistancePriority(.required - 2, for: .horizontal)
+-        
+         // content container: V - [ contentMetaText ]
+         statusView.contentContainer.axis = .vertical
+         statusView.contentContainer.spacing = 12
+@@ -508,15 +519,24 @@ extension StatusView.Style {
+         statusView.statusVisibilityView.preservesSuperviewLayoutMargins = true
+         statusView.containerStackView.addArrangedSubview(statusView.statusVisibilityView)
+         
++        statusView.spoilerBannerView.preservesSuperviewLayoutMargins = true
++        statusView.containerStackView.addArrangedSubview(statusView.spoilerBannerView)
++        
+         // action toolbar
+         statusView.actionToolbarContainer.configure(for: .inline)
+         statusView.actionToolbarContainer.preservesSuperviewLayoutMargins = true
+         statusView.containerStackView.addArrangedSubview(statusView.actionToolbarContainer)
+     }
+     
++    func inline(statusView: StatusView) {
++        base(statusView: statusView)
++        
++        statusView.statusVisibilityView.removeFromSuperview()
++    }
++    
+     func plain(statusView: StatusView) {
+         // container: V - [ … | statusMetricView ]
+-        inline(statusView: statusView)      // override the inline style
++        base(statusView: statusView)      // override the base style
+         
+         // statusMetricView
+         statusView.statusMetricView.layoutMargins = StatusView.containerLayoutMargin
+@@ -530,7 +550,7 @@ extension StatusView.Style {
+     }
+     
+     func report(statusView: StatusView) {
+-        inline(statusView: statusView)      // override the inline style
++        base(statusView: statusView)      // override the base style
+ 
+         statusView.menuButton.removeFromSuperview()
+         statusView.statusVisibilityView.removeFromSuperview()
+@@ -538,31 +558,36 @@ extension StatusView.Style {
+     }
+     
+     func notification(statusView: StatusView) {
+-        inline(statusView: statusView)      // override the inline style
++        base(statusView: statusView)      // override the base style
+         
+         statusView.headerContainerView.removeFromSuperview()
+         statusView.authorContainerView.removeFromSuperview()
++        statusView.statusVisibilityView.removeFromSuperview()
++        statusView.spoilerBannerView.removeFromSuperview()
+     }
+     
+     func notificationQuote(statusView: StatusView) {
+-        inline(statusView: statusView)      // override the inline style
++        base(statusView: statusView)      // override the base style
+         
+         statusView.contentContainer.layoutMargins.bottom = 16        // fix contentText align to edge issue
+         statusView.menuButton.removeFromSuperview()
+         statusView.statusVisibilityView.removeFromSuperview()
++        statusView.spoilerBannerView.removeFromSuperview()
+         statusView.actionToolbarContainer.removeFromSuperview()
+     }
+     
+     func composeStatusReplica(statusView: StatusView) {
+-        inline(statusView: statusView)
++        base(statusView: statusView)
+         
+         statusView.avatarButton.isUserInteractionEnabled = false
+         statusView.menuButton.removeFromSuperview()
++        statusView.statusVisibilityView.removeFromSuperview()
++        statusView.spoilerBannerView.removeFromSuperview()
+         statusView.actionToolbarContainer.removeFromSuperview()
+     }
+     
+     func composeStatusAuthor(statusView: StatusView) {
+-        inline(statusView: statusView)
++        base(statusView: statusView)
+         
+         statusView.avatarButton.isUserInteractionEnabled = false
+         statusView.menuButton.removeFromSuperview()
+@@ -573,6 +598,7 @@ extension StatusView.Style {
+         statusView.mediaContainerView.removeFromSuperview()
+         statusView.pollContainerView.removeFromSuperview()
+         statusView.statusVisibilityView.removeFromSuperview()
++        statusView.spoilerBannerView.removeFromSuperview()
+         statusView.actionToolbarContainer.removeFromSuperview()
+     }
+     
+@@ -583,11 +609,7 @@ extension StatusView {
+         headerContainerView.isHidden = false
+     }
+     
+-    func setContentWarningToggleButtonDisplay() {
+-        contentWarningToggleButton.isHidden = false
+-    }
+-    
+-    func setSpoilerOverlayViewHidden(_ isHidden: Bool) {
++    func setSpoilerOverlayViewHidden(isHidden: Bool) {
+         spoilerOverlayView.isHidden = isHidden
+         spoilerOverlayView.setComponentHidden(isHidden)
+     }
+@@ -604,6 +626,10 @@ extension StatusView {
+         statusVisibilityView.isHidden = false
+     }
+     
++    func setSpoilerBannerViewHidden(isHidden: Bool) {
++        spoilerBannerView.isHidden = isHidden
++    }
++    
+     // content text Width
+     public var contentMaxLayoutWidth: CGFloat {
+         let inset = contentLayoutInset
+diff --git a/MastodonSDK/Sources/MastodonUI/View/Control/SpoilerBannerView.swift b/MastodonSDK/Sources/MastodonUI/View/Control/SpoilerBannerView.swift
+new file mode 100644
+index 0000000000..5552be6336
+--- /dev/null
++++ b/MastodonSDK/Sources/MastodonUI/View/Control/SpoilerBannerView.swift
+@@ -0,0 +1,94 @@
++//
++//  SpoilerBannerView.swift
++//  
++//
++//  Created by MainasuK on 2022-2-8.
++//
++
++import UIKit
++import MastodonAsset
++import MetaTextKit
++
++public final class SpoilerBannerView: UIView {
++    
++    static let cornerRadius: CGFloat = 8
++    static let containerMargin: CGFloat = 14
++    
++    public let containerView = UIView()
++    
++    public let label = MetaLabel(style: .statusSpoilerBanner)
++    
++    public let hideLabel: UILabel = {
++        let label = UILabel()
++        label.textColor = Asset.Colors.Label.primary.color
++        label.font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: .systemFont(ofSize: 17, weight: .regular))
++        label.numberOfLines = 0
++        label.text = "Hide"     // TODO: i18n
++        return label
++    }()
++    
++    override init(frame: CGRect) {
++        super.init(frame: frame)
++        _init()
++    }
++    
++    required init?(coder: NSCoder) {
++        super.init(coder: coder)
++        _init()
++    }
++    
++}
++
++extension SpoilerBannerView {
++    
++    private func _init() {
++        containerView.translatesAutoresizingMaskIntoConstraints = false
++        addSubview(containerView)
++        NSLayoutConstraint.activate([
++            containerView.topAnchor.constraint(equalTo: topAnchor),
++            containerView.leadingAnchor.constraint(equalTo: layoutMarginsGuide.leadingAnchor),
++            containerView.trailingAnchor.constraint(equalTo: layoutMarginsGuide.trailingAnchor),
++            containerView.bottomAnchor.constraint(equalTo: bottomAnchor),
++        ])
++        
++        containerView.backgroundColor = .secondarySystemBackground
++        
++        containerView.layoutMargins = UIEdgeInsets(
++            top: StatusVisibilityView.containerMargin,
++            left: StatusVisibilityView.containerMargin,
++            bottom: StatusVisibilityView.containerMargin,
++            right: StatusVisibilityView.containerMargin
++        )
++        
++        let labelContainer = UIStackView()
++        labelContainer.axis = .horizontal
++        labelContainer.spacing = 16
++        labelContainer.alignment = .center
++        
++        labelContainer.translatesAutoresizingMaskIntoConstraints = false
++        containerView.addSubview(labelContainer)
++        NSLayoutConstraint.activate([
++            labelContainer.topAnchor.constraint(equalTo: containerView.layoutMarginsGuide.topAnchor),
++            labelContainer.leadingAnchor.constraint(equalTo: containerView.layoutMarginsGuide.leadingAnchor),
++            labelContainer.trailingAnchor.constraint(equalTo: containerView.layoutMarginsGuide.trailingAnchor),
++            labelContainer.bottomAnchor.constraint(equalTo: containerView.layoutMarginsGuide.bottomAnchor),
++        ])
++        
++        labelContainer.addArrangedSubview(label)
++        labelContainer.addArrangedSubview(hideLabel)
++        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
++        hideLabel.setContentHuggingPriority(.required - 1, for: .horizontal)
++        hideLabel.setContentCompressionResistancePriority(.required - 1, for: .horizontal)
++        
++        label.isUserInteractionEnabled = false
++    }
++    
++    public override func layoutSubviews() {
++        super.layoutSubviews()
++        
++        containerView.layer.masksToBounds = false
++        containerView.layer.cornerCurve = .continuous
++        containerView.layer.cornerRadius = StatusVisibilityView.cornerRadius
++    }
++    
++}
+diff --git a/MastodonSDK/Sources/MastodonUI/View/Control/SpoilerOverlayView.swift b/MastodonSDK/Sources/MastodonUI/View/Control/SpoilerOverlayView.swift
+index d6f3900aec..cf84bfa865 100644
+--- a/MastodonSDK/Sources/MastodonUI/View/Control/SpoilerOverlayView.swift
++++ b/MastodonSDK/Sources/MastodonUI/View/Control/SpoilerOverlayView.swift
+@@ -10,33 +10,27 @@ import MastodonLocalization
+ import MastodonAsset
+ import MetaTextKit
+ 
+-final class SpoilerOverlayView: UIView {
++public final class SpoilerOverlayView: UIView {
+     
+     let containerStackView: UIStackView = {
+         let stackView = UIStackView()
+         stackView.axis = .vertical
+-        // stackView.spacing = 8
++        stackView.spacing = 8
+         stackView.alignment = .center
+         return stackView
+     }()
+     
+-    let iconImageView: UIImageView = {
+-        let imageView = UIImageView()
+-        imageView.image = UIImage(systemName: "eye", withConfiguration: UIImage.SymbolConfiguration(font: .systemFont(ofSize: 34, weight: .light)))
+-        imageView.tintColor = Asset.Colors.Label.secondary.color
+-        return imageView
+-    }()
+-    
+-    let titleLabel: UILabel = {
++    let spoilerMetaLabel = MetaLabel(style: .statusSpoilerOverlay)
++
++    let hintLabel: UILabel = {
+         let label = UILabel()
+-        label.font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: .systemFont(ofSize: 20, weight: .semibold))
++        label.font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: .systemFont(ofSize: 17, weight: .regular))
+         label.textAlignment = .center
+-        label.textColor = Asset.Colors.Label.primary.color
+-        label.text = L10n.Common.Controls.Status.contentWarning
++        label.textColor = Asset.Colors.Label.secondary.color
++        label.text = L10n.Common.Controls.Status.mediaContentWarning
+         return label
+     }()
+     
+-    let spoilerMetaLabel = MetaLabel(style: .statusSpoiler)
+     
+     override init(frame: CGRect) {
+         super.init(frame: frame)
+@@ -61,19 +55,11 @@ extension SpoilerOverlayView {
+             containerStackView.bottomAnchor.constraint(equalTo: bottomAnchor),
+         ])
+         
+-        
+         let topPaddingView = UIView()
+         topPaddingView.translatesAutoresizingMaskIntoConstraints = false
+         containerStackView.addArrangedSubview(topPaddingView)
+-        iconImageView.translatesAutoresizingMaskIntoConstraints = false
+-        containerStackView.addArrangedSubview(iconImageView)
+-        NSLayoutConstraint.activate([
+-            iconImageView.widthAnchor.constraint(equalToConstant: 52.0).priority(.required - 1),
+-            iconImageView.heightAnchor.constraint(equalToConstant: 32.0).priority(.required - 1),
+-        ])
+-        iconImageView.setContentCompressionResistancePriority(.required, for: .vertical)
+-        containerStackView.addArrangedSubview(titleLabel)
+         containerStackView.addArrangedSubview(spoilerMetaLabel)
++        containerStackView.addArrangedSubview(hintLabel)
+         let bottomPaddingView = UIView()
+         bottomPaddingView.translatesAutoresizingMaskIntoConstraints = false
+         containerStackView.addArrangedSubview(bottomPaddingView)
+@@ -82,6 +68,8 @@ extension SpoilerOverlayView {
+         ])
+         topPaddingView.setContentCompressionResistancePriority(.defaultLow - 100, for: .vertical)
+         bottomPaddingView.setContentCompressionResistancePriority(.defaultLow - 100, for: .vertical)
++        
++        spoilerMetaLabel.isUserInteractionEnabled = false
+     }
+     
+     public func setComponentHidden(_ isHidden: Bool) {

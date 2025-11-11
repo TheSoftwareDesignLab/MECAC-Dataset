@@ -1,0 +1,200 @@
+diff --git a/AnkiDroid/build.gradle b/AnkiDroid/build.gradle
+index 328f5493ce38..19c2a7d7abf7 100644
+--- a/AnkiDroid/build.gradle
++++ b/AnkiDroid/build.gradle
+@@ -322,6 +322,7 @@ dependencies {
+     implementation 'com.vanniktech:android-image-cropper:4.5.0'
+     implementation 'org.nanohttpd:nanohttpd:2.3.1'
+     implementation "org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2"
++    implementation 'com.squareup:seismic:1.0.3'
+ 
+     // Backend libraries
+ 
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.kt b/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.kt
+index f71d04a8fa5a..373e657e4e1e 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/AbstractFlashcardViewer.kt
+@@ -26,6 +26,7 @@ import android.content.*
+ import android.content.res.Configuration
+ import android.graphics.Bitmap
+ import android.graphics.Color
++import android.hardware.SensorManager
+ import android.media.MediaPlayer
+ import android.net.Uri
+ import android.os.*
+@@ -100,6 +101,7 @@ import com.ichi2.utils.HandlerUtils.executeFunctionWithDelay
+ import com.ichi2.utils.HandlerUtils.newHandler
+ import com.ichi2.utils.HashUtil.hashSetInit
+ import com.ichi2.utils.WebViewDebugging.initializeDebugging
++import com.squareup.seismic.ShakeDetector
+ import kotlinx.coroutines.Job
+ import net.ankiweb.rsdroid.RustCleanup
+ import timber.log.Timber
+@@ -628,6 +630,7 @@ abstract class AbstractFlashcardViewer :
+     override fun onPause() {
+         super.onPause()
+         automaticAnswer.disable()
++        mGestureDetectorImpl.stopShakeDetector()
+         mLongClickHandler.removeCallbacks(mStartLongClickAction)
+         if (this::mSoundPlayer.isInitialized) {
+             mSoundPlayer.stopSounds()
+@@ -639,6 +642,7 @@ abstract class AbstractFlashcardViewer :
+     override fun onResume() {
+         super.onResume()
+         automaticAnswer.enable()
++        mGestureDetectorImpl.startShakeDetector()
+         // Reset the activity title
+         updateActionBar()
+         selectNavigationItem(-1)
+@@ -2143,6 +2147,14 @@ abstract class AbstractFlashcardViewer :
+         open fun eventCanBeSentToWebView(event: MotionEvent): Boolean {
+             return true
+         }
++
++        open fun startShakeDetector() {
++            // intentionally blank
++        }
++
++        open fun stopShakeDetector() {
++            // intentionally blank
++        }
+     }
+ 
+     protected open fun onSingleTap(): Boolean {
+@@ -2153,12 +2165,46 @@ abstract class AbstractFlashcardViewer :
+ 
+     /** #6141 - blocks clicking links from executing "touch" gestures.
+      * COULD_BE_BETTER: Make base class static and move this out of the CardViewer  */
+-    internal inner class LinkDetectingGestureDetector : MyGestureDetector() {
++    internal inner class LinkDetectingGestureDetector() :
++        MyGestureDetector(), ShakeDetector.Listener {
++        private var shakeDetector: ShakeDetector? = null
++
++        init {
++            initShakeDetector()
++        }
++
++        private fun initShakeDetector() {
++            Timber.d("Initializing shake detector")
++            if (mGestureProcessor.isBound(Gesture.SHAKE)) {
++                val sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
++                shakeDetector = ShakeDetector(this).apply {
++                    start(sensorManager, SensorManager.SENSOR_DELAY_UI)
++                }
++            }
++        }
++
++        override fun stopShakeDetector() {
++            shakeDetector?.stop()
++            shakeDetector = null
++        }
++
++        override fun startShakeDetector() {
++            if (shakeDetector == null) {
++                initShakeDetector()
++            }
++        }
++
+         /** A list of events to process when listening to WebView touches   */
+         private val mDesiredTouchEvents = hashSetInit<MotionEvent>(2)
+ 
+         /** A list of events we sent to the WebView (to block double-processing)  */
+         private val mDispatchedTouchEvents = hashSetInit<MotionEvent>(2)
++
++        override fun hearShake() {
++            Timber.d("Shake detected!")
++            mGestureProcessor.onShake()
++        }
++
+         override fun onFillFlashcard() {
+             Timber.d("Removing pending touch events for gestures")
+             mDesiredTouchEvents.clear()
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/cardviewer/Gesture.kt b/AnkiDroid/src/main/java/com/ichi2/anki/cardviewer/Gesture.kt
+index 76f10f6ca937..07a9d98a6814 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/cardviewer/Gesture.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/cardviewer/Gesture.kt
+@@ -27,13 +27,20 @@ import com.ichi2.anki.cardviewer.TapGestureMode.NINE_POINT
+  */
+ const val GESTURE_PREFIX = "\u235D"
+ 
++/**
++ * https://www.fileformat.info/info/unicode/char/1fa87/index.htm (Maracas)
++ */
++const val SHAKE_GESTURE_PREFIX = "\uD83E\uDE87"
++
+ fun interface GestureListener {
+     fun onGesture(gesture: Gesture)
+ }
+ 
+ enum class Gesture(
+-    @get:JvmName("getResourceId") val resourceId: Int
++    @get:JvmName("getResourceId") val resourceId: Int,
++    private val displayPrefix: String = GESTURE_PREFIX // Default prefix
+ ) {
++    SHAKE(R.string.gestures_shake, SHAKE_GESTURE_PREFIX),
+     SWIPE_UP(R.string.gestures_swipe_up),
+     SWIPE_DOWN(R.string.gestures_swipe_down),
+     SWIPE_LEFT(R.string.gestures_swipe_left),
+@@ -51,10 +58,7 @@ enum class Gesture(
+     TAP_BOTTOM_RIGHT(R.string.gestures_corner_tap_bottom_right);
+ 
+     fun toDisplayString(context: Context): String =
+-        getDisplayPrefix() + ' ' + context.getString(resourceId)
+-
+-    private fun getDisplayPrefix(): String =
+-        GESTURE_PREFIX
++        displayPrefix + ' ' + context.getString(resourceId)
+ }
+ 
+ /**
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/cardviewer/GestureProcessor.kt b/AnkiDroid/src/main/java/com/ichi2/anki/cardviewer/GestureProcessor.kt
+index 0aeff44d5d5e..07906a79b4ac 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/cardviewer/GestureProcessor.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/cardviewer/GestureProcessor.kt
+@@ -39,6 +39,7 @@ class GestureProcessor(private val processor: ViewerCommand.CommandProcessor?) {
+     private var gestureTapCenter: ViewerCommand? = null
+     private var gestureTapBottomLeft: ViewerCommand? = null
+     private var gestureTapBottomRight: ViewerCommand? = null
++    private var gestureShake: ViewerCommand? = null
+     private val gestureMapper = GestureMapper()
+ 
+     /**
+@@ -71,6 +72,7 @@ class GestureProcessor(private val processor: ViewerCommand.CommandProcessor?) {
+         gestureTapRight = associatedCommands[Gesture.TAP_RIGHT]
+         gestureTapTop = associatedCommands[Gesture.TAP_TOP]
+         gestureTapBottom = associatedCommands[Gesture.TAP_BOTTOM]
++        gestureShake = associatedCommands[Gesture.SHAKE]
+ 
+         val useCornerTouch = preferences.getBoolean("gestureCornerTouch", false)
+         if (useCornerTouch) {
+@@ -100,6 +102,10 @@ class GestureProcessor(private val processor: ViewerCommand.CommandProcessor?) {
+         return execute(gesture)
+     }
+ 
++    fun onShake(): Boolean? {
++        return execute(Gesture.SHAKE)
++    }
++
+     private fun execute(gesture: Gesture?): Boolean? {
+         val command = mapGestureToCommand(gesture) ?: return false
+         return processor?.executeCommand(command, gesture)
+@@ -122,6 +128,7 @@ class GestureProcessor(private val processor: ViewerCommand.CommandProcessor?) {
+             Gesture.TAP_BOTTOM_RIGHT -> gestureTapBottomRight
+             Gesture.DOUBLE_TAP -> gestureDoubleTap
+             Gesture.LONG_TAP -> gestureLongclick
++            Gesture.SHAKE -> gestureShake
+             else -> null
+         }
+     }
+diff --git a/AnkiDroid/src/main/res/values/10-preferences.xml b/AnkiDroid/src/main/res/values/10-preferences.xml
+index 3c20f6c8d06c..5dff4d9ffefb 100644
+--- a/AnkiDroid/src/main/res/values/10-preferences.xml
++++ b/AnkiDroid/src/main/res/values/10-preferences.xml
+@@ -94,6 +94,7 @@
+     <string name="gestures_corner_tap_middle_center" maxLength="41">Touch middle center</string>
+     <string name="gestures_corner_tap_bottom_left" maxLength="41">Touch bottom left</string>
+     <string name="gestures_corner_tap_bottom_right" maxLength="41">Touch bottom right</string>
++    <string name="gestures_shake" maxLength="41">Shake device</string>
+     <string name="card_browser_enable_external_context_menu">‘%s’ Menu</string>
+     <string name="card_browser_enable_external_context_menu_summary">Enables the ‘%s’ context menu globally</string>
+     <string name="double_scrolling_gap" maxLength="41">Double scrolling</string>

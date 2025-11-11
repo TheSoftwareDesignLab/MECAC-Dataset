@@ -1,0 +1,244 @@
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/components/QuoteView.java b/app/src/main/java/org/thoughtcrime/securesms/components/QuoteView.java
+index 6aa8d41fc6b..d480135cafe 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/components/QuoteView.java
++++ b/app/src/main/java/org/thoughtcrime/securesms/components/QuoteView.java
+@@ -276,7 +276,7 @@ private void setQuoteText(@Nullable CharSequence body, @NonNull SlideDeck attach
+     if (!TextUtils.isEmpty(body) || !attachments.containsMediaSlide()) {
+       if (isTextStory && body != null) {
+         try {
+-          bodyView.setText(StoryTextPostModel.parseFrom(body.toString()).getText());
++          bodyView.setText(StoryTextPostModel.parseFrom(body.toString(), id, author.getId()).getText());
+         } catch (Exception e) {
+           Log.w(TAG, "Could not parse body of text post.", e);
+           bodyView.setText("");
+@@ -326,7 +326,7 @@ private void setQuoteText(@Nullable CharSequence body, @NonNull SlideDeck attach
+ 
+   private void setQuoteAttachment(@NonNull GlideRequests glideRequests, @NonNull CharSequence body, @NonNull SlideDeck slideDeck) {
+     if (!attachments.containsMediaSlide() && isStoryReply()) {
+-      StoryTextPostModel model = StoryTextPostModel.parseFrom(body.toString());
++      StoryTextPostModel model = StoryTextPostModel.parseFrom(body.toString(), id, author.getId());
+       attachmentVideoOverlayView.setVisibility(GONE);
+       attachmentContainerView.setVisibility(GONE);
+       thumbnailView.setVisibility(VISIBLE);
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/stories/StoryLinkPreviewView.kt b/app/src/main/java/org/thoughtcrime/securesms/stories/StoryLinkPreviewView.kt
+index ffc3c1aa40d..f1c2875d330 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/stories/StoryLinkPreviewView.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/stories/StoryLinkPreviewView.kt
+@@ -14,6 +14,8 @@ import org.thoughtcrime.securesms.linkpreview.LinkPreviewViewModel
+ import org.thoughtcrime.securesms.mms.GlideApp
+ import org.thoughtcrime.securesms.mms.ImageSlide
+ import org.thoughtcrime.securesms.util.Util
++import org.thoughtcrime.securesms.util.concurrent.ListenableFuture
++import org.thoughtcrime.securesms.util.concurrent.SettableFuture
+ import org.thoughtcrime.securesms.util.visible
+ import java.text.DateFormat
+ import java.text.SimpleDateFormat
+@@ -33,7 +35,9 @@ class StoryLinkPreviewView @JvmOverloads constructor(
+   private val title: TextView = findViewById(R.id.link_preview_title)
+   private val url: TextView = findViewById(R.id.link_preview_url)
+ 
+-  fun bind(linkPreview: LinkPreview?, hiddenVisibility: Int = View.INVISIBLE) {
++  fun bind(linkPreview: LinkPreview?, hiddenVisibility: Int = View.INVISIBLE): ListenableFuture<Boolean> {
++    var listenableFuture: ListenableFuture<Boolean>? = null
++
+     if (linkPreview != null) {
+       visibility = View.VISIBLE
+       isClickable = true
+@@ -43,7 +47,7 @@ class StoryLinkPreviewView @JvmOverloads constructor(
+ 
+       val imageSlide: ImageSlide? = linkPreview.thumbnail.map { ImageSlide(image.context, it) }.orElse(null)
+       if (imageSlide != null) {
+-        image.setImageResource(GlideApp.with(image), imageSlide, false, false)
++        listenableFuture = image.setImageResource(GlideApp.with(image), imageSlide, false, false)
+         image.visible = true
+       } else {
+         image.visible = false
+@@ -56,6 +60,8 @@ class StoryLinkPreviewView @JvmOverloads constructor(
+       visibility = hiddenVisibility
+       isClickable = false
+     }
++
++    return listenableFuture ?: SettableFuture(false)
+   }
+ 
+   fun bind(linkPreviewState: LinkPreviewViewModel.LinkPreviewState, hiddenVisibility: Int = View.INVISIBLE) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/stories/StoryTextPostModel.kt b/app/src/main/java/org/thoughtcrime/securesms/stories/StoryTextPostModel.kt
+index e272c1a6d49..0ceb9b1f786 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/stories/StoryTextPostModel.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/stories/StoryTextPostModel.kt
+@@ -9,8 +9,13 @@ import com.bumptech.glide.load.Options
+ import com.bumptech.glide.load.ResourceDecoder
+ import com.bumptech.glide.load.engine.Resource
+ import com.bumptech.glide.load.resource.SimpleResource
++import org.thoughtcrime.securesms.database.SignalDatabase
++import org.thoughtcrime.securesms.database.model.MessageRecord
++import org.thoughtcrime.securesms.database.model.MmsMessageRecord
+ import org.thoughtcrime.securesms.database.model.databaseprotos.StoryTextPost
+ import org.thoughtcrime.securesms.dependencies.ApplicationDependencies
++import org.thoughtcrime.securesms.recipients.Recipient
++import org.thoughtcrime.securesms.recipients.RecipientId
+ import org.thoughtcrime.securesms.util.Base64
+ import java.security.MessageDigest
+ 
+@@ -18,19 +23,36 @@ import java.security.MessageDigest
+  * Glide model to render a StoryTextPost as a bitmap
+  */
+ data class StoryTextPostModel(
+-  private val storyTextPost: StoryTextPost
++  private val storyTextPost: StoryTextPost,
++  private val storySentAtMillis: Long,
++  private val storyAuthor: RecipientId
+ ) : Key {
+ 
+   override fun updateDiskCacheKey(messageDigest: MessageDigest) {
+     messageDigest.update(storyTextPost.toByteArray())
++    messageDigest.update(storySentAtMillis.toString().toByteArray())
++    messageDigest.update(storyAuthor.serialize().toByteArray())
+   }
+ 
+   val text: String = storyTextPost.body
+ 
+   companion object {
++
++    fun parseFrom(messageRecord: MessageRecord): StoryTextPostModel {
++      return parseFrom(
++        messageRecord.body,
++        messageRecord.timestamp,
++        if (messageRecord.isOutgoing) Recipient.self().id else messageRecord.individualRecipient.id
++      )
++    }
++
+     @JvmStatic
+-    fun parseFrom(body: String): StoryTextPostModel {
+-      return StoryTextPostModel(StoryTextPost.parseFrom(Base64.decode(body)))
++    fun parseFrom(body: String, storySentAtMillis: Long, storyAuthor: RecipientId): StoryTextPostModel {
++      return StoryTextPostModel(
++        storyTextPost = StoryTextPost.parseFrom(Base64.decode(body)),
++        storySentAtMillis = storySentAtMillis,
++        storyAuthor = storyAuthor
++      )
+     }
+   }
+ 
+@@ -44,13 +66,13 @@ data class StoryTextPostModel(
+     override fun handles(source: StoryTextPostModel, options: Options): Boolean = true
+ 
+     override fun decode(source: StoryTextPostModel, width: Int, height: Int, options: Options): Resource<Bitmap> {
++      val message = SignalDatabase.mmsSms.getMessageFor(source.storySentAtMillis, source.storyAuthor)
+       val view = StoryTextPostView(ApplicationDependencies.getApplication())
+ 
+-      view.measure(View.MeasureSpec.makeMeasureSpec(RENDER_WIDTH, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(RENDER_HEIGHT, View.MeasureSpec.EXACTLY))
+-      view.layout(0, 0, view.measuredWidth, view.measuredHeight)
+-
+       view.bindFromStoryTextPost(source.storyTextPost)
++      view.bindLinkPreview((message as? MmsMessageRecord)?.linkPreviews?.firstOrNull())
+ 
++      view.invalidate()
+       view.measure(View.MeasureSpec.makeMeasureSpec(RENDER_WIDTH, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(RENDER_HEIGHT, View.MeasureSpec.EXACTLY))
+       view.layout(0, 0, view.measuredWidth, view.measuredHeight)
+ 
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/stories/StoryTextPostView.kt b/app/src/main/java/org/thoughtcrime/securesms/stories/StoryTextPostView.kt
+index 286003e6798..9d1093a61f0 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/stories/StoryTextPostView.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/stories/StoryTextPostView.kt
+@@ -29,6 +29,7 @@ import org.thoughtcrime.securesms.mediasend.v2.text.TextAlignment
+ import org.thoughtcrime.securesms.mediasend.v2.text.TextStoryPostCreationState
+ import org.thoughtcrime.securesms.mediasend.v2.text.TextStoryScale
+ import org.thoughtcrime.securesms.util.ViewUtil
++import org.thoughtcrime.securesms.util.concurrent.ListenableFuture
+ import org.thoughtcrime.securesms.util.visible
+ import java.util.Locale
+ 
+@@ -160,8 +161,8 @@ class StoryTextPostView @JvmOverloads constructor(
+     postAdjustLinkPreviewTranslationY()
+   }
+ 
+-  fun bindLinkPreview(linkPreview: LinkPreview?) {
+-    linkPreviewView.bind(linkPreview, View.GONE)
++  fun bindLinkPreview(linkPreview: LinkPreview?): ListenableFuture<Boolean> {
++    return linkPreviewView.bind(linkPreview, View.GONE)
+   }
+ 
+   fun bindLinkPreviewState(linkPreviewState: LinkPreviewViewModel.LinkPreviewState, hiddenVisibility: Int) {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/stories/landing/StoriesLandingItem.kt b/app/src/main/java/org/thoughtcrime/securesms/stories/landing/StoriesLandingItem.kt
+index eedce99e7f0..b453b358157 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/stories/landing/StoriesLandingItem.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/stories/landing/StoriesLandingItem.kt
+@@ -9,12 +9,10 @@ import org.thoughtcrime.securesms.avatar.view.AvatarView
+ import org.thoughtcrime.securesms.components.ThumbnailView
+ import org.thoughtcrime.securesms.components.settings.PreferenceModel
+ import org.thoughtcrime.securesms.database.model.MediaMmsMessageRecord
+-import org.thoughtcrime.securesms.database.model.databaseprotos.StoryTextPost
+ import org.thoughtcrime.securesms.mms.GlideApp
+ import org.thoughtcrime.securesms.recipients.Recipient
+ import org.thoughtcrime.securesms.stories.StoryTextPostModel
+ import org.thoughtcrime.securesms.stories.dialogs.StoryContextMenu
+-import org.thoughtcrime.securesms.util.Base64
+ import org.thoughtcrime.securesms.util.DateUtils
+ import org.thoughtcrime.securesms.util.SpanUtil
+ import org.thoughtcrime.securesms.util.adapter.mapping.LayoutFactory
+@@ -111,7 +109,7 @@ object StoriesLandingItem {
+       avatarView.setStoryRingFromState(model.data.storyViewState)
+ 
+       if (record.storyType.isTextStory) {
+-        storyPreview.setImageResource(GlideApp.with(storyPreview), StoryTextPostModel(StoryTextPost.parseFrom(Base64.decode(record.body))), 0, 0)
++        storyPreview.setImageResource(GlideApp.with(storyPreview), StoryTextPostModel.parseFrom(record), 0, 0)
+       } else if (record.slideDeck.thumbnailSlide != null) {
+         storyPreview.setImageResource(GlideApp.with(storyPreview), record.slideDeck.thumbnailSlide!!, false, true)
+       } else {
+@@ -122,7 +120,7 @@ object StoriesLandingItem {
+         val secondaryRecord = model.data.secondaryStory.messageRecord as MediaMmsMessageRecord
+ 
+         if (secondaryRecord.storyType.isTextStory) {
+-          storyMulti.setImageResource(GlideApp.with(storyPreview), StoryTextPostModel(StoryTextPost.parseFrom(Base64.decode(secondaryRecord.body))), 0, 0)
++          storyMulti.setImageResource(GlideApp.with(storyPreview), StoryTextPostModel.parseFrom(secondaryRecord), 0, 0)
+         } else {
+           storyMulti.setImageResource(GlideApp.with(storyPreview), secondaryRecord.slideDeck.thumbnailSlide!!, false, true)
+         }
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/stories/my/MyStoriesItem.kt b/app/src/main/java/org/thoughtcrime/securesms/stories/my/MyStoriesItem.kt
+index bce52e526e1..3a08af10738 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/stories/my/MyStoriesItem.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/stories/my/MyStoriesItem.kt
+@@ -11,11 +11,9 @@ import org.thoughtcrime.securesms.components.menu.SignalContextMenu
+ import org.thoughtcrime.securesms.components.settings.PreferenceModel
+ import org.thoughtcrime.securesms.conversation.ConversationMessage
+ import org.thoughtcrime.securesms.database.model.MmsMessageRecord
+-import org.thoughtcrime.securesms.database.model.databaseprotos.StoryTextPost
+ import org.thoughtcrime.securesms.mms.GlideApp
+ import org.thoughtcrime.securesms.mms.Slide
+ import org.thoughtcrime.securesms.stories.StoryTextPostModel
+-import org.thoughtcrime.securesms.util.Base64
+ import org.thoughtcrime.securesms.util.DateUtils
+ import org.thoughtcrime.securesms.util.SpanUtil
+ import org.thoughtcrime.securesms.util.adapter.mapping.LayoutFactory
+@@ -103,7 +101,7 @@ object MyStoriesItem {
+ 
+       @Suppress("CascadeIf")
+       if (record.storyType.isTextStory) {
+-        storyPreview.setImageResource(GlideApp.with(storyPreview), StoryTextPostModel(StoryTextPost.parseFrom(Base64.decode(record.body))), 0, 0)
++        storyPreview.setImageResource(GlideApp.with(storyPreview), StoryTextPostModel.parseFrom(record), 0, 0)
+       } else if (thumbnail != null) {
+         storyPreview.setImageResource(GlideApp.with(itemView), thumbnail, false, true)
+       } else {
+diff --git a/app/src/main/java/org/thoughtcrime/securesms/stories/viewer/StoryViewerActivity.kt b/app/src/main/java/org/thoughtcrime/securesms/stories/viewer/StoryViewerActivity.kt
+index 50465342f7c..f9bc8f84173 100644
+--- a/app/src/main/java/org/thoughtcrime/securesms/stories/viewer/StoryViewerActivity.kt
++++ b/app/src/main/java/org/thoughtcrime/securesms/stories/viewer/StoryViewerActivity.kt
+@@ -21,10 +21,13 @@ class StoryViewerActivity : PassphraseRequiredActivity() {
+ 
+     if (savedInstanceState == null) {
+       supportFragmentManager.beginTransaction()
+-        .replace(R.id.fragment_container, StoryViewerFragment.create(
+-          intent.getParcelableExtra(ARG_START_RECIPIENT_ID)!!,
+-          intent.getLongExtra(ARG_START_STORY_ID, -1L)
+-        ))
++        .replace(
++          R.id.fragment_container,
++          StoryViewerFragment.create(
++            intent.getParcelableExtra(ARG_START_RECIPIENT_ID)!!,
++            intent.getLongExtra(ARG_START_STORY_ID, -1L)
++          )
++        )
+         .commit()
+     }
+   }

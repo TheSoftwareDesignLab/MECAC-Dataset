@@ -1,0 +1,542 @@
+diff --git a/android-components/.buildconfig.yml b/android-components/.buildconfig.yml
+index c31e636e83a9..d4b4f97d0f97 100644
+--- a/android-components/.buildconfig.yml
++++ b/android-components/.buildconfig.yml
+@@ -272,6 +272,10 @@ projects:
+     path: components/support/utils
+     description: 'A collection of generic helper classes.'
+     publish: true
++  support-sync-telemetry:
++    path: components/support/sync-telemetry
++    description: 'A collection of sync-related telemetry helper classes and ping descriptions.'
++    publish: true
+   support-rustlog:
+     path: components/support/rustlog
+     description: 'A bridge allowing log messages from Rust code to be sent to the log system in support-base'
+diff --git a/android-components/components/browser/storage-sync/README.md b/android-components/components/browser/storage-sync/README.md
+index 7914583c2e41..c9ebbeb2559b 100644
+--- a/android-components/components/browser/storage-sync/README.md
++++ b/android-components/components/browser/storage-sync/README.md
+@@ -5,7 +5,7 @@ A syncable implementation of `concept-storage` backed by [application-services'
+ ## Before using this component
+ Products sending telemetry and using this component *must request* a data-review following [this process](https://wiki.mozilla.org/Firefox/Data_Collection).
+ This component provides data collection using the [Glean SDK](https://mozilla.github.io/glean/book/index.html).
+-The list of metrics being collected is available in the [metrics documentation](docs/metrics.md).
++The list of metrics being collected is available in the [metrics documentation](../../support/telemetry/docs/metrics.md).
+ 
+ ### Setting up the dependency
+ 
+diff --git a/android-components/components/browser/storage-sync/build.gradle b/android-components/components/browser/storage-sync/build.gradle
+index 0c3be64d5934..a0e58a0c2337 100644
+--- a/android-components/components/browser/storage-sync/build.gradle
++++ b/android-components/components/browser/storage-sync/build.gradle
+@@ -2,10 +2,6 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-plugins {
+-    id "com.jetbrains.python.envs" version "0.0.26"
+-}
+-
+ apply plugin: 'com.android.library'
+ apply plugin: 'kotlin-android'
+ 
+@@ -50,9 +46,8 @@ dependencies {
+     api project(':concept-storage')
+     api project(':concept-sync')
+ 
+-    implementation project(':service-glean')
+     implementation project(':support-utils')
+-    implementation Dependencies.mozilla_sync15
++    implementation project(':support-sync-telemetry')
+ 
+     implementation Dependencies.kotlin_stdlib
+ 
+@@ -75,6 +70,3 @@ dependencies {
+ 
+ apply from: '../../../publish.gradle'
+ ext.configurePublish(config.componentsGroupId, archivesBaseName, project.ext.description)
+-
+-ext.gleanGenerateMarkdownDocs = true
+-apply from: '../../service/glean/scripts/sdk_generator.gradle'
+diff --git a/android-components/components/browser/storage-sync/src/main/java/mozilla/components/browser/storage/sync/Connection.kt b/android-components/components/browser/storage-sync/src/main/java/mozilla/components/browser/storage/sync/Connection.kt
+index dde58deed3a0..0a97505b1d56 100644
+--- a/android-components/components/browser/storage-sync/src/main/java/mozilla/components/browser/storage/sync/Connection.kt
++++ b/android-components/components/browser/storage-sync/src/main/java/mozilla/components/browser/storage/sync/Connection.kt
+@@ -8,13 +8,12 @@ import androidx.annotation.GuardedBy
+ import mozilla.appservices.places.PlacesApi
+ import mozilla.appservices.places.PlacesReaderConnection
+ import mozilla.appservices.places.PlacesWriterConnection
+-import mozilla.components.browser.storage.sync.GleanMetrics.Pings
+ import mozilla.components.concept.sync.SyncAuthInfo
++import mozilla.components.support.sync.telemetry.SyncTelemetry
+ import java.io.Closeable
+ import java.io.File
+ 
+ const val DB_NAME = "places.sqlite"
+-const val MAX_FAILURE_REASON_LENGTH = 100
+ 
+ /**
+  * A slight abstraction over [PlacesApi].
+@@ -33,12 +32,6 @@ internal interface Connection : Closeable {
+     // strange split that doesn't quite map all that well to our internal storage model.
+     fun syncHistory(syncInfo: SyncAuthInfo)
+     fun syncBookmarks(syncInfo: SyncAuthInfo)
+-
+-    @Suppress("EmptyFunctionBlock")
+-    fun sendHistoryPing() {}
+-
+-    @Suppress("EmptyFunctionBlock")
+-    fun sendBookmarksPing() {}
+ }
+ 
+ /**
+@@ -77,25 +70,13 @@ internal object RustPlacesConnection : Connection {
+     override fun syncHistory(syncInfo: SyncAuthInfo) {
+         check(api != null) { "must call init first" }
+         val ping = api!!.syncHistory(syncInfo.into())
+-        SyncTelemetry.processHistoryPing(ping) {
+-            Pings.historySync.send()
+-        }
+-    }
+-
+-    override fun sendHistoryPing() {
+-        Pings.historySync.send()
++        SyncTelemetry.processHistoryPing(ping)
+     }
+ 
+     override fun syncBookmarks(syncInfo: SyncAuthInfo) {
+         check(api != null) { "must call init first" }
+         val ping = api!!.syncBookmarks(syncInfo.into())
+-        SyncTelemetry.processBookmarksPing(ping) {
+-            Pings.bookmarksSync.send()
+-        }
+-    }
+-
+-    override fun sendBookmarksPing() {
+-        Pings.bookmarksSync.send()
++        SyncTelemetry.processBookmarksPing(ping)
+     }
+ 
+     override fun close() = synchronized(this) {
+diff --git a/android-components/components/browser/storage-sync/src/main/java/mozilla/components/browser/storage/sync/Types.kt b/android-components/components/browser/storage-sync/src/main/java/mozilla/components/browser/storage/sync/Types.kt
+index b08d17c93b3b..7e41fe5035f5 100644
+--- a/android-components/components/browser/storage-sync/src/main/java/mozilla/components/browser/storage/sync/Types.kt
++++ b/android-components/components/browser/storage-sync/src/main/java/mozilla/components/browser/storage/sync/Types.kt
+@@ -6,9 +6,6 @@
+ package mozilla.components.browser.storage.sync
+ 
+ import mozilla.appservices.places.SyncAuthInfo
+-import java.util.Date
+-import mozilla.appservices.sync15.EngineInfo
+-import mozilla.appservices.sync15.FailureReason
+ import mozilla.components.concept.storage.VisitInfo
+ import mozilla.components.concept.storage.VisitType
+ 
+@@ -64,51 +61,3 @@ internal fun mozilla.appservices.places.VisitInfo.into(): VisitInfo {
+         visitType = this.visitType.into()
+     )
+ }
+-
+-/**
+- * Holds fields common to all Glean sync engine pings.
+- */
+-internal data class BaseGleanSyncPing(
+-    val uid: String,
+-    val startedAt: Date,
+-    val finishedAt: Date,
+-    val applied: Int,
+-    val failedToApply: Int,
+-    val reconciled: Int,
+-    val uploaded: Int,
+-    val failedToUpload: Int,
+-    val outgoingBatches: Int,
+-    val failureReason: FailureReason?
+-) {
+-    companion object {
+-        const val MILLIS_PER_SEC = 1000L
+-
+-        fun fromEngineInfo(uid: String, info: EngineInfo): BaseGleanSyncPing {
+-            val failedToApply = info.incoming?.let {
+-                it.failed + it.newFailed
+-            } ?: 0
+-            val (uploaded, failedToUpload) = info.outgoing.fold(Pair(0, 0)) { totals, batch ->
+-                val (uploaded, failedToUpload) = totals
+-                Pair(uploaded + batch.sent, failedToUpload + batch.failed)
+-            }
+-            return BaseGleanSyncPing(
+-                uid = uid,
+-                startedAt = Date(info.at.toLong() * MILLIS_PER_SEC),
+-                // Glean intentionally doesn't support recording arbitrary
+-                // durations in timespans, and we can't use the timespan
+-                // measurement API because everything is measured in Rust
+-                // code. Instead, we record absolute start and end times.
+-                // The Sync ping records both `at` _and_ `took`, so this doesn't
+-                // leak additional info.
+-                finishedAt = Date(info.at.toLong() * MILLIS_PER_SEC + info.took),
+-                applied = info.incoming?.applied ?: 0,
+-                failedToApply = failedToApply,
+-                reconciled = info.incoming?.reconciled ?: 0,
+-                uploaded = uploaded,
+-                failedToUpload = failedToUpload,
+-                outgoingBatches = info.outgoing.size,
+-                failureReason = info.failureReason
+-            )
+-        }
+-    }
+-}
+diff --git a/android-components/components/browser/storage-sync/src/test/java/mozilla/components/browser/storage/sync/TestUtil.kt b/android-components/components/browser/storage-sync/src/test/java/mozilla/components/browser/storage/sync/TestUtil.kt
+deleted file mode 100644
+index 324ad77de388..000000000000
+--- a/android-components/components/browser/storage-sync/src/test/java/mozilla/components/browser/storage/sync/TestUtil.kt
++++ /dev/null
+@@ -1,9 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-package mozilla.components.browser.storage.sync
+-
+-import java.util.Date
+-
+-fun Date.asSeconds() = time / BaseGleanSyncPing.MILLIS_PER_SEC
+diff --git a/android-components/components/support/sync-telemetry/README.md b/android-components/components/support/sync-telemetry/README.md
+new file mode 100644
+index 000000000000..fce50d0f4fc4
+--- /dev/null
++++ b/android-components/components/support/sync-telemetry/README.md
+@@ -0,0 +1,24 @@
++# [Android Components](../../../README.md) > Support > Sync Telemetry
++
++Sync telemetry helper functionality and Glean ping descriptions to be shared between sync-related components.
++
++## Before using this component
++Products sending telemetry and using this component *must request* a data-review following [this process](https://wiki.mozilla.org/Firefox/Data_Collection).
++This component provides data collection using the [Glean SDK](https://mozilla.github.io/glean/book/index.html).
++The list of metrics being collected is available in the [metrics documentation](docs/metrics.md).
++
++## Usage
++
++### Setting up the dependency
++
++Use Gradle to download the library from [maven.mozilla.org](https://maven.mozilla.org/) ([Setup repository](../../../README.md#maven-repository)):
++
++```Groovy
++implementation "org.mozilla.components:support-sync-telemetry:{latest-version}"
++```
++
++## License
++
++    This Source Code Form is subject to the terms of the Mozilla Public
++    License, v. 2.0. If a copy of the MPL was not distributed with this
++    file, You can obtain one at http://mozilla.org/MPL/2.0/
+diff --git a/android-components/components/support/sync-telemetry/build.gradle b/android-components/components/support/sync-telemetry/build.gradle
+new file mode 100644
+index 000000000000..b609fa3bbe85
+--- /dev/null
++++ b/android-components/components/support/sync-telemetry/build.gradle
+@@ -0,0 +1,48 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++plugins {
++    id "com.jetbrains.python.envs" version "0.0.26"
++}
++
++apply plugin: 'com.android.library'
++apply plugin: 'kotlin-android'
++
++android {
++    compileSdkVersion config.compileSdkVersion
++
++    defaultConfig {
++        minSdkVersion config.minSdkVersion
++        targetSdkVersion config.targetSdkVersion
++
++        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
++    }
++
++    buildTypes {
++        release {
++            minifyEnabled false
++            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
++        }
++    }
++}
++
++dependencies {
++    implementation project(':support-base')
++
++    implementation project(':service-glean')
++    implementation Dependencies.kotlin_stdlib
++    implementation Dependencies.mozilla_sync15
++
++    testImplementation project(":support-test")
++    testImplementation Dependencies.androidx_test_core
++    testImplementation Dependencies.androidx_test_junit
++
++    testImplementation Dependencies.testing_mockito
++}
++
++apply from: '../../../publish.gradle'
++ext.configurePublish(config.componentsGroupId, archivesBaseName, project.ext.description)
++
++ext.gleanGenerateMarkdownDocs = true
++apply from: '../../service/glean/scripts/sdk_generator.gradle'
+diff --git a/android-components/components/browser/storage-sync/docs/metrics.md b/android-components/components/support/sync-telemetry/docs/metrics.md
+similarity index 100%
+rename from android-components/components/browser/storage-sync/docs/metrics.md
+rename to android-components/components/support/sync-telemetry/docs/metrics.md
+diff --git a/android-components/components/browser/storage-sync/metrics.yaml b/android-components/components/support/sync-telemetry/metrics.yaml
+similarity index 100%
+rename from android-components/components/browser/storage-sync/metrics.yaml
+rename to android-components/components/support/sync-telemetry/metrics.yaml
+diff --git a/android-components/components/browser/storage-sync/pings.yaml b/android-components/components/support/sync-telemetry/pings.yaml
+similarity index 100%
+rename from android-components/components/browser/storage-sync/pings.yaml
+rename to android-components/components/support/sync-telemetry/pings.yaml
+diff --git a/android-components/components/support/sync-telemetry/src/main/AndroidManifest.xml b/android-components/components/support/sync-telemetry/src/main/AndroidManifest.xml
+new file mode 100644
+index 000000000000..f1a8e3a351bc
+--- /dev/null
++++ b/android-components/components/support/sync-telemetry/src/main/AndroidManifest.xml
+@@ -0,0 +1,5 @@
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this file,
++   - You can obtain one at http://mozilla.org/MPL/2.0/.  -->
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="mozilla.components.support.sync.telemetry" />
+diff --git a/android-components/components/support/sync-telemetry/src/main/java/mozilla/components/support/sync/telemetry/BaseGleanSyncPing.kt b/android-components/components/support/sync-telemetry/src/main/java/mozilla/components/support/sync/telemetry/BaseGleanSyncPing.kt
+new file mode 100644
+index 000000000000..1e4a60d7611c
+--- /dev/null
++++ b/android-components/components/support/sync-telemetry/src/main/java/mozilla/components/support/sync/telemetry/BaseGleanSyncPing.kt
+@@ -0,0 +1,57 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package mozilla.components.support.sync.telemetry
++
++import mozilla.appservices.sync15.EngineInfo
++import mozilla.appservices.sync15.FailureReason
++import java.util.Date
++
++/**
++ * Holds fields common to all Glean sync engine pings.
++ */
++internal data class BaseGleanSyncPing(
++    val uid: String,
++    val startedAt: Date,
++    val finishedAt: Date,
++    val applied: Int,
++    val failedToApply: Int,
++    val reconciled: Int,
++    val uploaded: Int,
++    val failedToUpload: Int,
++    val outgoingBatches: Int,
++    val failureReason: FailureReason?
++) {
++    companion object {
++        const val MILLIS_PER_SEC = 1000L
++
++        fun fromEngineInfo(uid: String, info: EngineInfo): BaseGleanSyncPing {
++            val failedToApply = info.incoming?.let {
++                it.failed + it.newFailed
++            } ?: 0
++            val (uploaded, failedToUpload) = info.outgoing.fold(Pair(0, 0)) { totals, batch ->
++                val (uploaded, failedToUpload) = totals
++                Pair(uploaded + batch.sent, failedToUpload + batch.failed)
++            }
++            return BaseGleanSyncPing(
++                uid = uid,
++                startedAt = Date(info.at.toLong() * MILLIS_PER_SEC),
++                // Glean intentionally doesn't support recording arbitrary
++                // durations in timespans, and we can't use the timespan
++                // measurement API because everything is measured in Rust
++                // code. Instead, we record absolute start and end times.
++                // The Sync ping records both `at` _and_ `took`, so this doesn't
++                // leak additional info.
++                finishedAt = Date(info.at.toLong() * MILLIS_PER_SEC + info.took),
++                applied = info.incoming?.applied ?: 0,
++                failedToApply = failedToApply,
++                reconciled = info.incoming?.reconciled ?: 0,
++                uploaded = uploaded,
++                failedToUpload = failedToUpload,
++                outgoingBatches = info.outgoing.size,
++                failureReason = info.failureReason
++            )
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/android-components/components/browser/storage-sync/src/main/java/mozilla/components/browser/storage/sync/SyncTelemetry.kt b/android-components/components/support/sync-telemetry/src/main/java/mozilla/components/support/sync/telemetry/SyncTelemetry.kt
+similarity index 93%
+rename from android-components/components/browser/storage-sync/src/main/java/mozilla/components/browser/storage/sync/SyncTelemetry.kt
+rename to android-components/components/support/sync-telemetry/src/main/java/mozilla/components/support/sync/telemetry/SyncTelemetry.kt
+index 18d289213e8f..fab8c8004918 100644
+--- a/android-components/components/browser/storage-sync/src/main/java/mozilla/components/browser/storage/sync/SyncTelemetry.kt
++++ b/android-components/components/support/sync-telemetry/src/main/java/mozilla/components/support/sync/telemetry/SyncTelemetry.kt
+@@ -2,33 +2,25 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-package mozilla.components.browser.storage.sync
++package mozilla.components.support.sync.telemetry
+ 
+ import mozilla.appservices.sync15.FailureName
+ import mozilla.appservices.sync15.FailureReason
+ import mozilla.appservices.sync15.SyncTelemetryPing
+-import mozilla.components.browser.storage.sync.GleanMetrics.BookmarksSync
+-import mozilla.components.browser.storage.sync.GleanMetrics.HistorySync
+ import mozilla.components.service.glean.private.LabeledMetricType
+ import mozilla.components.service.glean.private.StringMetricType
++import mozilla.components.support.sync.telemetry.GleanMetrics.BookmarksSync
++import mozilla.components.support.sync.telemetry.GleanMetrics.HistorySync
++import mozilla.components.support.sync.telemetry.GleanMetrics.Pings
++
++const val MAX_FAILURE_REASON_LENGTH = 100
+ 
+ /**
+  * Contains functionality necessary to process instances of [SyncTelemetryPing].
+  */
+ object SyncTelemetry {
+-    private fun recordFailureReason(reason: FailureReason, failureReasonMetric: LabeledMetricType<StringMetricType>) {
+-        val metric = when (reason.name) {
+-            FailureName.Other, FailureName.Unknown -> failureReasonMetric["other"]
+-            FailureName.Unexpected, FailureName.Http -> failureReasonMetric["unexpected"]
+-            FailureName.Auth -> failureReasonMetric["auth"]
+-            FailureName.Shutdown -> return
+-        }
+-        val message = reason.message ?: "Unexpected error: ${reason.code}"
+-        metric.set(message.take(MAX_FAILURE_REASON_LENGTH))
+-    }
+-
+     @Suppress("ComplexMethod", "NestedBlockDepth")
+-    fun processHistoryPing(ping: SyncTelemetryPing, sendPing: () -> Unit) {
++    fun processHistoryPing(ping: SyncTelemetryPing, sendPing: () -> Unit = { Pings.historySync.send() }) {
+         ping.syncs.forEach eachSync@{ sync ->
+             sync.failureReason?.let {
+                 recordFailureReason(it, HistorySync.failureReason)
+@@ -79,7 +71,7 @@ object SyncTelemetry {
+     // `BookmarksSync` and `HistorySync` metrics are two separate objects, we
+     // can't factor this out into a generic function.
+     @Suppress("ComplexMethod", "NestedBlockDepth")
+-    fun processBookmarksPing(ping: SyncTelemetryPing, sendPing: () -> Unit) {
++    fun processBookmarksPing(ping: SyncTelemetryPing, sendPing: () -> Unit = { Pings.bookmarksSync.send() }) {
+         ping.syncs.forEach eachSync@{ sync ->
+             sync.failureReason?.let {
+                 // If the entire sync fails, don't try to unpack the ping; just
+@@ -128,4 +120,15 @@ object SyncTelemetry {
+             }
+         }
+     }
++
++    private fun recordFailureReason(reason: FailureReason, failureReasonMetric: LabeledMetricType<StringMetricType>) {
++        val metric = when (reason.name) {
++            FailureName.Other, FailureName.Unknown -> failureReasonMetric["other"]
++            FailureName.Unexpected, FailureName.Http -> failureReasonMetric["unexpected"]
++            FailureName.Auth -> failureReasonMetric["auth"]
++            FailureName.Shutdown -> return
++        }
++        val message = reason.message ?: "Unexpected error: ${reason.code}"
++        metric.set(message.take(MAX_FAILURE_REASON_LENGTH))
++    }
+ }
+diff --git a/android-components/components/browser/storage-sync/src/test/java/mozilla/components/browser/storage/sync/SyncTelemetryTest.kt b/android-components/components/support/sync-telemetry/src/test/java/mozilla/components/support/sync/telemetry/SyncTelemetryTest.kt
+similarity index 96%
+rename from android-components/components/browser/storage-sync/src/test/java/mozilla/components/browser/storage/sync/SyncTelemetryTest.kt
+rename to android-components/components/support/sync-telemetry/src/test/java/mozilla/components/support/sync/telemetry/SyncTelemetryTest.kt
+index 0bbf48278752..9da1cc102eb8 100644
+--- a/android-components/components/browser/storage-sync/src/test/java/mozilla/components/browser/storage/sync/SyncTelemetryTest.kt
++++ b/android-components/components/support/sync-telemetry/src/test/java/mozilla/components/support/sync/telemetry/SyncTelemetryTest.kt
+@@ -2,10 +2,9 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-package mozilla.components.browser.storage.sync
++package mozilla.components.support.sync.telemetry
+ 
+ import androidx.test.ext.junit.runners.AndroidJUnit4
+-import kotlinx.coroutines.runBlocking
+ import mozilla.appservices.sync15.EngineInfo
+ import mozilla.appservices.sync15.FailureName
+ import mozilla.appservices.sync15.FailureReason
+@@ -15,10 +14,10 @@ import mozilla.appservices.sync15.ProblemInfo
+ import mozilla.appservices.sync15.SyncInfo
+ import mozilla.appservices.sync15.SyncTelemetryPing
+ import mozilla.appservices.sync15.ValidationInfo
+-import mozilla.components.browser.storage.sync.GleanMetrics.BookmarksSync
+-import mozilla.components.browser.storage.sync.GleanMetrics.HistorySync
+-import mozilla.components.browser.storage.sync.GleanMetrics.Pings
+ import mozilla.components.service.glean.testing.GleanTestRule
++import mozilla.components.support.sync.telemetry.GleanMetrics.BookmarksSync
++import mozilla.components.support.sync.telemetry.GleanMetrics.HistorySync
++import mozilla.components.support.sync.telemetry.GleanMetrics.Pings
+ import mozilla.components.support.test.robolectric.testContext
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertTrue
+@@ -30,6 +29,8 @@ import org.junit.Test
+ import org.junit.runner.RunWith
+ import java.util.Date
+ 
++private fun Date.asSeconds() = time / BaseGleanSyncPing.MILLIS_PER_SEC
++
+ @RunWith(AndroidJUnit4::class)
+ class SyncTelemetryTest {
+     @get:Rule
+@@ -45,7 +46,7 @@ class SyncTelemetryTest {
+     }
+ 
+     @Test
+-    fun `sends history telemetry pings on success`() = runBlocking {
++    fun `sends history telemetry pings on success`() {
+         SyncTelemetry.processHistoryPing(SyncTelemetryPing(
+             version = 1,
+             uid = "abc123",
+@@ -149,7 +150,7 @@ class SyncTelemetryTest {
+     }
+ 
+     @Test
+-    fun `sends history telemetry pings on engine failure`() = runBlocking {
++    fun `sends history telemetry pings on engine failure`() {
+         SyncTelemetry.processHistoryPing(SyncTelemetryPing(
+             version = 1,
+             uid = "abc123",
+@@ -289,7 +290,7 @@ class SyncTelemetryTest {
+     }
+ 
+     @Test
+-    fun `sends history telemetry pings on sync failure`() = runBlocking {
++    fun `sends history telemetry pings on sync failure`() {
+         SyncTelemetry.processHistoryPing(SyncTelemetryPing(
+             version = 1,
+             uid = "abc123",
+@@ -321,7 +322,7 @@ class SyncTelemetryTest {
+     }
+ 
+     @Test
+-    fun `sends bookmarks telemetry pings on success`() = runBlocking {
++    fun `sends bookmarks telemetry pings on success`() {
+         SyncTelemetry.processBookmarksPing(SyncTelemetryPing(
+             version = 1,
+             uid = "xyz789",
+@@ -387,7 +388,7 @@ class SyncTelemetryTest {
+     }
+ 
+     @Test
+-    fun `sends bookmarks telemetry pings on engine failure`() = runBlocking {
++    fun `sends bookmarks telemetry pings on engine failure`() {
+         SyncTelemetry.processBookmarksPing(SyncTelemetryPing(
+             version = 1,
+             uid = "abc123",
+@@ -518,7 +519,7 @@ class SyncTelemetryTest {
+     }
+ 
+     @Test
+-    fun `sends bookmarks telemetry pings on sync failure`() = runBlocking {
++    fun `sends bookmarks telemetry pings on sync failure`() {
+         SyncTelemetry.processBookmarksPing(SyncTelemetryPing(
+             version = 1,
+             uid = "abc123",

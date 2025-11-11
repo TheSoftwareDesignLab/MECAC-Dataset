@@ -1,0 +1,613 @@
+diff --git a/twidere/src/google/kotlin/org/mariotaku/twidere/service/DropboxDataSyncService.kt b/twidere/src/google/kotlin/org/mariotaku/twidere/service/DropboxDataSyncService.kt
+index 84d96eaf87..a5b6f15786 100644
+--- a/twidere/src/google/kotlin/org/mariotaku/twidere/service/DropboxDataSyncService.kt
++++ b/twidere/src/google/kotlin/org/mariotaku/twidere/service/DropboxDataSyncService.kt
+@@ -1,6 +1,9 @@
+ package org.mariotaku.twidere.service
+ 
++import android.app.NotificationManager
++import android.content.Context
+ import android.content.Intent
++import android.support.v7.app.NotificationCompat
+ import android.util.Xml
+ import com.dropbox.core.DbxRequestConfig
+ import com.dropbox.core.v2.DbxClientV2
+@@ -8,31 +11,38 @@ import com.dropbox.core.v2.files.WriteMode
+ import org.mariotaku.kpreferences.get
+ import org.mariotaku.ktextension.map
+ import org.mariotaku.twidere.BuildConfig
++import org.mariotaku.twidere.R
+ import org.mariotaku.twidere.dropboxAuthTokenKey
+-import org.mariotaku.twidere.extension.model.read
+-import org.mariotaku.twidere.extension.model.serialize
+-import org.mariotaku.twidere.extension.model.writeMimeMessageTo
++import org.mariotaku.twidere.extension.model.*
+ import org.mariotaku.twidere.model.DraftCursorIndices
+ import org.mariotaku.twidere.model.FiltersData
+ import org.mariotaku.twidere.provider.TwidereDataStore.Drafts
++import java.io.*
+ 
+ /**
+  * Created by mariotaku on 2016/12/7.
+  */
+ 
+ class DropboxDataSyncService : BaseIntentService("dropbox_data_sync") {
++    private val NOTIFICATION_ID_SYNC_DATA = 302
+ 
+     override fun onHandleIntent(intent: Intent?) {
+         val authToken = preferences[dropboxAuthTokenKey] ?: return
++        val nb = NotificationCompat.Builder(this)
++        nb.setSmallIcon(R.drawable.ic_stat_refresh)
++        nb.setOngoing(true)
++        nb.setContentTitle("Syncing data")
++        nb.setContentText("Syncing using Dropbox")
++        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
++        nm.notify(NOTIFICATION_ID_SYNC_DATA, nb.build())
+         val requestConfig = DbxRequestConfig.newBuilder("twidere-android/${BuildConfig.VERSION_NAME}")
+                 .build()
+         val client = DbxClientV2(requestConfig, authToken)
+-        uploadFilters(client)
++        syncFilters(client)
+         uploadDrafts(client)
++        nm.cancel(NOTIFICATION_ID_SYNC_DATA)
+     }
+ 
+-    private fun DbxClientV2.newUploader(path: String) = files().uploadBuilder(path).withMode(WriteMode.OVERWRITE).withMute(true).start()
+-
+     private fun uploadDrafts(client: DbxClientV2) {
+         val cur = contentResolver.query(Drafts.CONTENT_URI, Drafts.COLUMNS, null, null, null) ?: return
+         cur.map(DraftCursorIndices(cur)).forEach { draft ->
+@@ -44,18 +54,95 @@ class DropboxDataSyncService : BaseIntentService("dropbox_data_sync") {
+         cur.close()
+     }
+ 
+-    private fun uploadFilters(client: DbxClientV2) {
+-        val uploader = client.newUploader("/Common/filters.xml")
+-        val filters = FiltersData()
+-        filters.read(contentResolver)
+-        val serializer = Xml.newSerializer()
+-        serializer.setFeature("http://xmlpull.org/v1/doc/features.html#indent-output", true)
+-        uploader.use {
+-            serializer.setOutput(it.outputStream, "UTF-8")
+-            filters.serialize(serializer)
+-            it.finish()
++    @Throws(IOException::class)
++    private fun syncFilters(client: DbxClientV2) {
++        val helper = DropboxFiltersDataSyncHelper(this, client)
++        helper.sync()
++    }
++
++    abstract class FileBasedFiltersDataSyncHelper(val context: Context) {
++        @Throws(IOException::class)
++        protected abstract fun loadFromRemote(): FiltersData
++
++        @Throws(IOException::class)
++        protected abstract fun saveToRemote(data: FiltersData)
++
++        fun sync() {
++            val remoteFilters: FiltersData = loadFromRemote()
++
++            val filters: FiltersData = FiltersData().apply {
++                read(context.contentResolver)
++                initFields()
++            }
++
++            val syncDataDir: File = context.syncDataDir.apply {
++                if (!exists()) {
++                    mkdirs()
++                }
++            }
++            val snapshotFile = File(syncDataDir, "filters.xml")
++            val deletedFilters: FiltersData? = try {
++                FileReader(snapshotFile).use {
++                    val result = FiltersData()
++                    val parser = Xml.newPullParser()
++                    parser.setInput(it)
++                    result.parse(parser)
++                    result.removeAll(filters)
++                    return@use result
++                }
++            } catch (e: FileNotFoundException) {
++                null
++            }
++
++            filters.addAll(remoteFilters, true)
++
++            if (deletedFilters != null) {
++                filters.removeAll(deletedFilters)
++            }
++
++            filters.write(context.contentResolver)
++
++            saveToRemote(filters)
++            try {
++                FileWriter(snapshotFile).use {
++                    val serializer = Xml.newSerializer()
++                    serializer.setFeature("http://xmlpull.org/v1/doc/features.html#indent-output", true)
++                    serializer.setOutput(it)
++                    filters.serialize(serializer)
++                }
++            } catch (e: FileNotFoundException) {
++                // Ignore
++            }
++        }
++
++        private val Context.syncDataDir: File
++            get() = File(filesDir, "sync_data")
++    }
++
++    class DropboxFiltersDataSyncHelper(context: Context, val client: DbxClientV2) : FileBasedFiltersDataSyncHelper(context) {
++        override fun loadFromRemote(): FiltersData = client.newDownloader("/Common/filters.xml").use { downloader ->
++            val result = FiltersData()
++            val parser = Xml.newPullParser()
++            parser.setInput(downloader.inputStream, "UTF-8")
++            result.parse(parser)
++            result.initFields()
++            return@use result
++        }
++
++        override fun saveToRemote(data: FiltersData) {
++            client.newUploader("/Common/filters.xml").use { uploader ->
++                val serializer = Xml.newSerializer()
++                serializer.setFeature("http://xmlpull.org/v1/doc/features.html#indent-output", true)
++                serializer.setOutput(uploader.outputStream, "UTF-8")
++                data.serialize(serializer)
++                uploader.finish()
++            }
+         }
++
+     }
+ 
+ }
+ 
++
++private fun DbxClientV2.newUploader(path: String) = files().uploadBuilder(path).withMode(WriteMode.OVERWRITE).withMute(true).start()
++private fun DbxClientV2.newDownloader(path: String) = files().downloadBuilder(path).start()
+diff --git a/twidere/src/main/java/org/mariotaku/twidere/util/ThemeUtils.java b/twidere/src/main/java/org/mariotaku/twidere/util/ThemeUtils.java
+index a01f71cf4b..862050cd2b 100644
+--- a/twidere/src/main/java/org/mariotaku/twidere/util/ThemeUtils.java
++++ b/twidere/src/main/java/org/mariotaku/twidere/util/ThemeUtils.java
+@@ -20,7 +20,6 @@
+ package org.mariotaku.twidere.util;
+ 
+ import android.content.Context;
+-import android.content.SharedPreferences;
+ import android.content.res.Configuration;
+ import android.content.res.Resources;
+ import android.content.res.TypedArray;
+@@ -35,8 +34,6 @@
+ import android.support.annotation.NonNull;
+ import android.support.annotation.Nullable;
+ import android.support.v4.content.ContextCompat;
+-import android.support.v4.graphics.ColorUtils;
+-import android.support.v7.app.AppCompatDelegate;
+ import android.support.v7.view.menu.ActionMenuItemView;
+ import android.support.v7.widget.ActionMenuView;
+ import android.support.v7.widget.Toolbar;
+@@ -52,6 +49,7 @@
+ import android.widget.FrameLayout;
+ 
+ import org.apache.commons.lang3.ArrayUtils;
++import org.mariotaku.chameleon.ChameleonUtils;
+ import org.mariotaku.twidere.Constants;
+ import org.mariotaku.twidere.R;
+ import org.mariotaku.twidere.graphic.ActionIconDrawable;
+@@ -542,18 +540,6 @@ public static void applyToolbarItemColor(Context context, Toolbar toolbar, int t
+         }
+     }
+ 
+-    public static int getLocalNightMode(SharedPreferences preferences) {
+-        switch (Utils.getNonEmptyString(preferences, KEY_THEME, VALUE_THEME_NAME_LIGHT)) {
+-            case VALUE_THEME_NAME_DARK: {
+-                return AppCompatDelegate.MODE_NIGHT_YES;
+-            }
+-            case VALUE_THEME_NAME_AUTO: {
+-                return AppCompatDelegate.MODE_NIGHT_AUTO;
+-            }
+-        }
+-        return AppCompatDelegate.MODE_NIGHT_NO;
+-    }
+-
+     public static void fixNightMode(Resources resources, Configuration newConfig) {
+         int currentNightMode = resources.getConfiguration().uiMode
+                 & Configuration.UI_MODE_NIGHT_MASK;
+@@ -564,13 +550,12 @@ public static void fixNightMode(Resources resources, Configuration newConfig) {
+     }
+ 
+     public static int getColorDependent(int color) {
+-        final boolean isDark = !isLightColor(color);
+-        return isDark ? Color.WHITE : Color.BLACK;
++        return ChameleonUtils.getColorDependent(color);
+     }
+ 
+ 
+     public static boolean isLightColor(int color) {
+-        return ColorUtils.calculateLuminance(color) * 0xFF > ACCENT_COLOR_THRESHOLD;
++        return ChameleonUtils.isColorLight(color);
+     }
+ 
+     public static int getOptimalAccentColor(int themeColor) {
+diff --git a/twidere/src/main/kotlin/org/mariotaku/ktextension/CollectionExtensions.kt b/twidere/src/main/kotlin/org/mariotaku/ktextension/CollectionExtensions.kt
+index 36519c76c2..9b25515ad6 100644
+--- a/twidere/src/main/kotlin/org/mariotaku/ktextension/CollectionExtensions.kt
++++ b/twidere/src/main/kotlin/org/mariotaku/ktextension/CollectionExtensions.kt
+@@ -11,3 +11,7 @@ fun Collection<*>?.isNotNullOrEmpty(): Boolean {
+ fun Collection<*>?.isNullOrEmpty(): Boolean {
+     return this == null || this.isEmpty()
+ }
++
++fun <T> MutableCollection<T>.addAllIgnoreDuplicates(collection: Collection<T>) {
++    addAll(collection.filter { it !in this })
++}
+\ No newline at end of file
+diff --git a/twidere/src/main/kotlin/org/mariotaku/twidere/activity/BaseActivity.kt b/twidere/src/main/kotlin/org/mariotaku/twidere/activity/BaseActivity.kt
+index 4601b9dbc8..4197f771c9 100644
+--- a/twidere/src/main/kotlin/org/mariotaku/twidere/activity/BaseActivity.kt
++++ b/twidere/src/main/kotlin/org/mariotaku/twidere/activity/BaseActivity.kt
+@@ -24,7 +24,6 @@ import android.app.PendingIntent
+ import android.content.Context
+ import android.content.Intent
+ import android.content.IntentFilter
+-import android.content.res.Configuration
+ import android.content.res.Resources
+ import android.graphics.Rect
+ import android.nfc.NfcAdapter
+@@ -47,11 +46,11 @@ import org.mariotaku.chameleon.ChameleonUtils
+ import org.mariotaku.kpreferences.KPreferences
+ import org.mariotaku.kpreferences.get
+ import org.mariotaku.twidere.BuildConfig
+-import org.mariotaku.twidere.R
+ import org.mariotaku.twidere.TwidereConstants.SHARED_PREFERENCES_NAME
+ import org.mariotaku.twidere.activity.iface.IControlBarActivity
+ import org.mariotaku.twidere.activity.iface.IExtendedActivity
+ import org.mariotaku.twidere.activity.iface.IThemedActivity
++import org.mariotaku.twidere.constant.nightModeKey
+ import org.mariotaku.twidere.constant.themeColorKey
+ import org.mariotaku.twidere.constant.themeKey
+ import org.mariotaku.twidere.fragment.iface.IBaseFragment.SystemWindowsInsetsCallback
+@@ -103,11 +102,6 @@ open class BaseActivity : ChameleonActivity(), IExtendedActivity, IThemedActivit
+         if (theme.isToolbarColored) {
+             theme.colorToolbar = theme.colorPrimary
+         }
+-        theme.actionBarWidgetTheme = if (ChameleonUtils.isColorLight(theme.colorToolbar)) {
+-            R.style.Theme_Twidere_Light
+-        } else {
+-            R.style.Theme_Twidere_Dark
+-        }
+         theme.statusBarColor = ChameleonUtils.darkenColor(theme.colorToolbar)
+         theme.lightStatusBarMode = LightStatusBarMode.AUTO
+         theme.textColorLink = ThemeUtils.getOptimalAccentColor(theme.colorAccent, theme.colorForeground)
+@@ -178,7 +172,7 @@ open class BaseActivity : ChameleonActivity(), IExtendedActivity, IThemedActivit
+             StrictModeUtils.detectAllThreadPolicy()
+         }
+         val prefs = getSharedPreferences(SHARED_PREFERENCES_NAME, Context.MODE_PRIVATE)
+-        val nightMode = ThemeUtils.getLocalNightMode(prefs)
++        val nightMode = prefs[nightModeKey]
+         val themeResource = getThemeResource(prefs[themeKey], prefs[themeColorKey], nightMode)
+         if (themeResource != 0) {
+             setTheme(themeResource)
+@@ -230,11 +224,6 @@ open class BaseActivity : ChameleonActivity(), IExtendedActivity, IThemedActivit
+         super.onPause()
+     }
+ 
+-    override fun onConfigurationChanged(newConfig: Configuration) {
+-        super.onConfigurationChanged(newConfig)
+-        ThemeUtils.fixNightMode(resources, newConfig)
+-    }
+-
+     override fun setControlBarOffset(offset: Float) {
+ 
+     }
+diff --git a/twidere/src/main/kotlin/org/mariotaku/twidere/app/TwidereApplication.kt b/twidere/src/main/kotlin/org/mariotaku/twidere/app/TwidereApplication.kt
+index 9cecc46c09..5f9fd21168 100644
+--- a/twidere/src/main/kotlin/org/mariotaku/twidere/app/TwidereApplication.kt
++++ b/twidere/src/main/kotlin/org/mariotaku/twidere/app/TwidereApplication.kt
+@@ -48,6 +48,7 @@ import org.mariotaku.twidere.activity.MainHondaJOJOActivity
+ import org.mariotaku.twidere.constant.apiLastChangeKey
+ import org.mariotaku.twidere.constant.bugReportsKey
+ import org.mariotaku.twidere.constant.defaultFeatureLastUpdated
++import org.mariotaku.twidere.constant.nightModeKey
+ import org.mariotaku.twidere.model.DefaultFeatures
+ import org.mariotaku.twidere.util.*
+ import org.mariotaku.twidere.util.content.TwidereSQLiteOpenHelper
+@@ -258,17 +259,7 @@ class TwidereApplication : Application(), Constants, OnSharedPreferenceChangeLis
+     }
+ 
+     private fun resetTheme(preferences: SharedPreferences) {
+-        when (ThemeUtils.getLocalNightMode(preferences)) {
+-            AppCompatDelegate.MODE_NIGHT_AUTO -> {
+-                AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_AUTO)
+-            }
+-            AppCompatDelegate.MODE_NIGHT_YES -> {
+-                AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES)
+-            }
+-            else -> {
+-                AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO)
+-            }
+-        }
++        AppCompatDelegate.setDefaultNightMode(preferences[nightModeKey])
+     }
+ 
+     private fun reloadDnsSettings() {
+diff --git a/twidere/src/main/kotlin/org/mariotaku/twidere/constant/PreferenceKeys.kt b/twidere/src/main/kotlin/org/mariotaku/twidere/constant/PreferenceKeys.kt
+index 376e0dbb0a..33737da3d4 100644
+--- a/twidere/src/main/kotlin/org/mariotaku/twidere/constant/PreferenceKeys.kt
++++ b/twidere/src/main/kotlin/org/mariotaku/twidere/constant/PreferenceKeys.kt
+@@ -2,6 +2,7 @@ package org.mariotaku.twidere.constant
+ 
+ import android.content.SharedPreferences
+ import android.os.Build
++import android.support.v7.app.AppCompatDelegate
+ import android.text.TextUtils
+ import org.mariotaku.kpreferences.*
+ import org.mariotaku.ktextension.toLong
+@@ -9,6 +10,7 @@ import org.mariotaku.twidere.BuildConfig
+ import org.mariotaku.twidere.Constants.KEY_DISPLAY_PROFILE_IMAGE
+ import org.mariotaku.twidere.Constants.KEY_NO_CLOSE_AFTER_TWEET_SENT
+ import org.mariotaku.twidere.TwidereConstants.*
++import org.mariotaku.twidere.constant.SharedPreferenceConstants.KEY_THEME
+ import org.mariotaku.twidere.extension.getNonEmptyString
+ import org.mariotaku.twidere.model.CustomAPIConfig
+ import org.mariotaku.twidere.model.account.cred.Credentials
+@@ -54,6 +56,25 @@ val themeColorKey = KIntKey(KEY_THEME_COLOR, 0)
+ val filterUnavailableQuoteStatusesKey = KBooleanKey("filter_unavailable_quote_statuses", false)
+ val filterPossibilitySensitiveStatusesKey = KBooleanKey("filter_possibility_sensitive_statuses", false)
+ 
++object nightModeKey : KSimpleKey<Int>(KEY_THEME, AppCompatDelegate.MODE_NIGHT_NO) {
++    override fun read(preferences: SharedPreferences): Int {
++        return when (preferences.getString(key, null)) {
++            VALUE_THEME_NAME_AUTO -> AppCompatDelegate.MODE_NIGHT_AUTO
++            VALUE_THEME_NAME_DARK -> AppCompatDelegate.MODE_NIGHT_YES
++            else -> AppCompatDelegate.MODE_NIGHT_NO
++        }
++    }
++
++    override fun write(editor: SharedPreferences.Editor, value: Int): Boolean {
++        editor.putString(key, when (value) {
++            AppCompatDelegate.MODE_NIGHT_NO -> VALUE_THEME_NAME_LIGHT
++            AppCompatDelegate.MODE_NIGHT_YES -> VALUE_THEME_NAME_DARK
++            else -> VALUE_THEME_NAME_AUTO
++        })
++        return true
++    }
++}
++
+ object profileImageStyleKey : KSimpleKey<Int>(KEY_PROFILE_IMAGE_STYLE, ProfileImageView.SHAPE_CIRCLE) {
+     override fun read(preferences: SharedPreferences): Int {
+         if (preferences.getString(key, null) == VALUE_PROFILE_IMAGE_STYLE_SQUARE) return ProfileImageView.SHAPE_RECTANGLE
+diff --git a/twidere/src/main/kotlin/org/mariotaku/twidere/extension/model/FiltersDataExtensions.kt b/twidere/src/main/kotlin/org/mariotaku/twidere/extension/model/FiltersDataExtensions.kt
+index f023cc5524..bbb60c5bc7 100644
+--- a/twidere/src/main/kotlin/org/mariotaku/twidere/extension/model/FiltersDataExtensions.kt
++++ b/twidere/src/main/kotlin/org/mariotaku/twidere/extension/model/FiltersDataExtensions.kt
+@@ -2,13 +2,13 @@ package org.mariotaku.twidere.extension.model
+ 
+ import android.content.ContentResolver
+ import android.net.Uri
++import org.mariotaku.ktextension.addAllIgnoreDuplicates
+ import org.mariotaku.ktextension.convert
+ import org.mariotaku.ktextension.map
+-import org.mariotaku.twidere.model.FiltersData
+-import org.mariotaku.twidere.model.UserKey
+-import org.mariotaku.twidere.model.`FiltersData$BaseItemCursorIndices`
+-import org.mariotaku.twidere.model.`FiltersData$UserItemCursorIndices`
++import org.mariotaku.sqliteqb.library.Expression
++import org.mariotaku.twidere.model.*
+ import org.mariotaku.twidere.provider.TwidereDataStore.Filters
++import org.mariotaku.twidere.util.content.ContentResolverUtils
+ import org.xmlpull.v1.XmlPullParser
+ import org.xmlpull.v1.XmlSerializer
+ import java.io.IOException
+@@ -18,9 +18,10 @@ import java.util.*
+  * Created by mariotaku on 2016/12/28.
+  */
+ 
+-fun FiltersData.read(cr: ContentResolver) {
++fun FiltersData.read(cr: ContentResolver, loadSubscription: Boolean = false) {
+     fun readBaseItems(uri: Uri): List<FiltersData.BaseItem>? {
+-        val c = cr.query(uri, Filters.COLUMNS, null, null, null) ?: return null
++        val where = if (loadSubscription) null else Expression.lesserThan(Filters.SOURCE, 0).sql
++        val c = cr.query(uri, Filters.COLUMNS, where, null, null) ?: return null
+         @Suppress("ConvertTryFinallyToUseCall")
+         try {
+             return c.map(`FiltersData$BaseItemCursorIndices`(c))
+@@ -29,7 +30,8 @@ fun FiltersData.read(cr: ContentResolver) {
+         }
+     }
+     this.users = run {
+-        val c = cr.query(Filters.Users.CONTENT_URI, Filters.Users.COLUMNS, null, null, null) ?: return@run null
++        val where = if (loadSubscription) null else Expression.lesserThan(Filters.Users.SOURCE, 0).sql
++        val c = cr.query(Filters.Users.CONTENT_URI, Filters.Users.COLUMNS, where, null, null) ?: return@run null
+         @Suppress("ConvertTryFinallyToUseCall")
+         try {
+             return@run c.map(`FiltersData$UserItemCursorIndices`(c))
+@@ -42,6 +44,25 @@ fun FiltersData.read(cr: ContentResolver) {
+     this.links = readBaseItems(Filters.Links.CONTENT_URI)
+ }
+ 
++fun FiltersData.write(cr: ContentResolver) {
++    if (users != null) {
++        ContentResolverUtils.bulkInsert(cr, Filters.Users.CONTENT_URI,
++                users.map(`FiltersData$UserItemValuesCreator`::create))
++    }
++    if (keywords != null) {
++        ContentResolverUtils.bulkInsert(cr, Filters.Keywords.CONTENT_URI,
++                keywords.map(`FiltersData$BaseItemValuesCreator`::create))
++    }
++    if (sources != null) {
++        ContentResolverUtils.bulkInsert(cr, Filters.Sources.CONTENT_URI,
++                sources.map(`FiltersData$BaseItemValuesCreator`::create))
++    }
++    if (links != null) {
++        ContentResolverUtils.bulkInsert(cr, Filters.Links.CONTENT_URI,
++                links.map(`FiltersData$BaseItemValuesCreator`::create))
++    }
++}
++
+ private const val TAG_FILTERS = "filters"
+ private const val TAG_KEYWORD = "keyword"
+ private const val TAG_SOURCE = "source"
+@@ -94,18 +115,7 @@ fun FiltersData.parse(parser: XmlPullParser) {
+     while (event != XmlPullParser.END_DOCUMENT) {
+         when (event) {
+             XmlPullParser.START_DOCUMENT -> {
+-                if (users == null) {
+-                    users = ArrayList()
+-                }
+-                if (keywords == null) {
+-                    keywords = ArrayList()
+-                }
+-                if (sources == null) {
+-                    sources = ArrayList()
+-                }
+-                if (links == null) {
+-                    links = ArrayList()
+-                }
++                initFields()
+             }
+             XmlPullParser.START_TAG -> {
+                 stack.push(when (parser.name) {
+@@ -138,4 +148,46 @@ fun FiltersData.parse(parser: XmlPullParser) {
+         event = parser.next()
+     }
+ 
+-}
+\ No newline at end of file
++}
++
++fun FiltersData.addAll(data: FiltersData, ignoreDuplicates: Boolean = false) {
++    this.users = mergeList(this.users, data.users, ignoreDuplicates = ignoreDuplicates)
++    this.keywords = mergeList(this.keywords, data.keywords, ignoreDuplicates = ignoreDuplicates)
++    this.sources = mergeList(this.sources, data.sources, ignoreDuplicates = ignoreDuplicates)
++    this.links = mergeList(this.links, data.links, ignoreDuplicates = ignoreDuplicates)
++}
++
++fun FiltersData.removeAll(data: FiltersData) {
++    data.users?.let { this.users?.removeAll(it) }
++    data.keywords?.let { this.keywords?.removeAll(it) }
++    data.sources?.let { this.sources?.removeAll(it) }
++    data.links?.let { this.links?.removeAll(it) }
++}
++
++private fun <T> mergeList(vararg lists: List<T>?, ignoreDuplicates: Boolean): List<T> {
++    val result = ArrayList<T>()
++    lists.forEach {
++        if (it == null) return@forEach
++        if (ignoreDuplicates) {
++            result.addAllIgnoreDuplicates(it)
++        } else {
++            result.addAll(it)
++        }
++    }
++    return result
++}
++
++fun FiltersData.initFields() {
++    if (users == null) {
++        users = ArrayList()
++    }
++    if (keywords == null) {
++        keywords = ArrayList()
++    }
++    if (sources == null) {
++        sources = ArrayList()
++    }
++    if (links == null) {
++        links = ArrayList()
++    }
++}
+diff --git a/twidere/src/main/kotlin/org/mariotaku/twidere/fragment/SettingsDetailsFragment.kt b/twidere/src/main/kotlin/org/mariotaku/twidere/fragment/SettingsDetailsFragment.kt
+index b2a2cf3039..bc8e3a767d 100644
+--- a/twidere/src/main/kotlin/org/mariotaku/twidere/fragment/SettingsDetailsFragment.kt
++++ b/twidere/src/main/kotlin/org/mariotaku/twidere/fragment/SettingsDetailsFragment.kt
+@@ -29,7 +29,6 @@ import org.mariotaku.twidere.util.Utils
+ 
+ class SettingsDetailsFragment : BasePreferenceFragment(), OnSharedPreferenceChangeListener {
+ 
+-
+     override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+         val preferenceManager = preferenceManager
+         preferenceManager.sharedPreferencesName = SHARED_PREFERENCES_NAME
+@@ -60,13 +59,11 @@ class SettingsDetailsFragment : BasePreferenceFragment(), OnSharedPreferenceChan
+ 
+     override fun onStart() {
+         super.onStart()
+-        val preferences = preferenceManager.sharedPreferences
+-        preferences.registerOnSharedPreferenceChangeListener(this)
++        preferenceManager.sharedPreferences.registerOnSharedPreferenceChangeListener(this)
+     }
+ 
+     override fun onStop() {
+-        val preferences = preferenceManager.sharedPreferences
+-        preferences.unregisterOnSharedPreferenceChangeListener(this)
++        preferenceManager.sharedPreferences.unregisterOnSharedPreferenceChangeListener(this)
+         super.onStop()
+     }
+ 
+@@ -74,7 +71,6 @@ class SettingsDetailsFragment : BasePreferenceFragment(), OnSharedPreferenceChan
+         val preference = findPreference(key) ?: return
+         val extras = preference.extras
+         if (extras != null) {
+-            val activity = activity
+             if (extras.containsKey(EXTRA_SHOULD_RESTART)) {
+                 SettingsActivity.setShouldRestart(activity)
+             } else if (extras.containsKey(EXTRA_SHOULD_RECREATE)) {
+diff --git a/twidere/src/main/res/values/strings.xml b/twidere/src/main/res/values/strings.xml
+index 0bf826093a..741c9e5083 100644
+--- a/twidere/src/main/res/values/strings.xml
++++ b/twidere/src/main/res/values/strings.xml
+@@ -869,4 +869,6 @@
+     <string name="message_no_user_selected">No user selected</string>
+     <string name="preference_title_advanced">Advanced</string>
+     <string name="preference_filter_possibility_sensitive_statuses">Filter sensitive tweets</string>
++    <string name="preference_title_filter_subscription">Filter subscription</string>
++    <string name="preference_title_filter_manage_subscriptions">Manage</string>
+ </resources>
+\ No newline at end of file
+diff --git a/twidere/src/main/res/values/themes_base.xml b/twidere/src/main/res/values/themes_base.xml
+index ece1fefa8b..b1bcdd75e4 100644
+--- a/twidere/src/main/res/values/themes_base.xml
++++ b/twidere/src/main/res/values/themes_base.xml
+@@ -42,7 +42,7 @@
+         <item name="colorToolbar">@color/background_color_action_bar_dark</item>
+         <item name="isToolbarColored">false</item>
+ 
+-        <item name="actionBarTheme">@style/Theme.Twidere.Light.ActionBar</item>
++        <item name="actionBarTheme">@style/Theme.Twidere.Dark.ActionBar</item>
+         <item name="preferenceTheme">@style/PreferenceThemeOverlay.v14.Material</item>
+     </style>
+ 
+@@ -67,7 +67,7 @@
+         <item name="colorToolbar">?colorPrimary</item>
+         <item name="isToolbarColored">true</item>
+ 
+-        <item name="actionBarTheme">@null</item>
++        <item name="actionBarTheme">@style/Theme.Twidere.Light.ActionBar</item>
+         <item name="preferenceTheme">@style/PreferenceThemeOverlay.v14.Material</item>
+     </style>
+ 
+diff --git a/twidere/src/main/res/xml/preferences_filters.xml b/twidere/src/main/res/xml/preferences_filters.xml
+index d985e56ef0..9d8539152e 100644
+--- a/twidere/src/main/res/xml/preferences_filters.xml
++++ b/twidere/src/main/res/xml/preferences_filters.xml
+@@ -8,4 +8,7 @@
+         android:defaultValue="false"
+         android:key="filter_possibility_sensitive_statuses"
+         android:title="@string/preference_filter_possibility_sensitive_statuses"/>
++    <PreferenceCategory android:title="@string/preference_title_filter_subscription">
++        <Preference android:title="@string/preference_title_filter_manage_subscriptions"/>
++    </PreferenceCategory>
+ </PreferenceScreen>
+\ No newline at end of file
+diff --git a/twidere/src/main/res/xml/preferences_theme.xml b/twidere/src/main/res/xml/preferences_theme.xml
+index 88cfe5d935..e689694038 100644
+--- a/twidere/src/main/res/xml/preferences_theme.xml
++++ b/twidere/src/main/res/xml/preferences_theme.xml
+@@ -14,7 +14,7 @@
+         android:title="@string/theme">
+         <extra
+             android:name="recreate_activity"
+-            android:value="true"/>
++            android:value="false"/>
+     </org.mariotaku.twidere.preference.EntrySummaryListPreference>
+ 
+     <org.mariotaku.twidere.preference.ThemeBackgroundPreference

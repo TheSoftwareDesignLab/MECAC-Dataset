@@ -1,0 +1,3058 @@
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/ai_prompt_input_bloc.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/ai_prompt_input_bloc.dart
+index 99a00228c7c75..c52a46419984e 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/ai_prompt_input_bloc.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/ai_prompt_input_bloc.dart
+@@ -5,6 +5,7 @@ import 'package:appflowy/workspace/application/settings/ai/local_llm_listener.da
+ import 'package:appflowy_backend/dispatch/dispatch.dart';
+ import 'package:appflowy_backend/log.dart';
+ import 'package:appflowy_backend/protobuf/flowy-ai/entities.pb.dart';
++import 'package:appflowy_backend/protobuf/flowy-folder/protobuf.dart';
+ import 'package:appflowy_result/appflowy_result.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+ import 'package:freezed_annotation/freezed_annotation.dart';
+@@ -20,18 +21,6 @@ class AIPromptInputBloc extends Bloc<AIPromptInputEvent, AIPromptInputState> {
+     _init();
+   }
+ 
+-  ChatInputFileMetadata consumeMetadata() {
+-    final metadata = {
+-      for (final file in state.uploadFiles) file.filePath: file,
+-    };
+-
+-    if (metadata.isNotEmpty) {
+-      add(const AIPromptInputEvent.clear());
+-    }
+-
+-    return metadata;
+-  }
+-
+   final LocalLLMListener _listener;
+ 
+   @override
+@@ -44,15 +33,6 @@ class AIPromptInputBloc extends Bloc<AIPromptInputEvent, AIPromptInputState> {
+     on<AIPromptInputEvent>(
+       (event, emit) {
+         event.when(
+-          newFile: (String filePath, String fileName) {
+-            final files = [...state.uploadFiles];
+-
+-            final newFile = ChatFile.fromFilePath(filePath);
+-            if (newFile != null) {
+-              files.add(newFile);
+-              emit(state.copyWith(uploadFiles: files));
+-            }
+-          },
+           updateChatState: (LocalAIChatPB chatState) {
+             // Only user enable chat with file and the plugin is already running
+             final supportChatWithFile = chatState.fileEnabled &&
+@@ -80,19 +60,37 @@ class AIPromptInputBloc extends Bloc<AIPromptInputEvent, AIPromptInputState> {
+               ),
+             );
+           },
+-          deleteFile: (file) {
+-            final files = List<ChatFile>.from(state.uploadFiles);
++          attachFile: (filePath, fileName) {
++            final newFile = ChatFile.fromFilePath(filePath);
++            if (newFile != null) {
++              emit(
++                state.copyWith(
++                  attachedFiles: [...state.attachedFiles, newFile],
++                ),
++              );
++            }
++          },
++          removeFile: (file) {
++            final files = [...state.attachedFiles];
+             files.remove(file);
+             emit(
+               state.copyWith(
+-                uploadFiles: files,
++                attachedFiles: files,
+               ),
+             );
+           },
+-          clear: () {
++          updateMentionedViews: (views) {
+             emit(
+               state.copyWith(
+-                uploadFiles: [],
++                mentionedPages: views,
++              ),
++            );
++          },
++          clearMetadata: () {
++            emit(
++              state.copyWith(
++                attachedFiles: [],
++                mentionedPages: [],
+               ),
+             );
+           },
+@@ -126,35 +124,55 @@ class AIPromptInputBloc extends Bloc<AIPromptInputEvent, AIPromptInputState> {
+       Log.error,
+     );
+   }
++
++  Map<String, dynamic> consumeMetadata() {
++    final metadata = {
++      for (final file in state.attachedFiles) file.filePath: file,
++      for (final page in state.mentionedPages) page.id: page,
++    };
++
++    if (metadata.isNotEmpty && !isClosed) {
++      add(const AIPromptInputEvent.clearMetadata());
++    }
++
++    return metadata;
++  }
+ }
+ 
+ @freezed
+ class AIPromptInputEvent with _$AIPromptInputEvent {
+-  const factory AIPromptInputEvent.newFile(String filePath, String fileName) =
+-      _NewFile;
+-  const factory AIPromptInputEvent.deleteFile(ChatFile file) = _DeleteFile;
+-  const factory AIPromptInputEvent.clear() = _ClearFile;
+   const factory AIPromptInputEvent.updateChatState(
+     LocalAIChatPB chatState,
+   ) = _UpdateChatState;
+   const factory AIPromptInputEvent.updatePluginState(
+     LocalAIPluginStatePB chatState,
+   ) = _UpdatePluginState;
++  const factory AIPromptInputEvent.attachFile(
++    String filePath,
++    String fileName,
++  ) = _AttachFile;
++  const factory AIPromptInputEvent.removeFile(ChatFile file) = _RemoveFile;
++  const factory AIPromptInputEvent.updateMentionedViews(List<ViewPB> views) =
++      _UpdateMentionedViews;
++  const factory AIPromptInputEvent.clearMetadata() = _ClearMetadata;
+ }
+ 
+ @freezed
+ class AIPromptInputState with _$AIPromptInputState {
+   const factory AIPromptInputState({
+-    required bool supportChatWithFile,
+-    LocalAIChatPB? chatState,
+-    required List<ChatFile> uploadFiles,
+     required AIType aiType,
++    required bool supportChatWithFile,
++    required LocalAIChatPB? chatState,
++    required List<ChatFile> attachedFiles,
++    required List<ViewPB> mentionedPages,
+   }) = _AIPromptInputState;
+ 
+   factory AIPromptInputState.initial() => const AIPromptInputState(
+-        supportChatWithFile: false,
+-        uploadFiles: [],
+         aiType: AIType.appflowyAI,
++        supportChatWithFile: false,
++        chatState: null,
++        attachedFiles: [],
++        mentionedPages: [],
+       );
+ }
+ 
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_entity.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_entity.dart
+index 9f5f02f8fe01b..abf1b99f44db0 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_entity.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_entity.dart
+@@ -2,6 +2,7 @@ import 'dart:io';
+ 
+ import 'package:appflowy_backend/protobuf/flowy-ai/entities.pbenum.dart';
+ import 'package:appflowy_backend/protobuf/flowy-error/errors.pb.dart';
++import 'package:appflowy_backend/protobuf/flowy-folder/protobuf.dart';
+ import 'package:equatable/equatable.dart';
+ import 'package:freezed_annotation/freezed_annotation.dart';
+ import 'package:path/path.dart' as path;
+@@ -106,7 +107,8 @@ class ChatFile extends Equatable {
+   List<Object?> get props => [filePath];
+ }
+ 
+-typedef ChatInputFileMetadata = Map<String, ChatFile>;
++typedef ChatFileMap = Map<String, ChatFile>;
++typedef ChatMentionedPageMap = Map<String, ViewPB>;
+ 
+ @freezed
+ class ChatLoadingState with _$ChatLoadingState {
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_action_bloc.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_action_bloc.dart
+deleted file mode 100644
+index 466f82ca0b4db..0000000000000
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_action_bloc.dart
++++ /dev/null
+@@ -1,217 +0,0 @@
+-import 'dart:async';
+-
+-import 'package:appflowy/workspace/application/view/view_ext.dart';
+-import 'package:appflowy/workspace/application/view/view_service.dart';
+-import 'package:appflowy_backend/log.dart';
+-import 'package:appflowy_backend/protobuf/flowy-folder/view.pb.dart';
+-import 'package:bloc/bloc.dart';
+-import 'package:equatable/equatable.dart';
+-import 'package:flutter/services.dart';
+-import 'package:flutter/widgets.dart';
+-import 'package:freezed_annotation/freezed_annotation.dart';
+-
+-import 'chat_input_action_control.dart';
+-
+-part 'chat_input_action_bloc.freezed.dart';
+-
+-class ChatInputActionBloc
+-    extends Bloc<ChatInputActionEvent, ChatInputActionState> {
+-  ChatInputActionBloc({required this.chatId})
+-      : super(const ChatInputActionState()) {
+-    on<ChatInputActionEvent>(_handleEvent);
+-  }
+-
+-  final String chatId;
+-
+-  Future<void> _handleEvent(
+-    ChatInputActionEvent event,
+-    Emitter<ChatInputActionState> emit,
+-  ) async {
+-    await event.when(
+-      started: () async {
+-        unawaited(
+-          ViewBackendService.getAllViews().then(
+-            (result) {
+-              final views = result
+-                      .toNullable()
+-                      ?.items
+-                      .where(
+-                        (v) =>
+-                            v.layout.isDocumentView &&
+-                            !v.isSpace &&
+-                            v.parentViewId.isNotEmpty,
+-                      )
+-                      .toList() ??
+-                  [];
+-              if (!isClosed) {
+-                add(ChatInputActionEvent.refreshViews(views));
+-              }
+-            },
+-          ),
+-        );
+-      },
+-      refreshViews: (List<ViewPB> views) {
+-        final List<ViewActionPage> pages = _filterPages(
+-          views,
+-          state.selectedPages,
+-          state.filter,
+-        );
+-        emit(
+-          state.copyWith(
+-            views: views,
+-            pages: pages,
+-            indicator: const ChatActionMenuIndicator.ready(),
+-          ),
+-        );
+-      },
+-      filter: (String filter) {
+-        Log.debug("Filter chat input pages: $filter");
+-        final List<ViewActionPage> pages = _filterPages(
+-          state.views,
+-          state.selectedPages,
+-          filter,
+-        );
+-
+-        emit(state.copyWith(pages: pages, filter: filter));
+-      },
+-      handleKeyEvent: (PhysicalKeyboardKey physicalKey) {
+-        emit(
+-          state.copyWith(
+-            keyboardKey: ChatInputKeyboardEvent(physicalKey: physicalKey),
+-          ),
+-        );
+-      },
+-      addPage: (ChatInputMention page) {
+-        if (!state.selectedPages.any((p) => p.pageId == page.pageId)) {
+-          final List<ViewActionPage> pages = _filterPages(
+-            state.views,
+-            state.selectedPages,
+-            state.filter,
+-          );
+-          emit(
+-            state.copyWith(
+-              pages: pages,
+-              selectedPages: [...state.selectedPages, page],
+-            ),
+-          );
+-        }
+-      },
+-      removePage: (String text) {
+-        final List<ChatInputMention> selectedPages =
+-            List.from(state.selectedPages);
+-        selectedPages.retainWhere((t) => !text.contains(t.title));
+-
+-        final List<ViewActionPage> allPages = _filterPages(
+-          state.views,
+-          state.selectedPages,
+-          state.filter,
+-        );
+-
+-        emit(
+-          state.copyWith(
+-            selectedPages: selectedPages,
+-            pages: allPages,
+-          ),
+-        );
+-      },
+-      clear: () {
+-        emit(
+-          state.copyWith(
+-            selectedPages: [],
+-            filter: "",
+-          ),
+-        );
+-      },
+-    );
+-  }
+-}
+-
+-List<ViewActionPage> _filterPages(
+-  List<ViewPB> views,
+-  List<ChatInputMention> selectedPages,
+-  String filter,
+-) {
+-  final pages = views
+-      .map(
+-        (v) => ViewActionPage(view: v),
+-      )
+-      .toList();
+-
+-  pages.retainWhere((page) {
+-    return !selectedPages.contains(page);
+-  });
+-
+-  if (filter.isEmpty) {
+-    return pages;
+-  }
+-
+-  return pages
+-      .where(
+-        (v) => v.title.toLowerCase().contains(filter.toLowerCase()),
+-      )
+-      .toList();
+-}
+-
+-class ViewActionPage extends ChatInputMention {
+-  ViewActionPage({required this.view});
+-
+-  final ViewPB view;
+-
+-  @override
+-  String get pageId => view.id;
+-
+-  @override
+-  String get title => view.name;
+-
+-  @override
+-  List<Object?> get props => [pageId];
+-
+-  @override
+-  dynamic get page => view;
+-
+-  @override
+-  Widget get icon => view.defaultIcon();
+-}
+-
+-@freezed
+-class ChatInputActionEvent with _$ChatInputActionEvent {
+-  const factory ChatInputActionEvent.started() = _Started;
+-  const factory ChatInputActionEvent.refreshViews(List<ViewPB> views) =
+-      _RefreshViews;
+-  const factory ChatInputActionEvent.filter(String filter) = _Filter;
+-  const factory ChatInputActionEvent.handleKeyEvent(
+-    PhysicalKeyboardKey keyboardKey,
+-  ) = _HandleKeyEvent;
+-  const factory ChatInputActionEvent.addPage(ChatInputMention page) = _AddPage;
+-  const factory ChatInputActionEvent.removePage(String text) = _RemovePage;
+-  const factory ChatInputActionEvent.clear() = _Clear;
+-}
+-
+-@freezed
+-class ChatInputActionState with _$ChatInputActionState {
+-  const factory ChatInputActionState({
+-    @Default([]) List<ViewPB> views,
+-    @Default([]) List<ChatInputMention> pages,
+-    @Default([]) List<ChatInputMention> selectedPages,
+-    @Default("") String filter,
+-    ChatInputKeyboardEvent? keyboardKey,
+-    @Default(ChatActionMenuIndicator.loading())
+-    ChatActionMenuIndicator indicator,
+-  }) = _ChatInputActionState;
+-}
+-
+-class ChatInputKeyboardEvent extends Equatable {
+-  ChatInputKeyboardEvent({required this.physicalKey});
+-
+-  final PhysicalKeyboardKey physicalKey;
+-  final int timestamp = DateTime.now().millisecondsSinceEpoch;
+-
+-  @override
+-  List<Object?> get props => [timestamp];
+-}
+-
+-@freezed
+-class ChatActionMenuIndicator with _$ChatActionMenuIndicator {
+-  const factory ChatActionMenuIndicator.ready() = _Ready;
+-  const factory ChatActionMenuIndicator.loading() = _Loading;
+-}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_action_control.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_action_control.dart
+deleted file mode 100644
+index b945b9c2d7ac8..0000000000000
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_action_control.dart
++++ /dev/null
+@@ -1,172 +0,0 @@
+-import 'package:appflowy/plugins/ai_chat/application/chat_input_action_bloc.dart';
+-import 'package:appflowy/plugins/ai_chat/presentation/chat_input_action_menu.dart';
+-import 'package:appflowy_backend/log.dart';
+-import 'package:equatable/equatable.dart';
+-import 'package:flutter/material.dart';
+-import 'package:flutter/services.dart';
+-
+-abstract class ChatInputMention extends Equatable {
+-  String get title;
+-  String get pageId;
+-  dynamic get page;
+-  Widget get icon;
+-}
+-
+-/// Key: the key is the pageId
+-typedef ChatInputMentionMetadata = Map<String, ChatInputMention>;
+-
+-class ChatInputActionControl extends ChatActionHandler {
+-  ChatInputActionControl({
+-    required this.textController,
+-    required this.textFieldFocusNode,
+-    required this.chatId,
+-  }) : _commandBloc = ChatInputActionBloc(chatId: chatId);
+-
+-  final TextEditingController textController;
+-  final ChatInputActionBloc _commandBloc;
+-  final FocusNode textFieldFocusNode;
+-  final String chatId;
+-
+-  // Private attributes
+-  String _atText = "";
+-  String _prevText = "";
+-  String _showMenuText = "";
+-
+-  // Getter
+-  List<String> get tags =>
+-      _commandBloc.state.selectedPages.map((e) => e.title).toList();
+-
+-  ChatInputMentionMetadata consumeMetaData() {
+-    final metadata = _commandBloc.state.selectedPages.fold(
+-      <String, ChatInputMention>{},
+-      (map, page) => map..putIfAbsent(page.pageId, () => page),
+-    );
+-
+-    if (metadata.isNotEmpty) {
+-      _commandBloc.add(const ChatInputActionEvent.clear());
+-    }
+-
+-    return metadata;
+-  }
+-
+-  void handleKeyEvent(KeyEvent event) {
+-    // ignore: deprecated_member_use
+-    if (event is KeyDownEvent || event is RawKeyDownEvent) {
+-      _commandBloc.add(ChatInputActionEvent.handleKeyEvent(event.physicalKey));
+-    }
+-  }
+-
+-  bool canHandleKeyEvent(KeyEvent event) {
+-    return _showMenuText.isNotEmpty &&
+-        <PhysicalKeyboardKey>{
+-          PhysicalKeyboardKey.arrowDown,
+-          PhysicalKeyboardKey.arrowUp,
+-          PhysicalKeyboardKey.enter,
+-          PhysicalKeyboardKey.escape,
+-        }.contains(event.physicalKey);
+-  }
+-
+-  void dispose() {
+-    _commandBloc.close();
+-  }
+-
+-  @override
+-  void onSelected(ChatInputMention page) {
+-    _commandBloc.add(ChatInputActionEvent.addPage(page));
+-    textController.text = "$_showMenuText${page.title}";
+-
+-    onExit();
+-  }
+-
+-  @override
+-  void onExit() {
+-    _atText = "";
+-    _showMenuText = "";
+-    _prevText = "";
+-    _commandBloc.add(const ChatInputActionEvent.filter(""));
+-  }
+-
+-  @override
+-  void onEnter() {
+-    _commandBloc.add(const ChatInputActionEvent.started());
+-    _showMenuText = textController.text;
+-  }
+-
+-  @override
+-  double actionMenuOffsetX() {
+-    final TextPosition textPosition = textController.selection.extent;
+-    if (textFieldFocusNode.context == null) {
+-      return 0;
+-    }
+-
+-    final RenderBox renderBox =
+-        textFieldFocusNode.context?.findRenderObject() as RenderBox;
+-
+-    final TextPainter textPainter = TextPainter(
+-      text: TextSpan(text: textController.text),
+-      textDirection: TextDirection.ltr,
+-    );
+-    textPainter.layout(
+-      minWidth: renderBox.size.width,
+-      maxWidth: renderBox.size.width,
+-    );
+-
+-    final Offset caretOffset =
+-        textPainter.getOffsetForCaret(textPosition, Rect.zero);
+-    final List<TextBox> boxes = textPainter.getBoxesForSelection(
+-      TextSelection(
+-        baseOffset: textPosition.offset,
+-        extentOffset: textPosition.offset,
+-      ),
+-    );
+-
+-    if (boxes.isNotEmpty) {
+-      return boxes.last.right;
+-    }
+-    return caretOffset.dx;
+-  }
+-
+-  bool onTextChanged(String text) {
+-    final String inputText = text;
+-    if (_prevText.length > inputText.length) {
+-      final deleteStartIndex = textController.selection.baseOffset;
+-      final deleteEndIndex =
+-          _prevText.length - inputText.length + deleteStartIndex;
+-      final deletedText = _prevText.substring(deleteStartIndex, deleteEndIndex);
+-      _commandBloc.add(ChatInputActionEvent.removePage(deletedText));
+-    }
+-
+-    // If the action menu is shown, filter the views
+-    if (_showMenuText.isNotEmpty) {
+-      if (text.length >= _showMenuText.length) {
+-        final filterText = inputText.substring(_showMenuText.length);
+-        _commandBloc.add(ChatInputActionEvent.filter(filterText));
+-      }
+-
+-      // If the text change from "xxx @"" to "xxx", which means user delete the @, we should hide the action menu
+-      if (_atText.isNotEmpty && !inputText.contains(_atText)) {
+-        _commandBloc.add(
+-          const ChatInputActionEvent.handleKeyEvent(PhysicalKeyboardKey.escape),
+-        );
+-      }
+-    } else {
+-      final isTypingNewAt =
+-          text.endsWith("@") && _prevText.length < text.length;
+-      if (isTypingNewAt) {
+-        _atText = text;
+-        _prevText = text;
+-        return true;
+-      }
+-    }
+-    _prevText = text;
+-    return false;
+-  }
+-
+-  @override
+-  void onFilter(String filter) {
+-    Log.info("filter: $filter");
+-  }
+-
+-  @override
+-  ChatInputActionBloc get commandBloc => _commandBloc;
+-}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_control_cubit.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_control_cubit.dart
+new file mode 100644
+index 0000000000000..c663699e2c77f
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_input_control_cubit.dart
+@@ -0,0 +1,239 @@
++import 'package:appflowy/generated/locale_keys.g.dart';
++import 'package:appflowy/workspace/application/view/prelude.dart';
++import 'package:appflowy/workspace/application/view/view_ext.dart';
++import 'package:appflowy_backend/log.dart';
++import 'package:appflowy_backend/protobuf/flowy-folder/view.pb.dart';
++import 'package:appflowy_result/appflowy_result.dart';
++import 'package:bloc/bloc.dart';
++import 'package:collection/collection.dart';
++import 'package:easy_localization/easy_localization.dart';
++import 'package:flutter/services.dart';
++import 'package:freezed_annotation/freezed_annotation.dart';
++
++part 'chat_input_control_cubit.freezed.dart';
++
++class ChatInputControlCubit extends Cubit<ChatInputControlState> {
++  ChatInputControlCubit() : super(const ChatInputControlState.loading());
++
++  final List<ViewPB> allViews = [];
++  final List<String> selectedViewIds = [];
++
++  /// used when mentioning a page
++  ///
++  /// the text position after the @ character
++  int _filterStartPosition = -1;
++
++  /// used when mentioning a page
++  ///
++  /// the text position after the @ character, at the end of the filter
++  int _filterEndPosition = -1;
++
++  /// used when mentioning a page
++  ///
++  /// the entire string input in the prompt
++  String _inputText = "";
++
++  /// used when mentioning a page
++  ///
++  /// the current filtering text, after the @ characater
++  String _filter = "";
++
++  String get inputText => _inputText;
++  int get filterStartPosition => _filterStartPosition;
++  int get filterEndPosition => _filterEndPosition;
++
++  void refreshViews() async {
++    final newViews = await ViewBackendService.getAllViews().fold(
++      (result) => result.items
++          .where((v) => v.layout.isDocumentView && v.parentViewId.isNotEmpty)
++          .toList(),
++      (err) {
++        Log.error(err);
++        return <ViewPB>[];
++      },
++    );
++    allViews
++      ..clear()
++      ..addAll(newViews);
++
++    // update visible views
++    newViews.retainWhere((v) => !selectedViewIds.contains(v.id));
++    if (_filter.isNotEmpty) {
++      newViews.retainWhere(
++        (v) {
++          final nonEmptyName = v.name.isEmpty
++              ? LocaleKeys.document_title_placeholder.tr()
++              : v.name;
++          return nonEmptyName.toLowerCase().contains(_filter);
++        },
++      );
++    }
++    final focusedViewIndex = newViews.isEmpty ? -1 : 0;
++    emit(
++      ChatInputControlState.ready(
++        visibleViews: newViews,
++        focusedViewIndex: focusedViewIndex,
++      ),
++    );
++  }
++
++  void startSearching(TextEditingValue textEditingValue) {
++    _filterStartPosition =
++        _filterEndPosition = textEditingValue.selection.baseOffset;
++    _filter = "";
++    _inputText = textEditingValue.text;
++    state.maybeMap(
++      ready: (readyState) {
++        emit(
++          readyState.copyWith(
++            visibleViews: allViews,
++            focusedViewIndex: allViews.isEmpty ? -1 : 0,
++          ),
++        );
++      },
++      orElse: () {},
++    );
++  }
++
++  void reset() {
++    _filterStartPosition = _filterEndPosition = -1;
++    _filter = _inputText = "";
++    state.maybeMap(
++      ready: (readyState) {
++        emit(
++          readyState.copyWith(
++            visibleViews: allViews,
++            focusedViewIndex: allViews.isEmpty ? -1 : 0,
++          ),
++        );
++      },
++      orElse: () {},
++    );
++  }
++
++  void updateFilter(
++    String newInputText,
++    String newFilter, {
++    int? newEndPosition,
++  }) {
++    updateInputText(newInputText);
++
++    // filter the views
++    _filter = newFilter.toLowerCase();
++    if (newEndPosition != null) {
++      _filterEndPosition = newEndPosition;
++    }
++
++    final newVisibleViews =
++        allViews.where((v) => !selectedViewIds.contains(v.id)).toList();
++
++    if (_filter.isNotEmpty) {
++      newVisibleViews.retainWhere(
++        (v) {
++          final nonEmptyName = v.name.isEmpty
++              ? LocaleKeys.document_title_placeholder.tr()
++              : v.name;
++          return nonEmptyName.toLowerCase().contains(_filter);
++        },
++      );
++    }
++
++    state.maybeWhen(
++      ready: (_, oldFocusedIndex) {
++        final newFocusedViewIndex = oldFocusedIndex < newVisibleViews.length
++            ? oldFocusedIndex
++            : (newVisibleViews.isEmpty ? -1 : 0);
++        emit(
++          ChatInputControlState.ready(
++            visibleViews: newVisibleViews,
++            focusedViewIndex: newFocusedViewIndex,
++          ),
++        );
++      },
++      orElse: () {},
++    );
++  }
++
++  void updateInputText(String newInputText) {
++    _inputText = newInputText;
++
++    // input text is changed, see if there are any deletions
++    selectedViewIds.retainWhere(_inputText.contains);
++    _notifyUpdateSelectedViews();
++  }
++
++  void updateSelectionUp() {
++    state.maybeMap(
++      ready: (readyState) {
++        final newIndex = readyState.visibleViews.isEmpty
++            ? -1
++            : (readyState.focusedViewIndex - 1) %
++                readyState.visibleViews.length;
++        emit(
++          readyState.copyWith(focusedViewIndex: newIndex),
++        );
++      },
++      orElse: () {},
++    );
++  }
++
++  void updateSelectionDown() {
++    state.maybeMap(
++      ready: (readyState) {
++        final newIndex = readyState.visibleViews.isEmpty
++            ? -1
++            : (readyState.focusedViewIndex + 1) %
++                readyState.visibleViews.length;
++        emit(
++          readyState.copyWith(focusedViewIndex: newIndex),
++        );
++      },
++      orElse: () {},
++    );
++  }
++
++  void selectPage(ViewPB view) {
++    selectedViewIds.add(view.id);
++    _notifyUpdateSelectedViews();
++    reset();
++  }
++
++  String formatIntputText(final String input) {
++    String result = input;
++    for (final viewId in selectedViewIds) {
++      if (!result.contains(viewId)) {
++        continue;
++      }
++      final view = allViews.firstWhereOrNull((view) => view.id == viewId);
++      if (view != null) {
++        final nonEmptyName = view.name.isEmpty
++            ? LocaleKeys.document_title_placeholder.tr()
++            : view.name;
++        result = result.replaceAll(RegExp(viewId), nonEmptyName);
++      }
++    }
++    return result;
++  }
++
++  void _notifyUpdateSelectedViews() {
++    final stateCopy = state;
++    final selectedViews =
++        allViews.where((view) => selectedViewIds.contains(view.id)).toList();
++    emit(ChatInputControlState.updateSelectedViews(selectedViews));
++    emit(stateCopy);
++  }
++}
++
++@freezed
++class ChatInputControlState with _$ChatInputControlState {
++  const factory ChatInputControlState.loading() = _Loading;
++
++  const factory ChatInputControlState.ready({
++    required List<ViewPB> visibleViews,
++    required int focusedViewIndex,
++  }) = _Ready;
++
++  const factory ChatInputControlState.updateSelectedViews(
++    List<ViewPB> selectedViews,
++  ) = _UpdateOneShot;
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_service.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_service.dart
+index 0e08d1dafbd12..70b64ac927d9f 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_service.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_service.dart
+@@ -1,12 +1,12 @@
+ import 'dart:convert';
+ 
+ import 'package:appflowy/plugins/ai_chat/application/chat_entity.dart';
+-import 'package:appflowy/plugins/ai_chat/application/chat_input_action_bloc.dart';
+ import 'package:appflowy/workspace/application/view/view_ext.dart';
+ import 'package:appflowy_backend/dispatch/dispatch.dart';
+ import 'package:appflowy_backend/log.dart';
+ import 'package:appflowy_backend/protobuf/flowy-ai/protobuf.dart';
+ import 'package:appflowy_backend/protobuf/flowy-document/entities.pb.dart';
++import 'package:appflowy_backend/protobuf/flowy-folder/protobuf.dart';
+ import 'package:appflowy_result/appflowy_result.dart';
+ import 'package:nanoid/nanoid.dart';
+ 
+@@ -129,14 +129,14 @@ Future<List<ChatMessageMetaPB>> metadataPBFromMetadata(
+ 
+   for (final value in map.values) {
+     switch (value) {
+-      case ViewActionPage(view: final view) when view.layout.isDocumentView:
+-        final payload = OpenDocumentPayloadPB(documentId: view.id);
++      case ViewPB _ when value.layout.isDocumentView:
++        final payload = OpenDocumentPayloadPB(documentId: value.id);
+         await DocumentEventGetDocumentText(payload).send().fold(
+           (pb) {
+             metadata.add(
+               ChatMessageMetaPB(
+-                id: view.id,
+-                name: view.name,
++                id: value.id,
++                name: value.name,
+                 data: pb.text,
+                 dataType: ChatMessageMetaTypePB.Txt,
+                 source: appflowySource,
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
+index 72cd3b65f9b32..6767bf80db676 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
+@@ -76,7 +76,7 @@ class AIChatPage extends StatelessWidget {
+                 for (final file in detail.files) {
+                   context
+                       .read<AIPromptInputBloc>()
+-                      .add(AIPromptInputEvent.newFile(file.path, file.name));
++                      .add(AIPromptInputEvent.attachFile(file.path, file.name));
+                 }
+               }
+             },
+@@ -345,7 +345,6 @@ class _ChatContentPage extends StatelessWidget {
+           return UniversalPlatform.isDesktop
+               ? DesktopAIPromptInput(
+                   chatId: view.id,
+-                  indicateFocus: true,
+                   onSubmitted: (text, metadata) {
+                     context.read<ChatBloc>().add(
+                           ChatEvent.sendMessage(
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input_file.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input_file.dart
+index b0e260fd08036..d2f6f6750e8e0 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input_file.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input_file.dart
+@@ -23,7 +23,7 @@ class ChatInputFile extends StatelessWidget {
+   @override
+   Widget build(BuildContext context) {
+     return BlocSelector<AIPromptInputBloc, AIPromptInputState, List<ChatFile>>(
+-      selector: (state) => state.uploadFiles,
++      selector: (state) => state.attachedFiles,
+       builder: (context, files) {
+         if (files.isEmpty) {
+           return const SizedBox.shrink();
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input_span.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input_span.dart
+index 854211d95d1fa..06d8248048e30 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input_span.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input_span.dart
+@@ -1,15 +1,18 @@
++import 'package:appflowy/generated/locale_keys.g.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_input_control_cubit.dart';
++import 'package:collection/collection.dart';
++import 'package:easy_localization/easy_localization.dart';
+ import 'package:extended_text_library/extended_text_library.dart';
+-import 'package:flutter/gestures.dart';
+ import 'package:flutter/material.dart';
+ 
+-import '../../application/chat_input_action_control.dart';
+-
+ class ChatInputTextSpanBuilder extends SpecialTextSpanBuilder {
+   ChatInputTextSpanBuilder({
+-    required this.inputActionControl,
++    required this.inputControlCubit,
++    this.specialTextStyle,
+   });
+ 
+-  final ChatInputActionControl inputActionControl;
++  final ChatInputControlCubit inputControlCubit;
++  final TextStyle? specialTextStyle;
+ 
+   @override
+   SpecialText? createSpecialText(
+@@ -22,51 +25,54 @@ class ChatInputTextSpanBuilder extends SpecialTextSpanBuilder {
+       return null;
+     }
+ 
+-    //index is end index of start flag, so text start index should be index-(flag.length-1)
+-    if (isStart(flag, AtText.flag)) {
+-      return AtText(
+-        inputActionControl,
+-        textStyle,
+-        onTap,
+-        start: index! - (AtText.flag.length - 1),
+-      );
++    if (!isStart(flag, AtText.flag)) {
++      return null;
+     }
+-    return null;
++
++    // index is at the end of the start flag, so the start index should be index - (flag.length - 1)
++    return AtText(
++      inputControlCubit,
++      specialTextStyle ?? textStyle,
++      onTap,
++      // scrubbing over text is kinda funky
++      start: index! - (AtText.flag.length - 1),
++    );
+   }
+ }
+ 
+ class AtText extends SpecialText {
+   AtText(
+-    this.inputActionControl,
++    this.inputControlCubit,
+     TextStyle? textStyle,
+     SpecialTextGestureTapCallback? onTap, {
+     this.start,
+   }) : super(flag, '', textStyle, onTap: onTap);
++
+   static const String flag = '@';
++
+   final int? start;
+-  final ChatInputActionControl inputActionControl;
++  final ChatInputControlCubit inputControlCubit;
+ 
+   @override
+-  bool isEnd(String value) {
+-    return inputActionControl.tags.contains(value);
+-  }
++  bool isEnd(String value) => inputControlCubit.selectedViewIds.contains(value);
+ 
+   @override
+   InlineSpan finishText() {
+-    final TextStyle? textStyle =
+-        this.textStyle?.copyWith(color: Colors.blue, fontSize: 15.0);
++    final String actualText = toString();
+ 
+-    final String atText = toString();
++    final viewName = inputControlCubit.allViews
++            .firstWhereOrNull((view) => view.id == actualText.substring(1))
++            ?.name ??
++        "";
++    final nonEmptyName = viewName.isEmpty
++        ? LocaleKeys.document_title_placeholder.tr()
++        : viewName;
+ 
+     return SpecialTextSpan(
+-      text: atText,
+-      actualText: atText,
++      text: "@$nonEmptyName",
++      actualText: actualText,
+       start: start!,
+       style: textStyle,
+-      recognizer: (TapGestureRecognizer()
+-        ..onTap = () {
+-          onTap?.call(atText);
+-        }),
+     );
+   }
+ }
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_mention_page_menu.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_mention_page_menu.dart
+new file mode 100644
+index 0000000000000..fff5338e6730a
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_mention_page_menu.dart
+@@ -0,0 +1,419 @@
++import 'package:appflowy/generated/flowy_svgs.g.dart';
++import 'package:appflowy/generated/locale_keys.g.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_input_control_cubit.dart';
++import 'package:appflowy/workspace/application/view/view_ext.dart';
++import 'package:appflowy/workspace/application/view_title/view_title_bar_bloc.dart';
++import 'package:appflowy/workspace/presentation/home/menu/sidebar/space/space_icon.dart';
++import 'package:appflowy_backend/protobuf/flowy-folder/protobuf.dart';
++import 'package:easy_localization/easy_localization.dart' hide TextDirection;
++import 'package:flowy_infra/theme_extension.dart';
++import 'package:flowy_infra_ui/flowy_infra_ui.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_bloc/flutter_bloc.dart';
++import 'package:scroll_to_index/scroll_to_index.dart';
++
++const double _itemHeight = 44.0;
++const double _noPageHeight = 20.0;
++const double _fixedWidth = 360.0;
++const double _maxHeight = 600.0;
++
++class ChatInputAnchor {
++  ChatInputAnchor(this.anchorKey, this.layerLink);
++
++  final GlobalKey<State<StatefulWidget>> anchorKey;
++  final LayerLink layerLink;
++}
++
++class ChatMentionPageMenu extends StatefulWidget {
++  const ChatMentionPageMenu({
++    super.key,
++    required this.anchor,
++    required this.textController,
++    required this.onPageSelected,
++  });
++
++  final ChatInputAnchor anchor;
++  final TextEditingController textController;
++  final void Function(ViewPB view) onPageSelected;
++
++  @override
++  State<ChatMentionPageMenu> createState() => _ChatMentionPageMenuState();
++}
++
++class _ChatMentionPageMenuState extends State<ChatMentionPageMenu> {
++  @override
++  void initState() {
++    super.initState();
++    Future.delayed(Duration.zero, () {
++      context.read<ChatInputControlCubit>().refreshViews();
++    });
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return BlocBuilder<ChatInputControlCubit, ChatInputControlState>(
++      builder: (context, state) {
++        return Stack(
++          children: [
++            CompositedTransformFollower(
++              link: widget.anchor.layerLink,
++              showWhenUnlinked: false,
++              offset: Offset(getPopupOffsetX(), 0.0),
++              followerAnchor: Alignment.bottomLeft,
++              child: Container(
++                constraints: const BoxConstraints(
++                  minWidth: _fixedWidth,
++                  maxWidth: _fixedWidth,
++                  maxHeight: _maxHeight,
++                ),
++                decoration: BoxDecoration(
++                  color: Theme.of(context).cardColor,
++                  borderRadius: BorderRadius.circular(6.0),
++                  boxShadow: const [
++                    BoxShadow(
++                      color: Color(0x0A1F2329),
++                      blurRadius: 24,
++                      offset: Offset(0, 8),
++                      spreadRadius: 8,
++                    ),
++                    BoxShadow(
++                      color: Color(0x0A1F2329),
++                      blurRadius: 12,
++                      offset: Offset(0, 6),
++                    ),
++                    BoxShadow(
++                      color: Color(0x0F1F2329),
++                      blurRadius: 8,
++                      offset: Offset(0, 4),
++                      spreadRadius: -8,
++                    ),
++                  ],
++                ),
++                child: TextFieldTapRegion(
++                  child: ChatMentionPageList(
++                    onPageSelected: widget.onPageSelected,
++                  ),
++                ),
++              ),
++            ),
++          ],
++        );
++      },
++    );
++  }
++
++  double getPopupOffsetX() {
++    if (widget.anchor.anchorKey.currentContext == null) {
++      return 0.0;
++    }
++
++    final cubit = context.read<ChatInputControlCubit>();
++    if (cubit.filterStartPosition == -1) {
++      return 0.0;
++    }
++
++    final textPosition = TextPosition(offset: cubit.filterEndPosition);
++    final renderBox =
++        widget.anchor.anchorKey.currentContext?.findRenderObject() as RenderBox;
++
++    final textPainter = TextPainter(
++      text: TextSpan(text: cubit.formatIntputText(widget.textController.text)),
++      textDirection: TextDirection.ltr,
++    );
++    textPainter.layout(
++      minWidth: renderBox.size.width,
++      maxWidth: renderBox.size.width,
++    );
++
++    final caretOffset = textPainter.getOffsetForCaret(textPosition, Rect.zero);
++    final boxes = textPainter.getBoxesForSelection(
++      TextSelection(
++        baseOffset: textPosition.offset,
++        extentOffset: textPosition.offset,
++      ),
++    );
++
++    if (boxes.isNotEmpty) {
++      return boxes.last.right;
++    }
++
++    return caretOffset.dx;
++  }
++}
++
++class ChatMentionPageList extends StatefulWidget {
++  const ChatMentionPageList({
++    super.key,
++    required this.onPageSelected,
++  });
++
++  final void Function(ViewPB view) onPageSelected;
++
++  @override
++  State<ChatMentionPageList> createState() => _ChatMentionPageListState();
++}
++
++class _ChatMentionPageListState extends State<ChatMentionPageList> {
++  final autoScrollController = AutoScrollController(
++    suggestedRowHeight: _itemHeight,
++  );
++
++  @override
++  void dispose() {
++    autoScrollController.dispose();
++    super.dispose();
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return BlocConsumer<ChatInputControlCubit, ChatInputControlState>(
++      listenWhen: (previous, current) {
++        return previous.maybeWhen(
++          ready: (pVisibleViews, pFocusedViewIndex) => current.maybeWhen(
++            ready: (cIsibleViews, cFocusedViewIndex) =>
++                pFocusedViewIndex != cFocusedViewIndex,
++            orElse: () => false,
++          ),
++          orElse: () => false,
++        );
++      },
++      listener: (context, state) {
++        state.maybeWhen(
++          ready: (views, focusedViewIndex) {
++            if (focusedViewIndex == -1 || !autoScrollController.hasClients) {
++              return;
++            }
++            if (autoScrollController.isAutoScrolling) {
++              autoScrollController.position
++                  .jumpTo(autoScrollController.position.pixels);
++            }
++            autoScrollController.scrollToIndex(
++              focusedViewIndex,
++              duration: const Duration(milliseconds: 200),
++              preferPosition: AutoScrollPosition.begin,
++            );
++          },
++          orElse: () {},
++        );
++      },
++      builder: (context, state) {
++        return state.maybeWhen(
++          loading: () {
++            return const Padding(
++              padding: EdgeInsets.all(8.0),
++              child: SizedBox(
++                height: _noPageHeight,
++                child: Center(
++                  child: CircularProgressIndicator.adaptive(),
++                ),
++              ),
++            );
++          },
++          ready: (views, focusedViewIndex) {
++            if (views.isEmpty) {
++              return Padding(
++                padding: const EdgeInsets.all(8.0),
++                child: SizedBox(
++                  height: _noPageHeight,
++                  child: Center(
++                    child: FlowyText(
++                      LocaleKeys.chat_inputActionNoPages.tr(),
++                    ),
++                  ),
++                ),
++              );
++            }
++
++            return ListView.builder(
++              shrinkWrap: true,
++              cacheExtent: 1,
++              addAutomaticKeepAlives: false,
++              controller: autoScrollController,
++              padding: const EdgeInsets.all(8.0),
++              itemCount: views.length,
++              itemBuilder: (context, index) {
++                final view = views[index];
++                return AutoScrollTag(
++                  key: ValueKey("chat_mention_page_item_${view.id}"),
++                  index: index,
++                  controller: autoScrollController,
++                  child: _ChatMentionPageItem(
++                    view: view,
++                    onTap: () => widget.onPageSelected(view),
++                    isSelected: focusedViewIndex == index,
++                  ),
++                );
++              },
++            );
++          },
++          orElse: () => const SizedBox.shrink(),
++        );
++      },
++    );
++  }
++}
++
++class _ChatMentionPageItem extends StatelessWidget {
++  const _ChatMentionPageItem({
++    required this.view,
++    required this.isSelected,
++    required this.onTap,
++  });
++
++  final ViewPB view;
++  final bool isSelected;
++  final VoidCallback onTap;
++
++  @override
++  Widget build(BuildContext context) {
++    return FlowyTooltip(
++      message: view.name,
++      child: MouseRegion(
++        cursor: SystemMouseCursors.click,
++        child: GestureDetector(
++          onTap: onTap,
++          behavior: HitTestBehavior.opaque,
++          child: Container(
++            height: _itemHeight,
++            decoration: BoxDecoration(
++              color: isSelected
++                  ? AFThemeExtension.of(context).lightGreyHover
++                  : Colors.transparent,
++              borderRadius: BorderRadius.circular(4.0),
++            ),
++            padding: const EdgeInsets.all(4.0),
++            child: Row(
++              children: [
++                _buildIcon(context, view),
++                const HSpace(8.0),
++                Expanded(child: _ViewTitleAndAncestors(view: view)),
++              ],
++            ),
++          ),
++        ),
++      ),
++    );
++  }
++
++  Widget _buildIcon(BuildContext context, ViewPB view) {
++    final spaceIcon = view.buildSpaceIconSvg(context);
++
++    if (view.icon.value.isNotEmpty) {
++      return SizedBox(
++        width: 16.0,
++        child: FlowyText.emoji(
++          view.icon.value,
++          fontSize: 14.0,
++          figmaLineHeight: 21.0,
++        ),
++      );
++    }
++
++    if (view.isSpace == true && spaceIcon != null) {
++      return SpaceIcon(
++        dimension: 16.0,
++        svgSize: 9.68,
++        space: view,
++        cornerRadius: 4,
++      );
++    }
++
++    return FlowySvg(
++      view.layout.icon,
++      size: const Size.square(16),
++      color: Theme.of(context).hintColor,
++    );
++  }
++}
++
++class _ViewTitleAndAncestors extends StatelessWidget {
++  const _ViewTitleAndAncestors({
++    required this.view,
++  });
++
++  final ViewPB view;
++
++  @override
++  Widget build(BuildContext context) {
++    return BlocProvider(
++      create: (_) =>
++          ViewTitleBarBloc(view: view)..add(const ViewTitleBarEvent.initial()),
++      child: BlocBuilder<ViewTitleBarBloc, ViewTitleBarState>(
++        builder: (context, state) {
++          final nonEmptyName = view.name.isEmpty
++              ? LocaleKeys.document_title_placeholder.tr()
++              : view.name;
++
++          final ancestorList = _getViewAncestorList(state.ancestors);
++
++          if (state.ancestors.isEmpty || ancestorList.trim().isEmpty) {
++            return FlowyText(
++              nonEmptyName,
++              overflow: TextOverflow.ellipsis,
++            );
++          }
++
++          return Column(
++            crossAxisAlignment: CrossAxisAlignment.start,
++            children: [
++              FlowyText(
++                nonEmptyName,
++                figmaLineHeight: 20.0,
++                overflow: TextOverflow.ellipsis,
++              ),
++              FlowyText(
++                ancestorList,
++                fontSize: 12.0,
++                figmaLineHeight: 16.0,
++                color: Theme.of(context).hintColor,
++                overflow: TextOverflow.ellipsis,
++              ),
++            ],
++          );
++        },
++      ),
++    );
++  }
++
++  /// see workspace/presentation/widgets/view_title_bar.dart, upon which this
++  /// function was based. This version doesn't include the current view in the
++  /// result, and returns a string rather than a list of widgets
++  String _getViewAncestorList(
++    List<ViewPB> views,
++  ) {
++    const lowerBound = 2;
++    final upperBound = views.length - 2;
++    bool hasAddedEllipsis = false;
++    String result = "";
++
++    if (views.length <= 1) {
++      return "";
++    }
++
++    // ignore the workspace name, use section name instead in the future
++    // skip the workspace view
++    for (var i = 1; i < views.length - 1; i++) {
++      final view = views[i];
++
++      if (i >= lowerBound && i < upperBound) {
++        if (!hasAddedEllipsis) {
++          hasAddedEllipsis = true;
++          result += "… / ";
++        }
++        continue;
++      }
++
++      final nonEmptyName = view.name.isEmpty
++          ? LocaleKeys.document_title_placeholder.tr()
++          : view.name;
++
++      result += nonEmptyName;
++
++      if (i != views.length - 2) {
++        // if not the last one, add a divider
++        result += " / ";
++      }
++    }
++    return result;
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/desktop_ai_prompt_input.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/desktop_ai_prompt_input.dart
+index 86b863f8c547c..c31b7f37cabfe 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/desktop_ai_prompt_input.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/desktop_ai_prompt_input.dart
+@@ -1,10 +1,8 @@
+ import 'package:appflowy/generated/locale_keys.g.dart';
+-import 'package:appflowy/plugins/ai_chat/application/chat_entity.dart';
+ import 'package:appflowy/plugins/ai_chat/application/ai_prompt_input_bloc.dart';
+-import 'package:appflowy/plugins/ai_chat/application/chat_input_action_control.dart';
+-import 'package:appflowy/plugins/ai_chat/presentation/chat_input/chat_input_file.dart';
+-import 'package:appflowy/plugins/ai_chat/presentation/chat_input_action_menu.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_input_control_cubit.dart';
+ import 'package:appflowy/startup/startup.dart';
++import 'package:appflowy_backend/protobuf/flowy-folder/protobuf.dart';
+ import 'package:easy_localization/easy_localization.dart';
+ import 'package:extended_text_field/extended_text_field.dart';
+ import 'package:flowy_infra/file_picker/file_picker_service.dart';
+@@ -14,22 +12,22 @@ import 'package:flutter/services.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+ import 'package:universal_platform/universal_platform.dart';
+ 
++import 'chat_mention_page_menu.dart';
++import '../layout_define.dart';
+ import 'ai_prompt_buttons.dart';
++import 'chat_input_file.dart';
+ import 'chat_input_span.dart';
+-import '../layout_define.dart';
+ 
+ class DesktopAIPromptInput extends StatefulWidget {
+   const DesktopAIPromptInput({
+     super.key,
+     required this.chatId,
+-    required this.indicateFocus,
+     required this.isStreaming,
+     required this.onStopStreaming,
+     required this.onSubmitted,
+   });
+ 
+   final String chatId;
+-  final bool indicateFocus;
+   final bool isStreaming;
+   final void Function() onStopStreaming;
+   final void Function(String, Map<String, dynamic>) onSubmitted;
+@@ -39,12 +37,12 @@ class DesktopAIPromptInput extends StatefulWidget {
+ }
+ 
+ class _DesktopAIPromptInputState extends State<DesktopAIPromptInput> {
+-  final GlobalKey _textFieldKey = GlobalKey();
+-  final LayerLink _layerLink = LayerLink();
+-
+-  late final ChatInputActionControl _inputActionControl;
+-  late final FocusNode _inputFocusNode;
+-  late final TextEditingController _textController;
++  final textFieldKey = GlobalKey();
++  final layerLink = LayerLink();
++  final overlayController = OverlayPortalController();
++  final inputControlCubit = ChatInputControlCubit();
++  final focusNode = FocusNode();
++  final textController = TextEditingController();
+ 
+   late SendButtonState sendButtonState;
+ 
+@@ -52,40 +50,22 @@ class _DesktopAIPromptInputState extends State<DesktopAIPromptInput> {
+   void initState() {
+     super.initState();
+ 
+-    _textController = TextEditingController()
+-      ..addListener(_handleTextControllerChange);
+-
+-    _inputFocusNode = FocusNode(
+-      onKeyEvent: (node, event) {
+-        if (_inputActionControl.canHandleKeyEvent(event)) {
+-          _inputActionControl.handleKeyEvent(event);
+-          return KeyEventResult.handled;
+-        } else {
+-          return _handleEnterKeyWithoutShift(
+-            event,
+-            _textController,
+-            widget.isStreaming,
+-            _handleSendPressed,
+-          );
+-        }
+-      },
+-    )..addListener(() {
+-        // refresh border color on focus change
+-        if (widget.indicateFocus) {
+-          setState(() {});
+-        }
+-      });
+-    WidgetsBinding.instance.addPostFrameCallback((_) {
+-      _inputFocusNode.requestFocus();
+-    });
++    textController.addListener(handleTextControllerChanged);
+ 
+-    _inputActionControl = ChatInputActionControl(
+-      chatId: widget.chatId,
+-      textController: _textController,
+-      textFieldFocusNode: _inputFocusNode,
++    // refresh border color on focus change and hide menu when lost focus
++    focusNode.addListener(
++      () => setState(() {
++        if (!focusNode.hasFocus) {
++          cancelMentionPage();
++        }
++      }),
+     );
+ 
+     updateSendButtonState();
++
++    WidgetsBinding.instance.addPostFrameCallback((_) {
++      focusNode.requestFocus();
++    });
+   }
+ 
+   @override
+@@ -96,205 +76,464 @@ class _DesktopAIPromptInputState extends State<DesktopAIPromptInput> {
+ 
+   @override
+   void dispose() {
+-    _inputFocusNode.dispose();
+-    _textController.dispose();
+-    _inputActionControl.dispose();
++    focusNode.dispose();
++    textController.dispose();
++    inputControlCubit.close();
+     super.dispose();
+   }
+ 
+   @override
+   Widget build(BuildContext context) {
+-    return DecoratedBox(
+-      decoration: BoxDecoration(
+-        border: Border.all(
+-          color: _inputFocusNode.hasFocus && widget.indicateFocus
+-              ? Theme.of(context).colorScheme.primary
+-              : Theme.of(context).colorScheme.outline,
+-        ),
+-        borderRadius: DesktopAIPromptSizes.promptFrameRadius,
+-      ),
+-      child: Column(
+-        mainAxisSize: MainAxisSize.min,
+-        children: [
+-          ConstrainedBox(
+-            constraints: BoxConstraints(
+-              maxHeight: DesktopAIPromptSizes.attachedFilesBarPadding.vertical +
+-                  DesktopAIPromptSizes.attachedFilesPreviewHeight,
+-            ),
+-            child: TextFieldTapRegion(
+-              child: ChatInputFile(
+-                chatId: widget.chatId,
+-                onDeleted: (file) => context
+-                    .read<AIPromptInputBloc>()
+-                    .add(AIPromptInputEvent.deleteFile(file)),
++    return BlocProvider.value(
++      value: inputControlCubit,
++      child: BlocListener<ChatInputControlCubit, ChatInputControlState>(
++        listener: (context, state) {
++          state.maybeWhen(
++            updateSelectedViews: (selectedViews) {
++              context
++                  .read<AIPromptInputBloc>()
++                  .add(AIPromptInputEvent.updateMentionedViews(selectedViews));
++            },
++            orElse: () {},
++          );
++        },
++        child: OverlayPortal(
++          controller: overlayController,
++          overlayChildBuilder: (context) {
++            return ChatMentionPageMenu(
++              anchor: ChatInputAnchor(textFieldKey, layerLink),
++              textController: textController,
++              onPageSelected: handlePageSelected,
++            );
++          },
++          child: DecoratedBox(
++            decoration: BoxDecoration(
++              border: Border.all(
++                color: focusNode.hasFocus
++                    ? Theme.of(context).colorScheme.primary
++                    : Theme.of(context).colorScheme.outline,
+               ),
++              borderRadius: DesktopAIPromptSizes.promptFrameRadius,
+             ),
+-          ),
+-          Stack(
+-            children: [
+-              ConstrainedBox(
+-                constraints: const BoxConstraints(
+-                  minHeight: DesktopAIPromptSizes.textFieldMinHeight +
+-                      DesktopAIPromptSizes.actionBarHeight,
+-                  maxHeight: 300,
+-                ),
+-                child: _inputTextField(context),
+-              ),
+-              Positioned.fill(
+-                top: null,
+-                child: TextFieldTapRegion(
+-                  child: Container(
+-                    height: DesktopAIPromptSizes.actionBarHeight,
+-                    padding: const EdgeInsets.symmetric(horizontal: 8),
+-                    child: BlocBuilder<AIPromptInputBloc, AIPromptInputState>(
+-                      builder: (context, state) {
+-                        return Row(
+-                          crossAxisAlignment: CrossAxisAlignment.start,
+-                          children: [
+-                            // _predefinedFormatButton(),
+-                            const Spacer(),
+-                            _mentionButton(),
+-                            const HSpace(
+-                              DesktopAIPromptSizes.actionBarButtonSpacing,
+-                            ),
+-                            if (UniversalPlatform.isDesktop &&
+-                                state.supportChatWithFile) ...[
+-                              _attachmentButton(),
+-                              const HSpace(
+-                                DesktopAIPromptSizes.actionBarButtonSpacing,
+-                              ),
+-                            ],
+-                            _sendButton(),
+-                          ],
+-                        );
+-                      },
++            child: Column(
++              mainAxisSize: MainAxisSize.min,
++              children: [
++                ConstrainedBox(
++                  constraints: BoxConstraints(
++                    maxHeight:
++                        DesktopAIPromptSizes.attachedFilesBarPadding.vertical +
++                            DesktopAIPromptSizes.attachedFilesPreviewHeight,
++                  ),
++                  child: TextFieldTapRegion(
++                    child: ChatInputFile(
++                      chatId: widget.chatId,
++                      onDeleted: (file) => context
++                          .read<AIPromptInputBloc>()
++                          .add(AIPromptInputEvent.removeFile(file)),
+                     ),
+                   ),
+                 ),
+-              ),
+-            ],
++                Stack(
++                  children: [
++                    ConstrainedBox(
++                      constraints: const BoxConstraints(
++                        minHeight: DesktopAIPromptSizes.textFieldMinHeight +
++                            DesktopAIPromptSizes.actionBarHeight,
++                        maxHeight: 300,
++                      ),
++                      child: inputTextField(),
++                    ),
++                    Positioned.fill(
++                      top: null,
++                      child: TextFieldTapRegion(
++                        child: _PromptBottomActions(
++                          textController: textController,
++                          overlayController: overlayController,
++                          focusNode: focusNode,
++                          sendButtonState: sendButtonState,
++                          onSendPressed: handleSendPressed,
++                          onStopStreaming: widget.onStopStreaming,
++                        ),
++                      ),
++                    ),
++                  ],
++                ),
++              ],
++            ),
+           ),
+-        ],
++        ),
+       ),
+     );
+   }
+ 
++  void cancelMentionPage() {
++    if (overlayController.isShowing) {
++      inputControlCubit.reset();
++      overlayController.hide();
++    }
++  }
++
+   void updateSendButtonState() {
+     if (widget.isStreaming) {
+       sendButtonState = SendButtonState.streaming;
+-    } else if (_textController.text.trim().isEmpty) {
++    } else if (textController.text.trim().isEmpty) {
+       sendButtonState = SendButtonState.disabled;
+     } else {
+       sendButtonState = SendButtonState.enabled;
+     }
+   }
+ 
+-  void _handleSendPressed() {
+-    final trimmedText = _textController.text.trim();
+-    _textController.clear();
++  void handleSendPressed() {
++    final trimmedText = inputControlCubit.formatIntputText(
++      textController.text.trim(),
++    );
++    textController.clear();
+     if (trimmedText.isEmpty) {
+       return;
+     }
+-    // consume metadata
+-    final ChatInputMentionMetadata mentionPageMetadata =
+-        _inputActionControl.consumeMetaData();
+-    final ChatInputFileMetadata fileMetadata =
+-        context.read<AIPromptInputBloc>().consumeMetadata();
+ 
+-    // combine metadata
+-    final Map<String, dynamic> metadata = {}
+-      ..addAll(mentionPageMetadata)
+-      ..addAll(fileMetadata);
++    // get the attached files and mentioned pages
++    final metadata = context.read<AIPromptInputBloc>().consumeMetadata();
+ 
+     widget.onSubmitted(trimmedText, metadata);
+   }
+ 
+-  void _handleTextControllerChange() {
+-    if (_textController.value.isComposingRangeValid) {
++  void handleTextControllerChanged() {
++    if (!textController.value.composing.isCollapsed) {
+       return;
+     }
++
++    // update whether send button is clickable
+     setState(() => updateSendButtonState());
++
++    // handle text and selection changes ONLY when mentioning a page
++    if (!overlayController.isShowing ||
++        inputControlCubit.filterStartPosition == -1) {
++      return;
++    }
++
++    // handle cases where mention a page is cancelled
++    final textSelection = textController.value.selection;
++    final isSelectingMultipleCharacters = !textSelection.isCollapsed;
++    final isCaretBeforeStartOfRange =
++        textSelection.baseOffset < inputControlCubit.filterStartPosition;
++    final isCaretAfterEndOfRange =
++        textSelection.baseOffset > inputControlCubit.filterEndPosition;
++    final isTextSame = inputControlCubit.inputText == textController.text;
++
++    if (isSelectingMultipleCharacters ||
++        isTextSame && (isCaretBeforeStartOfRange || isCaretAfterEndOfRange)) {
++      cancelMentionPage();
++      return;
++    }
++
++    final previousLength = inputControlCubit.inputText.characters.length;
++    final currentLength = textController.text.characters.length;
++
++    // delete "@"
++    if (previousLength != currentLength && isCaretBeforeStartOfRange) {
++      cancelMentionPage();
++      return;
++    }
++
++    // handle cases where mention the filter is updated
++    if (previousLength != currentLength) {
++      final diff = currentLength - previousLength;
++      final newEndPosition = inputControlCubit.filterEndPosition + diff;
++      final newFilter = textController.text.substring(
++        inputControlCubit.filterStartPosition,
++        newEndPosition,
++      );
++      inputControlCubit.updateFilter(
++        textController.text,
++        newFilter,
++        newEndPosition: newEndPosition,
++      );
++    } else if (!isTextSame) {
++      final newFilter = textController.text.substring(
++        inputControlCubit.filterStartPosition,
++        inputControlCubit.filterEndPosition,
++      );
++      inputControlCubit.updateFilter(textController.text, newFilter);
++    }
+   }
+ 
+-  Widget _inputTextField(BuildContext context) {
+-    return CompositedTransformTarget(
+-      link: _layerLink,
+-      child: BlocBuilder<AIPromptInputBloc, AIPromptInputState>(
+-        builder: (context, state) {
+-          return ExtendedTextField(
+-            key: _textFieldKey,
+-            controller: _textController,
+-            focusNode: _inputFocusNode,
+-            decoration: InputDecoration(
+-              border: InputBorder.none,
+-              enabledBorder: InputBorder.none,
+-              focusedBorder: InputBorder.none,
+-              contentPadding: DesktopAIPromptSizes.textFieldContentPadding.add(
+-                const EdgeInsets.only(
+-                  bottom: DesktopAIPromptSizes.actionBarHeight,
+-                ),
+-              ),
++  void handlePageSelected(ViewPB view) {
++    final newText = textController.text.replaceRange(
++      inputControlCubit.filterStartPosition,
++      inputControlCubit.filterEndPosition,
++      view.id,
++    );
++    textController.value = TextEditingValue(
++      text: newText,
++      selection: TextSelection.collapsed(
++        offset: inputControlCubit.filterStartPosition + view.id.length,
++        affinity: TextAffinity.upstream,
++      ),
++    );
++
++    inputControlCubit.selectPage(view);
++    overlayController.hide();
++  }
++
++  Widget inputTextField() {
++    return Actions(
++      actions: buildActions(),
++      child: CompositedTransformTarget(
++        link: layerLink,
++        child: BlocBuilder<AIPromptInputBloc, AIPromptInputState>(
++          builder: (context, state) {
++            return _PromptTextField(
++              key: textFieldKey,
++              cubit: inputControlCubit,
++              textController: textController,
++              textFieldFocusNode: focusNode,
+               hintText: switch (state.aiType) {
+                 AIType.appflowyAI => LocaleKeys.chat_inputMessageHint.tr(),
+                 AIType.localAI => LocaleKeys.chat_inputLocalAIMessageHint.tr()
+               },
+-              hintStyle: Theme.of(context)
+-                  .textTheme
+-                  .bodyMedium
+-                  ?.copyWith(color: Theme.of(context).hintColor),
+-              isCollapsed: true,
+-              isDense: true,
+-            ),
+-            keyboardType: TextInputType.multiline,
+-            textCapitalization: TextCapitalization.sentences,
+-            minLines: 1,
+-            maxLines: null,
+-            style: Theme.of(context).textTheme.bodyMedium,
+-            specialTextSpanBuilder: ChatInputTextSpanBuilder(
+-              inputActionControl: _inputActionControl,
+-            ),
+-            onChanged: (text) {
+-              _handleOnTextChange(context, text);
+-            },
+-          );
++              onStartMentioningPage: () {
++                WidgetsBinding.instance.addPostFrameCallback((_) {
++                  inputControlCubit.startSearching(textController.value);
++                  overlayController.show();
++                });
++              },
++            );
++          },
++        ),
++      ),
++    );
++  }
++
++  Map<Type, Action<Intent>> buildActions() {
++    return {
++      _FocusPreviousItemIntent: CallbackAction<_FocusPreviousItemIntent>(
++        onInvoke: (intent) {
++          inputControlCubit.updateSelectionUp();
++          return;
++        },
++      ),
++      _FocusNextItemIntent: CallbackAction<_FocusNextItemIntent>(
++        onInvoke: (intent) {
++          inputControlCubit.updateSelectionDown();
++          return;
++        },
++      ),
++      _CancelMentionPageIntent: CallbackAction<_CancelMentionPageIntent>(
++        onInvoke: (intent) {
++          cancelMentionPage();
++          return;
++        },
++      ),
++      _SubmitOrMentionPageIntent: CallbackAction<_SubmitOrMentionPageIntent>(
++        onInvoke: (intent) {
++          if (overlayController.isShowing) {
++            inputControlCubit.state.maybeWhen(
++              ready: (visibleViews, focusedViewIndex) {
++                if (focusedViewIndex != -1 &&
++                    focusedViewIndex < visibleViews.length) {
++                  handlePageSelected(visibleViews[focusedViewIndex]);
++                }
++              },
++              orElse: () {},
++            );
++          } else {
++            handleSendPressed();
++          }
++          return;
+         },
+       ),
++    };
++  }
++}
++
++class _PromptTextField extends StatefulWidget {
++  const _PromptTextField({
++    super.key,
++    required this.cubit,
++    required this.textController,
++    required this.textFieldFocusNode,
++    required this.onStartMentioningPage,
++    this.hintText = "",
++  });
++
++  final ChatInputControlCubit cubit;
++  final TextEditingController textController;
++  final FocusNode textFieldFocusNode;
++  final void Function() onStartMentioningPage;
++  final String hintText;
++
++  @override
++  State<_PromptTextField> createState() => _PromptTextFieldState();
++}
++
++class _PromptTextFieldState extends State<_PromptTextField> {
++  bool isComposing = false;
++
++  @override
++  void initState() {
++    super.initState();
++    widget.textFieldFocusNode.onKeyEvent = handleKeyEvent;
++    widget.textController.addListener(onTextChanged);
++  }
++
++  @override
++  void dispose() {
++    widget.textFieldFocusNode.onKeyEvent = null;
++    widget.textController.removeListener(onTextChanged);
++    super.dispose();
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return Shortcuts(
++      shortcuts: buildShortcuts(),
++      child: ExtendedTextField(
++        controller: widget.textController,
++        focusNode: widget.textFieldFocusNode,
++        decoration: InputDecoration(
++          border: InputBorder.none,
++          enabledBorder: InputBorder.none,
++          focusedBorder: InputBorder.none,
++          contentPadding: DesktopAIPromptSizes.textFieldContentPadding.add(
++            const EdgeInsets.only(
++              bottom: DesktopAIPromptSizes.actionBarHeight,
++            ),
++          ),
++          hintText: widget.hintText,
++          hintStyle: Theme.of(context)
++              .textTheme
++              .bodyMedium
++              ?.copyWith(color: Theme.of(context).hintColor),
++          isCollapsed: true,
++          isDense: true,
++        ),
++        keyboardType: TextInputType.multiline,
++        textCapitalization: TextCapitalization.sentences,
++        minLines: 1,
++        maxLines: null,
++        style: Theme.of(context).textTheme.bodyMedium,
++        specialTextSpanBuilder: ChatInputTextSpanBuilder(
++          inputControlCubit: widget.cubit,
++          specialTextStyle: Theme.of(context).textTheme.bodyMedium?.copyWith(
++                color: Theme.of(context).colorScheme.primary,
++                fontWeight: FontWeight.w600,
++              ),
++        ),
++      ),
+     );
+   }
+ 
+-  Future<void> _handleOnTextChange(BuildContext context, String text) async {
+-    if (!_inputActionControl.onTextChanged(text)) {
+-      return;
++  KeyEventResult handleKeyEvent(FocusNode node, KeyEvent event) {
++    if (event.character == '@') {
++      widget.onStartMentioningPage();
+     }
++    return KeyEventResult.ignored;
++  }
++
++  void onTextChanged() {
++    setState(
++      () => isComposing = !widget.textController.value.composing.isCollapsed,
++    );
++  }
++
++  Map<ShortcutActivator, Intent> buildShortcuts() {
++    if (isComposing) {
++      return const {};
++    }
++
++    return const {
++      SingleActivator(LogicalKeyboardKey.arrowUp): _FocusPreviousItemIntent(),
++      SingleActivator(LogicalKeyboardKey.arrowDown): _FocusNextItemIntent(),
++      SingleActivator(LogicalKeyboardKey.escape): _CancelMentionPageIntent(),
++      SingleActivator(LogicalKeyboardKey.enter): _SubmitOrMentionPageIntent(),
++    };
++  }
++}
+ 
+-    ChatActionsMenu(
+-      anchor: ChatInputAnchor(
+-        anchorKey: _textFieldKey,
+-        layerLink: _layerLink,
++class _SubmitOrMentionPageIntent extends Intent {
++  const _SubmitOrMentionPageIntent();
++}
++
++class _CancelMentionPageIntent extends Intent {
++  const _CancelMentionPageIntent();
++}
++
++class _FocusPreviousItemIntent extends Intent {
++  const _FocusPreviousItemIntent();
++}
++
++class _FocusNextItemIntent extends Intent {
++  const _FocusNextItemIntent();
++}
++
++class _PromptBottomActions extends StatelessWidget {
++  const _PromptBottomActions({
++    required this.textController,
++    required this.overlayController,
++    required this.focusNode,
++    required this.sendButtonState,
++    required this.onSendPressed,
++    required this.onStopStreaming,
++  });
++
++  final TextEditingController textController;
++  final OverlayPortalController overlayController;
++  final FocusNode focusNode;
++  final SendButtonState sendButtonState;
++  final void Function() onSendPressed;
++  final void Function() onStopStreaming;
++
++  @override
++  Widget build(BuildContext context) {
++    return Container(
++      height: DesktopAIPromptSizes.actionBarHeight,
++      padding: const EdgeInsets.symmetric(horizontal: 8),
++      child: BlocBuilder<AIPromptInputBloc, AIPromptInputState>(
++        builder: (context, state) {
++          return Row(
++            crossAxisAlignment: CrossAxisAlignment.start,
++            children: [
++              // predefinedFormatButton(),
++              const Spacer(),
++              _mentionButton(context),
++              const HSpace(
++                DesktopAIPromptSizes.actionBarButtonSpacing,
++              ),
++              if (UniversalPlatform.isDesktop && state.supportChatWithFile) ...[
++                _attachmentButton(context),
++                const HSpace(
++                  DesktopAIPromptSizes.actionBarButtonSpacing,
++                ),
++              ],
++              _sendButton(),
++            ],
++          );
++        },
+       ),
+-      handler: _inputActionControl,
+-      context: context,
+-      style: Theme.of(context).brightness == Brightness.dark
+-          ? const ChatActionsMenuStyle.dark()
+-          : const ChatActionsMenuStyle.light(),
+-    ).show();
++    );
+   }
+ 
+-  Widget _mentionButton() {
++  Widget _mentionButton(BuildContext context) {
+     return PromptInputMentionButton(
+       iconSize: DesktopAIPromptSizes.actionBarIconSize,
+       buttonSize: DesktopAIPromptSizes.actionBarButtonSize,
+       onTap: () {
+-        _textController.text += '@';
+-        if (!_inputFocusNode.hasFocus) {
+-          _inputFocusNode.requestFocus();
++        if (!focusNode.hasFocus) {
++          focusNode.requestFocus();
+         }
+-        _handleOnTextChange(context, _textController.text);
++        textController.text += '@';
++        Future.delayed(Duration.zero, () {
++          context
++              .read<ChatInputControlCubit>()
++              .startSearching(textController.value);
++          overlayController.show();
++        });
+       },
+     );
+   }
+ 
+-  Widget _attachmentButton() {
++  Widget _attachmentButton(BuildContext context) {
+     return PromptInputAttachmentButton(
+       onTap: () async {
+         final path = await getIt<FilePickerService>().pickFiles(
+@@ -308,12 +547,10 @@ class _DesktopAIPromptInputState extends State<DesktopAIPromptInput> {
+         }
+ 
+         for (final file in path.files) {
+-          if (file.path != null) {
+-            if (mounted) {
+-              context
+-                  .read<AIPromptInputBloc>()
+-                  .add(AIPromptInputEvent.newFile(file.path!, file.name));
+-            }
++          if (file.path != null && context.mounted) {
++            context
++                .read<AIPromptInputBloc>()
++                .add(AIPromptInputEvent.attachFile(file.path!, file.name));
+           }
+         }
+       },
+@@ -325,56 +562,8 @@ class _DesktopAIPromptInputState extends State<DesktopAIPromptInput> {
+       buttonSize: DesktopAIPromptSizes.actionBarButtonSize,
+       iconSize: DesktopAIPromptSizes.sendButtonSize,
+       state: sendButtonState,
+-      onSendPressed: _handleSendPressed,
+-      onStopStreaming: widget.onStopStreaming,
++      onSendPressed: onSendPressed,
++      onStopStreaming: onStopStreaming,
+     );
+   }
+ }
+-
+-class ChatInputAnchor extends ChatAnchor {
+-  ChatInputAnchor({
+-    required this.anchorKey,
+-    required this.layerLink,
+-  });
+-
+-  @override
+-  final GlobalKey<State<StatefulWidget>> anchorKey;
+-
+-  @override
+-  final LayerLink layerLink;
+-}
+-
+-/// Handles the key press event for the Enter key without Shift.
+-///
+-/// This function checks if the Enter key is pressed without either of the Shift keys.
+-/// If the conditions are met, it performs the action of sending a message if the
+-/// text controller is not in a composing range and if the event is a key down event.
+-///
+-/// - Returns: A `KeyEventResult` indicating whether the key event was handled or ignored.
+-KeyEventResult _handleEnterKeyWithoutShift(
+-  KeyEvent event,
+-  TextEditingController textController,
+-  bool isStreaming,
+-  void Function() handleSendPressed,
+-) {
+-  if (event.physicalKey == PhysicalKeyboardKey.enter &&
+-      !HardwareKeyboard.instance.physicalKeysPressed.any(
+-        (el) => <PhysicalKeyboardKey>{
+-          PhysicalKeyboardKey.shiftLeft,
+-          PhysicalKeyboardKey.shiftRight,
+-        }.contains(el),
+-      )) {
+-    if (textController.value.isComposingRangeValid) {
+-      return KeyEventResult.ignored;
+-    }
+-
+-    if (event is KeyDownEvent) {
+-      if (!isStreaming) {
+-        handleSendPressed();
+-      }
+-    }
+-    return KeyEventResult.handled;
+-  } else {
+-    return KeyEventResult.ignored;
+-  }
+-}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/mobile_ai_prompt_input.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/mobile_ai_prompt_input.dart
+index 3adb427350795..d42b247e84809 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/mobile_ai_prompt_input.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/mobile_ai_prompt_input.dart
+@@ -1,10 +1,6 @@
+ import 'package:appflowy/generated/locale_keys.g.dart';
+-import 'package:appflowy/plugins/ai_chat/application/chat_entity.dart';
+ import 'package:appflowy/plugins/ai_chat/application/ai_prompt_input_bloc.dart';
+-import 'package:appflowy/plugins/ai_chat/application/chat_input_action_bloc.dart';
+-import 'package:appflowy/plugins/ai_chat/application/chat_input_action_control.dart';
+-import 'package:appflowy/plugins/ai_chat/presentation/chat_input/chat_input_file.dart';
+-import 'package:appflowy/plugins/ai_chat/presentation/chat_input_action_menu.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_input_control_cubit.dart';
+ import 'package:appflowy/plugins/document/presentation/editor_plugins/mention/mobile_page_selector_sheet.dart';
+ import 'package:appflowy/workspace/application/view/view_ext.dart';
+ import 'package:easy_localization/easy_localization.dart';
+@@ -13,9 +9,10 @@ import 'package:flowy_infra_ui/flowy_infra_ui.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+ 
++import '../layout_define.dart';
+ import 'ai_prompt_buttons.dart';
++import 'chat_input_file.dart';
+ import 'chat_input_span.dart';
+-import '../layout_define.dart';
+ 
+ class MobileAIPromptInput extends StatefulWidget {
+   const MobileAIPromptInput({
+@@ -36,9 +33,9 @@ class MobileAIPromptInput extends StatefulWidget {
+ }
+ 
+ class _MobileAIPromptInputState extends State<MobileAIPromptInput> {
+-  late final ChatInputActionControl _inputActionControl;
+-  late final FocusNode _inputFocusNode;
+-  late final TextEditingController _textController;
++  final inputControlCubit = ChatInputControlCubit();
++  final focusNode = FocusNode();
++  final textController = TextEditingController();
+ 
+   late SendButtonState sendButtonState;
+ 
+@@ -46,20 +43,13 @@ class _MobileAIPromptInputState extends State<MobileAIPromptInput> {
+   void initState() {
+     super.initState();
+ 
+-    _textController = TextEditingController()
+-      ..addListener(_handleTextControllerChange);
++    textController.addListener(handleTextControllerChange);
++    focusNode.onKeyEvent = handleKeyEvent;
+ 
+-    _inputFocusNode = FocusNode();
+     WidgetsBinding.instance.addPostFrameCallback((_) {
+-      _inputFocusNode.requestFocus();
++      focusNode.requestFocus();
+     });
+ 
+-    _inputActionControl = ChatInputActionControl(
+-      chatId: widget.chatId,
+-      textController: _textController,
+-      textFieldFocusNode: _inputFocusNode,
+-    );
+-
+     updateSendButtonState();
+   }
+ 
+@@ -71,9 +61,9 @@ class _MobileAIPromptInputState extends State<MobileAIPromptInput> {
+ 
+   @override
+   void dispose() {
+-    _inputFocusNode.dispose();
+-    _textController.dispose();
+-    _inputActionControl.dispose();
++    focusNode.dispose();
++    textController.dispose();
++    inputControlCubit.close();
+     super.dispose();
+   }
+ 
+@@ -81,55 +71,71 @@ class _MobileAIPromptInputState extends State<MobileAIPromptInput> {
+   Widget build(BuildContext context) {
+     return Hero(
+       tag: "ai_chat_prompt",
+-      child: DecoratedBox(
+-        decoration: BoxDecoration(
+-          border: Border(
+-            top: BorderSide(color: Theme.of(context).colorScheme.outline),
+-          ),
+-          color: Theme.of(context).colorScheme.surface,
+-          boxShadow: const [
+-            BoxShadow(
+-              blurRadius: 4.0,
+-              offset: Offset(0, -2),
+-              color: Color.fromRGBO(0, 0, 0, 0.05),
+-            ),
+-          ],
+-          borderRadius: MobileAIPromptSizes.promptFrameRadius,
+-        ),
+-        child: Column(
+-          children: [
+-            ConstrainedBox(
+-              constraints: BoxConstraints(
+-                maxHeight:
+-                    MobileAIPromptSizes.attachedFilesBarPadding.vertical +
+-                        MobileAIPromptSizes.attachedFilesPreviewHeight,
+-              ),
+-              child: ChatInputFile(
+-                chatId: widget.chatId,
+-                onDeleted: (file) => context
+-                    .read<AIPromptInputBloc>()
+-                    .add(AIPromptInputEvent.deleteFile(file)),
++      child: BlocProvider.value(
++        value: inputControlCubit,
++        child: BlocListener<ChatInputControlCubit, ChatInputControlState>(
++          listener: (context, state) {
++            state.maybeWhen(
++              updateSelectedViews: (selectedViews) {
++                context.read<AIPromptInputBloc>().add(
++                      AIPromptInputEvent.updateMentionedViews(selectedViews),
++                    );
++              },
++              orElse: () {},
++            );
++          },
++          child: DecoratedBox(
++            decoration: BoxDecoration(
++              border: Border(
++                top: BorderSide(color: Theme.of(context).colorScheme.outline),
+               ),
++              color: Theme.of(context).colorScheme.surface,
++              boxShadow: const [
++                BoxShadow(
++                  blurRadius: 4.0,
++                  offset: Offset(0, -2),
++                  color: Color.fromRGBO(0, 0, 0, 0.05),
++                ),
++              ],
++              borderRadius: MobileAIPromptSizes.promptFrameRadius,
+             ),
+-            Container(
+-              constraints: const BoxConstraints(
+-                minHeight: MobileAIPromptSizes.textFieldMinHeight,
+-                maxHeight: 220,
+-              ),
+-              padding: const EdgeInsetsDirectional.fromSTEB(0, 8.0, 12.0, 8.0),
+-              child: IntrinsicHeight(
+-                child: Row(
+-                  children: [
+-                    const HSpace(8.0),
+-                    Expanded(child: _inputTextField(context)),
+-                    _mentionButton(),
+-                    const HSpace(6.0),
+-                    _sendButton(),
+-                  ],
++            child: Column(
++              children: [
++                ConstrainedBox(
++                  constraints: BoxConstraints(
++                    maxHeight:
++                        MobileAIPromptSizes.attachedFilesBarPadding.vertical +
++                            MobileAIPromptSizes.attachedFilesPreviewHeight,
++                  ),
++                  child: ChatInputFile(
++                    chatId: widget.chatId,
++                    onDeleted: (file) => context
++                        .read<AIPromptInputBloc>()
++                        .add(AIPromptInputEvent.removeFile(file)),
++                  ),
+                 ),
+-              ),
++                Container(
++                  constraints: const BoxConstraints(
++                    minHeight: MobileAIPromptSizes.textFieldMinHeight,
++                    maxHeight: 220,
++                  ),
++                  padding:
++                      const EdgeInsetsDirectional.fromSTEB(0, 8.0, 12.0, 8.0),
++                  child: IntrinsicHeight(
++                    child: Row(
++                      children: [
++                        const HSpace(8.0),
++                        Expanded(child: inputTextField(context)),
++                        mentionButton(),
++                        const HSpace(6.0),
++                        sendButton(),
++                      ],
++                    ),
++                  ),
++                ),
++              ],
+             ),
+-          ],
++          ),
+         ),
+       ),
+     );
+@@ -138,138 +144,149 @@ class _MobileAIPromptInputState extends State<MobileAIPromptInput> {
+   void updateSendButtonState() {
+     if (widget.isStreaming) {
+       sendButtonState = SendButtonState.streaming;
+-    } else if (_textController.text.trim().isEmpty) {
++    } else if (textController.text.trim().isEmpty) {
+       sendButtonState = SendButtonState.disabled;
+     } else {
+       sendButtonState = SendButtonState.enabled;
+     }
+   }
+ 
+-  void _handleSendPressed() {
+-    final trimmedText = _textController.text.trim();
+-    _textController.clear();
++  void handleSendPressed() {
++    final trimmedText = inputControlCubit.formatIntputText(
++      textController.text.trim(),
++    );
++    textController.clear();
+     if (trimmedText.isEmpty) {
+       return;
+     }
+-    // consume metadata
+-    final ChatInputMentionMetadata mentionPageMetadata =
+-        _inputActionControl.consumeMetaData();
+-    final ChatInputFileMetadata fileMetadata =
+-        context.read<AIPromptInputBloc>().consumeMetadata();
+ 
+-    // combine metadata
+-    final Map<String, dynamic> metadata = {}
+-      ..addAll(mentionPageMetadata)
+-      ..addAll(fileMetadata);
++    // get the attached files and mentioned pages
++    final metadata = context.read<AIPromptInputBloc>().consumeMetadata();
+ 
+     widget.onSubmitted(trimmedText, metadata);
+   }
+ 
+-  void _handleTextControllerChange() {
+-    if (_textController.value.isComposingRangeValid) {
++  void handleTextControllerChange() {
++    if (textController.value.isComposingRangeValid) {
+       return;
+     }
++    inputControlCubit.updateInputText(textController.text);
+     setState(() => updateSendButtonState());
+   }
+ 
+-  Widget _inputTextField(BuildContext context) {
++  KeyEventResult handleKeyEvent(FocusNode node, KeyEvent event) {
++    if (event.character == '@') {
++      WidgetsBinding.instance.addPostFrameCallback((_) {
++        mentionPage(context);
++      });
++    }
++    return KeyEventResult.ignored;
++  }
++
++  Future<void> mentionPage(BuildContext context) async {
++    // if the focus node is on focus, unfocus it for better animation
++    // otherwise, the page sheet animation will be blocked by the keyboard
++    inputControlCubit.refreshViews();
++    inputControlCubit.startSearching(textController.value);
++    if (focusNode.hasFocus) {
++      focusNode.unfocus();
++      await Future.delayed(const Duration(milliseconds: 100));
++    }
++
++    if (context.mounted) {
++      final selectedView = await showPageSelectorSheet(
++        context,
++        filter: (view) =>
++            view.layout.isDocumentView &&
++            view.parentViewId.isNotEmpty &&
++            !inputControlCubit.selectedViewIds.contains(view.id),
++      );
++      if (selectedView != null) {
++        final newText = textController.text.replaceRange(
++          inputControlCubit.filterStartPosition,
++          inputControlCubit.filterStartPosition,
++          selectedView.id,
++        );
++        textController.value = TextEditingValue(
++          text: newText,
++          selection: TextSelection.collapsed(
++            offset:
++                textController.selection.baseOffset + selectedView.id.length,
++            affinity: TextAffinity.upstream,
++          ),
++        );
++
++        inputControlCubit.selectPage(selectedView);
++      }
++      focusNode.requestFocus();
++      inputControlCubit.reset();
++    }
++  }
++
++  Widget inputTextField(BuildContext context) {
+     return BlocBuilder<AIPromptInputBloc, AIPromptInputState>(
+       builder: (context, state) {
+         return ExtendedTextField(
+-          controller: _textController,
+-          focusNode: _inputFocusNode,
+-          decoration: _buildInputDecoration(state),
++          controller: textController,
++          focusNode: focusNode,
++          decoration: InputDecoration(
++            border: InputBorder.none,
++            enabledBorder: InputBorder.none,
++            focusedBorder: InputBorder.none,
++            contentPadding: MobileAIPromptSizes.textFieldContentPadding,
++            hintText: switch (state.aiType) {
++              AIType.appflowyAI => LocaleKeys.chat_inputMessageHint.tr(),
++              AIType.localAI => LocaleKeys.chat_inputLocalAIMessageHint.tr()
++            },
++            isCollapsed: true,
++            isDense: true,
++          ),
+           keyboardType: TextInputType.multiline,
+           textCapitalization: TextCapitalization.sentences,
+           minLines: 1,
+           maxLines: null,
+           style: Theme.of(context).textTheme.bodyMedium,
+           specialTextSpanBuilder: ChatInputTextSpanBuilder(
+-            inputActionControl: _inputActionControl,
++            inputControlCubit: inputControlCubit,
++            specialTextStyle: Theme.of(context).textTheme.bodyMedium?.copyWith(
++                  color: Theme.of(context).colorScheme.primary,
++                  fontWeight: FontWeight.w600,
++                ),
+           ),
+-          onChanged: (text) {
+-            _handleOnTextChange(context, text);
+-          },
+         );
+       },
+     );
+   }
+ 
+-  InputDecoration _buildInputDecoration(AIPromptInputState state) {
+-    return InputDecoration(
+-      border: InputBorder.none,
+-      enabledBorder: InputBorder.none,
+-      focusedBorder: InputBorder.none,
+-      contentPadding: MobileAIPromptSizes.textFieldContentPadding,
+-      hintText: switch (state.aiType) {
+-        AIType.appflowyAI => LocaleKeys.chat_inputMessageHint.tr(),
+-        AIType.localAI => LocaleKeys.chat_inputLocalAIMessageHint.tr()
+-      },
+-      isCollapsed: true,
+-      isDense: true,
+-    );
+-  }
+-
+-  Future<void> _handleOnTextChange(BuildContext context, String text) async {
+-    if (!_inputActionControl.onTextChanged(text)) {
+-      return;
+-    }
+-
+-    // if the focus node is on focus, unfocus it for better animation
+-    // otherwise, the page sheet animation will be blocked by the keyboard
+-    if (_inputFocusNode.hasFocus) {
+-      _inputFocusNode.unfocus();
+-      Future.delayed(const Duration(milliseconds: 100), () async {
+-        await _referPage(_inputActionControl);
+-      });
+-    } else {
+-      await _referPage(_inputActionControl);
+-    }
+-  }
+-
+-  Widget _mentionButton() {
++  Widget mentionButton() {
+     return Align(
+       alignment: Alignment.bottomCenter,
+       child: PromptInputMentionButton(
+         iconSize: MobileAIPromptSizes.mentionIconSize,
+         buttonSize: MobileAIPromptSizes.sendButtonSize,
+         onTap: () {
+-          _textController.text += '@';
+-          if (!_inputFocusNode.hasFocus) {
+-            _inputFocusNode.requestFocus();
++          textController.text += '@';
++          if (!focusNode.hasFocus) {
++            focusNode.requestFocus();
+           }
+-          _handleOnTextChange(context, _textController.text);
++          WidgetsBinding.instance.addPostFrameCallback((_) {
++            mentionPage(context);
++          });
+         },
+       ),
+     );
+   }
+ 
+-  Widget _sendButton() {
++  Widget sendButton() {
+     return Align(
+       alignment: Alignment.bottomCenter,
+       child: PromptInputSendButton(
+         buttonSize: MobileAIPromptSizes.sendButtonSize,
+         iconSize: MobileAIPromptSizes.sendButtonSize,
+-        onSendPressed: _handleSendPressed,
++        onSendPressed: handleSendPressed,
+         onStopStreaming: widget.onStopStreaming,
+         state: sendButtonState,
+       ),
+     );
+   }
+-
+-  Future<void> _referPage(ChatActionHandler handler) async {
+-    handler.onEnter();
+-    final selectedView = await showPageSelectorSheet(
+-      context,
+-      filter: (view) =>
+-          view.layout.isDocumentView &&
+-          !view.isSpace &&
+-          view.parentViewId.isNotEmpty,
+-    );
+-    if (selectedView != null) {
+-      handler.onSelected(ViewActionPage(view: selectedView));
+-    }
+-    handler.onExit();
+-    _inputFocusNode.requestFocus();
+-  }
+ }
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input_action_menu.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input_action_menu.dart
+deleted file mode 100644
+index d23e966ecd5b8..0000000000000
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input_action_menu.dart
++++ /dev/null
+@@ -1,320 +0,0 @@
+-import 'dart:math';
+-
+-import 'package:appflowy/generated/locale_keys.g.dart';
+-import 'package:appflowy/plugins/ai_chat/application/chat_input_action_bloc.dart';
+-import 'package:appflowy/plugins/ai_chat/application/chat_input_action_control.dart';
+-import 'package:easy_localization/easy_localization.dart';
+-import 'package:flowy_infra_ui/flowy_infra_ui.dart';
+-import 'package:flutter/material.dart';
+-import 'package:flutter/services.dart';
+-import 'package:flutter_bloc/flutter_bloc.dart';
+-import 'package:scroll_to_index/scroll_to_index.dart';
+-
+-abstract class ChatActionHandler {
+-  void onEnter();
+-  void onSelected(ChatInputMention page);
+-  void onExit();
+-  ChatInputActionBloc get commandBloc;
+-  void onFilter(String filter);
+-  double actionMenuOffsetX();
+-}
+-
+-abstract class ChatAnchor {
+-  GlobalKey get anchorKey;
+-  LayerLink get layerLink;
+-}
+-
+-const int _itemHeight = 34;
+-const int _itemVerticalPadding = 4;
+-const int _noPageHeight = 20;
+-
+-class ChatActionsMenu {
+-  ChatActionsMenu({
+-    required this.anchor,
+-    required this.context,
+-    required this.handler,
+-    required this.style,
+-  });
+-
+-  final BuildContext context;
+-  final ChatAnchor anchor;
+-  final ChatActionsMenuStyle style;
+-  final ChatActionHandler handler;
+-
+-  OverlayEntry? _overlayEntry;
+-
+-  void dismiss() {
+-    _overlayEntry?.remove();
+-    _overlayEntry = null;
+-    handler.onExit();
+-  }
+-
+-  void show() {
+-    WidgetsBinding.instance.addPostFrameCallback((_) => _show());
+-  }
+-
+-  void _show() {
+-    if (_overlayEntry != null) {
+-      dismiss();
+-    }
+-
+-    if (anchor.anchorKey.currentContext == null) {
+-      return;
+-    }
+-
+-    handler.onEnter();
+-    const double maxHeight = 300;
+-
+-    _overlayEntry = OverlayEntry(
+-      builder: (context) => BlocProvider.value(
+-        value: handler.commandBloc,
+-        child: BlocBuilder<ChatInputActionBloc, ChatInputActionState>(
+-          builder: (context, state) {
+-            final height = min(
+-              max(
+-                state.pages.length * (_itemHeight + _itemVerticalPadding),
+-                _noPageHeight,
+-              ),
+-              maxHeight,
+-            );
+-            final isLoading =
+-                state.indicator == const ChatActionMenuIndicator.loading();
+-
+-            return Stack(
+-              children: [
+-                CompositedTransformFollower(
+-                  link: anchor.layerLink,
+-                  showWhenUnlinked: false,
+-                  offset: Offset(handler.actionMenuOffsetX(), -height - 4),
+-                  child: Material(
+-                    elevation: 4.0,
+-                    child: ConstrainedBox(
+-                      constraints: const BoxConstraints(
+-                        minWidth: 200,
+-                        maxWidth: 200,
+-                        maxHeight: maxHeight,
+-                      ),
+-                      child: DecoratedBox(
+-                        decoration: BoxDecoration(
+-                          color: Theme.of(context)
+-                              .colorScheme
+-                              .surfaceContainerHighest,
+-                          borderRadius: BorderRadius.circular(6.0),
+-                        ),
+-                        child: Padding(
+-                          padding: const EdgeInsets.symmetric(
+-                            horizontal: 2,
+-                            vertical: 2,
+-                          ),
+-                          child: ActionList(
+-                            isLoading: isLoading,
+-                            handler: handler,
+-                            onDismiss: () => dismiss(),
+-                            pages: state.pages,
+-                          ),
+-                        ),
+-                      ),
+-                    ),
+-                  ),
+-                ),
+-              ],
+-            );
+-          },
+-        ),
+-      ),
+-    );
+-
+-    Overlay.of(context).insert(_overlayEntry!);
+-  }
+-}
+-
+-class _ActionItem extends StatelessWidget {
+-  const _ActionItem({
+-    required this.item,
+-    required this.onTap,
+-    required this.isSelected,
+-  });
+-
+-  final ChatInputMention item;
+-  final VoidCallback? onTap;
+-  final bool isSelected;
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    return Container(
+-      height: _itemHeight.toDouble(),
+-      padding: const EdgeInsets.symmetric(vertical: _itemVerticalPadding / 2.0),
+-      decoration: BoxDecoration(
+-        color: isSelected
+-            ? Theme.of(context).colorScheme.primary.withOpacity(0.1)
+-            : Colors.transparent,
+-        borderRadius: BorderRadius.circular(4.0),
+-      ),
+-      child: FlowyTooltip(
+-        message: item.title,
+-        child: FlowyButton(
+-          leftIcon: item.icon,
+-          margin: const EdgeInsets.symmetric(horizontal: 6),
+-          iconPadding: 10.0,
+-          text: FlowyText(
+-            item.title.isEmpty
+-                ? LocaleKeys.document_title_placeholder.tr()
+-                : item.title,
+-            lineHeight: 1.0,
+-            overflow: TextOverflow.ellipsis,
+-          ),
+-          onTap: onTap,
+-        ),
+-      ),
+-    );
+-  }
+-}
+-
+-class ActionList extends StatefulWidget {
+-  const ActionList({
+-    super.key,
+-    required this.handler,
+-    required this.onDismiss,
+-    required this.pages,
+-    required this.isLoading,
+-  });
+-
+-  final ChatActionHandler handler;
+-  final VoidCallback? onDismiss;
+-  final List<ChatInputMention> pages;
+-  final bool isLoading;
+-
+-  @override
+-  State<ActionList> createState() => _ActionListState();
+-}
+-
+-class _ActionListState extends State<ActionList> {
+-  int _selectedIndex = 0;
+-  final _scrollController = AutoScrollController();
+-
+-  @override
+-  void dispose() {
+-    _scrollController.dispose();
+-    super.dispose();
+-  }
+-
+-  KeyEventResult _handleKeyPress(logicalKey) {
+-    bool isHandle = false;
+-    setState(() {
+-      if (logicalKey == PhysicalKeyboardKey.arrowDown) {
+-        _selectedIndex = (_selectedIndex + 1) % widget.pages.length;
+-        _scrollToSelectedIndex();
+-        isHandle = true;
+-      } else if (logicalKey == PhysicalKeyboardKey.arrowUp) {
+-        _selectedIndex =
+-            (_selectedIndex - 1 + widget.pages.length) % widget.pages.length;
+-        _scrollToSelectedIndex();
+-        isHandle = true;
+-      } else if (logicalKey == PhysicalKeyboardKey.enter) {
+-        widget.handler.onSelected(widget.pages[_selectedIndex]);
+-        widget.onDismiss?.call();
+-        isHandle = true;
+-      } else if (logicalKey == PhysicalKeyboardKey.escape) {
+-        widget.onDismiss?.call();
+-        isHandle = true;
+-      }
+-    });
+-    return isHandle ? KeyEventResult.handled : KeyEventResult.ignored;
+-  }
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    return BlocListener<ChatInputActionBloc, ChatInputActionState>(
+-      listenWhen: (previous, current) =>
+-          previous.keyboardKey != current.keyboardKey,
+-      listener: (context, state) {
+-        if (state.keyboardKey != null) {
+-          _handleKeyPress(state.keyboardKey!.physicalKey);
+-        }
+-      },
+-      child: ListView(
+-        shrinkWrap: true,
+-        controller: _scrollController,
+-        padding: const EdgeInsets.all(4),
+-        children: _buildPages(),
+-      ),
+-    );
+-  }
+-
+-  List<Widget> _buildPages() {
+-    if (widget.isLoading) {
+-      return [
+-        SizedBox(
+-          height: _noPageHeight.toDouble(),
+-          child: const Center(child: CircularProgressIndicator.adaptive()),
+-        ),
+-      ];
+-    }
+-
+-    if (widget.pages.isEmpty) {
+-      return [
+-        SizedBox(
+-          height: _noPageHeight.toDouble(),
+-          child:
+-              Center(child: FlowyText(LocaleKeys.chat_inputActionNoPages.tr())),
+-        ),
+-      ];
+-    }
+-
+-    return widget.pages.asMap().entries.map((entry) {
+-      final index = entry.key;
+-      final ChatInputMention item = entry.value;
+-      return AutoScrollTag(
+-        key: ValueKey(item.pageId),
+-        index: index,
+-        controller: _scrollController,
+-        child: _ActionItem(
+-          item: item,
+-          onTap: () {
+-            widget.handler.onSelected(item);
+-            widget.onDismiss?.call();
+-          },
+-          isSelected: _selectedIndex == index,
+-        ),
+-      );
+-    }).toList();
+-  }
+-
+-  void _scrollToSelectedIndex() {
+-    _scrollController.scrollToIndex(
+-      _selectedIndex,
+-      duration: const Duration(milliseconds: 200),
+-      preferPosition: AutoScrollPosition.begin,
+-    );
+-  }
+-}
+-
+-class ChatActionsMenuStyle {
+-  ChatActionsMenuStyle({
+-    required this.backgroundColor,
+-    required this.groupTextColor,
+-    required this.menuItemTextColor,
+-    required this.menuItemSelectedColor,
+-    required this.menuItemSelectedTextColor,
+-  });
+-
+-  const ChatActionsMenuStyle.light()
+-      : backgroundColor = Colors.white,
+-        groupTextColor = const Color(0xFF555555),
+-        menuItemTextColor = const Color(0xFF333333),
+-        menuItemSelectedColor = const Color(0xFFE0F8FF),
+-        menuItemSelectedTextColor = const Color.fromARGB(255, 56, 91, 247);
+-
+-  const ChatActionsMenuStyle.dark()
+-      : backgroundColor = const Color(0xFF282E3A),
+-        groupTextColor = const Color(0xFFBBC3CD),
+-        menuItemTextColor = const Color(0xFFBBC3CD),
+-        menuItemSelectedColor = const Color(0xFF00BCF0),
+-        menuItemSelectedTextColor = const Color(0xFF131720);
+-
+-  final Color backgroundColor;
+-  final Color groupTextColor;
+-  final Color menuItemTextColor;
+-  final Color menuItemSelectedColor;
+-  final Color menuItemSelectedTextColor;
+-}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_text_message.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_text_message.dart
+index 69b7ec102a224..1b58869688008 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_text_message.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_text_message.dart
+@@ -9,11 +9,11 @@ import 'package:flutter/material.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+ import 'package:flutter_chat_core/flutter_chat_core.dart';
+ 
+-import '../chat_loading.dart';
+ import '../layout_define.dart';
+ import 'ai_markdown_text.dart';
+ import 'ai_message_bubble.dart';
+ import 'ai_metadata.dart';
++import 'loading_indicator.dart';
+ import 'error_text_message.dart';
+ 
+ /// [ChatAIMessageWidget] includes both the text of the AI response as well as
+@@ -57,20 +57,23 @@ class ChatAIMessageWidget extends StatelessWidget {
+       ),
+       child: BlocBuilder<ChatAIMessageBloc, ChatAIMessageState>(
+         builder: (context, state) {
++          final loadingText =
++              state.progress?.step ?? LocaleKeys.chat_generatingResponse.tr();
++
+           return Padding(
+             padding: AIChatUILayout.messageMargin,
+             child: state.messageState.when(
+               loading: () => ChatAIMessageBubble(
+                 message: message,
+                 showActions: false,
+-                child: const ChatAILoading(),
++                child: ChatAILoading(text: loadingText),
+               ),
+               ready: () {
+                 return state.text.isEmpty
+                     ? ChatAIMessageBubble(
+                         message: message,
+                         showActions: false,
+-                        child: const ChatAILoading(),
++                        child: ChatAILoading(text: loadingText),
+                       )
+                     : ChatAIMessageBubble(
+                         message: message,
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_loading.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/loading_indicator.dart
+similarity index 79%
+rename from frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_loading.dart
+rename to frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/loading_indicator.dart
+index ee73e85b7d79f..be7bbf7ac98d5 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_loading.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/loading_indicator.dart
+@@ -1,18 +1,16 @@
+-import 'package:appflowy/generated/locale_keys.g.dart';
+-import 'package:appflowy/plugins/ai_chat/application/chat_ai_message_bloc.dart';
+-import 'package:easy_localization/easy_localization.dart';
+ import 'package:flowy_infra_ui/flowy_infra_ui.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_animate/flutter_animate.dart';
+-import 'package:flutter_bloc/flutter_bloc.dart';
+ 
+ /// An animated generating indicator for an AI response
+ class ChatAILoading extends StatelessWidget {
+   const ChatAILoading({
+     super.key,
++    this.text = "",
+     this.duration = const Duration(seconds: 1),
+   });
+ 
++  final String text;
+   final Duration duration;
+ 
+   @override
+@@ -27,14 +25,9 @@ class ChatAILoading extends StatelessWidget {
+           children: [
+             Padding(
+               padding: const EdgeInsetsDirectional.only(end: 4.0),
+-              child: BlocBuilder<ChatAIMessageBloc, ChatAIMessageState>(
+-                builder: (context, state) {
+-                  return FlowyText(
+-                    state.progress?.step ??
+-                        LocaleKeys.chat_generatingResponse.tr(),
+-                    color: Theme.of(context).hintColor,
+-                  );
+-                },
++              child: FlowyText(
++                text,
++                color: Theme.of(context).hintColor,
+               ),
+             ),
+             buildDot(const Color(0xFF9327FF))

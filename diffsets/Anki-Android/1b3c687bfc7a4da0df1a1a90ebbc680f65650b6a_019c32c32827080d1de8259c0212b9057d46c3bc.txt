@@ -1,0 +1,276 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/CardBrowser.java b/AnkiDroid/src/main/java/com/ichi2/anki/CardBrowser.java
+index 8b626460d1c8..5c490b35087a 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/CardBrowser.java
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/CardBrowser.java
+@@ -1995,6 +1995,9 @@ public void actualOnPostExecute(@NonNull CardBrowser browser, SearchCardsResult
+                 updateList();
+                 handleSearchResult();
+             }
++            if (result.hasError()) {
++                UIUtils.showThemedToast(CardBrowser.this, result.getError(), true);
++            }
+             if (mShouldRestoreScroll) {
+                 mShouldRestoreScroll = false;
+                 int newPosition = getNewPositionOfSelectedCard();
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/servicelayer/SearchService.kt b/AnkiDroid/src/main/java/com/ichi2/anki/servicelayer/SearchService.kt
+index 60fcc5b46619..198cbe0272c7 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/servicelayer/SearchService.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/servicelayer/SearchService.kt
+@@ -16,18 +16,37 @@
+ 
+ package com.ichi2.anki.servicelayer
+ 
++import com.ichi2.anki.AnkiDroidApp
+ import com.ichi2.anki.CardBrowser
++import com.ichi2.libanki.exception.InvalidSearchException
++import net.ankiweb.rsdroid.RustCleanup
+ 
+ class SearchService {
+ 
+-    class SearchCardsResult(val result: List<CardBrowser.CardCache>?) {
++    class SearchCardsResult(
++        val result: List<CardBrowser.CardCache>?,
++        val error: String?
++    ) {
++
+         @get:JvmName("hasResult")
+         val hasResult = result != null
++        @get:JvmName("hasError")
++        val hasError = error != null
+         fun size() = result?.size ?: 0
+ 
+         companion object {
+-            @JvmStatic fun success(result: List<CardBrowser.CardCache>) = SearchCardsResult(result)
+-            @JvmStatic fun invalidResult() = SearchCardsResult(null)
++            @RustCleanup("error checking")
++            @RustCleanup("i18n - we use an error message from the Rust")
++            @JvmStatic fun error(e: Exception): SearchCardsResult {
++                if (e !is InvalidSearchException) {
++                    // temporary check to see we haven't missed a backend exception
++                    AnkiDroidApp.sendExceptionReport(e, "unexpected error type")
++                }
++                val error = e.localizedMessage?.replace("net.ankiweb.rsdroid.exceptions.BackendInvalidInputException: ", "")
++                return SearchCardsResult(null, error)
++            }
++            @JvmStatic fun success(result: List<CardBrowser.CardCache>) = SearchCardsResult(result, null)
++            @JvmStatic fun invalidResult() = SearchCardsResult(null, null)
+         }
+     }
+ }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/async/CollectionTask.java b/AnkiDroid/src/main/java/com/ichi2/async/CollectionTask.java
+index 9470aebd3f01..11e739c395ac 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/async/CollectionTask.java
++++ b/AnkiDroid/src/main/java/com/ichi2/async/CollectionTask.java
+@@ -845,7 +845,15 @@ protected SearchCardsResult task(@NonNull Collection col, @NonNull ProgressSende
+                 return SearchCardsResult.invalidResult();
+             }
+             List<CardBrowser.CardCache> searchResult = new ArrayList<>();
+-            List<Long> searchResult_ = col.findCards(mQuery, mOrder, new PartialSearch(searchResult, mColumn1Index, mColumn2Index, mNumCardsToRender, collectionTask, col));
++            List<Long> searchResult_;
++            try {
++                searchResult_ = col.findCards(mQuery, mOrder, new PartialSearch(searchResult, mColumn1Index, mColumn2Index, mNumCardsToRender, collectionTask, col));
++            } catch (Exception e) {
++                // exception can occur via normal operation
++                Timber.w(e);
++                return SearchCardsResult.error(e);
++            }
++
+             Timber.d("The search found %d cards", searchResult_.size());
+             int position = 0;
+             for (Long cid : searchResult_) {
+diff --git a/AnkiDroid/src/main/java/com/ichi2/libanki/Collection.java b/AnkiDroid/src/main/java/com/ichi2/libanki/Collection.java
+index 7280f6be22e6..cc19b789ae4c 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/libanki/Collection.java
++++ b/AnkiDroid/src/main/java/com/ichi2/libanki/Collection.java
+@@ -50,6 +50,7 @@
+ import com.ichi2.upgrade.Upgrade;
+ import com.ichi2.utils.FunctionalInterfaces;
+ import com.ichi2.utils.HashUtil;
++import com.ichi2.utils.KotlinCleanup;
+ import com.ichi2.utils.VersionUtils;
+ 
+ import com.ichi2.utils.JSONArray;
+@@ -1228,16 +1229,22 @@ public String _flagNameFromCardFlags(int flags){
+      */
+ 
+     /** Return a list of card ids */
++    @KotlinCleanup("set reasonable defaults")
+     public List<Long> findCards(String search) {
+         return findCards(search, new SortOrder.NoOrdering());
+     }
+ 
+-
+-    /** Return a list of card ids */
++    /**
++     * @return A list of card ids
++     * @throws com.ichi2.libanki.exception.InvalidSearchException Invalid search string
++     */
+     public List<Long> findCards(String search, @NonNull SortOrder order) {
+         return new Finder(this).findCards(search, order);
+     }
+-
++    /**
++     * @return A list of card ids
++     * @throws com.ichi2.libanki.exception.InvalidSearchException Invalid search string
++     */
+     public List<Long> findCards(String search, @NonNull SortOrder order, CollectionTask.PartialSearch task) {
+         return new Finder(this).findCards(search, order, task);
+     }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/libanki/CollectionV16.kt b/AnkiDroid/src/main/java/com/ichi2/libanki/CollectionV16.kt
+index 6f09e31bcf25..9581ee184daa 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/libanki/CollectionV16.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/libanki/CollectionV16.kt
+@@ -16,12 +16,16 @@
+ package com.ichi2.libanki
+ 
+ import android.content.Context
++import com.ichi2.async.CollectionTask
+ import com.ichi2.libanki.backend.RustConfigBackend
+ import com.ichi2.libanki.backend.RustDroidDeckBackend
+ import com.ichi2.libanki.backend.RustDroidV16Backend
+ import com.ichi2.libanki.backend.RustTagsBackend
++import com.ichi2.libanki.backend.model.toProtoBuf
++import com.ichi2.libanki.exception.InvalidSearchException
+ import com.ichi2.libanki.utils.Time
+ import net.ankiweb.rsdroid.RustCleanup
++import net.ankiweb.rsdroid.exceptions.BackendInvalidInputException
+ 
+ class CollectionV16(
+     context: Context,
+@@ -74,4 +78,17 @@ class CollectionV16(
+     override fun render_output(c: Card, reload: Boolean, browser: Boolean): TemplateManager.TemplateRenderContext.TemplateRenderOutput {
+         return TemplateManager.TemplateRenderContext.from_existing_card(c, browser).render()
+     }
++
++    override fun findCards(search: String?, order: SortOrder, task: CollectionTask.PartialSearch?): MutableList<Long> {
++        val result = try {
++            backend.backend.searchCards(search, order.toProtoBuf())
++        } catch (e: BackendInvalidInputException) {
++            throw InvalidSearchException(e)
++        }
++
++        val cardIdsList = result.cardIdsList
++
++        task?.doProgress(cardIdsList)
++        return cardIdsList
++    }
+ }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/libanki/Finder.java b/AnkiDroid/src/main/java/com/ichi2/libanki/Finder.java
+index dce03e17ab08..39c1107ae928 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/libanki/Finder.java
++++ b/AnkiDroid/src/main/java/com/ichi2/libanki/Finder.java
+@@ -31,6 +31,8 @@
+ import com.ichi2.utils.JSONArray;
+ import com.ichi2.utils.JSONObject;
+ 
++import net.ankiweb.rsdroid.RustCleanup;
++
+ import java.text.Normalizer;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -52,6 +54,7 @@
+ import static com.ichi2.libanki.stats.Stats.SECONDS_PER_DAY;
+ 
+ @SuppressWarnings({"PMD.ExcessiveClassLength", "PMD.AvoidThrowingRawExceptionTypes","PMD.AvoidReassigningParameters","PMD.NPathComplexity","PMD.MethodNamingConventions"})
++@RustCleanup("remove this once Java backend is gone")
+ public class Finder {
+ 
+     private static final Pattern fPropPattern = Pattern.compile("(^.+?)(<=|>=|!=|=|<|>)(.+?$)");
+diff --git a/AnkiDroid/src/main/java/com/ichi2/libanki/backend/model/SortOrderUtil.kt b/AnkiDroid/src/main/java/com/ichi2/libanki/backend/model/SortOrderUtil.kt
+new file mode 100644
+index 000000000000..8b93b763b9bd
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/libanki/backend/model/SortOrderUtil.kt
+@@ -0,0 +1,67 @@
++/*
++ *  Copyright (c) 2021 David Allison <davidallisongithub@gmail.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify it under
++ *  the terms of the GNU General Public License as published by the Free Software
++ *  Foundation; either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++ *  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with
++ *  this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++@file:Suppress("deprecation") // BuiltinSortKind - is a valid choice
++
++package com.ichi2.libanki.backend.model
++
++import BackendProto.Backend
++import com.ichi2.libanki.SortOrder
++import com.ichi2.libanki.SortOrder.BuiltinSortKind.BuiltIn.*
++import BackendProto.Backend.BuiltinSearchOrder.BuiltinSortKind as BackendSortKind
++
++// Conversion functions from SortOrder to Backend.SortOrder
++
++fun SortOrder.toProtoBuf(): Backend.SortOrder {
++    val builder = Backend.SortOrder.newBuilder()
++    return when (this) {
++        is SortOrder.NoOrdering -> {
++            builder.setNone(Backend.Empty.getDefaultInstance())
++        }
++        is SortOrder.UseCollectionOrdering ->
++            builder.setFromConfig(Backend.Empty.getDefaultInstance())
++
++        is SortOrder.AfterSqlOrderBy ->
++            builder.setCustom(this.customOrdering)
++        is SortOrder.BuiltinSortKind ->
++            builder.setBuiltin(this.toProtoBuf())
++        else -> throw IllegalStateException(this.toString())
++    }.build()
++}
++
++fun SortOrder.BuiltinSortKind.toProtoBuf(): Backend.BuiltinSearchOrder {
++    val enumValue = when (this.value) {
++        NOTE_CREATION -> BackendSortKind.NOTE_CREATION
++        NOTE_MOD -> BackendSortKind.NOTE_MOD
++        NOTE_FIELD -> BackendSortKind.NOTE_FIELD
++        NOTE_TAGS -> BackendSortKind.NOTE_TAGS
++        NOTE_TYPE -> BackendSortKind.NOTE_TYPE
++        CARD_MOD -> BackendSortKind.CARD_MOD
++        CARD_REPS -> BackendSortKind.CARD_REPS
++        CARD_DUE -> BackendSortKind.CARD_DUE
++        CARD_EASE -> BackendSortKind.CARD_EASE
++        CARD_LAPSES -> BackendSortKind.CARD_LAPSES
++        CARD_INTERVAL -> BackendSortKind.CARD_INTERVAL
++        CARD_DECK -> BackendSortKind.CARD_DECK
++        CARD_TEMPLATE -> BackendSortKind.CARD_TEMPLATE
++        UNRECOGNIZED -> BackendSortKind.UNRECOGNIZED
++    }
++
++    return Backend.BuiltinSearchOrder.newBuilder()
++        .setKind(enumValue)
++        .setReverse(this.reverse)
++        .build()
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/libanki/exception/InvalidSearchException.kt b/AnkiDroid/src/main/java/com/ichi2/libanki/exception/InvalidSearchException.kt
+new file mode 100644
+index 000000000000..06b741e7826a
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/libanki/exception/InvalidSearchException.kt
+@@ -0,0 +1,19 @@
++/*
++ *  Copyright (c) 2021 David Allison <davidallisongithub@gmail.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify it under
++ *  the terms of the GNU General Public License as published by the Free Software
++ *  Foundation; either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  This program is distributed in the hope that it will be useful, but WITHOUT ANY
++ *  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++ *  PARTICULAR PURPOSE. See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with
++ *  this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++package com.ichi2.libanki.exception
++
++class InvalidSearchException(e: Exception) : IllegalArgumentException(e)

@@ -1,0 +1,1689 @@
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_file_bloc.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_file_bloc.dart
+index 703093a5ebb7a..032ae0b5e59ee 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_file_bloc.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_file_bloc.dart
+@@ -7,6 +7,8 @@ import 'package:appflowy_backend/protobuf/flowy-ai/entities.pb.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+ import 'package:freezed_annotation/freezed_annotation.dart';
+ 
++import 'chat_input_bloc.dart';
++
+ part 'chat_file_bloc.freezed.dart';
+ 
+ class ChatFileBloc extends Bloc<ChatFileEvent, ChatFileState> {
+@@ -46,9 +48,17 @@ class ChatFileBloc extends Bloc<ChatFileEvent, ChatFileState> {
+             );
+           },
+           newFile: (String filePath, String fileName) async {
++            final files = List<ChatFile>.from(state.uploadFiles);
++            files.add(ChatFile(filePath: filePath, fileName: fileName));
+             emit(
+               state.copyWith(
+-                indexFileIndicator: IndexFileIndicator.indexing(fileName),
++                uploadFiles: files,
++              ),
++            );
++
++            emit(
++              state.copyWith(
++                uploadFileIndicator: UploadFileIndicator.uploading(fileName),
+               ),
+             );
+             final payload = ChatFilePB(filePath: filePath, chatId: chatId);
+@@ -57,14 +67,14 @@ class ChatFileBloc extends Bloc<ChatFileEvent, ChatFileState> {
+                 if (!isClosed) {
+                   result.fold((_) {
+                     add(
+-                      ChatFileEvent.updateIndexFile(
+-                        IndexFileIndicator.finish(fileName),
++                      ChatFileEvent.updateUploadState(
++                        UploadFileIndicator.finish(fileName),
+                       ),
+                     );
+                   }, (err) {
+                     add(
+-                      ChatFileEvent.updateIndexFile(
+-                        IndexFileIndicator.error(err.msg),
++                      ChatFileEvent.updateUploadState(
++                        UploadFileIndicator.error(err.msg),
+                       ),
+                     );
+                   });
+@@ -83,16 +93,31 @@ class ChatFileBloc extends Bloc<ChatFileEvent, ChatFileState> {
+               ),
+             );
+           },
+-          updateIndexFile: (IndexFileIndicator indicator) {
+-            emit(
+-              state.copyWith(indexFileIndicator: indicator),
+-            );
+-          },
+           updatePluginState: (LocalAIPluginStatePB chatState) {
+             final fileEnabled = state.chatState?.fileEnabled ?? false;
+             final supportChatWithFile =
+                 fileEnabled && chatState.state == RunningStatePB.Running;
+-            emit(state.copyWith(supportChatWithFile: supportChatWithFile));
++
++            final aiType = chatState.state == RunningStatePB.Running
++                ? const AIType.localAI()
++                : const AIType.appflowyAI();
++
++            emit(
++              state.copyWith(
++                supportChatWithFile: supportChatWithFile,
++                aiType: aiType,
++              ),
++            );
++          },
++          clear: () {
++            emit(
++              state.copyWith(
++                uploadFiles: [],
++              ),
++            );
++          },
++          updateUploadState: (UploadFileIndicator indicator) {
++            emit(state.copyWith(uploadFileIndicator: indicator));
+           },
+         );
+       },
+@@ -113,27 +138,40 @@ class ChatFileEvent with _$ChatFileEvent {
+   const factory ChatFileEvent.initial() = Initial;
+   const factory ChatFileEvent.newFile(String filePath, String fileName) =
+       _NewFile;
++  const factory ChatFileEvent.clear() = _ClearFile;
++  const factory ChatFileEvent.updateUploadState(UploadFileIndicator indicator) =
++      _UpdateUploadState;
+   const factory ChatFileEvent.updateChatState(LocalAIChatPB chatState) =
+       _UpdateChatState;
+   const factory ChatFileEvent.updatePluginState(
+     LocalAIPluginStatePB chatState,
+   ) = _UpdatePluginState;
+-  const factory ChatFileEvent.updateIndexFile(IndexFileIndicator indicator) =
+-      _UpdateIndexFile;
+ }
+ 
+ @freezed
+ class ChatFileState with _$ChatFileState {
+   const factory ChatFileState({
+     @Default(false) bool supportChatWithFile,
+-    IndexFileIndicator? indexFileIndicator,
++    UploadFileIndicator? uploadFileIndicator,
+     LocalAIChatPB? chatState,
++    @Default([]) List<ChatFile> uploadFiles,
++    @Default(AIType.appflowyAI()) AIType aiType,
+   }) = _ChatFileState;
+ }
+ 
+ @freezed
+-class IndexFileIndicator with _$IndexFileIndicator {
+-  const factory IndexFileIndicator.finish(String fileName) = _Finish;
+-  const factory IndexFileIndicator.indexing(String fileName) = _Indexing;
+-  const factory IndexFileIndicator.error(String error) = _Error;
++class UploadFileIndicator with _$UploadFileIndicator {
++  const factory UploadFileIndicator.finish(String fileName) = _Finish;
++  const factory UploadFileIndicator.uploading(String fileName) = _Uploading;
++  const factory UploadFileIndicator.error(String error) = _Error;
++}
++
++class ChatFile {
++  ChatFile({
++    required this.filePath,
++    required this.fileName,
++  });
++
++  final String filePath;
++  final String fileName;
+ }
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_service.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_service.dart
+index dc2bc5dbbcdb6..6c627e56c5ab8 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_service.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/application/chat_message_service.dart
+@@ -23,7 +23,7 @@ Future<List<ChatMessageMetaPB>> metadataPBFromMetadata(
+                 ChatMessageMetaPB(
+                   id: view.id,
+                   name: view.name,
+-                  text: pb.text,
++                  data: pb.text,
+                   source: "appflowy document",
+                 ),
+               );
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
+index d33b6ac8cb399..2fb0869886d34 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/chat_page.dart
+@@ -4,10 +4,10 @@ import 'package:appflowy/generated/locale_keys.g.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_bloc.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_file_bloc.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_input_bloc.dart';
+-import 'package:appflowy/plugins/ai_chat/presentation/ai_message_bubble.dart';
+ import 'package:appflowy/plugins/ai_chat/presentation/chat_related_question.dart';
+-import 'package:appflowy/plugins/ai_chat/presentation/other_user_message_bubble.dart';
+-import 'package:appflowy/plugins/ai_chat/presentation/user_message_bubble.dart';
++import 'package:appflowy/plugins/ai_chat/presentation/message/ai_message_bubble.dart';
++import 'package:appflowy/plugins/ai_chat/presentation/message/other_user_message_bubble.dart';
++import 'package:appflowy/plugins/ai_chat/presentation/message/user_message_bubble.dart';
+ import 'package:appflowy/workspace/presentation/home/menu/sidebar/space/shared_widget.dart';
+ import 'package:appflowy/workspace/presentation/home/toast.dart';
+ import 'package:appflowy/workspace/presentation/widgets/dialogs.dart';
+@@ -79,7 +79,6 @@ class AIChatPage extends StatelessWidget {
+       return MultiBlocProvider(
+         providers: [
+           /// [ChatBloc] is used to handle chat messages including send/receive message
+-          ///
+           BlocProvider(
+             create: (_) => ChatBloc(
+               view: view,
+@@ -88,14 +87,12 @@ class AIChatPage extends StatelessWidget {
+           ),
+ 
+           /// [ChatFileBloc] is used to handle file indexing as a chat context
+-          ///
+           BlocProvider(
+-            create: (_) => ChatFileBloc(chatId: view.id.toString())
++            create: (_) => ChatFileBloc(chatId: view.id)
+               ..add(const ChatFileEvent.initial()),
+           ),
+ 
+           /// [ChatInputStateBloc] is used to handle chat input text field state
+-          ///
+           BlocProvider(
+             create: (_) =>
+                 ChatInputStateBloc()..add(const ChatInputStateEvent.started()),
+@@ -105,9 +102,9 @@ class AIChatPage extends StatelessWidget {
+         ],
+         child: BlocListener<ChatFileBloc, ChatFileState>(
+           listenWhen: (previous, current) =>
+-              previous.indexFileIndicator != current.indexFileIndicator,
++              previous.uploadFileIndicator != current.uploadFileIndicator,
+           listener: (context, state) {
+-            _handleIndexIndicator(state.indexFileIndicator, context);
++            _handleIndexIndicator(state.uploadFileIndicator, context);
+           },
+           child: BlocBuilder<ChatFileBloc, ChatFileState>(
+             builder: (context, state) {
+@@ -150,7 +147,7 @@ class AIChatPage extends StatelessWidget {
+   }
+ 
+   void _handleIndexIndicator(
+-    IndexFileIndicator? indicator,
++    UploadFileIndicator? indicator,
+     BuildContext context,
+   ) {
+     if (indicator != null) {
+@@ -161,7 +158,7 @@ class AIChatPage extends StatelessWidget {
+             LocaleKeys.chat_indexFileSuccess.tr(args: [fileName]),
+           );
+         },
+-        indexing: (fileName) {
++        uploading: (fileName) {
+           showSnackBarMessage(
+             context,
+             LocaleKeys.chat_indexingFile.tr(args: [fileName]),
+@@ -305,7 +302,7 @@ class _ChatContentPageState extends State<_ChatContentPage> {
+           // We use custom bottom widget for chat input, so
+           // do not need to handle this event.
+         },
+-        customBottomWidget: buildChatInput(blocContext),
++        customBottomWidget: buildBottom(blocContext),
+         user: _user,
+         theme: buildTheme(context),
+         onEndReached: () async {
+@@ -488,7 +485,7 @@ class _ChatContentPageState extends State<_ChatContentPage> {
+     }
+   }
+ 
+-  Widget buildChatInput(BuildContext context) {
++  Widget buildBottom(BuildContext context) {
+     return ClipRect(
+       child: Padding(
+         padding: AIChatUILayout.safeAreaInsets(context),
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_avatar.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_avatar.dart
+index b91d4e10994e2..c9f1422900883 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_avatar.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_avatar.dart
+@@ -8,6 +8,8 @@ import 'package:flowy_infra/size.dart';
+ import 'package:flowy_infra_ui/style_widget/text.dart';
+ import 'package:string_validator/string_validator.dart';
+ 
++const defaultAvatarSize = 30.0;
++
+ class ChatChatUserAvatar extends StatelessWidget {
+   const ChatChatUserAvatar({required this.userId, super.key});
+ 
+@@ -33,15 +35,18 @@ class ChatBorderedCircleAvatar extends StatelessWidget {
+ 
+   @override
+   Widget build(BuildContext context) {
+-    return CircleAvatar(
+-      backgroundColor: border.color,
+-      child: ConstrainedBox(
+-        constraints: const BoxConstraints.expand(),
+-        child: CircleAvatar(
+-          backgroundImage: backgroundImage,
+-          backgroundColor:
+-              Theme.of(context).colorScheme.surfaceContainerHighest,
+-          child: child,
++    return SizedBox(
++      width: defaultAvatarSize,
++      child: CircleAvatar(
++        backgroundColor: border.color,
++        child: ConstrainedBox(
++          constraints: const BoxConstraints.expand(),
++          child: CircleAvatar(
++            backgroundImage: backgroundImage,
++            backgroundColor:
++                Theme.of(context).colorScheme.surfaceContainerHighest,
++            child: child,
++          ),
+         ),
+       ),
+     );
+@@ -53,7 +58,7 @@ class ChatUserAvatar extends StatelessWidget {
+     super.key,
+     required this.iconUrl,
+     required this.name,
+-    required this.size,
++    this.size = defaultAvatarSize,
+     this.isHovering = false,
+     this.defaultName,
+   });
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_attachment.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_attachment.dart
+new file mode 100644
+index 0000000000000..13cbbadfb100f
+--- /dev/null
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_attachment.dart
+@@ -0,0 +1,30 @@
++import 'package:flutter/material.dart';
++import 'package:appflowy/generated/flowy_svgs.g.dart';
++import 'package:appflowy/generated/locale_keys.g.dart';
++import 'package:easy_localization/easy_localization.dart';
++import 'package:flowy_infra/theme_extension.dart';
++import 'package:flowy_infra_ui/style_widget/icon_button.dart';
++import 'package:flowy_infra_ui/widget/flowy_tooltip.dart';
++
++class ChatInputAttachment extends StatelessWidget {
++  const ChatInputAttachment({required this.onTap, super.key});
++
++  final VoidCallback onTap;
++
++  @override
++  Widget build(BuildContext context) {
++    return FlowyTooltip(
++      message: LocaleKeys.chat_uploadFile.tr(),
++      child: FlowyIconButton(
++        hoverColor: AFThemeExtension.of(context).lightGreyHover,
++        radius: BorderRadius.circular(18),
++        icon: FlowySvg(
++          FlowySvgs.ai_attachment_s,
++          size: const Size.square(20),
++          color: Theme.of(context).colorScheme.primary,
++        ),
++        onPressed: onTap,
++      ),
++    );
++  }
++}
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input.dart
+index 92b911c406059..86eedc786cdad 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_input.dart
+@@ -1,28 +1,31 @@
++import 'package:appflowy/plugins/ai_chat/application/chat_file_bloc.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_input_action_bloc.dart';
+-import 'package:appflowy/plugins/ai_chat/application/chat_input_action_control.dart';
+ import 'package:appflowy/plugins/ai_chat/application/chat_input_bloc.dart';
+ import 'package:appflowy/plugins/ai_chat/presentation/chat_input_action_menu.dart';
++import 'package:appflowy/plugins/ai_chat/application/chat_input_action_control.dart';
+ import 'package:appflowy/plugins/document/presentation/editor_plugins/mention/mobile_page_selector_sheet.dart';
++import 'package:appflowy/startup/startup.dart';
+ import 'package:appflowy/workspace/application/view/view_ext.dart';
+ import 'package:extended_text_field/extended_text_field.dart';
++import 'package:flowy_infra/file_picker/file_picker_service.dart';
+ import 'package:flowy_infra/platform_extension.dart';
+ import 'package:flowy_infra/theme_extension.dart';
+-import 'package:flowy_infra_ui/widget/spacing.dart';
+ import 'package:flutter/foundation.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter/services.dart';
++import 'package:flutter_bloc/flutter_bloc.dart';
+ import 'package:flutter_chat_types/flutter_chat_types.dart' as types;
+ import 'package:flutter_chat_ui/flutter_chat_ui.dart';
+ 
+ import 'chat_at_button.dart';
+-import 'chat_input_span.dart';
++import 'chat_attachment.dart';
+ import 'chat_send_button.dart';
++import 'chat_input_span.dart';
+ 
+ class ChatInput extends StatefulWidget {
+   /// Creates [ChatInput] widget.
+   const ChatInput({
+     super.key,
+-    this.isAttachmentUploading,
+     this.onAttachmentPressed,
+     required this.onSendPressed,
+     required this.chatId,
+@@ -33,7 +36,6 @@ class ChatInput extends StatefulWidget {
+     required this.aiType,
+   });
+ 
+-  final bool? isAttachmentUploading;
+   final VoidCallback? onAttachmentPressed;
+   final void Function(types.PartialText) onSendPressed;
+   final void Function() onStopStreaming;
+@@ -81,11 +83,16 @@ class _ChatInputState extends State<ChatInput> {
+       },
+     );
+ 
++    _inputFocusNode.addListener(() {
++      setState(() {});
++    });
++
+     _inputActionControl = ChatInputActionControl(
+       chatId: widget.chatId,
+       textController: _textController,
+       textFieldFocusNode: _inputFocusNode,
+     );
++    _inputFocusNode.requestFocus();
+     _handleSendButtonVisibilityModeChange();
+   }
+ 
+@@ -101,7 +108,6 @@ class _ChatInputState extends State<ChatInput> {
+   Widget build(BuildContext context) {
+     const buttonPadding = EdgeInsets.symmetric(horizontal: 2);
+     const inputPadding = EdgeInsets.all(6);
+-
+     final textPadding = isMobile
+         ? const EdgeInsets.only(left: 8.0, right: 4.0)
+         : const EdgeInsets.symmetric(horizontal: 16);
+@@ -109,32 +115,38 @@ class _ChatInputState extends State<ChatInput> {
+     final color = isMobile
+         ? Colors.transparent
+         : Theme.of(context).colorScheme.surfaceContainerHighest;
+-    final elevation = isMobile ? 0.0 : 0.6;
+-    final space = isMobile ? 8.0 : 14.0;
+ 
+-    return Focus(
+-      child: Padding(
+-        padding: inputPadding,
++    return Padding(
++      padding: inputPadding,
++      // ignore: use_decorated_box
++      child: Container(
++        decoration: BoxDecoration(
++          border: Border.all(
++            color: _inputFocusNode.hasFocus
++                ? Theme.of(context).colorScheme.primary.withOpacity(0.6)
++                : Colors.transparent,
++          ),
++          borderRadius: borderRadius,
++        ),
+         child: Material(
+           borderRadius: borderRadius,
+           color: color,
+-          elevation: elevation,
+-          child: Row(
+-            children: [
+-              if (widget.onAttachmentPressed != null)
+-                AttachmentButton(
+-                  isLoading: widget.isAttachmentUploading ?? false,
+-                  onPressed: widget.onAttachmentPressed,
+-                  padding: buttonPadding,
+-                ),
+-              Expanded(
+-                child: _inputTextField(context, textPadding),
+-              ),
+-              if (widget.aiType == const AIType.appflowyAI())
+-                _atButton(buttonPadding),
+-              _sendButton(buttonPadding),
+-              HSpace(space),
+-            ],
++          child: Padding(
++            padding: const EdgeInsets.symmetric(horizontal: 10),
++            child: Row(
++              children: [
++                // TODO(lucas): support mobile
++                if (PlatformExtension.isDesktop &&
++                    widget.aiType == const AIType.localAI())
++                  _attachmentButton(buttonPadding),
++                Expanded(child: _inputTextField(context, textPadding)),
++
++                if (PlatformExtension.isDesktop &&
++                    widget.aiType == const AIType.appflowyAI())
++                  _atButton(buttonPadding),
++                _sendButton(buttonPadding),
++              ],
++            ),
+           ),
+         ),
+       ),
+@@ -282,20 +294,54 @@ class _ChatInputState extends State<ChatInput> {
+   Widget _sendButton(EdgeInsets buttonPadding) {
+     return Padding(
+       padding: buttonPadding,
+-      child: ChatInputSendButton(
+-        onSendPressed: () {
+-          if (!_sendButtonEnabled) {
+-            return;
+-          }
++      child: SizedBox.square(
++        dimension: 26,
++        child: ChatInputSendButton(
++          onSendPressed: () {
++            if (!_sendButtonEnabled) {
++              return;
++            }
++
++            if (!widget.isStreaming) {
++              widget.onStopStreaming();
++              _handleSendPressed();
++            }
++          },
++          onStopStreaming: () => widget.onStopStreaming(),
++          isStreaming: widget.isStreaming,
++          enabled: _sendButtonEnabled,
++        ),
++      ),
++    );
++  }
+ 
+-          if (!widget.isStreaming) {
+-            widget.onStopStreaming();
+-            _handleSendPressed();
+-          }
+-        },
+-        onStopStreaming: () => widget.onStopStreaming(),
+-        isStreaming: widget.isStreaming,
+-        enabled: _sendButtonEnabled,
++  Widget _attachmentButton(EdgeInsets buttonPadding) {
++    return Padding(
++      padding: buttonPadding,
++      child: SizedBox.square(
++        dimension: 26,
++        child: ChatInputAttachment(
++          onTap: () async {
++            final path = await getIt<FilePickerService>().pickFiles(
++              dialogTitle: '',
++              type: FileType.custom,
++              allowedExtensions: ["pdf"],
++            );
++            if (path == null) {
++              return;
++            }
++
++            for (final file in path.files) {
++              if (file.path != null) {
++                if (mounted) {
++                  context
++                      .read<ChatFileBloc>()
++                      .add(ChatFileEvent.newFile(file.path!, file.name));
++                }
++              }
++            }
++          },
++        ),
+       ),
+     );
+   }
+@@ -303,14 +349,17 @@ class _ChatInputState extends State<ChatInput> {
+   Widget _atButton(EdgeInsets buttonPadding) {
+     return Padding(
+       padding: buttonPadding,
+-      child: ChatInputAtButton(
+-        onTap: () {
+-          _textController.text += '@';
+-          if (!isMobile) {
+-            _inputFocusNode.requestFocus();
+-          }
+-          _handleOnTextChange(context, _textController.text);
+-        },
++      child: SizedBox.square(
++        dimension: 26,
++        child: ChatInputAtButton(
++          onTap: () {
++            _textController.text += '@';
++            if (!isMobile) {
++              _inputFocusNode.requestFocus();
++            }
++            _handleOnTextChange(context, _textController.text);
++          },
++        ),
+       ),
+     );
+   }
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_send_button.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_send_button.dart
+index d3c7a11606ea6..33c9e47b02e39 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_send_button.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/chat_input/chat_send_button.dart
+@@ -38,7 +38,7 @@ class ChatInputSendButton extends StatelessWidget {
+         radius: BorderRadius.circular(18),
+         icon: FlowySvg(
+           FlowySvgs.send_s,
+-          size: const Size.square(20),
++          size: const Size.square(14),
+           color: enabled ? Theme.of(context).colorScheme.primary : null,
+         ),
+         onPressed: onSendPressed,
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/ai_message_bubble.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_message_bubble.dart
+similarity index 96%
+rename from frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/ai_message_bubble.dart
+rename to frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_message_bubble.dart
+index 5ce43f8182ba0..3e29af1a624c7 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/ai_message_bubble.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_message_bubble.dart
+@@ -49,8 +49,9 @@ class ChatAIMessageBubble extends StatelessWidget {
+       children: [
+         const ChatBorderedCircleAvatar(
+           child: FlowySvg(
+-            FlowySvgs.flowy_ai_chat_logo_s,
+-            size: Size.square(24),
++            FlowySvgs.flowy_logo_s,
++            size: Size.square(20),
++            blendMode: null,
+           ),
+         ),
+         Expanded(child: widget),
+@@ -177,10 +178,9 @@ class CopyButton extends StatelessWidget {
+         width: 24,
+         hoverColor: AFThemeExtension.of(context).lightGreyHover,
+         fillColor: Theme.of(context).cardColor,
+-        icon: FlowySvg(
+-          FlowySvgs.ai_copy_s,
+-          size: const Size.square(14),
+-          color: Theme.of(context).colorScheme.primary,
++        icon: const FlowySvg(
++          FlowySvgs.copy_s,
++          size: Size.square(20),
+         ),
+         onPressed: () async {
+           final document = customMarkdownToDocument(textMessage.text);
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_metadata.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_metadata.dart
+index 3b3f06114b557..f807d84c96289 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_metadata.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/ai_metadata.dart
+@@ -51,9 +51,7 @@ class AIMessageMetadata extends StatelessWidget {
+                         fontSize: 14,
+                       ),
+                     ),
+-                    onTap: () {
+-                      onSelectedMetadata(m);
+-                    },
++                    onTap: () => onSelectedMetadata(m),
+                   ),
+                 ),
+               )
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/other_user_message_bubble.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/other_user_message_bubble.dart
+similarity index 99%
+rename from frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/other_user_message_bubble.dart
+rename to frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/other_user_message_bubble.dart
+index 676df936c1237..899c0bec3cc2d 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/other_user_message_bubble.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/other_user_message_bubble.dart
+@@ -64,7 +64,6 @@ class OtherUserMessageBubble extends StatelessWidget {
+             return ChatUserAvatar(
+               iconUrl: member?.info.avatarUrl ?? "",
+               name: member?.info.name ?? "",
+-              size: 36,
+               defaultName: "",
+             );
+           },
+diff --git a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/user_message_bubble.dart b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/user_message_bubble.dart
+similarity index 99%
+rename from frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/user_message_bubble.dart
+rename to frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/user_message_bubble.dart
+index 9374af8a7b1c5..e0cdc455629a4 100644
+--- a/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/user_message_bubble.dart
++++ b/frontend/appflowy_flutter/lib/plugins/ai_chat/presentation/message/user_message_bubble.dart
+@@ -68,7 +68,6 @@ class ChatUserMessageBubble extends StatelessWidget {
+               child: ChatUserAvatar(
+                 iconUrl: member?.info.avatarUrl ?? "",
+                 name: member?.info.name ?? "",
+-                size: 36,
+               ),
+             ),
+           ],
+diff --git a/frontend/appflowy_tauri/src-tauri/Cargo.lock b/frontend/appflowy_tauri/src-tauri/Cargo.lock
+index e81c73782617c..2f5b138d61d20 100644
+--- a/frontend/appflowy_tauri/src-tauri/Cargo.lock
++++ b/frontend/appflowy_tauri/src-tauri/Cargo.lock
+@@ -172,7 +172,7 @@ checksum = "b3d1d046238990b9cf5bcde22a3fb3584ee5cf65fb2765f454ed428c7a0063da"
+ [[package]]
+ name = "app-error"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "bincode",
+@@ -192,7 +192,7 @@ dependencies = [
+ [[package]]
+ name = "appflowy-ai-client"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -423,7 +423,7 @@ dependencies = [
+  "bitflags 2.4.0",
+  "cexpr",
+  "clang-sys",
+- "itertools 0.12.1",
++ "itertools 0.10.5",
+  "lazy_static",
+  "lazycell",
+  "proc-macro2",
+@@ -826,7 +826,7 @@ dependencies = [
+ [[package]]
+ name = "client-api"
+ version = "0.2.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "again",
+  "anyhow",
+@@ -876,7 +876,7 @@ dependencies = [
+ [[package]]
+ name = "client-api-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "collab-entity",
+  "collab-rt-entity",
+@@ -888,7 +888,7 @@ dependencies = [
+ [[package]]
+ name = "client-websocket"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "futures-channel",
+  "futures-util",
+@@ -1132,7 +1132,7 @@ dependencies = [
+ [[package]]
+ name = "collab-rt-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "bincode",
+@@ -1157,7 +1157,7 @@ dependencies = [
+ [[package]]
+ name = "collab-rt-protocol"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "async-trait",
+@@ -1532,7 +1532,7 @@ checksum = "c2e66c9d817f1720209181c316d28635c050fa304f9c79e47a520882661b7308"
+ [[package]]
+ name = "database-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "app-error",
+@@ -3051,7 +3051,7 @@ dependencies = [
+ [[package]]
+ name = "gotrue"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "futures-util",
+@@ -3068,7 +3068,7 @@ dependencies = [
+ [[package]]
+ name = "gotrue-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "app-error",
+@@ -3500,7 +3500,7 @@ dependencies = [
+ [[package]]
+ name = "infra"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -6098,7 +6098,7 @@ dependencies = [
+ [[package]]
+ name = "shared-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "app-error",
+diff --git a/frontend/appflowy_tauri/src-tauri/Cargo.toml b/frontend/appflowy_tauri/src-tauri/Cargo.toml
+index cdfd51ef4fd59..103ea91b328d3 100644
+--- a/frontend/appflowy_tauri/src-tauri/Cargo.toml
++++ b/frontend/appflowy_tauri/src-tauri/Cargo.toml
+@@ -53,7 +53,7 @@ collab-user = { version = "0.2" }
+ # Run the script:
+ # scripts/tool/update_client_api_rev.sh  new_rev_id
+ # ⚠️⚠️⚠️️
+-client-api = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "40bd6b784eced6fe43c95941420b3ce444b0a60c" }
++client-api = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "30c7acce96f1a7b8865c05e70b6e525eaa286b37" }
+ 
+ [dependencies]
+ serde_json.workspace = true
+diff --git a/frontend/appflowy_web_app/src-tauri/Cargo.lock b/frontend/appflowy_web_app/src-tauri/Cargo.lock
+index 2af380a87a292..9f8bf03b05a09 100644
+--- a/frontend/appflowy_web_app/src-tauri/Cargo.lock
++++ b/frontend/appflowy_web_app/src-tauri/Cargo.lock
+@@ -163,7 +163,7 @@ checksum = "b3d1d046238990b9cf5bcde22a3fb3584ee5cf65fb2765f454ed428c7a0063da"
+ [[package]]
+ name = "app-error"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "bincode",
+@@ -183,7 +183,7 @@ dependencies = [
+ [[package]]
+ name = "appflowy-ai-client"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -800,7 +800,7 @@ dependencies = [
+ [[package]]
+ name = "client-api"
+ version = "0.2.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "again",
+  "anyhow",
+@@ -850,7 +850,7 @@ dependencies = [
+ [[package]]
+ name = "client-api-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "collab-entity",
+  "collab-rt-entity",
+@@ -862,7 +862,7 @@ dependencies = [
+ [[package]]
+ name = "client-websocket"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "futures-channel",
+  "futures-util",
+@@ -1115,7 +1115,7 @@ dependencies = [
+ [[package]]
+ name = "collab-rt-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "bincode",
+@@ -1140,7 +1140,7 @@ dependencies = [
+ [[package]]
+ name = "collab-rt-protocol"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "async-trait",
+@@ -1411,7 +1411,7 @@ dependencies = [
+  "cssparser-macros",
+  "dtoa-short",
+  "itoa 1.0.10",
+- "phf 0.11.2",
++ "phf 0.8.0",
+  "smallvec",
+ ]
+ 
+@@ -1522,7 +1522,7 @@ checksum = "7e962a19be5cfc3f3bf6dd8f61eb50107f356ad6270fbb3ed41476571db78be5"
+ [[package]]
+ name = "database-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "app-error",
+@@ -3118,7 +3118,7 @@ dependencies = [
+ [[package]]
+ name = "gotrue"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "futures-util",
+@@ -3135,7 +3135,7 @@ dependencies = [
+ [[package]]
+ name = "gotrue-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "app-error",
+@@ -3572,7 +3572,7 @@ dependencies = [
+ [[package]]
+ name = "infra"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -6162,7 +6162,7 @@ dependencies = [
+ [[package]]
+ name = "shared-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "app-error",
+diff --git a/frontend/appflowy_web_app/src-tauri/Cargo.toml b/frontend/appflowy_web_app/src-tauri/Cargo.toml
+index 20a052adb058a..7815cbbe03dd2 100644
+--- a/frontend/appflowy_web_app/src-tauri/Cargo.toml
++++ b/frontend/appflowy_web_app/src-tauri/Cargo.toml
+@@ -52,7 +52,7 @@ collab-user = { version = "0.2" }
+ # Run the script:
+ # scripts/tool/update_client_api_rev.sh  new_rev_id
+ # ⚠️⚠️⚠️️
+-client-api = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "40bd6b784eced6fe43c95941420b3ce444b0a60c" }
++client-api = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "30c7acce96f1a7b8865c05e70b6e525eaa286b37" }
+ 
+ [dependencies]
+ serde_json.workspace = true
+diff --git a/frontend/resources/flowy_icons/16x/ai_attachment.svg b/frontend/resources/flowy_icons/16x/ai_attachment.svg
+new file mode 100644
+index 0000000000000..60a3cd5177efa
+--- /dev/null
++++ b/frontend/resources/flowy_icons/16x/ai_attachment.svg
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="-0.5 -0.5 13.2 13.2" id="Paperclip-1--Streamline-Flex.svg" height="13.2" width="13.2"><desc>Paperclip 1 Streamline Icon: https://streamlinehq.com</desc><g id="paperclip-1--attachment-link-paperclip-unlink"><path id="Vector 201" stroke="#000000" stroke-linecap="round" stroke-linejoin="round" d="M6.100165571428572 4.376418857142857 3.9434931428571427 6.5331c-0.5104741428571429 0.5104654285714285 -0.5104741428571429 1.3381047142857143 0 1.848578857142857 0.5104654285714285 0.5104654285714285 1.3381047142857143 0.5104654285714285 1.848578857142857 0l3.5431065714285714 -3.5431152857142862c0.935827142857143 -0.935862 0.935827142857143 -2.4531934285714287 0 -3.3890554285714285 -0.935862 -0.935866357142857 -2.453202142857143 -0.935866357142857 -3.389064142857143 0L2.0949055714285714 5.300708285714285c-1.3612516000000001 1.3612585714285714 -1.3612524714285714 3.568256 0 4.929514571428571 1.3612585714285714 1.3612585714285714 3.5682908571428573 1.3612585714285714 4.929549428571429 0l4.313353571428571 -4.313318714285714" stroke-width="1"></path></g></svg>
+\ No newline at end of file
+diff --git a/frontend/resources/flowy_icons/16x/flowy_logo.svg b/frontend/resources/flowy_icons/16x/flowy_logo.svg
+new file mode 100644
+index 0000000000000..96af87f8ffbd6
+--- /dev/null
++++ b/frontend/resources/flowy_icons/16x/flowy_logo.svg
+@@ -0,0 +1,12 @@
++<svg width="30" height="30" viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg">
++<path d="M28.992 17.8574C28.9896 17.8574 28.9875 17.8592 28.987 17.8615C28.1826 22.2013 24.675 26.0049 20.6109 28.137C20.1001 28.4039 19.9667 28.5512 19.3938 28.5972H27.566C27.7515 28.604 27.9364 28.5733 28.1098 28.507C28.2832 28.4407 28.4414 28.3401 28.575 28.2112C28.7086 28.0823 28.8148 27.9278 28.8873 27.757C28.9598 27.5861 28.9971 27.4024 28.997 27.2168V17.8624C28.997 17.8597 28.9948 17.8574 28.992 17.8574V17.8574Z" fill="#F7931E"/>
++<path d="M20.0057 28.3418C19.8387 28.3533 19.6711 28.3533 19.5042 28.3418H20.0057Z" fill="#FFCE00"/>
++<path d="M11.797 9.47252C11.6728 9.57605 11.5485 9.67038 11.422 9.76011C9.33523 11.228 2.96683 15.9859 1.52888 13.9382C0.11624 11.9274 1.60481 6.2239 5.27216 3.47684C5.34118 3.42163 5.4102 3.37101 5.48152 3.32269C9.45947 0.525018 12.4366 0.911539 13.8838 2.96148C15.2274 4.88488 13.7158 7.90343 11.797 9.47252Z" fill="#8427E0"/>
++<path d="M27.3635 13.8847C25.394 15.2651 22.2858 13.6546 20.7443 11.6737C20.6822 11.5931 20.6224 11.5126 20.5648 11.4298C19.097 9.33614 14.3437 2.96774 16.3867 1.52749C18.4298 0.0872391 24.3196 1.65863 27.0022 5.48013C27.0621 5.56525 27.1196 5.64808 27.1748 5.73091C29.7838 9.58691 29.3674 12.4674 27.3635 13.8847Z" fill="#00B5FF"/>
++<path d="M24.7268 26.4382C24.6578 26.4919 24.5888 26.5425 24.5198 26.59C20.5395 29.3877 17.5624 28.9989 16.1221 26.9512C14.7716 25.0278 16.2809 22.0162 18.1928 20.4402C18.317 20.3367 18.4436 20.24 18.5701 20.1503C20.6569 18.6848 27.0253 13.9384 28.4632 15.9745C29.8851 17.983 28.3965 23.6911 24.7268 26.4382Z" fill="#FFBD00"/>
++<path d="M13.6143 28.3827C11.5644 29.8207 5.68145 28.247 2.99651 24.4278L2.83776 24.1977C0.214941 20.3302 0.629071 17.452 2.6376 16.0417C4.60472 14.6612 7.71299 16.2717 9.25447 18.2504C9.31659 18.3309 9.37641 18.4114 9.43623 18.4942C10.9041 20.5833 15.662 26.9517 13.6143 28.3827Z" fill="#E3006D"/>
++<path d="M13.9434 6.64539C13.2413 8.20966 11.9657 9.44491 10.3796 10.0965C7.30357 11.3918 2.78725 13.0368 2.00961 11.2468C1.24807 9.48678 2.65611 5.90225 5.26973 3.47729L5.32495 3.43128C9.38342 0.513965 12.4181 0.886682 13.8836 2.96193C14.6084 4.00416 14.5002 5.37309 13.9434 6.64539Z" fill="#9327FF"/>
++<path d="M27.3632 13.8805C26.2956 14.6305 24.8945 14.4994 23.59 13.9081C22.0248 13.1796 20.7922 11.8871 20.1389 10.2891C18.8666 7.2084 17.3136 2.83703 19.0668 2.0801C20.9074 1.28405 24.7565 2.86924 27.1745 5.72674C29.7835 9.58275 29.3671 12.4633 27.3632 13.8805Z" fill="#00C8FF"/>
++<path d="M24.7266 26.4401L24.6805 26.4769C20.6198 29.3988 17.5805 29.0284 16.1219 26.9532C15.3902 25.911 15.4984 24.5489 16.0551 23.272C16.7565 21.7072 18.0324 20.4717 19.619 19.8209C22.6927 18.5233 27.2113 16.8806 27.989 18.6706C28.7666 20.4605 27.3425 24.006 24.7266 26.4401Z" fill="#FFCE00"/>
++<path d="M10.934 27.8297C9.09342 28.6235 5.25812 27.0475 2.83776 24.1992C0.214941 20.3248 0.629071 17.4466 2.6376 16.0362C3.70283 15.2862 5.10397 15.415 6.40848 16.0063C7.97135 16.7389 9.19984 18.0348 9.84806 19.6345C11.1227 22.6922 12.6871 27.0682 10.934 27.8297Z" fill="#FB006D"/>
++</svg>
+diff --git a/frontend/resources/flowy_icons/16x/send.svg b/frontend/resources/flowy_icons/16x/send.svg
+index a5f933a8ca3d0..b141b255b0a03 100644
+--- a/frontend/resources/flowy_icons/16x/send.svg
++++ b/frontend/resources/flowy_icons/16x/send.svg
+@@ -1,3 +1 @@
+-<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+-<path d="M7.19048 8.71739L8.77817 12.3415C8.96008 12.7567 9.55634 12.735 9.70752 12.3076L12.6399 4.01804C12.7819 3.61644 12.3889 3.2325 11.9907 3.38397L4.1181 6.37898C3.7032 6.53683 3.68442 7.1168 4.08824 7.30115L7.19048 8.71739ZM7.19048 8.71739L8.89286 7.16304" stroke="#333333" stroke-linecap="round" stroke-linejoin="round"/>
+-</svg>
++<svg viewBox="-0.5 -0.5 13.2 13.2" fill="none" xmlns="http://www.w3.org/2000/svg" id="Arrow-Up--Streamline-Radix.svg" height="13.2" width="13.2"><desc>Arrow Up Streamline Icon: https://streamlinehq.com</desc><path fill-rule="evenodd" clip-rule="evenodd" d="M5.7157 0.2811693333333333C5.92798 0.06897066666666667 6.27202 0.06897066666666667 6.4843 0.2811693333333333L10.831973333333334 4.628842666666667C11.044090666666666 4.841041333333333 11.044090666666666 5.185162666666667 10.831973333333334 5.3973613333333335C10.619693333333334 5.609641333333333 10.275572 5.609641333333333 10.063292 5.3973613333333335L6.643469333333334 1.9774573333333332V11.534530666666667C6.643469333333334 11.834650666666667 6.40012 12.078 6.1000000000000005 12.078S5.556530666666667 11.834650666666667 5.556530666666667 11.534530666666667V1.9774573333333332L2.1366266666666665 5.3973613333333335C1.924428 5.609641333333333 1.5803066666666667 5.609641333333333 1.3681079999999999 5.3973613333333335C1.155828 5.185162666666667 1.155828 4.841041333333333 1.3681079999999999 4.628842666666667L5.7157 0.2811693333333333Z" stroke="#333333" fill="#333333" stroke-width="1"></path></svg>
+\ No newline at end of file
+diff --git a/frontend/resources/translations/en.json b/frontend/resources/translations/en.json
+index 49a40c640d1be..c39d31392e7f0 100644
+--- a/frontend/resources/translations/en.json
++++ b/frontend/resources/translations/en.json
+@@ -177,6 +177,7 @@
+     "referenceSource": "{} source found",
+     "referenceSources": "{} sources found",
+     "clickToMention": "Click to mention a page",
++    "uploadFile": "Upload PDFs, md or txt files to chat with",
+     "indexingFile": "Indexing {}"
+   },
+   "trash": {
+@@ -2377,4 +2378,4 @@
+     "commentAddedSuccessfully": "Comment added successfully.",
+     "commentAddedSuccessTip": "You've just added or replied to a comment. Would you like to jump to the top to see the latest comments?"
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/frontend/rust-lib/Cargo.lock b/frontend/rust-lib/Cargo.lock
+index adf338ec7bd1f..9d993c5e22016 100644
+--- a/frontend/rust-lib/Cargo.lock
++++ b/frontend/rust-lib/Cargo.lock
+@@ -163,7 +163,7 @@ checksum = "b3d1d046238990b9cf5bcde22a3fb3584ee5cf65fb2765f454ed428c7a0063da"
+ [[package]]
+ name = "app-error"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "bincode",
+@@ -183,7 +183,7 @@ dependencies = [
+ [[package]]
+ name = "appflowy-ai-client"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -718,7 +718,7 @@ dependencies = [
+ [[package]]
+ name = "client-api"
+ version = "0.2.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "again",
+  "anyhow",
+@@ -768,7 +768,7 @@ dependencies = [
+ [[package]]
+ name = "client-api-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "collab-entity",
+  "collab-rt-entity",
+@@ -780,7 +780,7 @@ dependencies = [
+ [[package]]
+ name = "client-websocket"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "futures-channel",
+  "futures-util",
+@@ -993,7 +993,7 @@ dependencies = [
+ [[package]]
+ name = "collab-rt-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "bincode",
+@@ -1018,7 +1018,7 @@ dependencies = [
+ [[package]]
+ name = "collab-rt-protocol"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "async-trait",
+@@ -1256,7 +1256,7 @@ dependencies = [
+  "cssparser-macros",
+  "dtoa-short",
+  "itoa",
+- "phf 0.8.0",
++ "phf 0.11.2",
+  "smallvec",
+ ]
+ 
+@@ -1356,7 +1356,7 @@ checksum = "c2e66c9d817f1720209181c316d28635c050fa304f9c79e47a520882661b7308"
+ [[package]]
+ name = "database-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "app-error",
+@@ -2730,7 +2730,7 @@ dependencies = [
+ [[package]]
+ name = "gotrue"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "futures-util",
+@@ -2747,7 +2747,7 @@ dependencies = [
+ [[package]]
+ name = "gotrue-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "app-error",
+@@ -3112,7 +3112,7 @@ dependencies = [
+ [[package]]
+ name = "infra"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -4068,7 +4068,7 @@ version = "0.8.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "3dfb61232e34fcb633f43d12c58f83c1df82962dcdfa565a4e866ffc17dafe12"
+ dependencies = [
+- "phf_macros",
++ "phf_macros 0.8.0",
+  "phf_shared 0.8.0",
+  "proc-macro-hack",
+ ]
+@@ -4088,6 +4088,7 @@ version = "0.11.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ade2d8b8f33c7333b51bcf0428d37e217e9f32192ae4772156f65063b8ce03dc"
+ dependencies = [
++ "phf_macros 0.11.2",
+  "phf_shared 0.11.2",
+ ]
+ 
+@@ -4155,6 +4156,19 @@ dependencies = [
+  "syn 1.0.109",
+ ]
+ 
++[[package]]
++name = "phf_macros"
++version = "0.11.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3444646e286606587e49f3bcf1679b8cef1dc2c5ecc29ddacaffc305180d464b"
++dependencies = [
++ "phf_generator 0.11.2",
++ "phf_shared 0.11.2",
++ "proc-macro2",
++ "quote",
++ "syn 2.0.47",
++]
++
+ [[package]]
+ name = "phf_shared"
+ version = "0.8.0"
+@@ -5307,7 +5321,7 @@ dependencies = [
+ [[package]]
+ name = "shared-entity"
+ version = "0.1.0"
+-source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=40bd6b784eced6fe43c95941420b3ce444b0a60c#40bd6b784eced6fe43c95941420b3ce444b0a60c"
++source = "git+https://github.com/AppFlowy-IO/AppFlowy-Cloud?rev=30c7acce96f1a7b8865c05e70b6e525eaa286b37#30c7acce96f1a7b8865c05e70b6e525eaa286b37"
+ dependencies = [
+  "anyhow",
+  "app-error",
+diff --git a/frontend/rust-lib/Cargo.toml b/frontend/rust-lib/Cargo.toml
+index ac2666ddc49ef..8fd538c6fbcaf 100644
+--- a/frontend/rust-lib/Cargo.toml
++++ b/frontend/rust-lib/Cargo.toml
+@@ -99,8 +99,8 @@ zip = "2.1.3"
+ # Run the script.add_workspace_members:
+ # scripts/tool/update_client_api_rev.sh  new_rev_id
+ # ⚠️⚠️⚠️️
+-client-api = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "40bd6b784eced6fe43c95941420b3ce444b0a60c" }
+-client-api-entity = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "40bd6b784eced6fe43c95941420b3ce444b0a60c" }
++client-api = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "30c7acce96f1a7b8865c05e70b6e525eaa286b37" }
++client-api-entity = { git = "https://github.com/AppFlowy-IO/AppFlowy-Cloud", rev = "30c7acce96f1a7b8865c05e70b6e525eaa286b37" }
+ 
+ [profile.dev]
+ opt-level = 0
+diff --git a/frontend/rust-lib/flowy-ai-pub/src/cloud.rs b/frontend/rust-lib/flowy-ai-pub/src/cloud.rs
+index 8d7932dc01f9b..2793cd18a633e 100644
+--- a/frontend/rust-lib/flowy-ai-pub/src/cloud.rs
++++ b/frontend/rust-lib/flowy-ai-pub/src/cloud.rs
+@@ -12,7 +12,7 @@ use flowy_error::FlowyError;
+ use futures::stream::BoxStream;
+ use lib_infra::async_trait::async_trait;
+ use lib_infra::future::FutureResult;
+-use std::path::PathBuf;
++use std::path::Path;
+ 
+ pub type ChatMessageStream = BoxStream<'static, Result<ChatMessage, AppResponseError>>;
+ pub type StreamAnswer = BoxStream<'static, Result<QuestionStreamValue, FlowyError>>;
+@@ -83,7 +83,7 @@ pub trait ChatCloudService: Send + Sync + 'static {
+   async fn index_file(
+     &self,
+     workspace_id: &str,
+-    file_path: PathBuf,
++    file_path: &Path,
+     chat_id: &str,
+   ) -> Result<(), FlowyError>;
+ 
+diff --git a/frontend/rust-lib/flowy-ai/src/ai_manager.rs b/frontend/rust-lib/flowy-ai/src/ai_manager.rs
+index c0ae334f9fad4..424b141e4d80f 100644
+--- a/frontend/rust-lib/flowy-ai/src/ai_manager.rs
++++ b/frontend/rust-lib/flowy-ai/src/ai_manager.rs
+@@ -1,22 +1,19 @@
+ use crate::chat::Chat;
+ use crate::entities::{
+-  ChatMessageListPB, ChatMessagePB, CreateChatContextPB, RepeatedRelatedQuestionPB,
++  ChatInfoPB, ChatMessageListPB, ChatMessagePB, FilePB, RepeatedRelatedQuestionPB,
+ };
+ use crate::local_ai::local_llm_chat::LocalAIController;
+ use crate::middleware::chat_service_mw::AICloudServiceMiddleware;
+-use crate::persistence::{insert_chat, ChatTable};
++use crate::persistence::{insert_chat, read_chat_metadata, ChatTable};
+ 
+ use appflowy_plugin::manager::PluginManager;
+ use dashmap::DashMap;
+-use flowy_ai_pub::cloud::{
+-  ChatCloudService, ChatMessageMetadata, ChatMessageType, CreateTextChatContext,
+-};
++use flowy_ai_pub::cloud::{ChatCloudService, ChatMessageMetadata, ChatMessageType};
+ use flowy_error::{FlowyError, FlowyResult};
+ use flowy_sqlite::kv::KVStorePreferences;
+ use flowy_sqlite::DBConnection;
+ 
+ use lib_infra::util::timestamp;
+-use serde_json::json;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+ use tracing::{info, trace};
+@@ -106,25 +103,22 @@ impl AIManager {
+     Ok(())
+   }
+ 
+-  pub async fn create_chat_context(&self, context: CreateChatContextPB) -> FlowyResult<()> {
+-    let workspace_id = self.user_service.workspace_id()?;
+-    let context = CreateTextChatContext {
+-      chat_id: context.chat_id,
+-      content_type: context.content_type,
+-      text: context.text,
+-      chunk_size: 2000,
+-      chunk_overlap: 20,
+-      metadata: context
+-        .metadata
+-        .into_iter()
+-        .map(|(k, v)| (k, json!(v)))
+-        .collect(),
+-    };
+-    self
+-      .cloud_service_wm
+-      .create_chat_context(&workspace_id, context)
+-      .await?;
+-    Ok(())
++  pub async fn get_chat_info(&self, chat_id: &str) -> FlowyResult<ChatInfoPB> {
++    let mut conn = self.user_service.sqlite_connection(0)?;
++    let metadata = read_chat_metadata(&mut conn, chat_id)?;
++    let files = metadata
++      .files
++      .into_iter()
++      .map(|file| FilePB {
++        id: file.id,
++        name: file.name,
++      })
++      .collect();
++
++    Ok(ChatInfoPB {
++      chat_id: chat_id.to_string(),
++      files,
++    })
+   }
+ 
+   pub async fn create_chat(&self, uid: &i64, chat_id: &str) -> Result<Arc<Chat>, FlowyError> {
+@@ -260,10 +254,10 @@ fn save_chat(conn: DBConnection, chat_id: &str) -> FlowyResult<()> {
+     chat_id: chat_id.to_string(),
+     created_at: timestamp(),
+     name: "".to_string(),
+-    local_model_path: "".to_string(),
+-    local_model_name: "".to_string(),
++    local_files: "".to_string(),
++    metadata: "".to_string(),
+     local_enabled: false,
+-    sync_to_cloud: true,
++    sync_to_cloud: false,
+   };
+ 
+   insert_chat(conn, &row)?;
+diff --git a/frontend/rust-lib/flowy-ai/src/chat.rs b/frontend/rust-lib/flowy-ai/src/chat.rs
+index e3b0808afd593..11116f451f32b 100644
+--- a/frontend/rust-lib/flowy-ai/src/chat.rs
++++ b/frontend/rust-lib/flowy-ai/src/chat.rs
+@@ -4,7 +4,10 @@ use crate::entities::{
+ };
+ use crate::middleware::chat_service_mw::AICloudServiceMiddleware;
+ use crate::notification::{make_notification, ChatNotification};
+-use crate::persistence::{insert_chat_messages, select_chat_messages, ChatMessageTable};
++use crate::persistence::{
++  insert_chat_messages, read_chat_metadata, select_chat_messages, update_chat, ChatMessageTable,
++  ChatTableChangeset,
++};
+ use allo_isolate::Isolate;
+ use flowy_ai_pub::cloud::{
+   ChatCloudService, ChatMessage, ChatMessageMetadata, ChatMessageType, MessageCursor,
+@@ -481,9 +484,37 @@ impl Chat {
+     );
+     self
+       .chat_service
+-      .index_file(&self.user_service.workspace_id()?, file_path, &self.chat_id)
++      .index_file(
++        &self.user_service.workspace_id()?,
++        &file_path,
++        &self.chat_id,
++      )
+       .await?;
+ 
++    let file_name = file_path
++      .file_name()
++      .unwrap_or_default()
++      .to_str()
++      .unwrap_or_default();
++
++    let mut conn = self.user_service.sqlite_connection(self.uid)?;
++    conn.immediate_transaction(|conn| {
++      let mut metadata = read_chat_metadata(conn, &self.chat_id)?;
++      metadata.add_file(
++        file_name.to_string(),
++        file_path.to_str().unwrap_or_default().to_string(),
++      );
++      let changeset = ChatTableChangeset::from_metadata(metadata);
++      update_chat(conn, changeset)?;
++      Ok::<(), FlowyError>(())
++    })?;
++
++    trace!(
++      "[Chat] created index file record: chat_id={}, file_path={:?}",
++      self.chat_id,
++      file_path
++    );
++
+     Ok(())
+   }
+ }
+diff --git a/frontend/rust-lib/flowy-ai/src/entities.rs b/frontend/rust-lib/flowy-ai/src/entities.rs
+index 04ce6c771f826..5ff3cd5bd3dbe 100644
+--- a/frontend/rust-lib/flowy-ai/src/entities.rs
++++ b/frontend/rust-lib/flowy-ai/src/entities.rs
+@@ -9,6 +9,29 @@ use flowy_ai_pub::cloud::{
+ use flowy_derive::{ProtoBuf, ProtoBuf_Enum};
+ use lib_infra::validator_fn::required_not_empty_str;
+ use validator::Validate;
++#[derive(Default, ProtoBuf, Validate, Clone, Debug)]
++pub struct ChatId {
++  #[pb(index = 1)]
++  #[validate(custom = "required_not_empty_str")]
++  pub value: String,
++}
++
++#[derive(Default, ProtoBuf, Clone, Debug)]
++pub struct ChatInfoPB {
++  #[pb(index = 1)]
++  pub chat_id: String,
++
++  #[pb(index = 2)]
++  pub files: Vec<FilePB>,
++}
++
++#[derive(Default, ProtoBuf, Clone, Debug)]
++pub struct FilePB {
++  #[pb(index = 1)]
++  pub id: String,
++  #[pb(index = 2)]
++  pub name: String,
++}
+ 
+ #[derive(Default, ProtoBuf, Validate, Clone, Debug)]
+ pub struct SendChatPayloadPB {
+@@ -53,7 +76,7 @@ pub struct ChatMessageMetaPB {
+   pub name: String,
+ 
+   #[pb(index = 3)]
+-  pub text: String,
++  pub data: String,
+ 
+   #[pb(index = 4)]
+   pub source: String,
+diff --git a/frontend/rust-lib/flowy-ai/src/event_handler.rs b/frontend/rust-lib/flowy-ai/src/event_handler.rs
+index 6ca6778c30bea..dd8e984ee4587 100644
+--- a/frontend/rust-lib/flowy-ai/src/event_handler.rs
++++ b/frontend/rust-lib/flowy-ai/src/event_handler.rs
+@@ -1,3 +1,4 @@
++use std::fs;
+ use std::path::PathBuf;
+ 
+ use crate::ai_manager::AIManager;
+@@ -39,10 +40,11 @@ pub(crate) async fn stream_chat_message_handler(
+     .metadata
+     .into_iter()
+     .map(|metadata| ChatMessageMetadata {
+-      data: ChatMetadataData::new_text(metadata.text),
++      data: ChatMetadataData::new_text(metadata.data),
+       id: metadata.id,
+       name: metadata.name.clone(),
+       source: metadata.source,
++      extract: None,
+     })
+     .collect::<Vec<_>>();
+ 
+@@ -231,6 +233,24 @@ pub(crate) async fn chat_file_handler(
+       "Only support pdf,md and txt",
+     ));
+   }
++  let file_size = fs::metadata(&file_path)
++    .map_err(|_| {
++      FlowyError::new(
++        ErrorCode::UnsupportedFileFormat,
++        "Failed to get file metadata",
++      )
++    })?
++    .len();
++
++  const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
++  if file_size > MAX_FILE_SIZE {
++    return Err(FlowyError::new(
++      ErrorCode::PayloadTooLarge,
++      "File size is too large. Max file size is 10MB",
++    ));
++  }
++
++  tracing::debug!("File size: {} bytes", file_size);
+ 
+   let (tx, rx) = oneshot::channel::<Result<(), FlowyError>>();
+   tokio::spawn(async move {
+@@ -406,3 +426,14 @@ pub(crate) async fn create_chat_context_handler(
+ 
+   Ok(())
+ }
++
++#[tracing::instrument(level = "debug", skip_all, err)]
++pub(crate) async fn get_chat_info_handler(
++  data: AFPluginData<ChatId>,
++  ai_manager: AFPluginState<Weak<AIManager>>,
++) -> DataResult<ChatInfoPB, FlowyError> {
++  let chat_id = data.try_into_inner()?.value;
++  let ai_manager = upgrade_ai_manager(ai_manager)?;
++  let pb = ai_manager.get_chat_info(&chat_id).await?;
++  data_result_ok(pb)
++}
+diff --git a/frontend/rust-lib/flowy-ai/src/event_map.rs b/frontend/rust-lib/flowy-ai/src/event_map.rs
+index e4e9d03b4c211..109be1a253480 100644
+--- a/frontend/rust-lib/flowy-ai/src/event_map.rs
++++ b/frontend/rust-lib/flowy-ai/src/event_map.rs
+@@ -56,6 +56,7 @@ pub fn init(ai_manager: Weak<AIManager>) -> AFPlugin {
+     )
+     .event(AIEvent::GetOfflineAIAppLink, get_offline_app_handler)
+     .event(AIEvent::CreateChatContext, create_chat_context_handler)
++    .event(AIEvent::GetChatInfo, create_chat_context_handler)
+ }
+ 
+ #[derive(Clone, Copy, PartialEq, Eq, Debug, Display, Hash, ProtoBuf_Enum, Flowy_Event)]
+@@ -138,4 +139,7 @@ pub enum AIEvent {
+ 
+   #[event(input = "CreateChatContextPB")]
+   CreateChatContext = 23,
++
++  #[event(input = "ChatId", output = "ChatInfoPB")]
++  GetChatInfo = 24,
+ }
+diff --git a/frontend/rust-lib/flowy-ai/src/middleware/chat_service_mw.rs b/frontend/rust-lib/flowy-ai/src/middleware/chat_service_mw.rs
+index 712e452d39a94..76a961531c903 100644
+--- a/frontend/rust-lib/flowy-ai/src/middleware/chat_service_mw.rs
++++ b/frontend/rust-lib/flowy-ai/src/middleware/chat_service_mw.rs
+@@ -16,7 +16,7 @@ use lib_infra::async_trait::async_trait;
+ use lib_infra::future::FutureResult;
+ 
+ use crate::local_ai::stream_util::LocalAIStreamAdaptor;
+-use std::path::PathBuf;
++use std::path::Path;
+ use std::sync::Arc;
+ 
+ pub struct AICloudServiceMiddleware {
+@@ -242,13 +242,13 @@ impl ChatCloudService for AICloudServiceMiddleware {
+   async fn index_file(
+     &self,
+     workspace_id: &str,
+-    file_path: PathBuf,
++    file_path: &Path,
+     chat_id: &str,
+   ) -> Result<(), FlowyError> {
+     if self.local_llm_controller.is_running() {
+       self
+         .local_llm_controller
+-        .index_file(chat_id, file_path)
++        .index_file(chat_id, file_path.to_path_buf())
+         .await
+         .map_err(|err| FlowyError::local_ai().with_context(err))?;
+       Ok(())
+diff --git a/frontend/rust-lib/flowy-ai/src/persistence/chat_sql.rs b/frontend/rust-lib/flowy-ai/src/persistence/chat_sql.rs
+index 9971713afb73b..6086c8e4661ae 100644
+--- a/frontend/rust-lib/flowy-ai/src/persistence/chat_sql.rs
++++ b/frontend/rust-lib/flowy-ai/src/persistence/chat_sql.rs
+@@ -1,4 +1,5 @@
+ use diesel::sqlite::SqliteConnection;
++use flowy_error::FlowyResult;
+ use flowy_sqlite::upsert::excluded;
+ use flowy_sqlite::{
+   diesel,
+@@ -6,6 +7,7 @@ use flowy_sqlite::{
+   schema::{chat_table, chat_table::dsl},
+   AsChangeset, DBConnection, ExpressionMethods, Identifiable, Insertable, QueryResult, Queryable,
+ };
++use serde::{Deserialize, Serialize};
+ 
+ #[derive(Clone, Default, Queryable, Insertable, Identifiable)]
+ #[diesel(table_name = chat_table)]
+@@ -14,24 +16,54 @@ pub struct ChatTable {
+   pub chat_id: String,
+   pub created_at: i64,
+   pub name: String,
+-  pub local_model_path: String,
+-  pub local_model_name: String,
++  pub local_files: String,
++  pub metadata: String,
+   pub local_enabled: bool,
+   pub sync_to_cloud: bool,
+ }
+ 
++#[derive(Debug, Clone, Default, Serialize, Deserialize)]
++pub struct ChatTableMetadata {
++  pub files: Vec<ChatTableFile>,
++}
++
++impl ChatTableMetadata {
++  pub fn add_file(&mut self, name: String, id: String) {
++    if let Some(file) = self.files.iter_mut().find(|f| f.name == name) {
++      file.id = id;
++    } else {
++      self.files.push(ChatTableFile { name, id });
++    }
++  }
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ChatTableFile {
++  pub name: String,
++  pub id: String,
++}
++
+ #[derive(AsChangeset, Identifiable, Default, Debug)]
+ #[diesel(table_name = chat_table)]
+ #[diesel(primary_key(chat_id))]
+ pub struct ChatTableChangeset {
+   pub chat_id: String,
+   pub name: Option<String>,
+-  pub local_model_path: Option<String>,
+-  pub local_model_name: Option<String>,
++  pub local_files: Option<String>,
++  pub metadata: Option<String>,
+   pub local_enabled: Option<bool>,
+   pub sync_to_cloud: Option<bool>,
+ }
+ 
++impl ChatTableChangeset {
++  pub fn from_metadata(metadata: ChatTableMetadata) -> Self {
++    ChatTableChangeset {
++      metadata: serde_json::to_string(&metadata).ok(),
++      ..Default::default()
++    }
++  }
++}
++
+ pub fn insert_chat(mut conn: DBConnection, new_chat: &ChatTable) -> QueryResult<usize> {
+   diesel::insert_into(chat_table::table)
+     .values(new_chat)
+@@ -44,8 +76,7 @@ pub fn insert_chat(mut conn: DBConnection, new_chat: &ChatTable) -> QueryResult<
+     .execute(&mut *conn)
+ }
+ 
+-#[allow(dead_code)]
+-pub fn update_chat_local_model(
++pub fn update_chat(
+   conn: &mut SqliteConnection,
+   changeset: ChatTableChangeset,
+ ) -> QueryResult<usize> {
+@@ -62,6 +93,18 @@ pub fn read_chat(mut conn: DBConnection, chat_id_val: &str) -> QueryResult<ChatT
+   Ok(row)
+ }
+ 
++pub fn read_chat_metadata(
++  conn: &mut SqliteConnection,
++  chat_id_val: &str,
++) -> FlowyResult<ChatTableMetadata> {
++  let metadata_str = dsl::chat_table
++    .select(chat_table::metadata)
++    .filter(chat_table::chat_id.eq(chat_id_val))
++    .first::<String>(&mut *conn)?;
++  let value = serde_json::from_str(&metadata_str).unwrap_or_default();
++  Ok(value)
++}
++
+ #[allow(dead_code)]
+ pub fn update_chat_name(
+   mut conn: DBConnection,
+diff --git a/frontend/rust-lib/flowy-core/src/integrate/trait_impls.rs b/frontend/rust-lib/flowy-core/src/integrate/trait_impls.rs
+index 0f6d4142332f6..da2d9d41e6ab7 100644
+--- a/frontend/rust-lib/flowy-core/src/integrate/trait_impls.rs
++++ b/frontend/rust-lib/flowy-core/src/integrate/trait_impls.rs
+@@ -1,6 +1,6 @@
+ use client_api::entity::search_dto::SearchDocumentResponseItem;
+ use flowy_search_pub::cloud::SearchCloudService;
+-use std::path::PathBuf;
++use std::path::Path;
+ use std::sync::Arc;
+ 
+ use anyhow::Error;
+@@ -729,7 +729,7 @@ impl ChatCloudService for ServerProvider {
+   async fn index_file(
+     &self,
+     workspace_id: &str,
+-    file_path: PathBuf,
++    file_path: &Path,
+     chat_id: &str,
+   ) -> Result<(), FlowyError> {
+     self
+diff --git a/frontend/rust-lib/flowy-error/src/code.rs b/frontend/rust-lib/flowy-error/src/code.rs
+index 9b546d0182abe..fc12ed46060eb 100644
+--- a/frontend/rust-lib/flowy-error/src/code.rs
++++ b/frontend/rust-lib/flowy-error/src/code.rs
+@@ -257,8 +257,8 @@ pub enum ErrorCode {
+   #[error("AppFlowy data folder import error")]
+   AppFlowyDataFolderImportError = 89,
+ 
+-  #[error("Cloud request payload too large")]
+-  CloudRequestPayloadTooLarge = 90,
++  #[error("payload too large")]
++  PayloadTooLarge = 90,
+ 
+   #[error("Workspace limit exceeded")]
+   WorkspaceLimitExceeded = 91,
+diff --git a/frontend/rust-lib/flowy-error/src/impl_from/cloud.rs b/frontend/rust-lib/flowy-error/src/impl_from/cloud.rs
+index a436544e01bde..c857fc7ec9aa3 100644
+--- a/frontend/rust-lib/flowy-error/src/impl_from/cloud.rs
++++ b/frontend/rust-lib/flowy-error/src/impl_from/cloud.rs
+@@ -20,7 +20,7 @@ impl From<AppResponseError> for FlowyError {
+       AppErrorCode::NotLoggedIn => ErrorCode::UserUnauthorized,
+       AppErrorCode::NotEnoughPermissions => ErrorCode::NotEnoughPermissions,
+       AppErrorCode::NetworkError => ErrorCode::HttpError,
+-      AppErrorCode::PayloadTooLarge => ErrorCode::CloudRequestPayloadTooLarge,
++      AppErrorCode::PayloadTooLarge => ErrorCode::PayloadTooLarge,
+       AppErrorCode::UserUnAuthorized => ErrorCode::UserUnauthorized,
+       AppErrorCode::WorkspaceLimitExceeded => ErrorCode::WorkspaceLimitExceeded,
+       AppErrorCode::WorkspaceMemberLimitExceeded => ErrorCode::WorkspaceMemberLimitExceeded,
+diff --git a/frontend/rust-lib/flowy-server/src/af_cloud/impls/chat.rs b/frontend/rust-lib/flowy-server/src/af_cloud/impls/chat.rs
+index 77a0198a97dc8..ca07dbc285e2c 100644
+--- a/frontend/rust-lib/flowy-server/src/af_cloud/impls/chat.rs
++++ b/frontend/rust-lib/flowy-server/src/af_cloud/impls/chat.rs
+@@ -16,7 +16,7 @@ use lib_infra::async_trait::async_trait;
+ use lib_infra::future::FutureResult;
+ use lib_infra::util::{get_operating_system, OperatingSystem};
+ use serde_json::json;
+-use std::path::PathBuf;
++use std::path::Path;
+ 
+ pub(crate) struct AFCloudChatCloudServiceImpl<T> {
+   pub inner: T,
+@@ -192,7 +192,7 @@ where
+   async fn index_file(
+     &self,
+     _workspace_id: &str,
+-    _file_path: PathBuf,
++    _file_path: &Path,
+     _chat_id: &str,
+   ) -> Result<(), FlowyError> {
+     return Err(
+diff --git a/frontend/rust-lib/flowy-server/src/default_impl.rs b/frontend/rust-lib/flowy-server/src/default_impl.rs
+index c2fde180d8bd4..22f6688ba946b 100644
+--- a/frontend/rust-lib/flowy-server/src/default_impl.rs
++++ b/frontend/rust-lib/flowy-server/src/default_impl.rs
+@@ -6,7 +6,7 @@ use flowy_ai_pub::cloud::{
+ use flowy_error::FlowyError;
+ use lib_infra::async_trait::async_trait;
+ use lib_infra::future::FutureResult;
+-use std::path::PathBuf;
++use std::path::Path;
+ 
+ pub(crate) struct DefaultChatCloudServiceImpl;
+ 
+@@ -100,7 +100,7 @@ impl ChatCloudService for DefaultChatCloudServiceImpl {
+   async fn index_file(
+     &self,
+     _workspace_id: &str,
+-    _file_path: PathBuf,
++    _file_path: &Path,
+     _chat_id: &str,
+   ) -> Result<(), FlowyError> {
+     Err(FlowyError::not_support().with_context("indexing file is not supported in local server."))
+diff --git a/frontend/rust-lib/flowy-sqlite/migrations/2024-08-07-093650_chat_metadata/down.sql b/frontend/rust-lib/flowy-sqlite/migrations/2024-08-07-093650_chat_metadata/down.sql
+new file mode 100644
+index 0000000000000..d9a93fe9a1a10
+--- /dev/null
++++ b/frontend/rust-lib/flowy-sqlite/migrations/2024-08-07-093650_chat_metadata/down.sql
+@@ -0,0 +1 @@
++-- This file should undo anything in `up.sql`
+diff --git a/frontend/rust-lib/flowy-sqlite/migrations/2024-08-07-093650_chat_metadata/up.sql b/frontend/rust-lib/flowy-sqlite/migrations/2024-08-07-093650_chat_metadata/up.sql
+new file mode 100644
+index 0000000000000..948cf866a7a3f
+--- /dev/null
++++ b/frontend/rust-lib/flowy-sqlite/migrations/2024-08-07-093650_chat_metadata/up.sql
+@@ -0,0 +1,4 @@
++-- Your SQL goes here
++ALTER TABLE chat_table RENAME COLUMN local_model_path TO local_files;
++ALTER TABLE chat_table RENAME COLUMN local_model_name TO metadata;
++
+diff --git a/frontend/rust-lib/flowy-sqlite/src/schema.rs b/frontend/rust-lib/flowy-sqlite/src/schema.rs
+index b65e026f6a083..28d278c6a4c11 100644
+--- a/frontend/rust-lib/flowy-sqlite/src/schema.rs
++++ b/frontend/rust-lib/flowy-sqlite/src/schema.rs
+@@ -26,8 +26,8 @@ diesel::table! {
+         chat_id -> Text,
+         created_at -> BigInt,
+         name -> Text,
+-        local_model_path -> Text,
+-        local_model_name -> Text,
++        local_files -> Text,
++        metadata -> Text,
+         local_enabled -> Bool,
+         sync_to_cloud -> Bool,
+     }

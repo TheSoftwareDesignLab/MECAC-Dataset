@@ -1,0 +1,410 @@
+diff --git a/android-components/components/browser/menu/src/main/java/mozilla/components/browser/menu/BrowserMenu.kt b/android-components/components/browser/menu/src/main/java/mozilla/components/browser/menu/BrowserMenu.kt
+index f62c8bde78e4..b702ae72a6a9 100644
+--- a/android-components/components/browser/menu/src/main/java/mozilla/components/browser/menu/BrowserMenu.kt
++++ b/android-components/components/browser/menu/src/main/java/mozilla/components/browser/menu/BrowserMenu.kt
+@@ -24,6 +24,8 @@ import mozilla.components.browser.menu.BrowserMenu.Orientation.DOWN
+ import mozilla.components.browser.menu.BrowserMenu.Orientation.UP
+ import mozilla.components.browser.menu.view.DynamicWidthRecyclerView
+ import mozilla.components.browser.menu.view.ExpandableLayout
++import mozilla.components.browser.menu.view.StickyItemPlacement
++import mozilla.components.browser.menu.view.StickyItemsLinearLayoutManager
+ import mozilla.components.concept.menu.MenuStyle
+ import mozilla.components.support.ktx.android.view.isRTL
+ import mozilla.components.support.ktx.android.view.onNextGlobalLayout
+@@ -41,6 +43,7 @@ open class BrowserMenu internal constructor(
+     internal var isShown = false
+     @VisibleForTesting
+     internal lateinit var menuPositioningData: MenuPositioningData
++    internal var backgroundColor: Int = Color.RED
+ 
+     /**
+      * @param anchor the view on which to pin the popup window.
+@@ -62,15 +65,16 @@ open class BrowserMenu internal constructor(
+         adapter.menu = this
+ 
+         menuList = view.findViewById<DynamicWidthRecyclerView>(R.id.mozac_browser_menu_recyclerView).apply {
+-            layoutManager = LinearLayoutManager(anchor.context, RecyclerView.VERTICAL, false)
++            layoutManager = StickyItemsLinearLayoutManager.get<BrowserMenuAdapter>(
++                anchor.context, StickyItemPlacement.BOTTOM, false
++            )
++
+             adapter = this@BrowserMenu.adapter
+             minWidth = style?.minWidth ?: resources.getDimensionPixelSize(R.dimen.mozac_browser_menu_width_min)
+             maxWidth = style?.maxWidth ?: resources.getDimensionPixelSize(R.dimen.mozac_browser_menu_width_max)
+         }
+ 
+-        view.findViewById<CardView>(R.id.mozac_browser_menu_menuView).apply {
+-            style?.backgroundColor?.let { setCardBackgroundColor(it) }
+-        }
++        setColors(view, style)
+ 
+         menuList?.accessibilityDelegate = object : View.AccessibilityDelegate() {
+             override fun onInitializeAccessibilityNodeInfo(
+@@ -120,36 +124,37 @@ open class BrowserMenu internal constructor(
+         view: ViewGroup,
+         endOfMenuAlwaysVisible: Boolean
+     ): ViewGroup {
++        // If the menu is placed at the bottom it should start as collapsed.
+         if (menuPositioningData.inferredMenuPlacement is BrowserMenuPlacement.AnchoredToBottom.Dropdown ||
+             menuPositioningData.inferredMenuPlacement is BrowserMenuPlacement.AnchoredToBottom.ManualAnchoring) {
+ 
+             val collapsingMenuIndexLimit = adapter.visibleItems.indexOfFirst { it.isCollapsingMenuLimit }
++            val stickyFooterPosition = adapter.visibleItems.indexOfLast { it.isSticky }
+             if (collapsingMenuIndexLimit > 0) {
+                 return ExpandableLayout.wrapContentInExpandableView(
+                     view,
+-                    collapsingMenuIndexLimit
++                    collapsingMenuIndexLimit,
++                    stickyFooterPosition
+                 ) { dismiss() }
+             }
+-        }
+-
+-        // When showing an expandable bottom menu it should always be scrolled to the top (default in LayoutManager).
+-        // Otherwise try showing the bottom of the menu when not enough space to fit it on the screen.
+-        if (endOfMenuAlwaysVisible) {
+-            menuList?.let {
+-                showMenuBottom(it)
++        } else {
++            // The menu is by default set as a bottom one. Reconfigure it as a top one.
++            menuList?.layoutManager = StickyItemsLinearLayoutManager.get<BrowserMenuAdapter>(
++                view.context, StickyItemPlacement.TOP
++            )
++
++            // By default the menu is laid out from and scrolled to top - showing the top most items.
++            // For the top menu it may be desired to initially show the bottom most items.
++            menuList?.let { list ->
++                list.setEndOfMenuAlwaysVisibleCompact(
++                    endOfMenuAlwaysVisible, list.layoutManager as LinearLayoutManager
++                )
+             }
+         }
+ 
+         return view
+     }
+ 
+-    @VisibleForTesting
+-    internal fun showMenuBottom(menu: RecyclerView) {
+-        menu.layoutManager = LinearLayoutManager(menu.context, RecyclerView.VERTICAL, false).also {
+-            menu.setEndOfMenuAlwaysVisibleCompact(true, it)
+-        }
+-    }
+-
+     @VisibleForTesting
+     internal fun getNewPopupWindow(view: ViewGroup): PopupWindow {
+         // If the menu is expandable we need to give it all the possible space to expand.
+@@ -200,6 +205,15 @@ open class BrowserMenu internal constructor(
+         menuList?.let { adapter.invalidate(it) }
+     }
+ 
++    @VisibleForTesting
++    internal fun setColors(menuLayout: View, colorState: MenuStyle?) {
++        val listParent: CardView = menuLayout.findViewById(R.id.mozac_browser_menu_menuView)
++        backgroundColor = colorState?.backgroundColor?.let {
++            listParent.setCardBackgroundColor(it)
++            it.defaultColor
++        } ?: listParent.cardBackgroundColor.defaultColor
++    }
++
+     companion object {
+         /**
+          * Determines the orientation to be used for a menu based on the positioning of the [parent] in the layout.
+diff --git a/android-components/components/browser/menu/src/main/java/mozilla/components/browser/menu/BrowserMenuAdapter.kt b/android-components/components/browser/menu/src/main/java/mozilla/components/browser/menu/BrowserMenuAdapter.kt
+index 99db8125a22f..7820ac453213 100644
+--- a/android-components/components/browser/menu/src/main/java/mozilla/components/browser/menu/BrowserMenuAdapter.kt
++++ b/android-components/components/browser/menu/src/main/java/mozilla/components/browser/menu/BrowserMenuAdapter.kt
+@@ -5,10 +5,12 @@
+ package mozilla.components.browser.menu
+ 
+ import android.content.Context
++import android.graphics.Color
+ import android.view.LayoutInflater
+ import android.view.View
+ import android.view.ViewGroup
+ import androidx.recyclerview.widget.RecyclerView
++import mozilla.components.browser.menu.view.StickyItemsAdapter
+ 
+ /**
+  * Adapter implementation used by the browser menu to display menu items in a RecyclerView.
+@@ -16,7 +18,7 @@ import androidx.recyclerview.widget.RecyclerView
+ internal class BrowserMenuAdapter(
+     context: Context,
+     items: List<BrowserMenuItem>
+-) : RecyclerView.Adapter<BrowserMenuItemViewHolder>() {
++) : RecyclerView.Adapter<BrowserMenuItemViewHolder>(), StickyItemsAdapter {
+     var menu: BrowserMenu? = null
+ 
+     internal val visibleItems = items.filter { it.visible() }
+@@ -42,6 +44,25 @@ internal class BrowserMenuAdapter(
+             }
+         }
+     }
++
++    @Suppress("TooGenericExceptionCaught")
++    override fun isStickyItem(position: Int): Boolean {
++        return try {
++            visibleItems[position].isSticky
++        } catch (e: IndexOutOfBoundsException) {
++            false
++        }
++    }
++
++    override fun setupStickyItem(stickyItem: View) {
++        menu?.let {
++            stickyItem.setBackgroundColor(it.backgroundColor)
++        }
++    }
++
++    override fun tearDownStickyItem(stickyItem: View) {
++        stickyItem.setBackgroundColor(Color.TRANSPARENT)
++    }
+ }
+ 
+ class BrowserMenuItemViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView)
+diff --git a/android-components/components/browser/menu/src/test/java/mozilla/components/browser/menu/BrowserMenuAdapterTest.kt b/android-components/components/browser/menu/src/test/java/mozilla/components/browser/menu/BrowserMenuAdapterTest.kt
+index 2b55c1caf23d..82badf723f73 100644
+--- a/android-components/components/browser/menu/src/test/java/mozilla/components/browser/menu/BrowserMenuAdapterTest.kt
++++ b/android-components/components/browser/menu/src/test/java/mozilla/components/browser/menu/BrowserMenuAdapterTest.kt
+@@ -4,11 +4,16 @@
+ 
+ package mozilla.components.browser.menu
+ 
++import android.graphics.Color
++import android.graphics.drawable.ColorDrawable
+ import android.view.View
+ import androidx.recyclerview.widget.RecyclerView
+ import androidx.test.ext.junit.runners.AndroidJUnit4
++import mozilla.components.support.test.mock
+ import mozilla.components.support.test.robolectric.testContext
+ import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
+ import org.junit.Assert.fail
+ import org.junit.Test
+ import org.junit.runner.RunWith
+@@ -120,6 +125,48 @@ class BrowserMenuAdapterTest {
+         assertEquals(6, adapter.interactiveCount)
+     }
+ 
++    @Test
++    fun `GIVEN a stickyItem exists in the visible items WHEN isStickyItem is called THEN it returns true`() {
++        val items = listOf(
++            createMenuItem(1, { true }, { 1 }),
++            createMenuItem(3, { true }, { 10 }, true),
++            createMenuItem(4, { true }, { 5 }),
++            createMenuItem(3, { false }, { 3 }, true)
++        )
++
++        val adapter = BrowserMenuAdapter(testContext, items)
++
++        assertFalse(adapter.isStickyItem(0))
++        assertTrue(adapter.isStickyItem(1))
++        assertFalse(adapter.isStickyItem(2))
++        assertFalse(adapter.isStickyItem(3))
++        assertFalse(adapter.isStickyItem(4))
++    }
++
++    @Test
++    fun `GIVEN a BrowserMenu exists WHEN setupStickyItem is called THEN the item background color is set for the View parameter`() {
++        val adapter = BrowserMenuAdapter(testContext, emptyList())
++        val menu: BrowserMenu = mock()
++        menu.backgroundColor = Color.CYAN
++        adapter.menu = menu
++        val view = View(testContext)
++
++        adapter.setupStickyItem(view)
++
++        assertEquals(menu.backgroundColor, (view.background as ColorDrawable).color)
++    }
++
++    @Test
++    fun `GIVEN BrowserMenuAdapter WHEN tearDownStickyItem is called THEN the item background is reset to transparent`() {
++        val adapter = BrowserMenuAdapter(testContext, emptyList())
++        val view = View(testContext)
++        view.setBackgroundColor(Color.CYAN)
++
++        adapter.tearDownStickyItem(view)
++
++        assertEquals(Color.TRANSPARENT, (view.background as ColorDrawable).color)
++    }
++
+     private fun List<BrowserMenuItem>.assertTrueForOne(predicate: (BrowserMenuItem) -> Boolean) {
+         for (item in this) {
+             if (predicate(item)) {
+@@ -140,7 +187,8 @@ class BrowserMenuAdapterTest {
+     private fun createMenuItem(
+         layout: Int = 0,
+         visible: () -> Boolean = { true },
+-        interactiveCount: () -> Int = { 1 }
++        interactiveCount: () -> Int = { 1 },
++        isSticky: Boolean = false
+     ): BrowserMenuItem {
+         return object : BrowserMenuItem {
+             override val visible = visible
+@@ -152,6 +200,8 @@ class BrowserMenuAdapterTest {
+             override fun bind(menu: BrowserMenu, view: View) {}
+ 
+             override fun invalidate(view: View) {}
++
++            override val isSticky = isSticky
+         }
+     }
+ }
+diff --git a/android-components/components/browser/menu/src/test/java/mozilla/components/browser/menu/BrowserMenuTest.kt b/android-components/components/browser/menu/src/test/java/mozilla/components/browser/menu/BrowserMenuTest.kt
+index 02fe7102b633..4dd3e6c20b9b 100644
+--- a/android-components/components/browser/menu/src/test/java/mozilla/components/browser/menu/BrowserMenuTest.kt
++++ b/android-components/components/browser/menu/src/test/java/mozilla/components/browser/menu/BrowserMenuTest.kt
+@@ -9,7 +9,6 @@ import android.graphics.Color
+ import android.os.Build
+ import android.view.Gravity
+ import android.view.View
+-import android.view.ViewGroup
+ import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+ import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+ import android.widget.Button
+@@ -23,8 +22,10 @@ import mozilla.components.browser.menu.BrowserMenu.Orientation.DOWN
+ import mozilla.components.browser.menu.item.SimpleBrowserMenuItem
+ import mozilla.components.browser.menu.view.DynamicWidthRecyclerView
+ import mozilla.components.browser.menu.view.ExpandableLayout
++import mozilla.components.browser.menu.view.StickyHeaderLinearLayoutManager
+ import mozilla.components.concept.menu.MenuStyle
+ import mozilla.components.support.test.any
++import mozilla.components.support.test.eq
+ import mozilla.components.support.test.mock
+ import mozilla.components.support.test.robolectric.testContext
+ import org.junit.Assert.assertEquals
+@@ -37,7 +38,6 @@ import org.junit.Test
+ import org.junit.runner.RunWith
+ import org.mockito.Mockito
+ import org.mockito.Mockito.doNothing
+-import org.mockito.Mockito.never
+ import org.mockito.Mockito.spy
+ import org.mockito.Mockito.verify
+ import org.robolectric.Shadows
+@@ -87,14 +87,15 @@ class BrowserMenuTest {
+ 
+         val adapter = BrowserMenuAdapter(testContext, items)
+ 
+-        val menu = BrowserMenu(adapter)
++        val menu = spy(BrowserMenu(adapter))
+ 
+         val anchor = Button(testContext)
+-        val popup = menu.show(anchor, style = MenuStyle(
++        val menuStyle = MenuStyle(
+             backgroundColor = Color.RED,
+             minWidth = 20,
+             maxWidth = 500
+-        ))
++        )
++        val popup = menu.show(anchor, style = menuStyle)
+ 
+         assertNotNull(popup)
+         assertEquals(anchor, menu.currAnchor)
+@@ -103,6 +104,7 @@ class BrowserMenuTest {
+         val cardView = popup.contentView.findViewById<CardView>(R.id.mozac_browser_menu_menuView)
+         val recyclerView = popup.contentView.findViewById<DynamicWidthRecyclerView>(R.id.mozac_browser_menu_recyclerView)
+ 
++        verify(menu).setColors(any(), eq(menuStyle))
+         assertEquals(ColorStateList.valueOf(Color.RED), cardView.cardBackgroundColor)
+         assertEquals(20, recyclerView.minWidth)
+         assertEquals(500, recyclerView.maxWidth)
+@@ -357,40 +359,40 @@ class BrowserMenuTest {
+     }
+ 
+     @Test
+-    fun `GIVEN a not expandable menu WHEN configureExpandableMenu is called for one which should not be scrolled to bottom THEN the same menu is returned`() {
++    fun `GIVEN a top anchored menu WHEN configureExpandableMenu is called THEN it a new layout manager with sticky item at top is set`() {
+         val menu = spy(BrowserMenu(mock()))
++        // Call show to have a default layout manager set
++        menu.show(View(testContext))
++        val initialLayoutManager = menu.menuList!!.layoutManager
+         menu.menuPositioningData = MenuPositioningData(BrowserMenuPlacement.AnchoredToTop.Dropdown(mock()))
+-        val viewGroup: ViewGroup = mock()
+ 
+-        val result = menu.configureExpandableMenu(viewGroup, false)
++        menu.configureExpandableMenu(menu.menuList!!, false)
+ 
+-        assertSame(viewGroup, result)
+-        verify(menu, never()).showMenuBottom(any())
++        assertNotSame(initialLayoutManager, menu.menuList!!.layoutManager)
++        assertTrue(menu.menuList!!.layoutManager is StickyHeaderLinearLayoutManager<*>)
+     }
+ 
+     @Test
+-    fun `GIVEN a not expandable menu WHEN configureExpandableMenu is called for one which should be scrolled to bottom THEN the layout manager is updated for this`() {
++    fun `GIVEN a top anchored menu WHEN configureExpandableMenu is called THEN stackFromEnd is false`() {
+         val menu = spy(BrowserMenu(mock()))
++        // Call show to have a default layout manager set
++        menu.show(View(testContext))
+         menu.menuPositioningData = MenuPositioningData(BrowserMenuPlacement.AnchoredToTop.Dropdown(mock()))
+-        val menuList = RecyclerView(testContext)
+-        menu.menuList = menuList
+ 
+-        val result = menu.configureExpandableMenu(menuList, true)
++        menu.configureExpandableMenu(menu.menuList!!, false)
+ 
+-        assertSame(menuList, result)
+-        verify(menu).showMenuBottom(menuList)
++        assertFalse((menu.menuList!!.layoutManager as LinearLayoutManager).stackFromEnd)
+     }
+ 
+     @Test
+-    fun `GIVEN a menu that should be scrolled to the bottom WHEN showMenuBottom is called THEN it replaces the layout manager and sets stackFromEnd`() {
++    fun `GIVEN a top anchored menu WHEN configureExpandableMenu is called THEN stackFromEnd is true`() {
+         val menu = spy(BrowserMenu(mock()))
+         // Call show to have a default layout manager set
+         menu.show(View(testContext))
+-        val initialLayoutManager = menu.menuList!!.layoutManager
++        menu.menuPositioningData = MenuPositioningData(BrowserMenuPlacement.AnchoredToTop.Dropdown(mock()))
+ 
+-        menu.showMenuBottom(menu.menuList!!)
++        menu.configureExpandableMenu(menu.menuList!!, true)
+ 
+-        assertNotSame(initialLayoutManager, menu.menuList!!.layoutManager)
+         assertTrue((menu.menuList!!.layoutManager as LinearLayoutManager).stackFromEnd)
+     }
+ 
+@@ -433,6 +435,43 @@ class BrowserMenuTest {
+         assertFalse(popupWindow.isShowing)
+     }
+ 
++    @Test
++    fun `GIVEN BrowserMenu WHEN setColor is called with a null MenuStyle THEN the color of the menuView is not changed but cached in backgroundColor`() {
++        val menu = BrowserMenu(mock())
++        val menuParent = CardView(testContext).apply {
++            id = R.id.mozac_browser_menu_menuView
++            setCardBackgroundColor(Color.YELLOW)
++        }
++        val menuLayout = FrameLayout(testContext).also { it.addView(menuParent) }
++        assertEquals(Color.RED, menu.backgroundColor)
++
++        menu.setColors(menuLayout, null)
++
++        assertEquals(Color.YELLOW, menuParent.cardBackgroundColor.defaultColor)
++        assertEquals(Color.YELLOW, menu.backgroundColor)
++    }
++
++    @Test
++    fun `GIVEN BrowserMenu WHEN setColor is called with a valid MenuStyle THEN the color of the menuView is changed and cached in backgroundColor`() {
++        val menu = BrowserMenu(mock())
++        val menuParent = CardView(testContext).apply {
++            id = R.id.mozac_browser_menu_menuView
++            setCardBackgroundColor(Color.YELLOW)
++        }
++        val menuLayout = FrameLayout(testContext).also { it.addView(menuParent) }
++        val menuStyle = MenuStyle(
++            backgroundColor = Color.GREEN,
++            minWidth = 20,
++            maxWidth = 500
++        )
++        assertEquals(Color.RED, menu.backgroundColor)
++
++        menu.setColors(menuLayout, menuStyle)
++
++        assertEquals(menuStyle.backgroundColor!!.defaultColor, menuParent.cardBackgroundColor.defaultColor)
++        assertEquals(menuStyle.backgroundColor!!.defaultColor, menu.backgroundColor)
++    }
++
+     private fun setScreenHeight(value: Int) {
+         val display = ShadowDisplay.getDefaultDisplay()
+         val shadow = Shadows.shadowOf(display)

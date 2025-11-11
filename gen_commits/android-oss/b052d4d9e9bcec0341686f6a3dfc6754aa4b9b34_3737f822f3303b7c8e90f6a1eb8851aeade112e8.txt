@@ -1,0 +1,169 @@
+diff --git a/app/src/main/java/com/kickstarter/viewmodels/CommentsViewHolderViewModel.kt b/app/src/main/java/com/kickstarter/viewmodels/CommentsViewHolderViewModel.kt
+index 5705cd4f61..0dea517dfd 100644
+--- a/app/src/main/java/com/kickstarter/viewmodels/CommentsViewHolderViewModel.kt
++++ b/app/src/main/java/com/kickstarter/viewmodels/CommentsViewHolderViewModel.kt
+@@ -106,6 +106,7 @@ interface CommentsViewHolderViewModel {
+         private val flagComment = PublishSubject.create<Comment>()
+         private val viewCommentReplies = PublishSubject.create<Comment>()
+         private val isCommentEnableThreads = PublishSubject.create<Boolean>()
++        private val internalError = BehaviorSubject.create<Throwable>()
+ 
+         val inputs: Inputs = this
+         val outputs: Outputs = this
+@@ -138,7 +139,14 @@ interface CommentsViewHolderViewModel {
+                 .map {
+                     Pair(requireNotNull(it.first.comment?.body()), requireNotNull(it.first.project))
+                 }
+-            postComment(commentData)
++
++            this.internalError
++                .compose(bindToLifecycle())
++                .delay(1, TimeUnit.SECONDS, environment.scheduler())
++                .subscribe {
++                    this.commentCardStatus.onNext(CommentCardStatus.FAILED_TO_SEND_COMMENT)
++                }
++            postComment(commentData, internalError)
+         }
+ 
+         /**
+@@ -217,10 +225,12 @@ interface CommentsViewHolderViewModel {
+ 
+             comment
+                 .compose(takeWhen(this.onRetryViewClicked))
++                .doOnNext {
++                    this.commentCardStatus.onNext(CommentCardStatus.RE_TRYING_TO_POST)
++                }
+                 .compose(bindToLifecycle())
+                 .subscribe {
+                     this.retrySendComment.onNext(it)
+-                    this.commentCardStatus.onNext(CommentCardStatus.RE_TRYING_TO_POST)
+                 }
+ 
+             comment
+@@ -233,9 +243,9 @@ interface CommentsViewHolderViewModel {
+          * Handles the logic for posting comments (new ones, and the retry attempts)
+          * @param commentData will emmit only in case we need to post a new comment
+          */
+-        private fun postComment(commentData: Observable<Pair<String, Project>>) {
++        private fun postComment(commentData: Observable<Pair<String, Project>>, errorObservable: BehaviorSubject<Throwable>) {
+             commentData
+-                .map { executePostCommentMutation(it) }
++                .map { executePostCommentMutation(it, errorObservable) }
+                 .switchMap {
+                     it
+                 }
+@@ -246,9 +256,8 @@ interface CommentsViewHolderViewModel {
+ 
+             Observable
+                 .combineLatest(onRetryViewClicked, commentData) { _, newData ->
+-                    return@combineLatest executePostCommentMutation(newData)
+-                }
+-                .switchMap {
++                    return@combineLatest executePostCommentMutation(newData, errorObservable)
++                }.switchMap {
+                     it
+                 }.doOnNext {
+                     this.commentCardStatus.onNext(CommentCardStatus.POSTING_COMMENT_COMPLETED_SUCCESSFULLY)
+@@ -289,7 +298,7 @@ interface CommentsViewHolderViewModel {
+          * // TODO: we will need the entire comment plus very important the [parentId]
+          * @return Observable<Comment>
+          */
+-        private fun executePostCommentMutation(commentData: Pair<String, Project>) =
++        private fun executePostCommentMutation(commentData: Pair<String, Project>, errorObservable: BehaviorSubject<Throwable>) =
+             this.apolloClient.createComment(
+                 PostCommentData(
+                     project = commentData.second,
+@@ -298,7 +307,7 @@ interface CommentsViewHolderViewModel {
+                     parentId = null
+                 )
+             ).doOnError {
+-                this.commentCardStatus.onNext(CommentCardStatus.FAILED_TO_SEND_COMMENT)
++                errorObservable.onNext(it)
+             }
+                 .onErrorResumeNext(Observable.empty())
+ 
+diff --git a/app/src/test/java/com/kickstarter/viewmodels/CommentsViewHolderViewModelTest.kt b/app/src/test/java/com/kickstarter/viewmodels/CommentsViewHolderViewModelTest.kt
+index 43ccaaa89c..c72e3aa141 100644
+--- a/app/src/test/java/com/kickstarter/viewmodels/CommentsViewHolderViewModelTest.kt
++++ b/app/src/test/java/com/kickstarter/viewmodels/CommentsViewHolderViewModelTest.kt
+@@ -17,6 +17,8 @@ import org.joda.time.DateTime
+ import org.junit.Test
+ import rx.Observable
+ import rx.observers.TestSubscriber
++import rx.schedulers.TestScheduler
++import java.util.concurrent.TimeUnit
+ 
+ class CommentsViewHolderViewModelTest : KSRobolectricTestCase() {
+ 
+@@ -33,7 +35,7 @@ class CommentsViewHolderViewModelTest : KSRobolectricTestCase() {
+     private val replyToComment = TestSubscriber<Comment>()
+     private val flagComment = TestSubscriber<Comment>()
+     private val repliesCount = TestSubscriber<Int>()
+-    private val newCommentBind = TestSubscriber<CommentCardData>()
++    private val testScheduler = TestScheduler()
+ 
+     private val createdAt = DateTime.now()
+     private val currentUser = UserFactory.user().toBuilder().id(1).avatar(
+@@ -302,6 +304,7 @@ class CommentsViewHolderViewModelTest : KSRobolectricTestCase() {
+                 return Observable.error(Throwable())
+             }
+         })
++            .scheduler(testScheduler)
+             .currentUser(MockCurrentUser(currentUser))
+             .build()
+ 
+@@ -315,9 +318,16 @@ class CommentsViewHolderViewModelTest : KSRobolectricTestCase() {
+             .build()
+ 
+         this.vm.inputs.configureWith(commentCardData)
++        testScheduler.advanceTimeBy(2, TimeUnit.SECONDS)
++
+         this.vm.inputs.onRetryViewClicked()
+ 
+         this.retrySendComment.assertValue(comment)
++
++        testScheduler.advanceTimeBy(2, TimeUnit.SECONDS)
++
++        this.retrySendComment.assertValue(comment)
++
+         this.commentCardStatus.assertValues(
+             CommentCardStatus.TRYING_TO_POST,
+             CommentCardStatus.FAILED_TO_SEND_COMMENT,
+@@ -327,6 +337,8 @@ class CommentsViewHolderViewModelTest : KSRobolectricTestCase() {
+ 
+         this.vm.inputs.onRetryViewClicked()
+ 
++        testScheduler.advanceTimeBy(2, TimeUnit.SECONDS)
++
+         this.commentCardStatus.assertValues(
+             CommentCardStatus.TRYING_TO_POST,
+             CommentCardStatus.FAILED_TO_SEND_COMMENT,
+@@ -423,11 +435,12 @@ class CommentsViewHolderViewModelTest : KSRobolectricTestCase() {
+     @Test
+     fun testSendCommentFailedAndPressRetry() {
+         val currentUser = UserFactory.user().toBuilder().id(1).build()
+-        val env = environment().toBuilder().apolloClient(object : MockApolloClient() {
+-            override fun createComment(comment: PostCommentData): Observable<Comment> {
+-                return Observable.error(Throwable())
+-            }
+-        })
++        val env = environment().toBuilder()
++            .apolloClient(object : MockApolloClient() {
++                override fun createComment(comment: PostCommentData): Observable<Comment> {
++                    return Observable.error(Throwable())
++                }
++            }).scheduler(testScheduler)
+             .currentUser(MockCurrentUser(currentUser))
+             .build()
+         setUpEnvironment(env)
+@@ -440,7 +453,10 @@ class CommentsViewHolderViewModelTest : KSRobolectricTestCase() {
+             .build()
+ 
+         this.vm.inputs.configureWith(commentCardData)
++        testScheduler.advanceTimeBy(1, TimeUnit.SECONDS)
++
+         this.vm.inputs.onRetryViewClicked()
++        testScheduler.advanceTimeBy(3, TimeUnit.SECONDS)
+ 
+         this.retrySendComment.assertValue(comment)
+         this.commentCardStatus.assertValues(
