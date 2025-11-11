@@ -36,12 +36,17 @@ This dual-message representation enables comparative analysis of human versus AI
 ---
 
 ##  Dataset Structure
+The dataset is organized as follows:
 
 dataset/
-│ master.csv → Master index file with metadata (repo, hash, author, date, keywords)
-│ commits/ → Original commit messages
-│ gen_commits/ → Regenerated AI messages
-│ diffsets/ → Code diffs (.patch) for each commit
+
+    master.csv → Master index file with metadata (repo, hash, author, date, keywords)
+
+    commits/ → Original commit messages
+
+    gen_commits/ → Regenerated AI messages
+
+    diffsets/ → Code diffs (.patch) for each commit
 
 The `master.csv` file is the main entry point, including commit identifiers, authors, matched keywords, and programming languages.
 
